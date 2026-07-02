@@ -652,6 +652,7 @@ fn merge_marketplace_configs_and_plugins_into_text(
 ) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(config_text)?;
     let marketplaces = table_mut_or_insert(&mut doc, "marketplaces")?;
+    let before = marketplaces.clone();
     for marketplace_name in marketplace_names {
         if marketplaces
             .get(marketplace_name)
@@ -979,7 +980,58 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn ensure_marketplace_configs_preserves_existing_marketplaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        // write_marketplace sets up openai-curated marketplace
+        write_marketplace(home);
+        // Pre-populate config.toml with third-party marketplace entries
+        std::fs::write(
+            home.join("config.toml"),
+            "[marketplaces.awesome-codex-plugins]\n"
+            + "source_type = \"local\"\n"
+            + "source = \"\\\\?\\C:\\Users\\test\\awesome\"\n"
+            + "\n"
+            + "[marketplaces.echobird-ai]\n"
+            + "source_type = \"local\"\n"
+            + "source = \"\\\\?\\C:\\Users\\test\\echobird\"\n"
+            + "\n"
+            + "[marketplaces.openai-curated]\n"
+            + "source_type = \"local\"\n"
+            + "source = \"\\\\?\\C:\\Users\\test\\old-path\"\n"
+            ,
+        )
+        .unwrap();
+
+        let changed = ensure_openai_curated_marketplace_config(home).unwrap();
+
+        assert!(changed);
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        let parsed = config.parse::<DocumentMut>().unwrap();
+        // Third-party entries must be preserved
+        assert_eq!(
+            parsed["marketplaces"]["awesome-codex-plugins"]["source"].as_str(),
+            Some("\\\\?\\C:\\Users\\test\\awesome")
+        );
+        assert_eq!(
+            parsed["marketplaces"]["echobird-ai"]["source"].as_str(),
+            Some("\\\\?\\C:\\Users\\test\\echobird")
+        );
+        // OpenAI curated entries must exist
+        assert_eq!(
+            parsed["marketplaces"]["openai-curated"]["source_type"].as_str(),
+            Some("local")
+        );
+        assert_eq!(
+            parsed["marketplaces"]["openai-api-curated"]["source_type"].as_str(),
+            Some("local")
+        );
+    }
+
+    #[test]
     fn ensure_openai_curated_remote_marketplace_config_registers_remote_only() {
+        
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
         write_remote_marketplace(home);
