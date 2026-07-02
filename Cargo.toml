@@ -4,7 +4,7 @@ members = [
   "crates/codex-plus-core",
   "crates/codex-plus-data",
   "apps/codex-plus-launcher",
-  "apps/codex-plus-manager/src-tauri",
+  "apps/codex-plus-manager/src-tauri",`r`n  "apps/codex-plus-mobile-relay",
 ]
 
 [workspace.package]
