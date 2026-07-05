@@ -681,6 +681,14 @@ fn merge_marketplace_configs_and_plugins_into_text(
             }
         }
     }
+    for (name, item) in before.iter() {
+        if marketplace_names.iter().any(|&n| n == name) {
+            continue;
+        }
+        if marketplaces.get(name).is_none() {
+            marketplaces[name] = item.clone();
+        }
+    }
     Ok(ensure_trailing_newline(doc.to_string()))
 }
 
@@ -980,7 +988,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn ensure_marketplace_configs_preserves_existing_marketplaces() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
@@ -989,18 +996,19 @@ mod tests {
         // Pre-populate config.toml with third-party marketplace entries
         std::fs::write(
             home.join("config.toml"),
-            "[marketplaces.awesome-codex-plugins]\n"
-            + "source_type = \"local\"\n"
-            + "source = \"\\\\?\\C:\\Users\\test\\awesome\"\n"
-            + "\n"
-            + "[marketplaces.echobird-ai]\n"
-            + "source_type = \"local\"\n"
-            + "source = \"\\\\?\\C:\\Users\\test\\echobird\"\n"
-            + "\n"
-            + "[marketplaces.openai-curated]\n"
-            + "source_type = \"local\"\n"
-            + "source = \"\\\\?\\C:\\Users\\test\\old-path\"\n"
-            ,
+            concat!(
+                "[marketplaces.awesome-codex-plugins]\n",
+                "source_type = \"local\"\n",
+                "source = \"\\\\?\\\\C:\\Users\\test\\awesome\"\n",
+                "\n",
+                "[marketplaces.echobird-ai]\n",
+                "source_type = \"local\"\n",
+                "source = \"\\\\?\\\\C:\\Users\\test\\echobird\"\n",
+                "\n",
+                "[marketplaces.openai-curated]\n",
+                "source_type = \"local\"\n",
+                "source = \"\\\\?\\\\C:\\Users\\test\\old-path\"\n",
+            ),
         )
         .unwrap();
 
