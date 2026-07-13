@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item};
 
+use crate::aggregate_model_alias;
 use crate::zed_remote::ZedOpenStrategy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -81,6 +82,10 @@ pub struct RelayProfile {
     pub model_insert_mode: RelayModelInsertMode,
     #[serde(rename = "modelList", default)]
     pub model_list: String,
+    #[serde(rename = "modelMappings", default)]
+    pub model_mappings: HashMap<String, String>,
+    #[serde(rename = "modelMappingsEnabled", default = "default_true")]
+    pub model_mappings_enabled: bool,
     #[serde(
         rename = "modelWindows",
         default,
@@ -128,13 +133,35 @@ pub struct AggregateRelayMember {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AggregateRelayDispatchTarget {
+    #[serde(rename = "relayId")]
+    pub relay_id: String,
+    #[serde(rename = "targetModel", default)]
+    pub target_model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregateRelayModelMapping {
+    #[serde(rename = "codexModel", default)]
+    pub codex_model: String,
+    #[serde(default)]
+    pub targets: Vec<AggregateRelayDispatchTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AggregateRelayProfile {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub strategy: AggregateRelayStrategy,
+    #[serde(default = "default_true")]
+    pub model_mappings_enabled: bool,
     #[serde(default)]
     pub members: Vec<AggregateRelayMember>,
+    #[serde(rename = "modelMappings", default)]
+    pub model_mappings: Vec<AggregateRelayModelMapping>,
 }
 
 impl Default for RelayProfile {
@@ -159,6 +186,8 @@ impl Default for RelayProfile {
             auto_compact_limit: String::new(),
             model_insert_mode: RelayModelInsertMode::Patch,
             model_list: String::new(),
+            model_mappings: HashMap::new(),
+            model_mappings_enabled: true,
             model_windows: String::new(),
             model_vlm: String::new(),
             vlm_api_key: String::new(),
@@ -574,6 +603,8 @@ impl BackendSettings {
                 auto_compact_limit: String::new(),
                 model_insert_mode: RelayModelInsertMode::Patch,
                 model_list: String::new(),
+                model_mappings: HashMap::new(),
+                model_mappings_enabled: true,
                 model_windows: String::new(),
                 model_vlm: String::new(),
                 vlm_api_key: String::new(),
@@ -623,6 +654,8 @@ impl BackendSettings {
             auto_compact_limit: String::new(),
             model_insert_mode: RelayModelInsertMode::Patch,
             model_list: String::new(),
+            model_mappings: HashMap::new(),
+            model_mappings_enabled: true,
             model_windows: String::new(),
             model_vlm: String::new(),
             vlm_api_key: String::new(),
@@ -1389,6 +1422,7 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     ]);
     settings.relay_common_config_contents = crate::relay_config::normalize_config_text(&common);
     settings.relay_context_config_contents = crate::relay_config::normalize_config_text(&context);
+    hydrate_aggregate_profile_model_lists(&mut settings);
     for profile in &mut settings.relay_profiles {
         let _ = crate::relay_config::normalize_relay_profile_for_storage(profile);
     }
@@ -1427,6 +1461,44 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings.codex_app_stepwise_timeout_ms =
         clamp_stepwise_timeout_ms(settings.codex_app_stepwise_timeout_ms);
     settings
+}
+
+fn hydrate_aggregate_profile_model_lists(settings: &mut BackendSettings) {
+    let aggregate_models = settings
+        .aggregate_relay_profiles
+        .iter()
+        .map(|aggregate| {
+            let member_profiles = aggregate
+                .members
+                .iter()
+                .filter_map(|member| {
+                    settings
+                        .relay_profiles
+                        .iter()
+                        .find(|profile| profile.id == member.relay_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let models = aggregate_model_alias::aggregate_catalog_aliases(aggregate, &member_profiles)
+                .into_iter()
+                .map(|alias| alias.alias)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (aggregate.id.clone(), models)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for profile in &mut settings.relay_profiles {
+        if profile.relay_mode != RelayMode::Aggregate {
+            continue;
+        }
+        if !profile.model_list.trim().is_empty() {
+            continue;
+        }
+        if let Some(models) = aggregate_models.get(&profile.id).filter(|value| !value.is_empty()) {
+            profile.model_list = models.clone();
+        }
+    }
 }
 
 fn split_context_config_sections(config: &str) -> (String, String) {
@@ -2095,6 +2167,8 @@ experimental_bearer_token = "sk-existing""#
                         weight: 3,
                     },
                 ],
+                model_mappings_enabled: true,
+                model_mappings: vec![],
             }],
             active_aggregate_relay_id: "agg".to_string(),
             ..BackendSettings::default()
@@ -2113,6 +2187,73 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(active_aggregate.members[1].relay_id, "relay-b");
         assert_eq!(active_aggregate.members[1].weight, 3);
         assert!(loaded.active_relay_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn normalize_settings_config_sections_restores_aggregate_model_list_from_members() {
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "relay-a".to_string(),
+                    model: "gpt-5.5".to_string(),
+                    model_list: "gpt-5.5\ngpt-5.4".to_string(),
+                    base_url: "https://a.example/v1".to_string(),
+                    upstream_base_url: "https://a.example/v1".to_string(),
+                    api_key: "sk-a".to_string(),
+                    relay_mode: RelayMode::PureApi,
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "relay-b".to_string(),
+                    model: "deepseek-v4-pro".to_string(),
+                    model_list: "deepseek-v4-pro".to_string(),
+                    base_url: "https://b.example/v1".to_string(),
+                    upstream_base_url: "https://b.example/v1".to_string(),
+                    api_key: "sk-b".to_string(),
+                    relay_mode: RelayMode::PureApi,
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "agg".to_string(),
+                    name: "聚合".to_string(),
+                    relay_mode: RelayMode::Aggregate,
+                    model_list: String::new(),
+                    ..RelayProfile::default()
+                },
+            ],
+            active_relay_id: "agg".to_string(),
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合".to_string(),
+                strategy: AggregateRelayStrategy::Failover,
+                members: vec![
+                    AggregateRelayMember {
+                        relay_id: "relay-a".to_string(),
+                        weight: 1,
+                    },
+                    AggregateRelayMember {
+                        relay_id: "relay-b".to_string(),
+                        weight: 1,
+                    },
+                ],
+                model_mappings_enabled: true,
+                model_mappings: vec![],
+            }],
+            active_aggregate_relay_id: "agg".to_string(),
+            ..BackendSettings::default()
+        };
+
+        let normalized = normalize_settings_config_sections(settings);
+        let aggregate = normalized
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == "agg")
+            .unwrap();
+
+        assert_eq!(
+            aggregate.model_list,
+            "gpt-5.5\ngpt-5.4\n中转 A：gpt-5.5\n中转 A：gpt-5.4\n中转 B：deepseek-v4-pro"
+        );
     }
 
     #[test]

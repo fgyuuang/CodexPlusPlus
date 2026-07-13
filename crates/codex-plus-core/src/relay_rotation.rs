@@ -17,6 +17,10 @@ pub enum SelectionError {
     EmptyAggregateMembers {
         aggregate_id: String,
     },
+    UnsupportedModel {
+        aggregate_id: String,
+        model: String,
+    },
     UnknownMemberRelay {
         aggregate_id: String,
         relay_id: String,
@@ -34,6 +38,13 @@ impl std::fmt::Display for SelectionError {
             SelectionError::EmptyAggregateMembers { aggregate_id } => {
                 write!(formatter, "聚合供应商「{aggregate_id}」没有成员")
             }
+            SelectionError::UnsupportedModel {
+                aggregate_id,
+                model,
+            } => write!(
+                formatter,
+                "聚合供应商「{aggregate_id}」中没有可以处理模型「{model}」的成员"
+            ),
             SelectionError::UnknownMemberRelay {
                 aggregate_id,
                 relay_id,
@@ -79,6 +90,7 @@ pub struct RelayRotationSelector {
     failover_index: usize,
     request_index: usize,
     weighted_index: usize,
+    last_member_pool_signature: Vec<String>,
     conversation_assignments: HashMap<String, String>,
 }
 
@@ -93,6 +105,7 @@ impl RelayRotationSelector {
             failover_index: 0,
             request_index: 0,
             weighted_index: 0,
+            last_member_pool_signature: Vec::new(),
             conversation_assignments: HashMap::new(),
         })
     }
@@ -101,15 +114,18 @@ impl RelayRotationSelector {
         &mut self,
         settings: &BackendSettings,
         context: RotationContext,
+        model: Option<&str>,
     ) -> Result<RelayProfile, SelectionError> {
         validate_aggregate_members(settings, &self.aggregate)?;
+        let members = member_pool_for_model(settings, &self.aggregate, model)?;
+        self.refresh_pool_state(&members);
         let relay_id = match self.aggregate.strategy {
-            AggregateRelayStrategy::Failover => self.member_id_at(self.failover_index),
+            AggregateRelayStrategy::Failover => member_id_at(&members, self.failover_index),
             AggregateRelayStrategy::ConversationRoundRobin => {
-                self.select_for_conversation(context.conversation_id)
+                self.select_for_conversation(context.conversation_id, &members)
             }
-            AggregateRelayStrategy::RequestRoundRobin => self.select_next_request(),
-            AggregateRelayStrategy::WeightedRoundRobin => self.select_next_weighted(),
+            AggregateRelayStrategy::RequestRoundRobin => self.select_next_request(&members),
+            AggregateRelayStrategy::WeightedRoundRobin => self.select_next_weighted(&members),
         };
         relay_profile_by_id(settings, &relay_id).ok_or_else(|| SelectionError::UnknownMemberRelay {
             aggregate_id: self.aggregate.id.clone(),
@@ -117,14 +133,21 @@ impl RelayRotationSelector {
         })
     }
 
-    pub fn peek(&self, settings: &BackendSettings) -> Result<RelayProfile, SelectionError> {
+    pub fn peek(
+        &self,
+        settings: &BackendSettings,
+        model: Option<&str>,
+    ) -> Result<RelayProfile, SelectionError> {
         validate_aggregate_members(settings, &self.aggregate)?;
+        let members = member_pool_for_model(settings, &self.aggregate, model)?;
         let relay_id = match self.aggregate.strategy {
-            AggregateRelayStrategy::Failover => self.member_id_at(self.failover_index),
+            AggregateRelayStrategy::Failover => member_id_at(&members, self.failover_index),
             AggregateRelayStrategy::ConversationRoundRobin
-            | AggregateRelayStrategy::RequestRoundRobin => self.member_id_at(self.request_index),
+            | AggregateRelayStrategy::RequestRoundRobin => {
+                member_id_at(&members, self.request_index)
+            }
             AggregateRelayStrategy::WeightedRoundRobin => {
-                let schedule = self.weighted_schedule();
+                let schedule = weighted_schedule(&members);
                 schedule[self.weighted_index % schedule.len()].clone()
             }
         };
@@ -143,53 +166,62 @@ impl RelayRotationSelector {
         }
     }
 
-    fn select_for_conversation(&mut self, conversation_id: Option<String>) -> String {
+    fn select_for_conversation(
+        &mut self,
+        conversation_id: Option<String>,
+        members: &[crate::settings::AggregateRelayMember],
+    ) -> String {
         let Some(conversation_id) = conversation_id else {
-            return self.select_next_request();
+            return self.select_next_request(members);
         };
         if let Some(relay_id) = self.conversation_assignments.get(&conversation_id) {
-            return relay_id.clone();
+            if members.iter().any(|member| member.relay_id == *relay_id) {
+                return relay_id.clone();
+            }
         }
 
-        let relay_id = self.select_next_request();
+        let relay_id = self.select_next_request(members);
         self.conversation_assignments
             .insert(conversation_id, relay_id.clone());
         relay_id
     }
 
-    fn select_next_request(&mut self) -> String {
-        let relay_id = self.member_id_at(self.request_index);
-        self.request_index = (self.request_index + 1) % self.aggregate.members.len();
+    fn select_next_request(
+        &mut self,
+        members: &[crate::settings::AggregateRelayMember],
+    ) -> String {
+        let relay_id = member_id_at(members, self.request_index);
+        self.request_index = (self.request_index + 1) % members.len();
         relay_id
     }
 
-    fn select_next_weighted(&mut self) -> String {
-        let schedule = self.weighted_schedule();
+    fn select_next_weighted(
+        &mut self,
+        members: &[crate::settings::AggregateRelayMember],
+    ) -> String {
+        let schedule = weighted_schedule(members);
         let relay_id = schedule[self.weighted_index % schedule.len()].clone();
         self.weighted_index = (self.weighted_index + 1) % schedule.len();
         relay_id
     }
 
-    fn weighted_schedule(&self) -> Vec<String> {
-        self.aggregate
-            .members
+    fn refresh_pool_state(&mut self, members: &[crate::settings::AggregateRelayMember]) {
+        let signature = members
             .iter()
-            .flat_map(|member| {
-                std::iter::repeat_n(member.relay_id.clone(), member.weight.max(1) as usize)
-            })
-            .collect()
-    }
-
-    fn member_id_at(&self, index: usize) -> String {
-        self.aggregate.members[index % self.aggregate.members.len()]
-            .relay_id
-            .clone()
+            .map(|member| format!("{}:{}", member.relay_id, member.weight))
+            .collect::<Vec<_>>();
+        if self.last_member_pool_signature != signature {
+            self.request_index = 0;
+            self.weighted_index = 0;
+            self.last_member_pool_signature = signature;
+        }
     }
 }
 
 pub fn select_relay_for_request(
     settings: &BackendSettings,
     context: RotationContext,
+    model: Option<&str>,
 ) -> Result<RelayProfile, SelectionError> {
     let Some(active_aggregate) = settings.active_aggregate_relay_profile() else {
         clear_global_selector();
@@ -208,10 +240,13 @@ pub fn select_relay_for_request(
     guard
         .as_mut()
         .expect("selector initialized")
-        .select(settings, context)
+        .select(settings, context, model)
 }
 
-pub fn select_relay_for_probe(settings: &BackendSettings) -> Result<RelayProfile, SelectionError> {
+pub fn select_relay_for_probe(
+    settings: &BackendSettings,
+    model: Option<&str>,
+) -> Result<RelayProfile, SelectionError> {
     let Some(active_aggregate) = settings.active_aggregate_relay_profile() else {
         clear_global_selector();
         return Ok(settings.active_relay_profile());
@@ -226,27 +261,31 @@ pub fn select_relay_for_probe(settings: &BackendSettings) -> Result<RelayProfile
     if needs_new_selector {
         *guard = Some(RelayRotationSelector::from_settings(settings)?);
     }
-    guard.as_ref().expect("selector initialized").peek(settings)
+    guard
+        .as_ref()
+        .expect("selector initialized")
+        .peek(settings, model)
 }
 
 pub fn fallback_relays_after(
     settings: &BackendSettings,
     relay_id: &str,
+    model: Option<&str>,
 ) -> Result<Vec<RelayProfile>, SelectionError> {
     let Some(active_aggregate) = settings.active_aggregate_relay_profile() else {
         return Ok(Vec::new());
     };
     validate_aggregate_members(settings, &active_aggregate)?;
-    let start_index = active_aggregate
-        .members
+    let members = member_pool_for_model(settings, &active_aggregate, model)?;
+    let start_index = members
         .iter()
         .position(|member| member.relay_id == relay_id)
         .map(|index| index + 1)
         .unwrap_or(0);
-    (0..active_aggregate.members.len().saturating_sub(1))
+    (0..members.len().saturating_sub(1))
         .map(|offset| {
-            let index = (start_index + offset) % active_aggregate.members.len();
-            &active_aggregate.members[index]
+            let index = (start_index + offset) % members.len();
+            &members[index]
         })
         .map(|member| {
             relay_profile_by_id(settings, &member.relay_id).ok_or_else(|| {
@@ -320,16 +359,239 @@ fn validate_aggregate_members(
     Ok(())
 }
 
+fn member_pool_for_model(
+    settings: &BackendSettings,
+    aggregate: &AggregateRelayProfile,
+    model: Option<&str>,
+) -> Result<Vec<crate::settings::AggregateRelayMember>, SelectionError> {
+    let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(aggregate.members.clone());
+    };
+    let original_model = model;
+    let normalized_model = crate::aggregate_model_alias::normalize_requested_model_name(model);
+    let model = if normalized_model.is_empty() {
+        model
+    } else {
+        normalized_model.as_str()
+    };
+
+    if let Some(provider_specific_members) =
+        aggregate_member_pool_for_provider_alias(settings, aggregate, model)
+    {
+        return Ok(provider_specific_members);
+    }
+
+    let direct_members = aggregate
+        .members
+        .iter()
+        .filter(|member| {
+            raw_relay_profile_by_id(settings, &member.relay_id)
+                .is_some_and(|relay| relay_supports_direct_model(relay, model))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !direct_members.is_empty() {
+        return Ok(direct_members);
+    }
+
+    let explicit_dispatch_members = aggregate_dispatch_member_pool(settings, aggregate, model);
+    if !explicit_dispatch_members.is_empty() {
+        return Ok(explicit_dispatch_members);
+    }
+
+    if !crate::aggregate_model_alias::looks_like_codex_model_key(model) {
+        return Ok(aggregate.members.clone());
+    }
+
+    if original_model != model {
+        let mapped_members = aggregate
+            .members
+            .iter()
+            .filter(|member| {
+                raw_relay_profile_by_id(settings, &member.relay_id).is_some_and(|relay| {
+                    relay.model_mappings_enabled
+                        && relay
+                            .model_mappings
+                            .keys()
+                            .any(|mapping| mapping.trim() == model)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !mapped_members.is_empty() {
+            return Ok(mapped_members);
+        }
+    }
+
+    Err(SelectionError::UnsupportedModel {
+        aggregate_id: aggregate.id.clone(),
+        model: model.to_string(),
+    })
+}
+
+fn aggregate_member_pool_for_provider_alias(
+    settings: &BackendSettings,
+    aggregate: &AggregateRelayProfile,
+    model: &str,
+) -> Option<Vec<crate::settings::AggregateRelayMember>> {
+    let member_profiles = aggregate
+        .members
+        .iter()
+        .filter_map(|member| raw_relay_profile_by_id(settings, &member.relay_id).cloned())
+        .collect::<Vec<_>>();
+    let relay_weight_by_id = aggregate
+        .members
+        .iter()
+        .map(|member| (member.relay_id.as_str(), member.weight))
+        .collect::<HashMap<_, _>>();
+    let mut matches = Vec::new();
+    for profile in member_profiles {
+        for alias in crate::aggregate_model_alias::aggregate_model_aliases_for_member(&profile, false)
+        {
+            if alias.alias != model {
+                continue;
+            }
+            let relay_id = alias.provider_id;
+            let weight = *relay_weight_by_id.get(relay_id.as_str()).unwrap_or(&1);
+            matches.push(crate::settings::AggregateRelayMember { relay_id, weight });
+        }
+    }
+    (!matches.is_empty()).then_some(matches)
+}
+
+fn aggregate_dispatch_member_pool(
+    settings: &BackendSettings,
+    aggregate: &AggregateRelayProfile,
+    model: &str,
+) -> Vec<crate::settings::AggregateRelayMember> {
+    let member_profiles = aggregate
+        .members
+        .iter()
+        .filter_map(|member| raw_relay_profile_by_id(settings, &member.relay_id).cloned())
+        .collect::<Vec<_>>();
+    let dispatch_entries = crate::aggregate_model_alias::aggregate_dispatch_entries(aggregate, &member_profiles);
+    let relay_weight_by_id = aggregate
+        .members
+        .iter()
+        .map(|member| (member.relay_id.as_str(), member.weight))
+        .collect::<HashMap<_, _>>();
+
+    dispatch_entries
+        .into_iter()
+        .filter(|entry| entry.codex_model == model || entry.alias == model)
+        .map(|entry| {
+            let relay_id = entry.provider_id;
+            let weight = *relay_weight_by_id.get(relay_id.as_str()).unwrap_or(&1);
+            crate::settings::AggregateRelayMember {
+                relay_id,
+                weight,
+            }
+        })
+        .collect()
+}
+
+fn relay_supports_direct_model(relay: &RelayProfile, model: &str) -> bool {
+    relay_models(relay).iter().any(|item| item == model)
+        || crate::aggregate_model_alias::aggregate_model_aliases_for_member(relay, false)
+            .iter()
+            .any(|alias| alias.alias == model)
+}
+
+fn relay_models(relay: &RelayProfile) -> Vec<String> {
+    crate::aggregate_model_alias::relay_profile_model_ids(relay)
+}
+
+fn weighted_schedule(members: &[crate::settings::AggregateRelayMember]) -> Vec<String> {
+    members
+        .iter()
+        .flat_map(|member| {
+            std::iter::repeat_n(member.relay_id.clone(), member.weight.max(1) as usize)
+        })
+        .collect()
+}
+
+fn member_id_at(members: &[crate::settings::AggregateRelayMember], index: usize) -> String {
+    members[index % members.len()].relay_id.clone()
+}
+
 fn clear_global_selector() {
     let lock = GLOBAL_SELECTOR.get_or_init(|| Mutex::new(None));
     let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = None;
 }
 
-fn relay_profile_by_id(settings: &BackendSettings, relay_id: &str) -> Option<RelayProfile> {
+pub fn clear_relay_rotation_state_for_tests() {
+    clear_global_selector();
+}
+
+fn raw_relay_profile_by_id<'a>(
+    settings: &'a BackendSettings,
+    relay_id: &str,
+) -> Option<&'a RelayProfile> {
     settings
         .relay_profiles
         .iter()
         .find(|profile| profile.id == relay_id)
-        .cloned()
+}
+
+fn relay_profile_by_id(settings: &BackendSettings, relay_id: &str) -> Option<RelayProfile> {
+    raw_relay_profile_by_id(settings, relay_id).map(|profile| {
+        let mut relay = profile.clone();
+        let mut effective_model_mappings = HashMap::new();
+
+        for alias in crate::aggregate_model_alias::aggregate_model_aliases_for_member(profile, false)
+        {
+            effective_model_mappings.insert(alias.alias, alias.target_model);
+        }
+
+        if profile.model_mappings_enabled {
+            for (mapping_key, target_model) in &profile.model_mappings {
+                let mapping_key = mapping_key.trim();
+                let target_model = target_model.trim();
+                if mapping_key.is_empty() || target_model.is_empty() {
+                    continue;
+                }
+                effective_model_mappings
+                    .insert(mapping_key.to_string(), target_model.to_string());
+            }
+            for alias in crate::aggregate_model_alias::aggregate_model_aliases_for_member(
+                profile,
+                true,
+            )
+            .into_iter()
+            .filter(|alias| alias.via_mapping)
+            {
+                effective_model_mappings.insert(alias.alias, alias.target_model);
+            }
+        }
+        relay.model_list = crate::aggregate_model_alias::aggregate_model_aliases_for_member(
+            profile,
+            false,
+        )
+        .into_iter()
+        .map(|alias| alias.alias)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        if let Some(aggregate) = settings.active_aggregate_relay_profile() {
+            let member_profiles = aggregate
+                .members
+                .iter()
+                .filter_map(|member| raw_relay_profile_by_id(settings, &member.relay_id).cloned())
+                .collect::<Vec<_>>();
+            for entry in crate::aggregate_model_alias::aggregate_dispatch_entries(&aggregate, &member_profiles) {
+                if entry.provider_id == relay.id {
+                    let target_model = entry.target_model;
+                    effective_model_mappings
+                        .insert(entry.codex_model, target_model.clone());
+                    effective_model_mappings.insert(entry.alias, target_model);
+                }
+            }
+        }
+
+        relay.model_mappings = effective_model_mappings;
+        relay.model_mappings_enabled = !relay.model_mappings.is_empty();
+
+        relay
+    })
 }

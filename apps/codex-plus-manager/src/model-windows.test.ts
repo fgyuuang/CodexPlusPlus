@@ -30,6 +30,8 @@ const _profileTypeCheck: RelayProfile = {
   contextWindow: "",
   autoCompactLimit: "",
   modelList: "",
+  modelMappings: {},
+  modelMappingsEnabled: true,
   modelWindows: "",
   modelVlm: "",
   vlmApiKey: "",

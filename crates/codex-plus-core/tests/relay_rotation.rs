@@ -30,6 +30,7 @@ fn aggregate(strategy: AggregateRelayStrategy) -> AggregateRelayProfile {
         id: "agg".to_string(),
         name: "聚合".to_string(),
         strategy,
+        model_mappings_enabled: true,
         members: vec![
             AggregateRelayMember {
                 relay_id: "relay-a".to_string(),
@@ -44,6 +45,7 @@ fn aggregate(strategy: AggregateRelayStrategy) -> AggregateRelayProfile {
                 weight: 1,
             },
         ],
+        model_mappings: Vec::new(),
     }
 }
 
@@ -52,6 +54,7 @@ fn aggregate_with_id(id: &str, strategy: AggregateRelayStrategy) -> AggregateRel
         id: id.to_string(),
         name: "聚合".to_string(),
         strategy,
+        model_mappings_enabled: true,
         members: vec![
             AggregateRelayMember {
                 relay_id: "relay-a".to_string(),
@@ -62,6 +65,7 @@ fn aggregate_with_id(id: &str, strategy: AggregateRelayStrategy) -> AggregateRel
                 weight: 2,
             },
         ],
+        model_mappings: Vec::new(),
     }
 }
 
@@ -91,15 +95,15 @@ fn failover_keeps_current_provider_until_failure_then_moves_to_next_member() {
     let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
 
     let first = selector
-        .select(&settings, RotationContext::for_conversation("chat-1"))
+        .select(&settings, RotationContext::for_conversation("chat-1"), None)
         .unwrap();
     selector.record_event(RotationEvent::Success);
     let second = selector
-        .select(&settings, RotationContext::for_conversation("chat-1"))
+        .select(&settings, RotationContext::for_conversation("chat-1"), None)
         .unwrap();
     selector.record_event(RotationEvent::Failure);
     let third = selector
-        .select(&settings, RotationContext::for_conversation("chat-1"))
+        .select(&settings, RotationContext::for_conversation("chat-1"), None)
         .unwrap();
 
     assert_eq!(first.id, "relay-a");
@@ -113,13 +117,13 @@ fn conversation_rotation_sticks_each_conversation_to_a_stable_member() {
     let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
 
     let chat_a_first = selector
-        .select(&settings, RotationContext::for_conversation("chat-a"))
+        .select(&settings, RotationContext::for_conversation("chat-a"), None)
         .unwrap();
     let chat_a_second = selector
-        .select(&settings, RotationContext::for_conversation("chat-a"))
+        .select(&settings, RotationContext::for_conversation("chat-a"), None)
         .unwrap();
     let chat_b_first = selector
-        .select(&settings, RotationContext::for_conversation("chat-b"))
+        .select(&settings, RotationContext::for_conversation("chat-b"), None)
         .unwrap();
 
     assert_eq!(chat_a_first.id, "relay-a");
@@ -135,7 +139,7 @@ fn request_rotation_advances_on_every_request() {
     let selected = (0..5)
         .map(|_| {
             selector
-                .select(&settings, RotationContext::default())
+                .select(&settings, RotationContext::default(), None)
                 .unwrap()
                 .id
         })
@@ -155,7 +159,7 @@ fn weighted_rotation_repeats_members_by_configured_weight() {
     let selected = (0..6)
         .map(|_| {
             selector
-                .select(&settings, RotationContext::default())
+                .select(&settings, RotationContext::default(), None)
                 .unwrap()
                 .id
         })
@@ -197,10 +201,10 @@ fn aggregate_with_one_member_is_allowed_without_rotation() {
 
     let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
     let first = selector
-        .select(&settings, RotationContext::default())
+        .select(&settings, RotationContext::default(), None)
         .unwrap();
     let second = selector
-        .select(&settings, RotationContext::default())
+        .select(&settings, RotationContext::default(), None)
         .unwrap();
 
     assert_eq!(first.id, "relay-a");
@@ -242,7 +246,7 @@ fn select_relay_for_request_uses_active_relay_id_as_aggregate_source_of_truth() 
     settings.active_relay_id = "agg".to_string();
     settings.active_aggregate_relay_id.clear();
 
-    let selected = select_relay_for_request(&settings, RotationContext::default()).unwrap();
+    let selected = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
 
     assert_eq!(selected.id, "relay-a");
 }
@@ -254,7 +258,7 @@ fn select_relay_for_request_ignores_stale_active_aggregate_id_for_regular_relay(
     settings.active_relay_id = "relay-b".to_string();
     settings.active_aggregate_relay_id = "agg".to_string();
 
-    let selected = select_relay_for_request(&settings, RotationContext::default()).unwrap();
+    let selected = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
 
     assert_eq!(selected.id, "relay-b");
 }
@@ -265,12 +269,12 @@ fn select_relay_for_request_resets_rotation_after_switching_to_regular_relay() {
     let mut settings = settings(AggregateRelayStrategy::RequestRoundRobin);
     settings.active_relay_id = "agg".to_string();
 
-    let first = select_relay_for_request(&settings, RotationContext::default()).unwrap();
+    let first = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
     let mut regular_settings = settings.clone();
     regular_settings.active_relay_id = "relay-c".to_string();
     regular_settings.active_aggregate_relay_id.clear();
-    let regular = select_relay_for_request(&regular_settings, RotationContext::default()).unwrap();
-    let after_reselect = select_relay_for_request(&settings, RotationContext::default()).unwrap();
+    let regular = select_relay_for_request(&regular_settings, RotationContext::default(), None).unwrap();
+    let after_reselect = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
 
     assert_eq!(first.id, "relay-a");
     assert_eq!(regular.id, "relay-c");
@@ -301,9 +305,9 @@ fn record_relay_request_failure_advances_global_failover_selector() {
         ..BackendSettings::default()
     };
 
-    let first = select_relay_for_request(&settings, RotationContext::default()).unwrap();
+    let first = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
     record_relay_request_failure(&settings);
-    let second = select_relay_for_request(&settings, RotationContext::default()).unwrap();
+    let second = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
 
     assert_eq!(first.id, "relay-a");
     assert_eq!(second.id, "relay-b");
@@ -333,10 +337,10 @@ fn select_relay_for_probe_does_not_advance_request_rotation() {
         ..BackendSettings::default()
     };
 
-    let first_probe = select_relay_for_probe(&settings).unwrap();
-    let second_probe = select_relay_for_probe(&settings).unwrap();
-    let first_request = select_relay_for_request(&settings, RotationContext::default()).unwrap();
-    let second_request = select_relay_for_request(&settings, RotationContext::default()).unwrap();
+    let first_probe = select_relay_for_probe(&settings, None).unwrap();
+    let second_probe = select_relay_for_probe(&settings, None).unwrap();
+    let first_request = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
+    let second_request = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
 
     assert_eq!(first_probe.id, "relay-a");
     assert_eq!(second_probe.id, "relay-a");
@@ -348,7 +352,7 @@ fn select_relay_for_probe_does_not_advance_request_rotation() {
 fn fallback_relays_after_returns_remaining_aggregate_members_after_current_then_wraps() {
     let settings = settings(AggregateRelayStrategy::RequestRoundRobin);
 
-    let fallbacks = fallback_relays_after(&settings, "relay-b").unwrap();
+    let fallbacks = fallback_relays_after(&settings, "relay-b", None).unwrap();
 
     assert_eq!(
         fallbacks
@@ -364,7 +368,7 @@ fn fallback_relays_after_regular_relay_returns_empty_candidates() {
     let mut settings = settings(AggregateRelayStrategy::RequestRoundRobin);
     settings.active_relay_id = "relay-a".to_string();
 
-    let fallbacks = fallback_relays_after(&settings, "relay-a").unwrap();
+    let fallbacks = fallback_relays_after(&settings, "relay-a", None).unwrap();
 
     assert!(fallbacks.is_empty());
 }
@@ -393,12 +397,12 @@ fn select_relay_for_request_rebuilds_selector_when_active_aggregate_changes() {
         ..BackendSettings::default()
     };
 
-    let first = select_relay_for_request(&settings, RotationContext::default()).unwrap();
+    let first = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
     settings.aggregate_relay_profiles[0].strategy = AggregateRelayStrategy::WeightedRoundRobin;
 
     let selected = (0..3)
         .map(|_| {
-            select_relay_for_request(&settings, RotationContext::default())
+            select_relay_for_request(&settings, RotationContext::default(), None)
                 .unwrap()
                 .id
         })

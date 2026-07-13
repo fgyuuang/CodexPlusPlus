@@ -413,12 +413,8 @@ fn local_plugin_marketplaces() -> Value {
 
 fn local_plugin_marketplaces_from_home(home: &Path) -> Value {
     let installed_plugins = installed_plugins_from_config(&home);
-    let marketplace_dir = home
-        .join(".tmp")
-        .join("plugins")
-        .join(".agents")
-        .join("plugins");
-    let candidates = [
+    let marketplace_dir = home.join(".tmp").join("plugins").join(".agents").join("plugins");
+    let mut candidates = vec![
         marketplace_dir.join("marketplace.json"),
         marketplace_dir.join("api_marketplace.json"),
         home.join(".tmp")
@@ -426,7 +422,27 @@ fn local_plugin_marketplaces_from_home(home: &Path) -> Value {
             .join(".agents")
             .join("plugins")
             .join("marketplace.json"),
+        home.join("plugins")
+            .join("sources")
+            .join("openai-primary-runtime")
+            .join(".agents")
+            .join("plugins")
+            .join("marketplace.json"),
     ];
+    let sources_root = home.join("plugins").join("sources");
+    let mut seen_third_party_roots = std::collections::BTreeSet::new();
+    collect_local_marketplace_candidates(
+        &mut candidates,
+        &mut seen_third_party_roots,
+        &home.join(".tmp").join("marketplaces"),
+        false,
+    );
+    collect_local_marketplace_candidates(
+        &mut candidates,
+        &mut seen_third_party_roots,
+        &sources_root,
+        true,
+    );
     let marketplaces = candidates
         .iter()
         .filter_map(|path| {
@@ -442,6 +458,50 @@ fn local_plugin_marketplaces_from_home(home: &Path) -> Value {
         })
         .collect::<Vec<_>>();
     Value::Array(marketplaces)
+}
+
+fn collect_local_marketplace_candidates(
+    candidates: &mut Vec<std::path::PathBuf>,
+    seen_roots: &mut std::collections::BTreeSet<std::path::PathBuf>,
+    parent: &Path,
+    from_sources_root: bool,
+) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let root = entry.path();
+        if !root.is_dir() {
+            continue;
+        }
+        let name = root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if skip_local_marketplace_root(&name, from_sources_root) {
+            continue;
+        }
+        let marketplace_path = root.join(".agents").join("plugins").join("marketplace.json");
+        let api_marketplace_path = root.join(".agents").join("plugins").join("api_marketplace.json");
+        if marketplace_path.is_file() && seen_roots.insert(root.clone()) {
+            candidates.push(marketplace_path);
+        }
+        if api_marketplace_path.is_file() && seen_roots.insert(root.clone()) {
+            candidates.push(api_marketplace_path);
+        }
+    }
+}
+
+fn skip_local_marketplace_root(name: &str, from_sources_root: bool) -> bool {
+    if name.is_empty() || name.starts_with('.') || name == "echobird-ai" {
+        return true;
+    }
+    from_sources_root
+        && matches!(
+            name,
+            "openai-bundled" | "openai-primary-runtime" | "openai-bundled-fixed"
+        )
 }
 
 fn expand_local_plugin_marketplace(
@@ -491,6 +551,7 @@ fn expand_local_plugin_marketplace(
         if let Some(manifest) = plugin_manifest(&manifest_path) {
             merge_plugin_manifest(plugin_object, manifest);
         }
+        apply_official_office_plugin_aliases(&marketplace_name, &plugin_name, plugin_object);
         absolutize_plugin_icon_paths(plugin_object, &plugin_root);
         plugin_object
             .entry("name".to_string())
@@ -510,6 +571,31 @@ fn expand_local_plugin_marketplace(
         plugin_object.insert(
             "installed".to_string(),
             Value::Bool(installed_plugins.contains(&format!("{plugin_name}@{marketplace_name}"))),
+        );
+    }
+}
+
+fn apply_official_office_plugin_aliases(
+    marketplace_name: &str,
+    plugin_name: &str,
+    plugin: &mut Map<String, Value>,
+) {
+    if marketplace_name != "openai-primary-runtime" {
+        return;
+    }
+    let display_name = match plugin_name {
+        "documents" => "Word / Documents",
+        "presentations" => "PPT / Presentations",
+        "spreadsheets" => "Excel / Spreadsheets",
+        _ => return,
+    };
+    let interface = plugin
+        .entry("interface".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(interface) = interface.as_object_mut() {
+        interface.insert(
+            "displayName".to_string(),
+            Value::String(display_name.to_string()),
         );
     }
 }
@@ -742,5 +828,244 @@ mod tests {
             array[2]["plugins"][0]["marketplacePath"].as_str(),
             Some("openai-curated-remote")
         );
+    }
+
+    #[test]
+    fn local_plugin_marketplaces_includes_primary_runtime_and_third_party_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let runtime_marketplace_dir = home
+            .join("plugins")
+            .join("sources")
+            .join("openai-primary-runtime")
+            .join(".agents")
+            .join("plugins");
+        let runtime_plugin_dir = home
+            .join("plugins")
+            .join("sources")
+            .join("openai-primary-runtime")
+            .join("plugins")
+            .join("documents");
+        let third_party_marketplace_dir = home
+            .join("plugins")
+            .join("sources")
+            .join("awesome-codex-plugins")
+            .join(".agents")
+            .join("plugins");
+        let third_party_plugin_dir = home
+            .join("plugins")
+            .join("sources")
+            .join("awesome-codex-plugins")
+            .join("plugins")
+            .join("productivity");
+        std::fs::create_dir_all(&runtime_marketplace_dir).unwrap();
+        std::fs::create_dir_all(runtime_plugin_dir.join(".codex-plugin")).unwrap();
+        std::fs::create_dir_all(&third_party_marketplace_dir).unwrap();
+        std::fs::create_dir_all(third_party_plugin_dir.join(".codex-plugin")).unwrap();
+        std::fs::write(
+            runtime_marketplace_dir.join("marketplace.json"),
+            r#"{"name":"openai-primary-runtime","plugins":[{"name":"documents"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            runtime_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            r#"{"interface":{"displayName":"Documents"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            third_party_marketplace_dir.join("marketplace.json"),
+            r#"{"name":"awesome-codex-plugins","plugins":[{"name":"productivity"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            third_party_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            r#"{"interface":{"displayName":"Productivity"}}"#,
+        )
+        .unwrap();
+
+        let marketplaces = local_plugin_marketplaces_from_home(home);
+        let array = marketplaces.as_array().unwrap();
+        let names = array
+            .iter()
+            .filter_map(|item| item.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"openai-primary-runtime"));
+        assert!(names.contains(&"awesome-codex-plugins"));
+        let runtime = array
+            .iter()
+            .find(|item| item["name"].as_str() == Some("openai-primary-runtime"))
+            .unwrap();
+        assert_eq!(
+            runtime["plugins"][0]["interface"]["displayName"].as_str(),
+            Some("Word / Documents")
+        );
+        let third_party = array
+            .iter()
+            .find(|item| item["name"].as_str() == Some("awesome-codex-plugins"))
+            .unwrap();
+        assert_eq!(
+            third_party["plugins"][0]["interface"]["displayName"].as_str(),
+            Some("Productivity")
+        );
+    }
+
+    #[test]
+    fn local_plugin_marketplaces_expose_official_office_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let runtime_marketplace_dir = home
+            .join("plugins")
+            .join("sources")
+            .join("openai-primary-runtime")
+            .join(".agents")
+            .join("plugins");
+        let documents_plugin_dir = home
+            .join("plugins")
+            .join("sources")
+            .join("openai-primary-runtime")
+            .join("plugins")
+            .join("documents");
+        let presentations_plugin_dir = home
+            .join("plugins")
+            .join("sources")
+            .join("openai-primary-runtime")
+            .join("plugins")
+            .join("presentations");
+        let spreadsheets_plugin_dir = home
+            .join("plugins")
+            .join("sources")
+            .join("openai-primary-runtime")
+            .join("plugins")
+            .join("spreadsheets");
+        std::fs::create_dir_all(&runtime_marketplace_dir).unwrap();
+        std::fs::create_dir_all(documents_plugin_dir.join(".codex-plugin")).unwrap();
+        std::fs::create_dir_all(presentations_plugin_dir.join(".codex-plugin")).unwrap();
+        std::fs::create_dir_all(spreadsheets_plugin_dir.join(".codex-plugin")).unwrap();
+        std::fs::write(
+            runtime_marketplace_dir.join("marketplace.json"),
+            concat!(
+                r#"{"name":"openai-primary-runtime","plugins":["#,
+                r#"{"name":"documents"},"#,
+                r#"{"name":"presentations"},"#,
+                r#"{"name":"spreadsheets"}"#,
+                r#"]}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            documents_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            r#"{"interface":{"displayName":"Documents"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            presentations_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            r#"{"interface":{"displayName":"Presentations"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            spreadsheets_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            r#"{"interface":{"displayName":"Spreadsheets"}}"#,
+        )
+        .unwrap();
+
+        let marketplaces = local_plugin_marketplaces_from_home(home);
+        let runtime = marketplaces
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"].as_str() == Some("openai-primary-runtime"))
+            .unwrap();
+        let plugins = runtime["plugins"].as_array().unwrap();
+
+        assert_eq!(
+            plugins[0]["interface"]["displayName"].as_str(),
+            Some("Word / Documents")
+        );
+        assert_eq!(
+            plugins[1]["interface"]["displayName"].as_str(),
+            Some("PPT / Presentations")
+        );
+        assert_eq!(
+            plugins[2]["interface"]["displayName"].as_str(),
+            Some("Excel / Spreadsheets")
+        );
+    }
+
+    #[test]
+    fn local_plugin_marketplaces_include_tmp_marketplaces_and_skip_echobird_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let awesome_marketplace_dir = home
+            .join(".tmp")
+            .join("marketplaces")
+            .join("awesome-codex-plugins")
+            .join(".agents")
+            .join("plugins");
+        let awesome_plugin_dir = home
+            .join(".tmp")
+            .join("marketplaces")
+            .join("awesome-codex-plugins")
+            .join("plugins")
+            .join("agent-workflow-system");
+        let echobird_cn_marketplace_dir = home
+            .join(".tmp")
+            .join("marketplaces")
+            .join("echobird-cn")
+            .join(".agents")
+            .join("plugins");
+        let echobird_cn_plugin_dir = home
+            .join(".tmp")
+            .join("marketplaces")
+            .join("echobird-cn")
+            .join("plugins")
+            .join("gmail");
+        let echobird_ai_marketplace_dir = home
+            .join(".tmp")
+            .join("marketplaces")
+            .join("echobird-ai")
+            .join(".agents")
+            .join("plugins");
+        std::fs::create_dir_all(awesome_plugin_dir.join(".codex-plugin")).unwrap();
+        std::fs::create_dir_all(echobird_cn_plugin_dir.join(".codex-plugin")).unwrap();
+        std::fs::create_dir_all(&awesome_marketplace_dir).unwrap();
+        std::fs::create_dir_all(&echobird_cn_marketplace_dir).unwrap();
+        std::fs::create_dir_all(&echobird_ai_marketplace_dir).unwrap();
+        std::fs::write(
+            awesome_marketplace_dir.join("marketplace.json"),
+            r#"{"name":"awesome-codex-plugins","plugins":[{"name":"agent-workflow-system"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            awesome_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            r#"{"interface":{"displayName":"Agent Workflow System"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            echobird_cn_marketplace_dir.join("marketplace.json"),
+            r#"{"name":"echobird-cn","plugins":[{"name":"gmail"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            echobird_cn_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            r#"{"interface":{"displayName":"Gmail"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            echobird_ai_marketplace_dir.join("marketplace.json"),
+            r#"{"name":"echobird-ai","plugins":[{"name":"gmail"}]}"#,
+        )
+        .unwrap();
+
+        let marketplaces = local_plugin_marketplaces_from_home(home);
+        let array = marketplaces.as_array().unwrap();
+        let names = array
+            .iter()
+            .filter_map(|item| item.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"awesome-codex-plugins"));
+        assert!(names.contains(&"echobird-cn"));
+        assert!(!names.contains(&"echobird-ai"));
     }
 }

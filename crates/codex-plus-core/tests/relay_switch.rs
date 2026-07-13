@@ -218,10 +218,12 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
             id: "agg".to_string(),
             name: "聚合供应商 1".to_string(),
             strategy: AggregateRelayStrategy::Failover,
+            model_mappings_enabled: true,
             members: vec![AggregateRelayMember {
                 relay_id: "api".to_string(),
                 weight: 1,
             }],
+            model_mappings: Vec::new(),
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()

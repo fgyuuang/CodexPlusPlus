@@ -1,4 +1,5 @@
 pub mod ads;
+pub mod aggregate_model_alias;
 pub mod app_paths;
 pub mod assets;
 pub mod bridge;

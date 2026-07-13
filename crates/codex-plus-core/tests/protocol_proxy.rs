@@ -1510,6 +1510,7 @@ fn aggregate_proxy_settings(
             id: aggregate_id,
             name: "aggregate".to_string(),
             strategy: AggregateRelayStrategy::RequestRoundRobin,
+            model_mappings_enabled: true,
             members: vec![
                 AggregateRelayMember {
                     relay_id: first_id,
@@ -1520,6 +1521,7 @@ fn aggregate_proxy_settings(
                     weight: 1,
                 },
             ],
+            model_mappings: Vec::new(),
         }],
         ..BackendSettings::default()
     }

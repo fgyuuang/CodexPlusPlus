@@ -90,6 +90,35 @@ pub fn preserve_openai_curated_remote_marketplace_config(
     )
 }
 
+
+pub fn preserve_existing_marketplace_configs(
+    home: &Path,
+    config_text: &str,
+) -> anyhow::Result<String> {
+    let config_path = home.join("config.toml");
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(config_text.to_string());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
+        }
+    };
+    let mut target = parse_toml_document(config_text)?;
+    let existing_doc = parse_toml_document(&existing)?;
+    let existing_marketplaces = existing_doc.get("marketplaces").and_then(Item::as_table);
+    let target_marketplaces = table_mut_or_insert(&mut target, "marketplaces")?;
+    if let Some(existing_marketplaces) = existing_marketplaces {
+        for (name, item) in existing_marketplaces.iter() {
+            if target_marketplaces.get(name).is_none() {
+                target_marketplaces[name] = item.clone();
+            }
+        }
+    }
+    Ok(ensure_trailing_newline(target.to_string()))
+}
+
 pub fn openai_curated_marketplace_status(home: &Path) -> MarketplaceStatus {
     let marketplace_root = local_openai_curated_marketplace_root(home).ok().flatten();
     let remote_marketplace_root = local_openai_curated_remote_marketplace_root(home)

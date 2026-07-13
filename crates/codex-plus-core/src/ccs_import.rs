@@ -104,6 +104,8 @@ pub fn relay_profile_from_ccs(
         vlm_model: String::new(),
         vlm_base_url: String::new(),
         user_agent: String::new(),
+        model_mappings: Default::default(),
+        model_mappings_enabled: true,
     }
 }
 

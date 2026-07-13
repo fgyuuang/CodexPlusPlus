@@ -3460,14 +3460,13 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
 }
 
 fn apply_aggregate_relay_injection_to_home(home: &Path) -> CommandResult<RelayPayload> {
-    match codex_plus_core::relay_config::apply_relay_config_to_home_with_protocol(
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let relay = settings.active_relay_profile();
+    match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
         home,
-        &codex_plus_core::protocol_proxy::local_responses_proxy_base_url(
-            codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-        ),
-        "codex-plus-aggregate",
-        codex_plus_core::settings::RelayProtocol::Responses,
-        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        &relay,
+        &relay_combined_common_config(&settings),
+        settings.computer_use_guard_enabled,
     ) {
         Ok(result) => {
             let status = codex_plus_core::relay_config::relay_status_from_home(home);
@@ -4561,15 +4560,56 @@ mod tests {
     #[test]
     fn aggregate_relay_injection_writes_local_proxy_without_chatgpt_auth() {
         let temp = tempfile::tempdir().unwrap();
-
+        let settings_path = temp.path().join("settings.json");
+        let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "api".to_string(),
+                    name: "API".to_string(),
+                    model: "gpt-5.5".to_string(),
+                    model_list: "gpt-5.5\ngpt-5.4".to_string(),
+                    base_url: "https://api.example/v1".to_string(),
+                    upstream_base_url: "https://api.example/v1".to_string(),
+                    api_key: "sk-api".to_string(),
+                    relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+                    auth_contents: "{\n  \"OPENAI_API_KEY\": \"sk-api\"\n}\n".to_string(),
+                    config_contents: "model_provider = \"custom\"\nmodel = \"gpt-5.5\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://api.example/v1\"\n".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "agg".to_string(),
+                    name: "聚合供应商 1".to_string(),
+                    relay_mode: codex_plus_core::settings::RelayMode::Aggregate,
+                    model_list: "gpt-5.5\ngpt-5.4".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            active_relay_id: "agg".to_string(),
+            aggregate_relay_profiles: vec![codex_plus_core::settings::AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合供应商 1".to_string(),
+                strategy: codex_plus_core::settings::AggregateRelayStrategy::Failover,
+                members: vec![codex_plus_core::settings::AggregateRelayMember {
+                    relay_id: "api".to_string(),
+                    weight: 1,
+                }],
+            }],
+            active_aggregate_relay_id: "agg".to_string(),
+            ..BackendSettings::default()
+        };
+        SettingsStore::default().save(&settings).unwrap();
         let result = apply_aggregate_relay_injection_to_home(temp.path());
         let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        codex_plus_core::paths::set_settings_path_for_tests(previous);
 
         assert_eq!(result.status, "ok");
         assert!(result.payload.configured);
         assert!(!result.payload.authenticated);
         assert!(config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
         assert!(config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+        assert!(config.contains(r#"model_provider = "custom""#));
+        assert!(config.contains(r#"model = "gpt-5.5""#));
     }
 
     #[test]

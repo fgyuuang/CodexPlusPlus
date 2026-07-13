@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::settings::{RelayProfile, SettingsStore};
-use serde_json::{Map, Value, json};
+use crate::settings::{BackendSettings, RelayProfile, SettingsStore};
+use serde_json::{Value, json};
 
 const BASE_URL_ENV_KEYS: &[&str] = &[
     "CODEX_PLUS_OPENAI_BASE_URL",
@@ -39,15 +39,7 @@ pub async fn read_codex_model_catalog() -> Value {
     let settings_path = crate::paths::default_settings_path();
     if settings_path.exists() {
         if let Ok(settings) = SettingsStore::new(settings_path).load() {
-            let profile = settings.active_relay_profile();
-            let catalog = relay_profile_model_catalog_value(&home, &profile);
-            if catalog
-                .get("models")
-                .and_then(Value::as_array)
-                .map_or(false, |m| !m.is_empty())
-            {
-                return catalog;
-            }
+            return relay_profile_model_catalog_value(&home, &settings);
         }
     }
     let env = std::env::vars().collect::<HashMap<_, _>>();
@@ -63,7 +55,6 @@ pub async fn read_codex_model_catalog() -> Value {
                 "provider_name": "",
                 "default_model": "",
                 "models": [],
-                "modelMetadata": {},
                 "sources": [],
                 "responses_api": responses_api_status("unknown", "", "")
             });
@@ -72,8 +63,12 @@ pub async fn read_codex_model_catalog() -> Value {
     read_codex_model_catalog_from_home(&home, &env, client).await
 }
 
-fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Value {
-    let models = relay_profile_model_ids(profile);
+fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) -> Value {
+    let profile = settings.active_relay_profile();
+    if let Some(aggregate) = settings.active_aggregate_relay_profile() {
+        return aggregate_relay_model_catalog_value(home, settings, &profile, &aggregate);
+    }
+    let models = relay_profile_model_ids(&profile);
     let model = profile.model.trim().to_string();
     let default_model = models.first().cloned().unwrap_or_default();
     let provider_name = if profile.name.trim().is_empty() {
@@ -82,7 +77,6 @@ fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Val
         profile.name.trim()
     };
     let model_count = models.len();
-    let model_metadata = model_ui_metadata_map(&models);
     json!({
         "status": if models.is_empty() { "not_configured" } else { "ok" },
         "path": home.join("config.toml").to_string_lossy(),
@@ -91,7 +85,6 @@ fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Val
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,
-        "modelMetadata": model_metadata,
         "sources": [
             {
                 "id": format!("relay-profile:{}", profile.id),
@@ -108,26 +101,75 @@ fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Val
 }
 
 fn relay_profile_model_ids(profile: &RelayProfile) -> Vec<String> {
-    unique_strings(
-        profile
-            .model_list
-            .split(['\r', '\n', ','])
-            .chain(std::iter::once(profile.model.as_str()))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .collect(),
-    )
+    unique_strings(crate::aggregate_model_alias::relay_profile_model_ids(profile))
 }
 
-fn model_ui_metadata_map(models: &[String]) -> Value {
-    let mut metadata = Map::new();
-    for model in models {
-        if let Some(value) = crate::model_suffix::model_ui_metadata(model) {
-            metadata.insert(model.clone(), value);
+fn aggregate_relay_model_catalog_value(
+    home: &Path,
+    settings: &BackendSettings,
+    profile: &RelayProfile,
+    aggregate: &crate::settings::AggregateRelayProfile,
+) -> Value {
+    let mut models = Vec::new();
+    let mut model_details = Vec::new();
+    let mut seen = HashSet::new();
+    let member_profiles = aggregate
+        .members
+        .iter()
+        .filter_map(|member| {
+            settings
+                .relay_profiles
+                .iter()
+                .find(|relay| relay.id == member.relay_id)
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+
+    for alias in crate::aggregate_model_alias::aggregate_catalog_aliases(aggregate, &member_profiles) {
+        if seen.insert(alias.alias.clone()) {
+            models.push(alias.alias.clone());
         }
+        model_details.push(json!({
+            "model": alias.alias,
+            "raw_model": alias.target_model,
+            "mapping_key": alias.mapping_key,
+            "provider_id": alias.provider_id,
+            "provider_name": alias.provider_name,
+            "via_mapping": alias.via_mapping
+        }));
     }
-    Value::Object(metadata)
+
+    let default_model = if models.iter().any(|item| item == &profile.model) {
+        profile.model.trim().to_string()
+    } else {
+        models.first().cloned().unwrap_or_default()
+    };
+    let provider_name = if profile.name.trim().is_empty() {
+        profile.id.trim()
+    } else {
+        profile.name.trim()
+    };
+
+    json!({
+        "status": if models.is_empty() { "not_configured" } else { "ok" },
+        "path": home.join("config.toml").to_string_lossy(),
+        "model": profile.model.trim(),
+        "model_provider": profile.id.trim(),
+        "provider_name": provider_name,
+        "default_model": default_model,
+        "models": models,
+        "model_details": model_details,
+        "sources": member_profiles.iter().map(|member| json!({
+            "id": format!("relay-profile:{}", member.id),
+            "type": "aggregate_member_model_list",
+            "name": if member.name.trim().is_empty() { member.id.trim() } else { member.name.trim() },
+            "base_url": member.base_url.trim(),
+            "status": "ok",
+            "models": relay_profile_model_ids(member).len(),
+            "responses_api": responses_api_status("unknown", "", "")
+        })).collect::<Vec<_>>(),
+        "responses_api": responses_api_status("unknown", "", "")
+    })
 }
 
 pub async fn read_codex_model_catalog_from_home(
@@ -162,7 +204,6 @@ pub async fn read_codex_model_catalog_from_home(
             "provider_name": provider_name,
             "default_model": "",
             "models": [],
-            "modelMetadata": {},
             "sources": [],
             "responses_api": responses_api_status("unknown", "", "")
         });
@@ -217,7 +258,6 @@ pub async fn read_codex_model_catalog_from_home(
         "not_configured"
     };
     let responses_api = preferred_responses_api_status(&source_statuses);
-    let model_metadata = model_ui_metadata_map(&models);
 
     json!({
         "status": status,
@@ -227,7 +267,6 @@ pub async fn read_codex_model_catalog_from_home(
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,
-        "modelMetadata": model_metadata,
         "sources": source_statuses,
         "responses_api": responses_api
     })
@@ -586,12 +625,7 @@ fn models_endpoint(base_url: &str) -> String {
     if cleaned.ends_with("/models") {
         return cleaned;
     }
-    // Only append the default `/v1` version prefix when the base URL does not
-    // already carry a version segment. Providers such as Volcano Engine ARK use
-    // a versioned base (e.g. `.../api/coding/v3`), so blindly appending
-    // `/v1/models` produced `.../api/coding/v3/v1/models` and 404'd. This mirrors
-    // the version handling already used by the protocol proxy. See issue #1349.
-    if crate::protocol_proxy::has_version_suffix(&cleaned) {
+    if cleaned.ends_with("/v1") {
         return format!("{cleaned}/models");
     }
     format!("{cleaned}/v1/models")
