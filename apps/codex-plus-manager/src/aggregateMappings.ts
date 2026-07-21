@@ -50,7 +50,7 @@ export function relayProfileModels(profile: RelayProfileLike): string[] {
 }
 
 export function aggregateProviderLabel(profile: RelayProfileLike, model: string): string {
-  return `${profile.name || profile.id}：${model}`;
+  return `${profile.name || profile.id}:${model}`;
 }
 
 export function aggregateCodexAlias(codexModel: string, profile: RelayProfileLike, targetModel: string): string {

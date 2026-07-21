@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::settings::{BackendSettings, RelayProfile, SettingsStore};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 const BASE_URL_ENV_KEYS: &[&str] = &[
     "CODEX_PLUS_OPENAI_BASE_URL",
@@ -62,6 +62,7 @@ pub async fn read_codex_model_catalog() -> Value {
                 "provider_name": "",
                 "default_model": "",
                 "models": [],
+                "modelMetadata": {},
                 "sources": [],
                 "responses_api": responses_api_status("unknown", "", "")
             });
@@ -84,6 +85,7 @@ fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) ->
         profile.name.trim()
     };
     let model_count = models.len();
+    let model_metadata = model_ui_metadata_map(&models);
     json!({
         "status": if models.is_empty() { "not_configured" } else { "ok" },
         "path": home.join("config.toml").to_string_lossy(),
@@ -92,6 +94,7 @@ fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) ->
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,
+        "modelMetadata": model_metadata,
         "sources": [
             {
                 "id": format!("relay-profile:{}", profile.id),
@@ -113,15 +116,39 @@ fn relay_profile_model_ids(profile: &RelayProfile) -> Vec<String> {
     ))
 }
 
+fn model_ui_metadata_map(models: &[String]) -> Value {
+    let mut metadata = Map::new();
+    for model in models {
+        if let Some(value) = crate::model_suffix::model_ui_metadata(model) {
+            metadata.insert(model.clone(), value);
+        }
+    }
+    Value::Object(metadata)
+}
+
+fn aggregate_model_ui_metadata_map(
+    aliases: &[crate::aggregate_model_alias::AggregateModelAlias],
+    display_models: &HashMap<String, String>,
+) -> Value {
+    let mut metadata = Map::new();
+    for alias in aliases {
+        let display_model = display_models
+            .get(&alias.alias)
+            .cloned()
+            .unwrap_or_else(|| alias.alias.clone());
+        if let Some(value) = crate::model_suffix::model_ui_metadata(&alias.alias) {
+            metadata.entry(display_model).or_insert(value);
+        }
+    }
+    Value::Object(metadata)
+}
+
 fn aggregate_relay_model_catalog_value(
     home: &Path,
     settings: &BackendSettings,
     profile: &RelayProfile,
     aggregate: &crate::settings::AggregateRelayProfile,
 ) -> Value {
-    let mut models = Vec::new();
-    let mut model_details = Vec::new();
-    let mut seen = HashSet::new();
     let member_profiles = aggregate
         .members
         .iter()
@@ -133,15 +160,48 @@ fn aggregate_relay_model_catalog_value(
                 .cloned()
         })
         .collect::<Vec<_>>();
+    let aliases =
+        crate::aggregate_model_alias::aggregate_catalog_aliases(aggregate, &member_profiles);
+    let mut display_labels = HashMap::<String, Vec<String>>::new();
+    for alias in &aliases {
+        if !crate::aggregate_model_alias::looks_like_codex_model_key(&alias.alias) {
+            continue;
+        }
+        let label = if alias.alias.eq_ignore_ascii_case(alias.target_model.trim()) {
+            alias.provider_name.trim().to_string()
+        } else {
+            format!(
+                "{}:{}",
+                alias.provider_name.trim(),
+                alias.target_model.trim()
+            )
+        };
+        let labels = display_labels.entry(alias.alias.clone()).or_default();
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    let display_models = display_labels
+        .iter()
+        .map(|(model, labels)| (model.clone(), format!("{}({})", model, labels.join("|"))))
+        .collect::<HashMap<_, _>>();
 
-    for alias in
-        crate::aggregate_model_alias::aggregate_catalog_aliases(aggregate, &member_profiles)
-    {
-        if seen.insert(alias.alias.clone()) {
-            models.push(alias.alias.clone());
+    let mut models = Vec::new();
+    let mut model_details = Vec::new();
+    let mut seen = HashSet::new();
+    for alias in &aliases {
+        let model = display_models
+            .get(&alias.alias)
+            .cloned()
+            .unwrap_or_else(|| alias.alias.clone());
+        let provider_variant_of_codex_model =
+            !crate::aggregate_model_alias::looks_like_codex_model_key(&alias.alias)
+                && crate::aggregate_model_alias::looks_like_codex_model_key(&alias.target_model);
+        if !provider_variant_of_codex_model && seen.insert(model.clone()) {
+            models.push(model.clone());
         }
         model_details.push(json!({
-            "model": alias.alias,
+            "model": model,
             "raw_model": alias.target_model,
             "mapping_key": alias.mapping_key,
             "provider_id": alias.provider_id,
@@ -150,8 +210,11 @@ fn aggregate_relay_model_catalog_value(
         }));
     }
 
-    let default_model = if models.iter().any(|item| item == &profile.model) {
-        profile.model.trim().to_string()
+    let profile_model = profile.model.trim();
+    let default_model = if let Some(display_model) = display_models.get(profile_model) {
+        display_model.clone()
+    } else if models.iter().any(|item| item == profile_model) {
+        profile_model.to_string()
     } else {
         models.first().cloned().unwrap_or_default()
     };
@@ -160,6 +223,7 @@ fn aggregate_relay_model_catalog_value(
     } else {
         profile.name.trim()
     };
+    let model_metadata = aggregate_model_ui_metadata_map(&aliases, &display_models);
 
     json!({
         "status": if models.is_empty() { "not_configured" } else { "ok" },
@@ -169,6 +233,7 @@ fn aggregate_relay_model_catalog_value(
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,
+        "modelMetadata": model_metadata,
         "model_details": model_details,
         "sources": member_profiles.iter().map(|member| json!({
             "id": format!("relay-profile:{}", member.id),
@@ -269,6 +334,7 @@ pub async fn read_codex_model_catalog_from_home(
         "not_configured"
     };
     let responses_api = preferred_responses_api_status(&source_statuses);
+    let model_metadata = model_ui_metadata_map(&models);
 
     json!({
         "status": status,
@@ -278,6 +344,7 @@ pub async fn read_codex_model_catalog_from_home(
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,
+        "modelMetadata": model_metadata,
         "sources": source_statuses,
         "responses_api": responses_api
     })
@@ -636,7 +703,7 @@ fn models_endpoint(base_url: &str) -> String {
     if cleaned.ends_with("/models") {
         return cleaned;
     }
-    if cleaned.ends_with("/v1") {
+    if crate::protocol_proxy::has_version_suffix(&cleaned) {
         return format!("{cleaned}/models");
     }
     format!("{cleaned}/v1/models")

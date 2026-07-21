@@ -32,7 +32,7 @@ pub fn provider_display_name(profile: &RelayProfile) -> String {
 }
 
 pub fn provider_label(provider_name: &str, model: &str) -> String {
-    format!("{}：{}", provider_name.trim(), model.trim())
+    format!("{}:{}", provider_name.trim(), model.trim())
 }
 
 pub fn codex_model_alias(codex_model: &str, provider_name: &str, target_model: &str) -> String {
@@ -291,7 +291,7 @@ fn aggregate_catalog_tail_rank(alias: &AggregateModelAlias) -> u8 {
     if looks_like_codex_model_key(text) {
         return 0;
     }
-    if !text.contains('：') && !text.contains('(') {
+    if !text.contains(':') && !text.contains('(') {
         return 1;
     }
     2
@@ -379,8 +379,29 @@ pub fn normalize_requested_model_name(model: &str) -> String {
         return trimmed.to_string();
     }
     let suffix = trimmed[open_index + 1..trimmed.len() - 1].trim();
-    if suffix.is_empty() || !suffix.contains('：') {
+    if suffix.is_empty() || !looks_like_codex_model_key(base) {
         return trimmed.to_string();
     }
     base.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_requested_model_name;
+
+    #[test]
+    fn normalizes_aggregate_codex_display_labels_with_or_without_target_model() {
+        assert_eq!(
+            normalize_requested_model_name("gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)"),
+            "gpt-5.4"
+        );
+        assert_eq!(
+            normalize_requested_model_name("gpt-5.4(供应商一|供应商二)"),
+            "gpt-5.4"
+        );
+        assert_eq!(
+            normalize_requested_model_name("custom-model(供应商一)"),
+            "custom-model(供应商一)"
+        );
+    }
 }

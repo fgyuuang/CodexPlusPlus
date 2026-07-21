@@ -1466,6 +1466,105 @@ async fn aggregate_stream_request_sends_sse_accept_header() {
     fallback_server.abort();
 }
 
+#[tokio::test]
+async fn aggregate_proxy_rewrites_display_model_to_selected_provider_target() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let request = String::from_utf8_lossy(&buffer);
+            let Some((headers, body)) = request.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            if body.as_bytes().len() >= content_length {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&buffer).to_string();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
+            )
+            .await
+            .unwrap();
+        request
+    });
+    let aggregate_id = "mapped-aggregate";
+    let provider_id = "mapped-provider";
+    let settings = BackendSettings {
+        relay_profiles: vec![
+            RelayProfile {
+                id: provider_id.to_string(),
+                name: "ProviderB".to_string(),
+                model: "vendor-gpt-5.4".to_string(),
+                model_list: "vendor-gpt-5.4".to_string(),
+                base_url: format!("http://{addr}/v1"),
+                api_key: "sk-provider".to_string(),
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: aggregate_id.to_string(),
+                name: "Aggregate".to_string(),
+                model: "gpt-5.4".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            },
+        ],
+        active_relay_id: aggregate_id.to_string(),
+        active_aggregate_relay_id: aggregate_id.to_string(),
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: aggregate_id.to_string(),
+            name: "Aggregate".to_string(),
+            strategy: AggregateRelayStrategy::Failover,
+            model_mappings_enabled: true,
+            members: vec![AggregateRelayMember {
+                relay_id: provider_id.to_string(),
+                weight: 1,
+            }],
+            model_mappings: vec![codex_plus_core::settings::AggregateRelayModelMapping {
+                codex_model: "gpt-5.4".to_string(),
+                targets: vec![codex_plus_core::settings::AggregateRelayDispatchTarget {
+                    relay_id: provider_id.to_string(),
+                    target_model: "vendor-gpt-5.4".to_string(),
+                }],
+            }],
+        }],
+        ..BackendSettings::default()
+    };
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.4(ProviderB:vendor-gpt-5.4)","input":"hi"}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    let request = server.await.unwrap();
+
+    assert_eq!(result.status_code, 200);
+    assert!(request.contains(r#""model":"vendor-gpt-5.4""#));
+}
+
 async fn respond_once(listener: tokio::net::TcpListener, response: &'static str) {
     let (mut stream, _) = listener.accept().await.unwrap();
     let mut buffer = [0; 1024];

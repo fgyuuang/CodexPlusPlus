@@ -189,6 +189,117 @@ async fn model_catalog_uses_active_relay_profile_model_list_for_display() {
 }
 
 #[tokio::test]
+async fn model_catalog_displays_aggregate_provider_targets_without_repeating_matching_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let settings_path = temp.path().join("settings.json");
+    let previous_codex_home = std::env::var_os("CODEX_HOME");
+    let previous_settings_path =
+        codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+    unsafe {
+        std::env::set_var("CODEX_HOME", &codex_home);
+    }
+
+    let result = async {
+        SettingsStore::new(settings_path)
+            .save(&BackendSettings {
+                active_relay_id: "aggregate".to_string(),
+                active_aggregate_relay_id: "aggregate".to_string(),
+                relay_profiles: vec![
+                    RelayProfile {
+                        id: "provider-a".to_string(),
+                        name: "供应商一".to_string(),
+                        model: "gpt-5.4".to_string(),
+                        model_list: "gpt-5.4\ngpt-5.6-sol".to_string(),
+                        base_url: "https://a.example.test/v1".to_string(),
+                        api_key: "key-a".to_string(),
+                        relay_mode: RelayMode::PureApi,
+                        ..RelayProfile::default()
+                    },
+                    RelayProfile {
+                        id: "provider-b".to_string(),
+                        name: "供应商二".to_string(),
+                        model: "vendor-gpt-5.4".to_string(),
+                        model_list: "vendor-gpt-5.4".to_string(),
+                        base_url: "https://b.example.test/v1".to_string(),
+                        api_key: "key-b".to_string(),
+                        relay_mode: RelayMode::PureApi,
+                        ..RelayProfile::default()
+                    },
+                    RelayProfile {
+                        id: "aggregate".to_string(),
+                        name: "聚合".to_string(),
+                        model: "gpt-5.4".to_string(),
+                        relay_mode: RelayMode::Aggregate,
+                        ..RelayProfile::default()
+                    },
+                ],
+                aggregate_relay_profiles: vec![codex_plus_core::settings::AggregateRelayProfile {
+                    id: "aggregate".to_string(),
+                    name: "聚合".to_string(),
+                    strategy: codex_plus_core::settings::AggregateRelayStrategy::Failover,
+                    model_mappings_enabled: true,
+                    members: vec![
+                        codex_plus_core::settings::AggregateRelayMember {
+                            relay_id: "provider-a".to_string(),
+                            weight: 1,
+                        },
+                        codex_plus_core::settings::AggregateRelayMember {
+                            relay_id: "provider-b".to_string(),
+                            weight: 1,
+                        },
+                    ],
+                    model_mappings: vec![codex_plus_core::settings::AggregateRelayModelMapping {
+                        codex_model: "gpt-5.4".to_string(),
+                        targets: vec![
+                            codex_plus_core::settings::AggregateRelayDispatchTarget {
+                                relay_id: "provider-a".to_string(),
+                                target_model: "gpt-5.4".to_string(),
+                            },
+                            codex_plus_core::settings::AggregateRelayDispatchTarget {
+                                relay_id: "provider-b".to_string(),
+                                target_model: "vendor-gpt-5.4".to_string(),
+                            },
+                        ],
+                    }],
+                }],
+                ..BackendSettings::default()
+            })
+            .unwrap();
+
+        read_codex_model_catalog().await
+    }
+    .await;
+
+    match previous_codex_home {
+        Some(value) => unsafe {
+            std::env::set_var("CODEX_HOME", value);
+        },
+        None => unsafe {
+            std::env::remove_var("CODEX_HOME");
+        },
+    }
+    codex_plus_core::paths::set_settings_path_for_tests(previous_settings_path);
+
+    assert_eq!(
+        result["default_model"],
+        "gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)"
+    );
+    assert!(
+        result["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model == "gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)")
+    );
+    assert_eq!(
+        result["modelMetadata"]["gpt-5.6-sol(供应商一)"]["defaultReasoningEffort"],
+        "low"
+    );
+}
+
+#[tokio::test]
 async fn model_catalog_uses_single_provider_when_root_model_provider_is_absent() {
     let temp = tempfile::tempdir().unwrap();
     let server = spawn_models_server(json!({

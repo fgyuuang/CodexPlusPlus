@@ -810,6 +810,7 @@ async fn upstream_request_parts(
         RelayProtocol::Responses => request_json,
         RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
     };
+    rewrite_model_for_relay(&mut body, relay);
 
     // Image handling (per-model): send-as-is / strip / VLM analysis
     let model = body
@@ -868,6 +869,29 @@ async fn upstream_request_parts(
         body,
         wire_api,
     ))
+}
+
+fn rewrite_model_for_relay(body: &mut Value, relay: &crate::settings::RelayProfile) {
+    let Some(requested_model) = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return;
+    };
+    let normalized_model =
+        crate::aggregate_model_alias::normalize_requested_model_name(requested_model);
+    let target_model = relay
+        .model_mappings
+        .get(requested_model)
+        .or_else(|| relay.model_mappings.get(&normalized_model))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    if let Some(target_model) = target_model.filter(|model| *model != requested_model) {
+        body["model"] = Value::String(target_model.to_string());
+    }
 }
 
 fn upstream_request_builder(
