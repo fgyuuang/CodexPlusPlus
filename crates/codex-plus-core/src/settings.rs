@@ -1479,11 +1479,12 @@ fn hydrate_aggregate_profile_model_lists(settings: &mut BackendSettings) {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let models = aggregate_model_alias::aggregate_catalog_aliases(aggregate, &member_profiles)
-                .into_iter()
-                .map(|alias| alias.alias)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let models =
+                aggregate_model_alias::aggregate_catalog_aliases(aggregate, &member_profiles)
+                    .into_iter()
+                    .map(|alias| alias.alias)
+                    .collect::<Vec<_>>()
+                    .join("\n");
             (aggregate.id.clone(), models)
         })
         .collect::<std::collections::HashMap<_, _>>();
@@ -1495,7 +1496,10 @@ fn hydrate_aggregate_profile_model_lists(settings: &mut BackendSettings) {
         if !profile.model_list.trim().is_empty() {
             continue;
         }
-        if let Some(models) = aggregate_models.get(&profile.id).filter(|value| !value.is_empty()) {
+        if let Some(models) = aggregate_models
+            .get(&profile.id)
+            .filter(|value| !value.is_empty())
+        {
             profile.model_list = models.clone();
         }
     }
@@ -2195,6 +2199,7 @@ experimental_bearer_token = "sk-existing""#
             relay_profiles: vec![
                 RelayProfile {
                     id: "relay-a".to_string(),
+                    name: "中转 A".to_string(),
                     model: "gpt-5.5".to_string(),
                     model_list: "gpt-5.5\ngpt-5.4".to_string(),
                     base_url: "https://a.example/v1".to_string(),
@@ -2205,6 +2210,7 @@ experimental_bearer_token = "sk-existing""#
                 },
                 RelayProfile {
                     id: "relay-b".to_string(),
+                    name: "中转 B".to_string(),
                     model: "deepseek-v4-pro".to_string(),
                     model_list: "deepseek-v4-pro".to_string(),
                     base_url: "https://b.example/v1".to_string(),
@@ -2252,7 +2258,7 @@ experimental_bearer_token = "sk-existing""#
 
         assert_eq!(
             aggregate.model_list,
-            "gpt-5.5\ngpt-5.4\n中转 A：gpt-5.5\n中转 A：gpt-5.4\n中转 B：deepseek-v4-pro"
+            "gpt-5.5\ngpt-5.4\n中转 A：gpt-5.4\n中转 A：gpt-5.5\n中转 B：deepseek-v4-pro"
         );
     }
 

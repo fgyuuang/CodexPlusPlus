@@ -258,6 +258,8 @@ export type RelayProfile = {
   autoCompactLimit: string;
   modelList: string;
   modelWindows: string;
+  modelMappings: Record<string, string>;
+  modelMappingsEnabled: boolean;
   modelVlm: string;
   vlmApiKey: string;
   vlmModel: string;
@@ -827,6 +829,8 @@ const defaultSettings: BackendSettings = {
       autoCompactLimit: "",
       modelList: "",
       modelWindows: "",
+      modelMappings: {},
+      modelMappingsEnabled: true,
       modelVlm: "",
       vlmApiKey: "",
       vlmModel: "",
@@ -1924,7 +1928,7 @@ export function App() {
     setProviderSyncProgress({
       active: true,
       percent: 12,
-      message: selectedProviderSyncTarget ? tf("正在同步到 {0}…", [selectedProviderSyncTarget]) : t("正在扫描历史会话与索引…"),
+      message: t("正在统一历史会话到 custom…"),
       result: null,
     });
     const progressTimer = window.setInterval(() => {
@@ -1939,9 +1943,7 @@ export function App() {
     }, 350);
     try {
       const targetProvider = selectedProviderSyncTarget || undefined;
-      const result = await run(() =>
-        call<CommandResult<ProviderSyncPayload>>("sync_providers_now", { targetProvider }),
-      );
+      const result = await run(() => call<CommandResult<ProviderSyncPayload>>("sync_providers_now"));
       if (result) {
         let finalResult = result;
         let cleanupFailure: { status: Status; message: string } | null = null;
@@ -4453,22 +4455,9 @@ function SessionsScreen({
             <Metric label={t("当前页已归档")} value={tf("{0} 个", [archivedCount])} />
             <Metric label={t("数据库")} value={sessions?.dbPath ?? "~/.codex/sqlite/*.db"} />
           </div>
-          <div className="form-row">
-            <Field label={t("同步目标")}>
-              <select
-                className="select-input"
-                disabled={providerSyncProgress.active || !(providerSyncTargets?.targets ?? []).length}
-                value={selectedProviderSyncTarget}
-                onChange={(event) => actions.setProviderSyncTarget(event.currentTarget.value)}
-              >
-                {(providerSyncTargets?.targets ?? []).map((target) => (
-                  <option key={target.id} value={target.id}>
-                    {target.id}{t("（")}{providerSyncTargetLabel(target)}{t("）")}
-                  </option>
-                ))}
-                {!(providerSyncTargets?.targets ?? []).length ? <option value="">{t("当前配置 provider")}</option> : null}
-              </select>
-            </Field>
+          <div className="hint-line">
+            <Info className="h-4 w-4" />
+            <span>{t("统一会将 rollout 和 SQLite 中的 provider 元数据改为 custom，并在写入前备份；不会删除会话正文。被占用的 rollout 会跳过并在结果中列出。")}</span>
           </div>
           <Toolbar>
             <Button onClick={() => void actions.refreshLocalSessions()}>
@@ -4477,7 +4466,7 @@ function SessionsScreen({
             </Button>
             <Button disabled={providerSyncProgress.active} onClick={() => void actions.syncProvidersNow()} variant="outline">
               <RefreshCw className="h-4 w-4" />
-              {providerSyncProgress.active ? t("正在修复…") : t("立刻修复历史会话")}
+              {providerSyncProgress.active ? t("正在统一…") : t("统一全部历史会话到 custom")}
             </Button>
           </Toolbar>
           <div className="provider-sync-progress" data-active={providerSyncProgress.active}>
@@ -5382,7 +5371,6 @@ function RelayProfileDetail({
         effectiveRelayConfigPreview(normalizedDraft, form, normalizedDraft),
         true,
       );
-      await actions.saveRelayFile("auth", normalizedDraft.authContents, true);
     }
     onSaved?.();
   };
@@ -7610,6 +7598,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             autoCompactLimit: "",
             modelList: "",
             modelWindows: "",
+            modelMappings: {},
+            modelMappingsEnabled: true,
             modelVlm: "",
             vlmApiKey: "",
             vlmModel: "",
@@ -7880,8 +7870,8 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
   }
   return {
     ...profile,
-    configContents: buildRelayConfigToml(profile, { includeBearerToken: false }),
-    authContents: buildRelayAuthJson(profile),
+    configContents: buildRelayConfigToml(profile, { includeBearerToken: true }),
+    authContents: profile.authContents || "",
   };
 }
 
@@ -7901,15 +7891,11 @@ function buildRelayConfigToml(
     "[model_providers.custom]",
     'name = "custom"',
     'wire_api = "responses"',
-    "requires_openai_auth = true",
+    "requires_openai_auth = false",
     `base_url = "${tomlString(baseUrl)}"`,
     options.includeBearerToken && apiKey ? `experimental_bearer_token = "${tomlString(apiKey)}"` : null,
     "",
   ].filter((line): line is string => line !== null).join("\n");
-}
-
-function buildRelayAuthJson(profile: Pick<RelayProfile, "apiKey">): string {
-  return `${JSON.stringify({ OPENAI_API_KEY: profile.apiKey.trim() }, null, 2)}\n`;
 }
 
 function buildOfficialRelayAuthJson(contents: string): string {
@@ -7947,7 +7933,7 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
     upstreamBaseUrl,
     apiKey: profile.relayMode === "official"
       ? configApiKey || profile.apiKey || ""
-      : codexApiKeyFromAuth(authContents) || configApiKey || "",
+      : configApiKey || profile.apiKey || "",
     contextWindow: codexTopLevelIntFromConfig(configContents, "model_context_window"),
     autoCompactLimit: codexTopLevelIntFromConfig(configContents, "model_auto_compact_token_limit"),
     configContents,
@@ -7965,9 +7951,8 @@ function applyRelayProfilePatchToFiles(
     return normalizeAggregateRelayProfile(next, null);
   }
   const shouldHaveFiles =
-    next.relayMode !== "official" || next.officialMixApiKey || next.configContents.trim() || next.authContents.trim();
-  const needsAuthFile = next.relayMode === "pureApi";
-  if (options.allowGenerateFiles && shouldHaveFiles && (!next.configContents.trim() || (needsAuthFile && !next.authContents.trim()))) {
+    next.relayMode !== "official" || next.officialMixApiKey || next.configContents.trim();
+  if (options.allowGenerateFiles && shouldHaveFiles && !next.configContents.trim()) {
     next = withGeneratedRelayFiles(next);
   }
 
@@ -7978,12 +7963,7 @@ function applyRelayProfilePatchToFiles(
     next.configContents = setRootTomlStringKey(next.configContents, "model", slug);
   }
   if ("apiKey" in patch) {
-    if (next.relayMode === "pureApi") {
-      next.authContents = setAuthOpenAiApiKey(next.authContents, patch.apiKey || "");
-      next.configContents = removeCodexExperimentalBearerToken(next.configContents);
-    } else {
-      next.configContents = setCodexExperimentalBearerToken(next.configContents, patch.apiKey || "");
-    }
+    next.configContents = setCodexExperimentalBearerToken(next.configContents, patch.apiKey || "");
   }
   if ("baseUrl" in patch) {
     next.upstreamBaseUrl = patch.baseUrl || "";
@@ -8075,15 +8055,6 @@ function codexProviderStringFromConfig(contents: string, key: string): string {
   return matches.length === 1 ? matches[0] : "";
 }
 
-function codexApiKeyFromAuth(contents: string): string {
-  try {
-    const parsed = JSON.parse(contents || "{}") as { OPENAI_API_KEY?: unknown };
-    return typeof parsed.OPENAI_API_KEY === "string" ? parsed.OPENAI_API_KEY : "";
-  } catch {
-    return "";
-  }
-}
-
 function codexTopLevelIntFromConfig(contents: string, key: string): string {
   const topLevel = splitTomlRootAndTables(contents).root;
   const pattern = new RegExp(`^\\s*${key}\\s*=\\s*(\\d+)\\s*(?:#.*)?$`);
@@ -8113,19 +8084,6 @@ function tomlStringAssignmentValue(line: string, key: string): string | null {
   if (!match) return null;
   return match[2].replace(/\\(["'\\])/g, "$1");
 }
-
-function setAuthOpenAiApiKey(contents: string, apiKey: string): string {
-  let parsed: Record<string, unknown> = {};
-  try {
-    const value = JSON.parse(contents || "{}");
-    if (value && typeof value === "object" && !Array.isArray(value)) parsed = value as Record<string, unknown>;
-  } catch {
-    parsed = {};
-  }
-  parsed.OPENAI_API_KEY = apiKey.trim();
-  return `${JSON.stringify(parsed, null, 2)}\n`;
-}
-
 function setRootTomlStringKey(contents: string, key: string, value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return removeRootTomlKey(contents, key);
@@ -8180,7 +8138,7 @@ function ensureCodexProviderDefaults(contents: string, provider: string): string
   const section = `model_providers.${provider}`;
   next = setTomlSectionStringKey(next, section, "name", provider);
   next = setTomlSectionStringKey(next, section, "wire_api", "responses");
-  return setTomlSectionBoolKey(next, section, "requires_openai_auth", true);
+  return setTomlSectionBoolKey(next, section, "requires_openai_auth", false);
 }
 
 function setTomlSectionBoolKey(contents: string, sectionName: string, key: string, value: boolean): string {
@@ -8347,6 +8305,8 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     autoCompactLimit: "",
     modelList: "",
     modelWindows: "",
+    modelMappings: {},
+    modelMappingsEnabled: true,
     modelVlm: "",
     vlmApiKey: "",
     vlmModel: "",
@@ -8381,6 +8341,8 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       autoCompactLimit: "",
       modelList: "",
       modelWindows: "",
+      modelMappings: {},
+      modelMappingsEnabled: true,
       modelVlm: "",
       vlmApiKey: "",
       vlmModel: "",

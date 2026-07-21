@@ -186,10 +186,7 @@ impl RelayRotationSelector {
         relay_id
     }
 
-    fn select_next_request(
-        &mut self,
-        members: &[crate::settings::AggregateRelayMember],
-    ) -> String {
+    fn select_next_request(&mut self, members: &[crate::settings::AggregateRelayMember]) -> String {
         let relay_id = member_id_at(members, self.request_index);
         self.request_index = (self.request_index + 1) % members.len();
         relay_id
@@ -367,7 +364,6 @@ fn member_pool_for_model(
     let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(aggregate.members.clone());
     };
-    let original_model = model;
     let normalized_model = crate::aggregate_model_alias::normalize_requested_model_name(model);
     let model = if normalized_model.is_empty() {
         model
@@ -399,34 +395,9 @@ fn member_pool_for_model(
         return Ok(explicit_dispatch_members);
     }
 
-    if !crate::aggregate_model_alias::looks_like_codex_model_key(model) {
-        return Ok(aggregate.members.clone());
-    }
-
-    if original_model != model {
-        let mapped_members = aggregate
-            .members
-            .iter()
-            .filter(|member| {
-                raw_relay_profile_by_id(settings, &member.relay_id).is_some_and(|relay| {
-                    relay.model_mappings_enabled
-                        && relay
-                            .model_mappings
-                            .keys()
-                            .any(|mapping| mapping.trim() == model)
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !mapped_members.is_empty() {
-            return Ok(mapped_members);
-        }
-    }
-
-    Err(SelectionError::UnsupportedModel {
-        aggregate_id: aggregate.id.clone(),
-        model: model.to_string(),
-    })
+    // 未声明模型目录或映射时，保持聚合的既有兜底语义：让成员自行决定
+    // 是否接受该模型，而不是因 catalog 不完整阻断整个请求。
+    Ok(aggregate.members.clone())
 }
 
 fn aggregate_member_pool_for_provider_alias(
@@ -446,7 +417,8 @@ fn aggregate_member_pool_for_provider_alias(
         .collect::<HashMap<_, _>>();
     let mut matches = Vec::new();
     for profile in member_profiles {
-        for alias in crate::aggregate_model_alias::aggregate_model_aliases_for_member(&profile, false)
+        for alias in
+            crate::aggregate_model_alias::aggregate_model_aliases_for_member(&profile, false)
         {
             if alias.alias != model {
                 continue;
@@ -469,7 +441,8 @@ fn aggregate_dispatch_member_pool(
         .iter()
         .filter_map(|member| raw_relay_profile_by_id(settings, &member.relay_id).cloned())
         .collect::<Vec<_>>();
-    let dispatch_entries = crate::aggregate_model_alias::aggregate_dispatch_entries(aggregate, &member_profiles);
+    let dispatch_entries =
+        crate::aggregate_model_alias::aggregate_dispatch_entries(aggregate, &member_profiles);
     let relay_weight_by_id = aggregate
         .members
         .iter()
@@ -482,10 +455,7 @@ fn aggregate_dispatch_member_pool(
         .map(|entry| {
             let relay_id = entry.provider_id;
             let weight = *relay_weight_by_id.get(relay_id.as_str()).unwrap_or(&1);
-            crate::settings::AggregateRelayMember {
-                relay_id,
-                weight,
-            }
+            crate::settings::AggregateRelayMember { relay_id, weight }
         })
         .collect()
 }
@@ -539,7 +509,8 @@ fn relay_profile_by_id(settings: &BackendSettings, relay_id: &str) -> Option<Rel
         let mut relay = profile.clone();
         let mut effective_model_mappings = HashMap::new();
 
-        for alias in crate::aggregate_model_alias::aggregate_model_aliases_for_member(profile, false)
+        for alias in
+            crate::aggregate_model_alias::aggregate_model_aliases_for_member(profile, false)
         {
             effective_model_mappings.insert(alias.alias, alias.target_model);
         }
@@ -551,27 +522,22 @@ fn relay_profile_by_id(settings: &BackendSettings, relay_id: &str) -> Option<Rel
                 if mapping_key.is_empty() || target_model.is_empty() {
                     continue;
                 }
-                effective_model_mappings
-                    .insert(mapping_key.to_string(), target_model.to_string());
+                effective_model_mappings.insert(mapping_key.to_string(), target_model.to_string());
             }
-            for alias in crate::aggregate_model_alias::aggregate_model_aliases_for_member(
-                profile,
-                true,
-            )
-            .into_iter()
-            .filter(|alias| alias.via_mapping)
+            for alias in
+                crate::aggregate_model_alias::aggregate_model_aliases_for_member(profile, true)
+                    .into_iter()
+                    .filter(|alias| alias.via_mapping)
             {
                 effective_model_mappings.insert(alias.alias, alias.target_model);
             }
         }
-        relay.model_list = crate::aggregate_model_alias::aggregate_model_aliases_for_member(
-            profile,
-            false,
-        )
-        .into_iter()
-        .map(|alias| alias.alias)
-        .collect::<Vec<_>>()
-        .join("\n");
+        relay.model_list =
+            crate::aggregate_model_alias::aggregate_model_aliases_for_member(profile, false)
+                .into_iter()
+                .map(|alias| alias.alias)
+                .collect::<Vec<_>>()
+                .join("\n");
 
         if let Some(aggregate) = settings.active_aggregate_relay_profile() {
             let member_profiles = aggregate
@@ -579,11 +545,13 @@ fn relay_profile_by_id(settings: &BackendSettings, relay_id: &str) -> Option<Rel
                 .iter()
                 .filter_map(|member| raw_relay_profile_by_id(settings, &member.relay_id).cloned())
                 .collect::<Vec<_>>();
-            for entry in crate::aggregate_model_alias::aggregate_dispatch_entries(&aggregate, &member_profiles) {
+            for entry in crate::aggregate_model_alias::aggregate_dispatch_entries(
+                &aggregate,
+                &member_profiles,
+            ) {
                 if entry.provider_id == relay.id {
                     let target_model = entry.target_model;
-                    effective_model_mappings
-                        .insert(entry.codex_model, target_model.clone());
+                    effective_model_mappings.insert(entry.codex_model, target_model.clone());
                     effective_model_mappings.insert(entry.alias, target_model);
                 }
             }

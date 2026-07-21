@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PROVIDER: &str = "openai";
+const CUSTOM_PROVIDER: &str = "custom";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const BACKUP_KEEP_COUNT: usize = 5;
 
@@ -157,6 +158,10 @@ impl SqliteUpdateCounts {
 
 pub fn run_provider_sync(codex_home: Option<&Path>) -> ProviderSyncResult {
     run_provider_sync_with_target(codex_home, None)
+}
+
+pub fn normalize_all_session_providers_to_custom(codex_home: Option<&Path>) -> ProviderSyncResult {
+    run_provider_sync_with_target(codex_home, Some(CUSTOM_PROVIDER))
 }
 
 pub fn run_provider_sync_with_target(

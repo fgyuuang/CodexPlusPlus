@@ -1946,26 +1946,18 @@ pub async fn apply_session_index_cleanup(
 }
 
 #[tauri::command]
-pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResult<Value> {
-    let target_provider = target_provider
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let target_for_settings = target_provider.clone();
+pub async fn sync_providers_now() -> CommandResult<Value> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     prepare_codex_app_state_before_provider_switch(&home, "manager.sync_providers_now.before");
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        codex_plus_data::run_provider_sync_with_target(None, target_provider.as_deref())
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        codex_plus_data::normalize_all_session_providers_to_custom(None)
     })
     .await
     .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"));
     match result {
         Ok(sync) => {
             if is_success_sync_status(&sync.status) {
-                persist_provider_sync_selection(
-                    target_for_settings
-                        .as_deref()
-                        .unwrap_or(&sync.target_provider),
-                );
+                persist_provider_sync_selection(&sync.target_provider);
                 finish_codex_app_state_after_provider_switch(
                     &home,
                     "manager.sync_providers_now.after",
@@ -3795,7 +3787,7 @@ fn save_relay_file_in_home(
 ) -> anyhow::Result<()> {
     let path = match kind {
         "config" => home.join("config.toml"),
-        "auth" => home.join("auth.json"),
+        "auth" => anyhow::bail!("auth.json 只能由独立登录管理写入"),
         other => anyhow::bail!("未知配置文件类型：{other}"),
     };
     if let Some(parent) = path.parent() {
@@ -4590,10 +4582,12 @@ mod tests {
                 id: "agg".to_string(),
                 name: "聚合供应商 1".to_string(),
                 strategy: codex_plus_core::settings::AggregateRelayStrategy::Failover,
+                model_mappings_enabled: true,
                 members: vec![codex_plus_core::settings::AggregateRelayMember {
                     relay_id: "api".to_string(),
                     weight: 1,
                 }],
+                model_mappings: Vec::new(),
             }],
             active_aggregate_relay_id: "agg".to_string(),
             ..BackendSettings::default()
@@ -4604,7 +4598,7 @@ mod tests {
         codex_plus_core::paths::set_settings_path_for_tests(previous);
 
         assert_eq!(result.status, "ok");
-        assert!(result.payload.configured);
+        assert!(result.payload.configured, "{config}");
         assert!(!result.payload.authenticated);
         assert!(config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
         assert!(config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
@@ -4905,7 +4899,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_relay_profile_to_home_with_switch_rules_preserves_custom_provider_id() {
+    fn apply_relay_profile_to_home_with_switch_rules_normalizes_provider_id_to_custom() {
         let temp = tempfile::tempdir().unwrap();
         let profile = RelayProfile {
             relay_mode: codex_plus_core::settings::RelayMode::PureApi,
@@ -4924,26 +4918,24 @@ mod tests {
         .unwrap();
 
         let applied = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-        assert!(applied.contains("model_provider = \"ai\""));
-        assert!(applied.contains("[model_providers.ai]"));
-        assert!(!applied.contains("[model_providers.custom]"));
+        assert!(applied.contains("model_provider = \"custom\""));
+        assert!(applied.contains("[model_providers.custom]"));
+        assert!(applied.contains("requires_openai_auth = false"));
+        assert!(!applied.contains("[model_providers.ai]"));
     }
 
     #[test]
-    fn save_relay_file_in_home_only_allows_known_files() {
+    fn save_relay_file_in_home_only_allows_config() {
         let temp = tempfile::tempdir().unwrap();
 
         save_relay_file_in_home(temp.path(), "config", "model = \"gpt-5\"\n").unwrap();
-        save_relay_file_in_home(temp.path(), "auth", "{}\n").unwrap();
 
         assert_eq!(
             std::fs::read_to_string(temp.path().join("config.toml")).unwrap(),
             "model = \"gpt-5\"\n"
         );
-        assert_eq!(
-            std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
-            "{}\n"
-        );
+        assert!(save_relay_file_in_home(temp.path(), "auth", "{}\n").is_err());
+        assert!(!temp.path().join("auth.json").exists());
         assert!(save_relay_file_in_home(temp.path(), "../bad", "").is_err());
     }
 

@@ -49,9 +49,13 @@ base_url = "https://a.example/v1"
     };
 
     let error = switch_relay_profile_in_home(&store, &temp.path().join("codex"), next, "a")
-        .expect_err("invalid auth should fail switch");
+        .expect_err("missing API key should fail switch status validation");
 
-    assert!(error.to_string().contains("auth.json"));
+    assert!(
+        error
+            .to_string()
+            .contains("纯 API 配置写入后未检测到完整 custom provider")
+    );
     assert_eq!(store.load().unwrap().active_relay_id, "a");
     assert!(
         std::fs::read_to_string(temp.path().join("codex").join("config.toml"))
@@ -183,7 +187,17 @@ base_url = "https://edited-a.example/v1"
         .find(|profile| profile.id == "a")
         .unwrap();
     assert!(previous.config_contents.contains("edited-live-model"));
-    assert!(previous.config_contents.contains("manual_a"));
+    assert!(
+        previous
+            .config_contents
+            .contains(r#"model_provider = "custom""#)
+    );
+    assert!(
+        previous
+            .config_contents
+            .contains("[model_providers.custom]")
+    );
+    assert_eq!(previous.api_key, "sk-edited-a");
     assert_eq!(previous.context_window, "1000000");
     assert_eq!(previous.auto_compact_limit, "900000");
     assert_eq!(stored.active_relay_id, "b");

@@ -435,6 +435,31 @@ fn provider_sync_explicit_target_overrides_config_without_switching_config() {
 }
 
 #[test]
+fn normalize_all_session_providers_to_custom_ignores_active_config_provider() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+    let rollout = home.join("sessions/2026/rollout-custom.jsonl");
+    write_rollout(&rollout, "openai", "thread-1", "C:/workspace");
+    create_state_db(&home.join("state_5.sqlite"));
+
+    let result = codex_plus_data::normalize_all_session_providers_to_custom(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.target_provider, "custom");
+    let first: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(&rollout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["payload"]["model_provider"], "custom");
+}
+
+#[test]
 fn provider_sync_rejects_invalid_explicit_target_before_writes() {
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");

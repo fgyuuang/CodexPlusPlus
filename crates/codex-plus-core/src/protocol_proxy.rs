@@ -517,10 +517,18 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let context = RotationContext {
         conversation_id: conversation_id_from_responses_request(&request_json),
     };
-    let relay = crate::relay_rotation::select_relay_for_request(&settings, context)?;
+    let requested_model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let relay =
+        crate::relay_rotation::select_relay_for_request(&settings, context, requested_model)?;
     let mut relays = vec![relay.clone()];
     relays.extend(crate::relay_rotation::fallback_relays_after(
-        &settings, &relay.id,
+        &settings,
+        &relay.id,
+        requested_model,
     )?);
     let relay_count = relays.len();
     for (attempt, relay) in relays.into_iter().enumerate() {
@@ -647,7 +655,7 @@ pub async fn open_models_proxy_request(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let relay = crate::relay_rotation::select_relay_for_probe(&settings, None)?;
     validate_upstream(&relay)?;
 
     let endpoint = models_url(&relay.base_url);
@@ -692,7 +700,7 @@ pub async fn open_audio_transcriptions_proxy_request(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let relay = crate::relay_rotation::select_relay_for_probe(&settings, None)?;
     validate_upstream(&relay)?;
     let content_type = content_type.trim();
     if content_type.is_empty() {

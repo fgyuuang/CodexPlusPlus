@@ -273,8 +273,10 @@ fn select_relay_for_request_resets_rotation_after_switching_to_regular_relay() {
     let mut regular_settings = settings.clone();
     regular_settings.active_relay_id = "relay-c".to_string();
     regular_settings.active_aggregate_relay_id.clear();
-    let regular = select_relay_for_request(&regular_settings, RotationContext::default(), None).unwrap();
-    let after_reselect = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
+    let regular =
+        select_relay_for_request(&regular_settings, RotationContext::default(), None).unwrap();
+    let after_reselect =
+        select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
 
     assert_eq!(first.id, "relay-a");
     assert_eq!(regular.id, "relay-c");
@@ -339,8 +341,10 @@ fn select_relay_for_probe_does_not_advance_request_rotation() {
 
     let first_probe = select_relay_for_probe(&settings, None).unwrap();
     let second_probe = select_relay_for_probe(&settings, None).unwrap();
-    let first_request = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
-    let second_request = select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
+    let first_request =
+        select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
+    let second_request =
+        select_relay_for_request(&settings, RotationContext::default(), None).unwrap();
 
     assert_eq!(first_probe.id, "relay-a");
     assert_eq!(second_probe.id, "relay-a");

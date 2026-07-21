@@ -108,7 +108,9 @@ fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) ->
 }
 
 fn relay_profile_model_ids(profile: &RelayProfile) -> Vec<String> {
-    unique_strings(crate::aggregate_model_alias::relay_profile_model_ids(profile))
+    unique_strings(crate::aggregate_model_alias::relay_profile_model_ids(
+        profile,
+    ))
 }
 
 fn aggregate_relay_model_catalog_value(
@@ -132,7 +134,9 @@ fn aggregate_relay_model_catalog_value(
         })
         .collect::<Vec<_>>();
 
-    for alias in crate::aggregate_model_alias::aggregate_catalog_aliases(aggregate, &member_profiles) {
+    for alias in
+        crate::aggregate_model_alias::aggregate_catalog_aliases(aggregate, &member_profiles)
+    {
         if seen.insert(alias.alias.clone()) {
             models.push(alias.alias.clone());
         }

@@ -254,7 +254,7 @@ experimental_bearer_token = "sk-test-redacted"
 }
 
 #[test]
-fn reports_pure_api_configured_from_auth_api_key_without_bearer_token() {
+fn reports_legacy_auth_api_key_configuration() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("config.toml"),
@@ -319,7 +319,7 @@ model = "gpt-5-mini"
     assert!(updated.contains("[model_providers.custom]"));
     assert!(updated.contains(r#"name = "custom""#));
     assert!(updated.contains(r#"wire_api = "responses""#));
-    assert!(updated.contains("requires_openai_auth = true"));
+    assert!(updated.contains("requires_openai_auth = false"));
     assert!(updated.contains(r#"base_url = "https://relay.example.test/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "sk-test-redacted""#));
 }
@@ -534,39 +534,67 @@ fn official_mix_api_profile_removes_auth_api_key_on_storage() {
 }
 
 #[test]
-fn apply_pure_api_config_switches_auth_json_and_writes_provider_token() {
+fn apply_pure_api_config_preserves_official_auth_and_writes_provider_token() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temp.path().join("auth.json"),
-        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"old"}}"#,
-    )
-    .unwrap();
+    let official_auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"old"}}"#;
+    std::fs::write(temp.path().join("auth.json"), official_auth).unwrap();
     std::fs::write(temp.path().join("config.toml"), r#"model = "gpt-5""#).unwrap();
 
     let result = apply_pure_api_config_to_home(
         temp.path(),
         "http://192.168.188.245:3001/v1",
-        "sk-test-redacted",
+        "«redacted:sk-…»",
     )
     .unwrap();
 
-    let auth: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
-            .unwrap();
+    let auth = std::fs::read_to_string(temp.path().join("auth.json")).unwrap();
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(result.configured);
     assert!(!config.contains(r#"model = "gpt-5""#));
-    assert_eq!(
-        auth,
-        serde_json::json!({"OPENAI_API_KEY":"sk-test-redacted"})
-    );
+    assert_eq!(auth, official_auth);
     assert!(config.contains(r#"model_provider = "custom""#));
     assert!(config.contains("[model_providers.custom]"));
     assert!(config.contains(r#"name = "custom""#));
     assert!(config.contains(r#"wire_api = "responses""#));
-    assert!(config.contains("requires_openai_auth = true"));
+    assert!(config.contains("requires_openai_auth = false"));
     assert!(config.contains(r#"base_url = "http://192.168.188.245:3001/v1""#));
-    assert!(config.contains(r#"experimental_bearer_token = "sk-test-redacted""#));
+    assert!(config.contains(r#"experimental_bearer_token = "«redacted:sk-…»""#));
+}
+
+#[test]
+fn pure_api_profile_switch_preserves_official_auth_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let official_auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#;
+    std::fs::write(temp.path().join("auth.json"), official_auth).unwrap();
+    let profile = RelayProfile {
+        relay_mode: RelayMode::PureApi,
+        base_url: "https://relay.example/v1".to_string(),
+        api_key: "«redacted:sk-…»".to_string(),
+        config_contents: r#"model_provider = "legacy"
+
+[model_providers.legacy]
+name = "legacy"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://legacy.example/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"stale-provider-key"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        official_auth
+    );
+    assert!(config.contains(r#"model_provider = "custom""#));
+    assert!(config.contains("[model_providers.custom]"));
+    assert!(config.contains("requires_openai_auth = false"));
+    assert!(config.contains("experimental_bearer_token"));
+    assert!(!config.contains("[model_providers.legacy]"));
 }
 
 #[test]
@@ -1508,8 +1536,8 @@ model_provider = "vendor_alpha"
             .config_contents
             .contains(r#"model_provider = "vendor_alpha""#)
     );
-    let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
-    assert_eq!(auth["OPENAI_API_KEY"], "sk-new");
+    assert_eq!(profile.api_key, "sk-new");
+    assert!(profile.auth_contents.is_empty());
 }
 
 #[test]
@@ -1718,7 +1746,7 @@ model = "gpt-5-mini"
 }
 
 #[test]
-fn clear_relay_config_removes_pure_api_auth_json_key_and_preserves_other_auth_fields() {
+fn clear_relay_config_preserves_auth_json_with_other_auth_fields() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("auth.json"),
@@ -1745,13 +1773,13 @@ experimental_bearer_token = "sk-test-redacted"
         serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
             .unwrap();
     let auth_object = auth.as_object().unwrap();
-    assert!(!auth_object.contains_key("OPENAI_API_KEY"));
+    assert!(auth_object.contains_key("OPENAI_API_KEY"));
     assert_eq!(auth["auth_mode"], "chatgpt");
     assert_eq!(auth["tokens"]["access_token"], "keep");
 }
 
 #[test]
-fn clear_relay_config_removes_openai_api_key_when_auth_json_only_contains_pure_api_key() {
+fn clear_relay_config_preserves_auth_json_with_only_api_key() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("auth.json"),
@@ -1765,12 +1793,12 @@ fn clear_relay_config_removes_openai_api_key_when_auth_json_only_contains_pure_a
         serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
             .unwrap();
     let auth_object = auth.as_object().unwrap();
-    assert!(!auth_object.contains_key("OPENAI_API_KEY"));
-    assert!(auth_object.is_empty());
+    assert!(auth_object.contains_key("OPENAI_API_KEY"));
+    assert_eq!(auth_object.len(), 1);
 }
 
 #[test]
-fn clear_relay_config_with_auth_restores_official_profile_auth_json() {
+fn clear_relay_config_does_not_apply_profile_auth_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("auth.json"),
@@ -1796,9 +1824,8 @@ experimental_bearer_token = "sk-relay"
     let auth: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
             .unwrap();
-    assert_eq!(auth["auth_mode"], "chatgpt");
-    assert_eq!(auth["tokens"]["access_token"], "official-edited");
-    assert!(auth.get("OPENAI_API_KEY").is_none());
+    assert_eq!(auth["OPENAI_API_KEY"], "sk-relay");
+    assert!(auth.get("auth_mode").is_none());
 }
 
 #[test]
@@ -1990,12 +2017,12 @@ enabled = true
             .config_contents
             .contains("[plugins.\"superpowers@openai-curated\"]")
     );
-    let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
-    assert_eq!(auth["OPENAI_API_KEY"], "sk-live-token");
+    assert!(profile.auth_contents.is_empty());
+    assert_eq!(profile.api_key, "sk-live-token");
 }
 
 #[test]
-fn backfill_relay_profile_with_common_lifts_bearer_token_to_auth() {
+fn backfill_relay_profile_with_common_keeps_bearer_token_out_of_auth() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("config.toml"),
@@ -2017,8 +2044,8 @@ experimental_bearer_token = "sk-live-token"
             .config_contents
             .contains("experimental_bearer_token")
     );
-    let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
-    assert_eq!(auth["OPENAI_API_KEY"], "sk-live-token");
+    assert!(profile.auth_contents.is_empty());
+    assert_eq!(profile.api_key, "sk-live-token");
 }
 
 #[test]
@@ -2061,7 +2088,7 @@ experimental_bearer_token = "sk-old"
 }
 
 #[test]
-fn apply_relay_profile_preserves_provider_specific_id_in_live_config() {
+fn apply_relay_profile_writes_custom_provider_id_in_live_config() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("auth.json"),
@@ -2092,9 +2119,10 @@ model = "gpt-5.4"
 
     apply_relay_profile_to_home_with_switch_rules(temp.path(), &provider_b, "").unwrap();
     let live_config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(live_config.contains(r#"model_provider = "aihubmix""#));
-    assert!(live_config.contains("[model_providers.aihubmix]"));
-    assert!(!live_config.contains("[model_providers.custom]"));
+    assert!(live_config.contains(r#"model_provider = "custom""#));
+    assert!(live_config.contains("[model_providers.custom]"));
+    assert!(live_config.contains("requires_openai_auth = false"));
+    assert!(!live_config.contains("[model_providers.aihubmix]"));
 
     let mut common = String::new();
     backfill_relay_profile_from_home_with_common(temp.path(), &mut provider_b, &mut common)
@@ -2108,22 +2136,10 @@ model = "gpt-5.4"
     assert!(
         provider_b
             .config_contents
-            .contains("[model_providers.aihubmix]")
-    );
-    assert!(provider_b.config_contents.contains(r#"name = "AiHubMix""#));
-    assert!(
-        provider_b
-            .config_contents
-            .contains(r#"model_provider = "aihubmix""#)
-    );
-    assert!(
-        !provider_b
-            .config_contents
-            .contains("[model_providers.custom]")
+            .contains(r#"experimental_bearer_token = "aihubmix-key""#)
     );
     let auth: serde_json::Value = serde_json::from_str(&provider_b.auth_contents).unwrap();
-    assert_eq!(auth["OPENAI_API_KEY"], "aihubmix-key");
-    assert!(auth.get("tokens").is_none());
+    assert!(auth.get("OPENAI_API_KEY").is_none());
 }
 
 #[test]
@@ -2469,7 +2485,8 @@ experimental_bearer_token = "22222222222222222222222222222222222"
 }
 
 #[test]
-fn apply_relay_profile_to_home_with_switch_rules_switches_auth_and_writes_provider_token() {
+fn apply_relay_profile_to_home_with_switch_rules_preserves_official_auth_and_writes_provider_token()
+{
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("auth.json"),
@@ -2497,11 +2514,10 @@ base_url = "https://relay.example/v1"
 
     let auth = std::fs::read_to_string(temp.path().join("auth.json")).unwrap();
     let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
-    assert_eq!(auth["OPENAI_API_KEY"], "sk-new");
-    assert!(auth.get("auth_mode").is_none());
-    assert!(auth.get("tokens").is_none());
+    assert_eq!(auth["auth_mode"], "chatgpt");
+    assert_eq!(auth["tokens"]["access_token"], "official");
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!config.contains("experimental_bearer_token"));
+    assert!(config.contains("experimental_bearer_token"));
     assert!(config.contains(r#"model_provider = "custom""#));
     assert!(config.contains("[model_providers.custom]"));
 }
@@ -2542,15 +2558,15 @@ experimental_bearer_token = "sk-new"
     assert!(config.contains("[model_providers.custom]"));
     assert!(config.contains(r#"name = "custom""#));
     assert!(config.contains(r#"wire_api = "responses""#));
-    assert!(config.contains("requires_openai_auth = true"));
+    assert!(config.contains("requires_openai_auth = false"));
     assert!(config.contains(r#"base_url = "https://relay.example/v1""#));
-    assert!(!config.contains("experimental_bearer_token"));
+    assert!(config.contains("experimental_bearer_token"));
     assert!(!config.contains("live_provider"));
     assert!(!config.contains("https://live.example/v1"));
 }
 
 #[test]
-fn apply_relay_profile_to_home_with_switch_rules_uses_config_contents_as_source() {
+fn apply_relay_profile_to_home_with_switch_rules_normalizes_config_contents_to_custom() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
         id: "relay-a".to_string(),
@@ -2574,13 +2590,50 @@ requires_openai_auth = true
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains(r#"model = "gpt-5.4""#));
-    assert!(config.contains("disable_response_storage = true"));
-    assert!(config.contains(r#"model_provider = "max_ai""#));
-    assert!(config.contains("[model_providers.max_ai]"));
-    assert!(config.contains(r#"name = "max_ai""#));
+    assert!(!config.contains("disable_response_storage = true"));
+    assert!(config.contains(r#"model_provider = "custom""#));
+    assert!(config.contains("[model_providers.custom]"));
+    assert!(config.contains(r#"name = "custom""#));
     assert!(config.contains(r#"base_url = "https://max2.jojocode.com/v1""#));
-    assert!(!config.contains("experimental_bearer_token"));
-    assert!(!config.contains("[model_providers.custom]"));
+    assert!(config.contains("experimental_bearer_token"));
+    assert!(!config.contains("[model_providers.max_ai]"));
+}
+
+#[test]
+fn pure_api_profile_write_does_not_require_openai_auth_or_disable_response_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "relay-a".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model_provider = "custom"
+model = "gpt-5.5"
+disable_response_storage = true
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_to_home_with_switch_rules(
+        temp.path(),
+        &profile,
+        "disable_response_storage = true\n",
+    )
+    .unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains("requires_openai_auth = false"));
+    assert!(!config.contains("disable_response_storage = true"));
+
+    let status = relay_config_status_from_home(temp.path());
+    assert!(status.configured);
+    assert!(!status.requires_openai_auth);
 }
 
 #[cfg(windows)]
@@ -2899,7 +2952,7 @@ base_url = "http://192.168.188.245:3001/v1"
 }
 
 #[test]
-fn apply_relay_profile_to_home_with_switch_rules_switches_auth_even_when_provider_token_exists() {
+fn apply_relay_profile_to_home_with_switch_rules_preserves_auth_when_provider_token_exists() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("auth.json"),
@@ -2928,10 +2981,11 @@ experimental_bearer_token = "sk-provider-token"
 
     let auth = std::fs::read_to_string(temp.path().join("auth.json")).unwrap();
     let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
-    assert!(auth.as_object().is_some_and(|object| object.is_empty()));
+    assert_eq!(auth["auth_mode"], "chatgpt");
+    assert_eq!(auth["tokens"]["access_token"], "official");
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!config.contains("experimental_bearer_token"));
+    assert!(config.contains("experimental_bearer_token"));
 }
 
 #[test]
@@ -2966,7 +3020,7 @@ experimental_bearer_token = "sk-official-mix"
 
     let auth = std::fs::read_to_string(temp.path().join("auth.json")).unwrap();
     let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
-    assert!(auth.get("OPENAI_API_KEY").is_none());
+    assert_eq!(auth["OPENAI_API_KEY"], "sk-pure-api");
     assert_eq!(auth["auth_mode"], "chatgpt");
     assert_eq!(auth["tokens"]["access_token"], "official");
 
@@ -3002,8 +3056,7 @@ experimental_bearer_token = "sk-from-config"
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains(r#"experimental_bearer_token = "sk-from-config""#));
-    let auth = std::fs::read_to_string(temp.path().join("auth.json")).unwrap();
-    assert!(auth.trim().is_empty());
+    assert!(!temp.path().join("auth.json").exists());
 }
 
 #[test]
@@ -3093,8 +3146,8 @@ experimental_bearer_token = "sk-new"
     assert!(config.contains(r#"name = "custom""#));
     assert!(config.contains(r#"base_url = "https://max2.jojocode.com/v1""#));
     assert!(config.contains(r#"wire_api = "responses""#));
-    assert!(config.contains("requires_openai_auth = true"));
-    assert!(!config.contains("experimental_bearer_token"));
+    assert!(config.contains("requires_openai_auth = false"));
+    assert!(config.contains("experimental_bearer_token"));
 }
 
 #[test]

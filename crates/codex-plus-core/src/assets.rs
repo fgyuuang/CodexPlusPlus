@@ -413,7 +413,11 @@ fn local_plugin_marketplaces() -> Value {
 
 fn local_plugin_marketplaces_from_home(home: &Path) -> Value {
     let installed_plugins = installed_plugins_from_config(&home);
-    let marketplace_dir = home.join(".tmp").join("plugins").join(".agents").join("plugins");
+    let marketplace_dir = home
+        .join(".tmp")
+        .join("plugins")
+        .join(".agents")
+        .join("plugins");
     let mut candidates = vec![
         marketplace_dir.join("marketplace.json"),
         marketplace_dir.join("api_marketplace.json"),
@@ -482,8 +486,14 @@ fn collect_local_marketplace_candidates(
         if skip_local_marketplace_root(&name, from_sources_root) {
             continue;
         }
-        let marketplace_path = root.join(".agents").join("plugins").join("marketplace.json");
-        let api_marketplace_path = root.join(".agents").join("plugins").join("api_marketplace.json");
+        let marketplace_path = root
+            .join(".agents")
+            .join("plugins")
+            .join("marketplace.json");
+        let api_marketplace_path = root
+            .join(".agents")
+            .join("plugins")
+            .join("api_marketplace.json");
         if marketplace_path.is_file() && seen_roots.insert(root.clone()) {
             candidates.push(marketplace_path);
         }
@@ -878,7 +888,9 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            third_party_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            third_party_plugin_dir
+                .join(".codex-plugin")
+                .join("plugin.json"),
             r#"{"interface":{"displayName":"Productivity"}}"#,
         )
         .unwrap();
@@ -954,17 +966,23 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            documents_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            documents_plugin_dir
+                .join(".codex-plugin")
+                .join("plugin.json"),
             r#"{"interface":{"displayName":"Documents"}}"#,
         )
         .unwrap();
         std::fs::write(
-            presentations_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            presentations_plugin_dir
+                .join(".codex-plugin")
+                .join("plugin.json"),
             r#"{"interface":{"displayName":"Presentations"}}"#,
         )
         .unwrap();
         std::fs::write(
-            spreadsheets_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            spreadsheets_plugin_dir
+                .join(".codex-plugin")
+                .join("plugin.json"),
             r#"{"interface":{"displayName":"Spreadsheets"}}"#,
         )
         .unwrap();
@@ -1047,7 +1065,9 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            echobird_cn_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            echobird_cn_plugin_dir
+                .join(".codex-plugin")
+                .join("plugin.json"),
             r#"{"interface":{"displayName":"Gmail"}}"#,
         )
         .unwrap();

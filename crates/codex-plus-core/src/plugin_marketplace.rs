@@ -90,7 +90,6 @@ pub fn preserve_openai_curated_remote_marketplace_config(
     )
 }
 
-
 pub fn preserve_existing_marketplace_configs(
     home: &Path,
     config_text: &str,
@@ -680,20 +679,23 @@ fn merge_marketplace_configs_and_plugins_into_text(
     plugin_ids: &[String],
 ) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(config_text)?;
-    let marketplaces = table_mut_or_insert(&mut doc, "marketplaces")?;
-    let before = marketplaces.clone();
-    for marketplace_name in marketplace_names {
-        if marketplaces
-            .get(marketplace_name)
-            .and_then(Item::as_table)
-            .is_none()
-        {
-            marketplaces[marketplace_name] = toml_edit::table();
+    let before = {
+        let marketplaces = table_mut_or_insert(&mut doc, "marketplaces")?;
+        let before = marketplaces.clone();
+        for marketplace_name in marketplace_names {
+            if marketplaces
+                .get(marketplace_name)
+                .and_then(Item::as_table)
+                .is_none()
+            {
+                marketplaces[marketplace_name] = toml_edit::table();
+            }
+            marketplaces[marketplace_name]["source_type"] = toml_edit::value("local");
+            marketplaces[marketplace_name]["source"] =
+                toml_edit::value(windows_extended_path(marketplace_root));
         }
-        marketplaces[marketplace_name]["source_type"] = toml_edit::value("local");
-        marketplaces[marketplace_name]["source"] =
-            toml_edit::value(windows_extended_path(marketplace_root));
-    }
+        before
+    };
     if !plugin_ids.is_empty() {
         let plugins = table_mut_or_insert(&mut doc, "plugins")?;
         for plugin_id in plugin_ids {
@@ -714,6 +716,7 @@ fn merge_marketplace_configs_and_plugins_into_text(
         if marketplace_names.iter().any(|&n| n == name) {
             continue;
         }
+        let marketplaces = table_mut_or_insert(&mut doc, "marketplaces")?;
         if marketplaces.get(name).is_none() {
             marketplaces[name] = item.clone();
         }
@@ -1028,15 +1031,15 @@ mod tests {
             concat!(
                 "[marketplaces.awesome-codex-plugins]\n",
                 "source_type = \"local\"\n",
-                "source = \"\\\\?\\\\C:\\Users\\test\\awesome\"\n",
+                "source = '\\?\\C:\\Users\\test\\awesome'\n",
                 "\n",
                 "[marketplaces.echobird-ai]\n",
                 "source_type = \"local\"\n",
-                "source = \"\\\\?\\\\C:\\Users\\test\\echobird\"\n",
+                "source = '\\?\\C:\\Users\\test\\echobird'\n",
                 "\n",
                 "[marketplaces.openai-curated]\n",
                 "source_type = \"local\"\n",
-                "source = \"\\\\?\\\\C:\\Users\\test\\old-path\"\n",
+                "source = '\\?\\C:\\Users\\test\\old-path'\n",
             ),
         )
         .unwrap();
@@ -1049,11 +1052,11 @@ mod tests {
         // Third-party entries must be preserved
         assert_eq!(
             parsed["marketplaces"]["awesome-codex-plugins"]["source"].as_str(),
-            Some("\\\\?\\C:\\Users\\test\\awesome")
+            Some("\\?\\C:\\Users\\test\\awesome")
         );
         assert_eq!(
             parsed["marketplaces"]["echobird-ai"]["source"].as_str(),
-            Some("\\\\?\\C:\\Users\\test\\echobird")
+            Some("\\?\\C:\\Users\\test\\echobird")
         );
         // OpenAI curated entries must exist
         assert_eq!(
@@ -1068,7 +1071,6 @@ mod tests {
 
     #[test]
     fn ensure_openai_curated_remote_marketplace_config_registers_remote_only() {
-        
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
         write_remote_marketplace(home);

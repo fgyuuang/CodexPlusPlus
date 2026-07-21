@@ -884,18 +884,6 @@ fn injection_script_logs_marketplace_grouping_diagnostics() {
 }
 
 #[test]
-fn injection_script_rewrites_office_installs_to_local_marketplace_path() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("const requestedPath = String(requestMarketplacePath || \"\").trim();"));
-    assert!(script.contains("const requestedName = restorePluginMarketplaceName("));
-    assert!(script.contains("String(requestRemoteMarketplaceName || \"\").trim() || requestedPath"));
-    assert!(script.contains("if (exactName) return localPluginMarketplaceSourcePath(exactName);"));
-    assert!(script.contains("next.marketplacePath = injectedMarketplacePath;"));
-    assert!(script.contains("delete next.remoteMarketplaceName;"));
-}
-
-#[test]
 fn injection_script_omits_force_install_unlock_loop() {
     let script = assets::injection_script(57321);
 
