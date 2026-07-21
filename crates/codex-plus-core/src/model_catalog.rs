@@ -128,17 +128,23 @@ fn model_ui_metadata_map(models: &[String]) -> Value {
 
 fn aggregate_model_ui_metadata_map(
     aliases: &[crate::aggregate_model_alias::AggregateModelAlias],
-    display_models: &HashMap<String, String>,
+    display_suffixes: &HashMap<String, String>,
 ) -> Value {
     let mut metadata = Map::new();
     for alias in aliases {
-        let display_model = display_models
-            .get(&alias.alias)
-            .cloned()
-            .unwrap_or_else(|| alias.alias.clone());
-        if let Some(value) = crate::model_suffix::model_ui_metadata(&alias.alias) {
-            metadata.entry(display_model).or_insert(value);
-        }
+        let Some(display_suffix) = display_suffixes.get(&alias.alias) else {
+            continue;
+        };
+        let mut value = crate::model_suffix::model_ui_metadata(&alias.alias)
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        value.insert(
+            "displaySuffix".to_string(),
+            Value::String(display_suffix.clone()),
+        );
+        metadata
+            .entry(alias.alias.clone())
+            .or_insert(Value::Object(value));
     }
     Value::Object(metadata)
 }
@@ -181,19 +187,16 @@ fn aggregate_relay_model_catalog_value(
             labels.push(label);
         }
     }
-    let display_models = display_labels
+    let display_suffixes = display_labels
         .iter()
-        .map(|(model, labels)| (model.clone(), format!("{}({})", model, labels.join("|"))))
+        .map(|(model, labels)| (model.clone(), format!("({})", labels.join("|"))))
         .collect::<HashMap<_, _>>();
 
     let mut models = Vec::new();
     let mut model_details = Vec::new();
     let mut seen = HashSet::new();
     for alias in &aliases {
-        let model = display_models
-            .get(&alias.alias)
-            .cloned()
-            .unwrap_or_else(|| alias.alias.clone());
+        let model = alias.alias.clone();
         let provider_variant_of_codex_model =
             !crate::aggregate_model_alias::looks_like_codex_model_key(&alias.alias)
                 && crate::aggregate_model_alias::looks_like_codex_model_key(&alias.target_model);
@@ -211,8 +214,10 @@ fn aggregate_relay_model_catalog_value(
     }
 
     let profile_model = profile.model.trim();
-    let default_model = if let Some(display_model) = display_models.get(profile_model) {
-        display_model.clone()
+    let normalized_profile_model =
+        crate::aggregate_model_alias::normalize_requested_model_name(profile_model);
+    let default_model = if models.iter().any(|item| item == &normalized_profile_model) {
+        normalized_profile_model
     } else if models.iter().any(|item| item == profile_model) {
         profile_model.to_string()
     } else {
@@ -223,7 +228,7 @@ fn aggregate_relay_model_catalog_value(
     } else {
         profile.name.trim()
     };
-    let model_metadata = aggregate_model_ui_metadata_map(&aliases, &display_models);
+    let model_metadata = aggregate_model_ui_metadata_map(&aliases, &display_suffixes);
 
     json!({
         "status": if models.is_empty() { "not_configured" } else { "ok" },

@@ -5752,6 +5752,7 @@
       currentModelName: () => codexServiceTierCurrentModelName(),
       fastAvailability: (modelName = codexServiceTierCurrentModelName()) => codexServiceTierFastAvailability(modelName),
       modelDescriptor: (modelName) => codexPlusModelDescriptor(modelName),
+      patchModelArray: (models, allowEmpty = false) => patchModelArray(models, allowEmpty),
       setModelCatalog: (catalog = {}) => {
         codexModelCatalog = {
           status: "ok",
@@ -5862,11 +5863,22 @@
     const metadata = codexPlusModelMetadata(modelName);
     if (!descriptor || !metadata) return false;
     let changed = false;
-    for (const key of ["displayName", "description", "defaultReasoningEffort"]) {
+    for (const key of ["description", "defaultReasoningEffort"]) {
       if (typeof metadata[key] === "string" && metadata[key] && descriptor[key] !== metadata[key]) {
         descriptor[key] = metadata[key];
         changed = true;
       }
+    }
+    const displaySuffix = typeof metadata.displaySuffix === "string" ? metadata.displaySuffix.trim() : "";
+    const baseDisplayName = typeof metadata.displayName === "string" && metadata.displayName
+      ? metadata.displayName
+      : (typeof descriptor.displayName === "string" && descriptor.displayName ? descriptor.displayName : modelName);
+    const displayName = displaySuffix && !baseDisplayName.endsWith(displaySuffix)
+      ? `${baseDisplayName}${displaySuffix}`
+      : baseDisplayName;
+    if (descriptor.displayName !== displayName) {
+      descriptor.displayName = displayName;
+      changed = true;
     }
     if (Array.isArray(metadata.supportedReasoningEfforts) && metadata.supportedReasoningEfforts.length > 0) {
       const nextEfforts = modelReasoningEfforts(modelName);
@@ -5880,12 +5892,14 @@
 
   function codexPlusModelDescriptor(modelName) {
     const metadata = codexPlusModelMetadata(modelName);
+    const displayName = metadata?.displayName || modelName;
+    const displaySuffix = typeof metadata?.displaySuffix === "string" ? metadata.displaySuffix.trim() : "";
     return {
       model: modelName,
       id: modelName,
       slug: modelName,
       name: modelName,
-      displayName: metadata?.displayName || modelName,
+      displayName: displaySuffix && !displayName.endsWith(displaySuffix) ? `${displayName}${displaySuffix}` : displayName,
       description: metadata?.description || codexModelCatalog.provider_name || codexModelCatalog.model_provider || "Custom model",
       hidden: false,
       isDefault: (codexModelCatalog.default_model || codexModelCatalog.model) === modelName,

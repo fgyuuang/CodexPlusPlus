@@ -282,20 +282,34 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
     }
     codex_plus_core::paths::set_settings_path_for_tests(previous_settings_path);
 
+    assert_eq!(result["default_model"], "gpt-5.4");
     assert_eq!(
-        result["default_model"],
-        "gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)"
+        result["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|model| *model == "gpt-5.4")
+            .count(),
+        1
     );
     assert!(
-        result["models"]
+        !result["models"]
             .as_array()
             .unwrap()
             .iter()
             .any(|model| model == "gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)")
     );
     assert_eq!(
-        result["modelMetadata"]["gpt-5.6-sol(供应商一)"]["defaultReasoningEffort"],
+        result["modelMetadata"]["gpt-5.4"]["displaySuffix"],
+        "(供应商一|供应商二:vendor-gpt-5.4)"
+    );
+    assert_eq!(
+        result["modelMetadata"]["gpt-5.6-sol"]["defaultReasoningEffort"],
         "low"
+    );
+    assert_eq!(
+        result["modelMetadata"]["gpt-5.6-sol"]["displaySuffix"],
+        "(供应商一)"
     );
 }
 

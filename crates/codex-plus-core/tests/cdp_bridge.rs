@@ -1172,6 +1172,17 @@ fn injection_script_applies_fast_service_tier_contract() {
         cases["solDescriptor"]["supportedReasoningEfforts"][5]["reasoningEffort"],
         "ultra"
     );
+    assert_eq!(cases["officialModels"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        cases["officialModels"][0]["displayName"],
+        "GPT-5.4(供应商一|供应商二:vendor-gpt-5.4)"
+    );
+    assert_eq!(
+        cases["officialModels"][1]["displayName"],
+        "GPT-5.6-Sol(供应商一)"
+    );
+    assert_eq!(cases["firstOfficialPatchChanged"], true);
+    assert_eq!(cases["secondOfficialPatchChanged"], false);
     assert_eq!(cases["dispatcherFromSingleton"], true);
     assert_eq!(cases["dispatcherFromClass"], true);
 }
@@ -1303,6 +1314,25 @@ api.setModelCatalog({{
   }},
 }});
 const solDescriptor = api.modelDescriptor("gpt-5.6-sol");
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-5.4",
+  default_model: "gpt-5.4",
+  models: ["gpt-5.4", "gpt-5.6-sol"],
+  modelMetadata: {{
+    "gpt-5.4": {{ displaySuffix: "(供应商一|供应商二:vendor-gpt-5.4)" }},
+    "gpt-5.6-sol": {{
+      displayName: "GPT-5.6-Sol",
+      displaySuffix: "(供应商一)",
+    }},
+  }},
+}});
+const officialModels = [
+  {{ model: "gpt-5.4", displayName: "GPT-5.4", hidden: false }},
+  {{ model: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", hidden: false }},
+];
+const firstOfficialPatchChanged = api.patchModelArray(officialModels);
+const secondOfficialPatchChanged = api.patchModelArray(officialModels);
 const singletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
 const dispatcherFromSingleton = api.dispatcherFromModule({{ current: singletonDispatcher }}) === singletonDispatcher;
 class DispatcherClass {{
@@ -1321,6 +1351,9 @@ process.stdout.write(JSON.stringify({{
   startConversation,
   solFastAvailability,
   solDescriptor,
+  officialModels,
+  firstOfficialPatchChanged,
+  secondOfficialPatchChanged,
   dispatcherFromSingleton,
   dispatcherFromClass,
 }}));
