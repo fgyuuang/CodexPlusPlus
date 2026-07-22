@@ -57,13 +57,8 @@ export function aggregateProviderLabel(profile: RelayProfileLike, model: string)
 }
 
 export function aggregateCodexAlias(codexModel: string, profile: RelayProfileLike, targetModel: string): string {
-  const normalizedCodexModel = codexModel.trim();
-  const normalizedTargetModel = targetModel.trim();
-  const provider = profile.name || profile.id;
-  if (normalizedCodexModel.toLowerCase() === normalizedTargetModel.toLowerCase()) {
-    return `${normalizedCodexModel}(${provider})`;
-  }
-  return `${normalizedCodexModel}(${aggregateProviderLabel(profile, normalizedTargetModel)})`;
+  void codexModel;
+  return aggregateProviderLabel(profile, targetModel.trim());
 }
 
 export function looksLikeCodexModelKey(model: string): boolean {

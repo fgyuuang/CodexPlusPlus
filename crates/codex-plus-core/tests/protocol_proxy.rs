@@ -1554,7 +1554,7 @@ async fn aggregate_proxy_rewrites_display_model_to_selected_provider_target() {
     };
 
     let result = open_responses_proxy_request_with_settings(
-        r#"{"model":"gpt-5.4(ProviderB:vendor-gpt-5.4)","input":"hi"}"#,
+        r#"{"model":"ProviderB:vendor-gpt-5.4","input":"hi"}"#,
         settings,
     )
     .await

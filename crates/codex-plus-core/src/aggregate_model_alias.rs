@@ -68,11 +68,7 @@ pub fn aggregate_model_aliases_for_member(
     let mut aliases = relay_profile_model_ids(profile)
         .into_iter()
         .map(|model| AggregateModelAlias {
-            alias: if looks_like_codex_model_key(&model) {
-                codex_model_alias(&model, &provider_name, &model)
-            } else {
-                provider_label(&provider_name, &model)
-            },
+            alias: provider_label(&provider_name, &model),
             target_model: model,
             via_mapping: false,
             mapping_key: None,
@@ -190,7 +186,7 @@ pub fn aggregate_catalog_aliases(
             provider_name: entry.provider_name.clone(),
         });
         aliases.push(AggregateModelAlias {
-            alias: entry.alias,
+            alias: provider_label(&entry.provider_name, &entry.target_model),
             target_model: entry.target_model,
             via_mapping: entry.via_mapping,
             mapping_key: Some(entry.codex_model),
@@ -239,7 +235,7 @@ pub fn aggregate_catalog_aliases(
                         provider_name: provider_name.clone(),
                     });
                 }
-                let provider_alias = codex_model_alias(&model, &provider_name, &model);
+                let provider_alias = provider_label(&provider_name, &model);
                 let provider_detail_key = (
                     provider_alias.clone(),
                     provider_id.clone(),

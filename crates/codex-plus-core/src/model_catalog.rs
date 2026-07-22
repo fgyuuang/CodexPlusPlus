@@ -132,7 +132,12 @@ fn aggregate_model_ui_metadata_map(
 ) -> Value {
     let mut metadata = Map::new();
     for alias in aliases {
-        let base_model = crate::aggregate_model_alias::normalize_requested_model_name(&alias.alias);
+        let is_provider_alias = alias.alias.contains(':');
+        let base_model = if is_provider_alias {
+            alias.target_model.trim().to_string()
+        } else {
+            crate::aggregate_model_alias::normalize_requested_model_name(&alias.alias)
+        };
         let mut value = crate::model_suffix::model_ui_metadata(&base_model)
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
@@ -140,6 +145,11 @@ fn aggregate_model_ui_metadata_map(
             value.insert(
                 "displaySuffix".to_string(),
                 Value::String(display_suffix.clone()),
+            );
+        } else if is_provider_alias && !value.is_empty() {
+            value.insert(
+                "displayName".to_string(),
+                Value::String(alias.alias.clone()),
             );
         } else if base_model != alias.alias && !value.is_empty() {
             let base_display_name = value
@@ -212,10 +222,7 @@ fn aggregate_relay_model_catalog_value(
     let mut seen = HashSet::new();
     for alias in &aliases {
         let model = alias.alias.clone();
-        let provider_variant_of_codex_model =
-            !crate::aggregate_model_alias::looks_like_codex_model_key(&alias.alias)
-                && crate::aggregate_model_alias::looks_like_codex_model_key(&alias.target_model);
-        if !provider_variant_of_codex_model && seen.insert(model.clone()) {
+        if seen.insert(model.clone()) {
             models.push(model.clone());
         }
         model_details.push(json!({

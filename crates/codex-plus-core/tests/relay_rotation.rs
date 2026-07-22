@@ -117,7 +117,7 @@ fn provider_specific_gpt_alias_selects_only_the_requested_member() {
         .select(
             &settings,
             RotationContext::default(),
-            Some("gpt-5.4(ProviderB:vendor-gpt-5.4)"),
+            Some("ProviderB:vendor-gpt-5.4"),
         )
         .unwrap();
 
@@ -141,7 +141,7 @@ fn provider_specific_gpt_alias_selects_requested_member_when_implicit_mappings_a
         .select(
             &settings,
             RotationContext::default(),
-            Some("gpt-5.4(ProviderB)"),
+            Some("ProviderB:gpt-5.4"),
         )
         .unwrap();
 

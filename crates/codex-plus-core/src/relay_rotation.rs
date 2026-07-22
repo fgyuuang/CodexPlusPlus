@@ -456,7 +456,14 @@ fn aggregate_dispatch_member_pool(
 
     dispatch_entries
         .into_iter()
-        .filter(|entry| entry.codex_model == model || entry.alias == model)
+        .filter(|entry| {
+            entry.codex_model == model
+                || entry.alias == model
+                || crate::aggregate_model_alias::provider_label(
+                    &entry.provider_name,
+                    &entry.target_model,
+                ) == model
+        })
         .map(|entry| {
             let relay_id = entry.provider_id;
             let weight = *relay_weight_by_id.get(relay_id.as_str()).unwrap_or(&1);
@@ -557,7 +564,13 @@ fn relay_profile_by_id(settings: &BackendSettings, relay_id: &str) -> Option<Rel
                 if entry.provider_id == relay.id {
                     let target_model = entry.target_model;
                     effective_model_mappings.insert(entry.codex_model, target_model.clone());
-                    effective_model_mappings.insert(entry.alias, target_model);
+                    effective_model_mappings.insert(
+                        crate::aggregate_model_alias::provider_label(
+                            &entry.provider_name,
+                            &target_model,
+                        ),
+                        target_model,
+                    );
                 }
             }
         }
