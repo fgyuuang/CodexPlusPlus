@@ -132,16 +132,28 @@ fn aggregate_model_ui_metadata_map(
 ) -> Value {
     let mut metadata = Map::new();
     for alias in aliases {
-        let Some(display_suffix) = display_suffixes.get(&alias.alias) else {
-            continue;
-        };
-        let mut value = crate::model_suffix::model_ui_metadata(&alias.alias)
+        let base_model = crate::aggregate_model_alias::normalize_requested_model_name(&alias.alias);
+        let mut value = crate::model_suffix::model_ui_metadata(&base_model)
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
-        value.insert(
-            "displaySuffix".to_string(),
-            Value::String(display_suffix.clone()),
-        );
+        if let Some(display_suffix) = display_suffixes.get(&alias.alias) {
+            value.insert(
+                "displaySuffix".to_string(),
+                Value::String(display_suffix.clone()),
+            );
+        } else if base_model != alias.alias && !value.is_empty() {
+            let base_display_name = value
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or(&base_model);
+            let alias_suffix = alias.alias.strip_prefix(&base_model).unwrap_or("");
+            value.insert(
+                "displayName".to_string(),
+                Value::String(format!("{}{}", base_display_name, alias_suffix)),
+            );
+        } else if value.is_empty() {
+            continue;
+        }
         metadata
             .entry(alias.alias.clone())
             .or_insert(Value::Object(value));
@@ -170,7 +182,10 @@ fn aggregate_relay_model_catalog_value(
         crate::aggregate_model_alias::aggregate_catalog_aliases(aggregate, &member_profiles);
     let mut display_labels = HashMap::<String, Vec<String>>::new();
     for alias in &aliases {
-        if !crate::aggregate_model_alias::looks_like_codex_model_key(&alias.alias) {
+        let is_base_dispatch_alias = alias.mapping_key.as_deref() == Some(alias.alias.as_str());
+        if !is_base_dispatch_alias
+            || !crate::aggregate_model_alias::looks_like_codex_model_key(&alias.alias)
+        {
             continue;
         }
         let label = if alias.alias.eq_ignore_ascii_case(alias.target_model.trim()) {

@@ -3548,6 +3548,148 @@ body {
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
+.aggregate-mapping-heading-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.aggregate-model-mappings-list {
+  display: grid;
+  gap: 12px;
+}
+
+.aggregate-model-mapping-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  padding: 12px;
+  background: hsl(var(--surface-raised));
+}
+
+.aggregate-model-mapping-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.aggregate-model-mapping-card-actions,
+.aggregate-model-mapping-target-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.aggregate-model-mapping-card-title,
+.aggregate-model-mapping-preview-stack,
+.aggregate-model-mapping-targets {
+  display: grid;
+  gap: 8px;
+}
+
+.aggregate-model-mapping-card-title small,
+.aggregate-model-mapping-preview-stack small {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.aggregate-model-mapping-target-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1.1fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.aggregate-model-mapping-target-order {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+}
+
+.aggregate-mapping-move-down {
+  margin-left: 4px;
+  transform: rotate(180deg);
+}
+
+.relay-model-mappings-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.relay-model-mapping-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 200px) minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.relay-model-mapping-row > label {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+}
+
+.relay-model-mapping-select {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  padding: 0 10px;
+  color: hsl(var(--foreground));
+  background: hsl(var(--background));
+}
+
+.relay-model-mappings-help {
+  margin-bottom: 10px;
+}
+
+.relay-model-mappings-summary {
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.relay-model-mappings-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.relay-model-mappings-toggle-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.relay-model-mappings-toggle-inline input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: hsl(var(--brand-accent));
+  cursor: pointer;
+}
+
+@media (max-width: 900px) {
+  .relay-model-mapping-row {
+    grid-template-columns: 1fr;
+  }
+
+  .aggregate-model-mapping-target-row {
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+  }
+
+  .aggregate-model-mapping-preview-stack {
+    grid-column: 1 / -1;
+  }
+}
+
 /* Codex App visual system */
 ::selection {
   background: hsl(var(--brand-accent) / 0.3);

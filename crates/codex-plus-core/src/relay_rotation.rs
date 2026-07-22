@@ -364,18 +364,23 @@ fn member_pool_for_model(
     let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(aggregate.members.clone());
     };
+    if let Some(provider_specific_members) =
+        aggregate_member_pool_for_provider_alias(settings, aggregate, model)
+    {
+        return Ok(provider_specific_members);
+    }
+
+    let explicit_alias_members = aggregate_dispatch_member_pool(settings, aggregate, model);
+    if !explicit_alias_members.is_empty() {
+        return Ok(explicit_alias_members);
+    }
+
     let normalized_model = crate::aggregate_model_alias::normalize_requested_model_name(model);
     let model = if normalized_model.is_empty() {
         model
     } else {
         normalized_model.as_str()
     };
-
-    if let Some(provider_specific_members) =
-        aggregate_member_pool_for_provider_alias(settings, aggregate, model)
-    {
-        return Ok(provider_specific_members);
-    }
 
     let direct_members = aggregate
         .members

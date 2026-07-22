@@ -36,11 +36,14 @@ pub fn provider_label(provider_name: &str, model: &str) -> String {
 }
 
 pub fn codex_model_alias(codex_model: &str, provider_name: &str, target_model: &str) -> String {
-    format!(
-        "{}({})",
-        codex_model.trim(),
-        provider_label(provider_name, target_model)
-    )
+    let codex_model = codex_model.trim();
+    let target_model = target_model.trim();
+    let provider = provider_name.trim();
+    if codex_model.eq_ignore_ascii_case(target_model) {
+        format!("{}({})", codex_model, provider)
+    } else {
+        format!("{}({}:{})", codex_model, provider, target_model)
+    }
 }
 
 pub fn relay_profile_model_ids(profile: &RelayProfile) -> Vec<String> {
@@ -65,7 +68,11 @@ pub fn aggregate_model_aliases_for_member(
     let mut aliases = relay_profile_model_ids(profile)
         .into_iter()
         .map(|model| AggregateModelAlias {
-            alias: provider_label(&provider_name, &model),
+            alias: if looks_like_codex_model_key(&model) {
+                codex_model_alias(&model, &provider_name, &model)
+            } else {
+                provider_label(&provider_name, &model)
+            },
             target_model: model,
             via_mapping: false,
             mapping_key: None,
@@ -171,18 +178,27 @@ pub fn aggregate_catalog_aliases(
     aggregate: &AggregateRelayProfile,
     members: &[RelayProfile],
 ) -> Vec<AggregateModelAlias> {
-    let dispatch_alias_count = aggregate_dispatch_entries(aggregate, members).len();
-    let mut aliases = aggregate_dispatch_entries(aggregate, members)
-        .into_iter()
-        .map(|entry| AggregateModelAlias {
+    let dispatch_entries = aggregate_dispatch_entries(aggregate, members);
+    let mut aliases = Vec::new();
+    for entry in dispatch_entries {
+        aliases.push(AggregateModelAlias {
             alias: entry.codex_model.clone(),
+            target_model: entry.target_model.clone(),
+            via_mapping: entry.via_mapping,
+            mapping_key: Some(entry.codex_model.clone()),
+            provider_id: entry.provider_id.clone(),
+            provider_name: entry.provider_name.clone(),
+        });
+        aliases.push(AggregateModelAlias {
+            alias: entry.alias,
             target_model: entry.target_model,
             via_mapping: entry.via_mapping,
             mapping_key: Some(entry.codex_model),
             provider_id: entry.provider_id,
             provider_name: entry.provider_name,
-        })
-        .collect::<Vec<_>>();
+        });
+    }
+    let dispatch_alias_count = aliases.len();
     let mut seen_details = aliases
         .iter()
         .map(|alias| {
@@ -223,7 +239,7 @@ pub fn aggregate_catalog_aliases(
                         provider_name: provider_name.clone(),
                     });
                 }
-                let provider_alias = provider_label(&provider_name, &model);
+                let provider_alias = codex_model_alias(&model, &provider_name, &model);
                 let provider_detail_key = (
                     provider_alias.clone(),
                     provider_id.clone(),

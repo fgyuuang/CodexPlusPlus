@@ -72,6 +72,17 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  aggregateCodexAlias,
+  aggregateDisplayModelEntries,
+  aggregateEffectiveMappings,
+  aggregateMappingKeyOptions,
+  aggregatePersistedMappingsFromEffective,
+  aggregateProviderLabel,
+  DEFAULT_CODEX_MODEL_MAPPING_KEYS,
+  relayProfileModels,
+  type AggregateEffectiveModelMapping,
+} from "@/aggregateMappings";
 import { isGitHubRepositoryHomepage } from "./github-repository";
 import {
   mergeModelWindowRows,
@@ -273,19 +284,39 @@ type RelayAggregateMember = {
   profileId: string;
   weight: number;
 };
+type RelayAggregateDispatchTarget = {
+  profileId: string;
+  targetModel: string;
+};
+type RelayAggregateModelMapping = {
+  codexModel: string;
+  targets: RelayAggregateDispatchTarget[];
+};
 type RelayAggregateConfig = {
   strategy: RelayAggregateStrategy;
+  modelMappingsEnabled: boolean;
   members: RelayAggregateMember[];
+  modelMappings: RelayAggregateModelMapping[];
 };
 type AggregateRelayMember = {
   relayId: string;
   weight: number;
 };
+type AggregateRelayDispatchTarget = {
+  relayId: string;
+  targetModel: string;
+};
+type AggregateRelayModelMapping = {
+  codexModel: string;
+  targets: AggregateRelayDispatchTarget[];
+};
 type AggregateRelayProfile = {
   id: string;
   name: string;
   strategy: RelayAggregateStrategy;
+  modelMappingsEnabled: boolean;
   members: AggregateRelayMember[];
+  modelMappings: AggregateRelayModelMapping[];
 };
 
 type RelayContextSelection = {
@@ -314,6 +345,7 @@ type CodexContextEntries = {
 type RelayProtocol = "responses" | "chatCompletions";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
 const PROTOCOL_PROXY_BASE_URL = "http://127.0.0.1:57321/v1";
+const CODEX_MODEL_MAPPING_KEYS = DEFAULT_CODEX_MODEL_MAPPING_KEYS;
 const CHAT_UPSTREAM_BASE_URL_KEY = "codex_plus_chat_base_url";
 const SCRIPT_MARKET_REPOSITORY_URL = "https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket";
 
@@ -5498,6 +5530,16 @@ function RelayProfileEditor({
   const addModelWindowRows = (rows: ModelWindowRow[]) => {
     setModelWindowRows(mergeModelWindowRows(modelWindowRows, rows));
   };
+  const serializedModelRows = useMemo(() => serializeModelWindowRows(modelWindowRows), [modelWindowRows]);
+  const availableModels = useMemo(
+    () => relayProfileModels({
+      id: profile.id,
+      name: profile.name,
+      model: profile.model,
+      modelList: serializedModelRows.modelList,
+    }),
+    [profile.id, profile.name, profile.model, serializedModelRows.modelList],
+  );
   const runProviderDoctor = async () => {
     setDoctorOpen(true);
     setDoctorRunning(true);
@@ -5769,6 +5811,56 @@ function RelayProfileEditor({
             </p>
           </Field>
         ) : null}
+        {showApiFields ? (
+          <div className="relay-field-model-mappings field">
+            <div className="relay-model-mappings-help hint-line">
+              <Info className="h-4 w-4" />
+              <span>{t("把 Codex 官方模型名映射到当前供应商的真实上游模型；先从上游获取模型后再选择。")}</span>
+            </div>
+            <span className="relay-model-mappings-heading">
+              <span>{t("Model Mappings")}</span>
+              <label className="relay-model-mappings-toggle-inline">
+                <input
+                  type="checkbox"
+                  id={`model-mappings-enabled-${profile.id}`}
+                  checked={profile.modelMappingsEnabled !== false}
+                  onChange={(event) => updateDraft({ modelMappingsEnabled: event.currentTarget.checked })}
+                />
+                {t("启用官方模型映射")}
+              </label>
+            </span>
+            <div className="relay-model-mappings-grid">
+              {CODEX_MODEL_MAPPING_KEYS.map((codexModel) => {
+                const currentValue = (profile.modelMappings || {})[codexModel] || "";
+                const options = Array.from(new Set([...availableModels, currentValue].filter(Boolean)));
+                return (
+                  <div className="relay-model-mapping-row" key={codexModel}>
+                    <label>{codexModel}</label>
+                    <select
+                      className="relay-model-mapping-select"
+                      value={currentValue}
+                      onChange={(event) => {
+                        const nextMappings = { ...(profile.modelMappings || {}) };
+                        const nextValue = event.currentTarget.value.trim();
+                        if (nextValue) nextMappings[codexModel] = nextValue;
+                        else delete nextMappings[codexModel];
+                        updateDraft({ modelMappings: nextMappings });
+                      }}
+                    >
+                      <option value="">{t("未映射")}</option>
+                      {options.map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="relay-model-list-tools">
+              <span className="relay-model-mappings-summary">{tf("可选模型：{0}", [availableModels.length])}</span>
+            </div>
+          </div>
+        ) : null}
         {showApiFields && modelWindowRows.some((row) => row.imageHandling === "vlm") ? (
           <div className="relay-vlm-section">
             <div className="relay-vlm-section-header">{t("Vision Analysis Provider")}</div>
@@ -5848,17 +5940,35 @@ function AggregateRelayProfileEditor({
   isNew?: boolean;
   onProfileChange: (value: RelayProfile) => void;
 }) {
+  const [showAggregateMappings, setShowAggregateMappings] = useState(true);
+  const [refreshingAggregateMappings, setRefreshingAggregateMappings] = useState(false);
   const candidates = aggregateMemberCandidates(form, profile.id);
   const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
   const memberIds = new Set(aggregate.members.map((member) => member.profileId));
+  const memberProfiles = aggregateSelectedMemberProfiles(aggregate, candidates);
+  const effectiveMappings = aggregateEffectiveMappings(aggregate, memberProfiles);
+  const aggregateDisplayModels = aggregateDisplayModelEntries(aggregate, memberProfiles);
+  const upstreamOptions = aggregateUpstreamModelOptions(memberProfiles);
+  const memberWeightById = aggregateMemberWeightMap(aggregate);
   const updateAggregate = (nextAggregate: RelayAggregateConfig) => {
     onProfileChange(normalizeAggregateRelayProfile({ ...profile, aggregate: nextAggregate }, form));
+  };
+  const refreshAggregateMappings = () => {
+    if (refreshingAggregateMappings) return;
+    setRefreshingAggregateMappings(true);
+    onProfileChange(normalizeAggregateRelayProfile({ ...profile, modelList: "", aggregate }, form));
+    window.setTimeout(() => setRefreshingAggregateMappings(false), 200);
   };
   const toggleMember = (profileId: string, checked: boolean) => {
     const members = checked
       ? [...aggregate.members, { profileId, weight: 1 }]
       : aggregate.members.filter((member) => member.profileId !== profileId);
-    updateAggregate({ ...aggregate, members });
+    const modelMappings = checked
+      ? aggregate.modelMappings
+      : aggregate.modelMappings
+        .map((mapping) => ({ ...mapping, targets: mapping.targets.filter((target) => target.profileId !== profileId) }))
+        .filter((mapping) => mapping.targets.length > 0 || mapping.codexModel.trim().length > 0);
+    updateAggregate({ ...aggregate, members, modelMappings });
   };
   const updateWeight = (profileId: string, weight: number) => {
     updateAggregate({
@@ -5867,6 +5977,62 @@ function AggregateRelayProfileEditor({
         member.profileId === profileId ? { ...member, weight: clampAggregateWeight(weight) } : member,
       ),
     });
+  };
+  const addModelMapping = () => {
+    const codexModel = nextAggregateMappingKey(effectiveMappings);
+    updateAggregate({ ...aggregate, modelMappings: [...aggregate.modelMappings, { codexModel, targets: [] }] });
+  };
+  const updateEffectiveMappings = (
+    updater: (mappings: AggregateEffectiveModelMapping[]) => AggregateEffectiveModelMapping[],
+  ) => {
+    updateAggregate({ ...aggregate, modelMappings: aggregatePersistedMappingsFromEffective(updater(effectiveMappings)) });
+  };
+  const updateModelMapping = (
+    index: number,
+    updater: (mapping: AggregateEffectiveModelMapping) => AggregateEffectiveModelMapping,
+  ) => {
+    updateEffectiveMappings((mappings) => mappings.map((mapping, mappingIndex) => {
+      if (mappingIndex !== index) return mapping;
+      return { ...updater(mapping), source: "explicit" as const };
+    }));
+  };
+  const removeModelMapping = (index: number) => {
+    updateEffectiveMappings((mappings) => mappings.filter((_, mappingIndex) => mappingIndex !== index));
+  };
+  const addModelMappingTarget = (mappingIndex: number) => {
+    const currentMapping = effectiveMappings[mappingIndex];
+    const used = new Set((currentMapping?.targets ?? []).map((target) => `${target.profileId}::${target.targetModel}`));
+    const fallbackTarget = upstreamOptions.find((option) => !used.has(option.key)) || upstreamOptions[0];
+    if (!fallbackTarget) return;
+    updateModelMapping(mappingIndex, (mapping) => ({
+      ...mapping,
+      targets: [...mapping.targets, { profileId: fallbackTarget.profileId, targetModel: fallbackTarget.model }],
+    }));
+  };
+  const moveModelMappingTarget = (mappingIndex: number, targetIndex: number, direction: -1 | 1) => {
+    updateModelMapping(mappingIndex, (mapping) => {
+      const nextIndex = targetIndex + direction;
+      if (nextIndex < 0 || nextIndex >= mapping.targets.length) return mapping;
+      const targets = [...mapping.targets];
+      const [item] = targets.splice(targetIndex, 1);
+      targets.splice(nextIndex, 0, item);
+      return { ...mapping, targets };
+    });
+  };
+  const updateModelMappingTarget = (mappingIndex: number, targetIndex: number, nextValue: string) => {
+    const [profileId = "", targetModel = ""] = nextValue.split("::", 2);
+    updateModelMapping(mappingIndex, (mapping) => ({
+      ...mapping,
+      targets: mapping.targets.map((target, currentIndex) => (
+        currentIndex === targetIndex ? { profileId, targetModel } : target
+      )),
+    }));
+  };
+  const removeModelMappingTarget = (mappingIndex: number, targetIndex: number) => {
+    updateModelMapping(mappingIndex, (mapping) => ({
+      ...mapping,
+      targets: mapping.targets.filter((_, currentIndex) => currentIndex !== targetIndex),
+    }));
   };
   const totalWeight = aggregate.members.reduce((total, member) => total + clampAggregateWeight(member.weight), 0);
 
@@ -5963,11 +6129,136 @@ function AggregateRelayProfileEditor({
           <div className="empty">{t("先添加至少 1 个已填写 Base URL / Key 的 API 供应商，再创建聚合供应商。")}</div>
         )}
       </div>
+      <div className="relay-field-model-mappings field">
+        <div className="relay-model-mappings-help hint-line">
+          <Info className="h-4 w-4" />
+          <span>{t("为官方模型设置成员供应商和真实上游模型。显示别名统一使用半角字符，例如 gpt-5.4(供应商:模型)。")}</span>
+        </div>
+        <span className="relay-model-mappings-heading">
+          <span>{t("Model Mappings")}</span>
+          <div className="aggregate-mapping-heading-actions">
+            <label className="relay-model-mappings-toggle-inline">
+              <input checked={showAggregateMappings} onChange={(event) => setShowAggregateMappings(event.currentTarget.checked)} type="checkbox" />
+              {t("展开映射")}
+            </label>
+            <label className="relay-model-mappings-toggle-inline">
+              <input
+                checked={aggregate.modelMappingsEnabled !== false}
+                onChange={(event) => updateAggregate({ ...aggregate, modelMappingsEnabled: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              {t("自动补入官方模型")}
+            </label>
+            <span className="relay-model-mappings-summary">{tf("{0} 项", [aggregateDisplayModels.length])}</span>
+            <Button onClick={refreshAggregateMappings} size="sm" type="button" variant="outline">
+              <RefreshCw className={`h-4 w-4 ${refreshingAggregateMappings ? "spin" : ""}`} />
+              {t("刷新")}
+            </Button>
+            <Button onClick={addModelMapping} size="sm" type="button" variant="secondary">
+              <Plus className="h-4 w-4" />
+              {t("添加映射")}
+            </Button>
+          </div>
+        </span>
+        {showAggregateMappings ? (
+          effectiveMappings.length ? (
+            <div className="aggregate-model-mappings-list">
+              {effectiveMappings.map((mapping, mappingIndex) => {
+                const mappingKeyOptions = aggregateMappingKeyOptions(effectiveMappings, memberProfiles, mapping.codexModel);
+                return (
+                  <div className="aggregate-model-mapping-card" key={`${mapping.codexModel || "mapping"}-${mappingIndex}`}>
+                    <div className="aggregate-model-mapping-card-head">
+                      <div className="aggregate-model-mapping-card-title">
+                        <strong>{mapping.codexModel || tf("映射 {0}", [mappingIndex + 1])}</strong>
+                        <small>{mapping.source === "implicit" ? t("由成员供应商的官方模型自动补入。") : t("按目标顺序进行调度和失败切换。")}</small>
+                      </div>
+                      <div className="aggregate-model-mapping-card-actions">
+                        <UiBadge variant={mapping.source === "implicit" ? "outline" : "secondary"}>
+                          {mapping.source === "implicit" ? t("默认") : t("手动")}
+                        </UiBadge>
+                        <Button
+                          disabled={mapping.source === "implicit"}
+                          onClick={() => removeModelMapping(mappingIndex)}
+                          size="icon"
+                          title={mapping.source === "implicit" ? t("自动映射需先关闭自动补入") : t("删除映射")}
+                          type="button"
+                          variant="ghost"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="relay-model-mapping-row aggregate-model-mapping-key-row">
+                      <label>{t("Codex 模型")}</label>
+                      <Input
+                        className="relay-model-mapping-select"
+                        list={`aggregate-model-keys-${mappingIndex}`}
+                        value={mapping.codexModel}
+                        onChange={(event) => updateModelMapping(mappingIndex, (current) => ({ ...current, codexModel: event.currentTarget.value.trim() }))}
+                        placeholder={t("输入或选择 Codex 模型")}
+                      />
+                      <datalist id={`aggregate-model-keys-${mappingIndex}`}>
+                        {mappingKeyOptions.map((option) => <option key={option} value={option} />)}
+                      </datalist>
+                    </div>
+                    <div className="aggregate-model-mapping-targets">
+                      {mapping.targets.map((target, targetIndex) => {
+                        const selectedValue = `${target.profileId}::${target.targetModel}`;
+                        const previewProfile = memberProfiles.find((member) => member.id === target.profileId);
+                        const previewAlias = previewProfile
+                          ? aggregateCodexAlias(mapping.codexModel, previewProfile, target.targetModel)
+                          : "";
+                        const weight = memberWeightById.get(target.profileId) ?? 1;
+                        return (
+                          <div className="aggregate-model-mapping-target-row" key={`${mappingIndex}-${targetIndex}`}>
+                            <div className="aggregate-model-mapping-target-order">{targetIndex + 1}</div>
+                            <select
+                              className="relay-model-mapping-select"
+                              value={selectedValue}
+                              onChange={(event) => updateModelMappingTarget(mappingIndex, targetIndex, event.currentTarget.value)}
+                            >
+                              <option value="">{t("选择供应商模型")}</option>
+                              {upstreamOptions.map((option) => (
+                                <option key={option.key} value={`${option.profileId}::${option.model}`}>{option.label}</option>
+                              ))}
+                            </select>
+                            <div className="aggregate-model-mapping-preview-stack">
+                              <Input readOnly value={previewAlias} placeholder="gpt-5.4(供应商:模型)" />
+                              <small>{tf("成员权重 {0}", [weight])}</small>
+                            </div>
+                            <div className="aggregate-model-mapping-target-actions">
+                              <Button disabled={targetIndex === 0} onClick={() => moveModelMappingTarget(mappingIndex, targetIndex, -1)} size="icon" title={t("上移")} type="button" variant="ghost">
+                                <CircleArrowUp className="h-4 w-4" />
+                              </Button>
+                              <Button className="aggregate-mapping-move-down" disabled={targetIndex >= mapping.targets.length - 1} onClick={() => moveModelMappingTarget(mappingIndex, targetIndex, 1)} size="icon" title={t("下移")} type="button" variant="ghost">
+                                <CircleArrowUp className="h-4 w-4" />
+                              </Button>
+                              <Button onClick={() => removeModelMappingTarget(mappingIndex, targetIndex)} size="icon" title={t("删除目标")} type="button" variant="ghost">
+                                <Trash2 className="h-4 w-4" />
+                              </Button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div className="relay-model-list-tools">
+                      <Button onClick={() => addModelMappingTarget(mappingIndex)} size="sm" type="button" variant="secondary">
+                        <Plus className="h-4 w-4" />
+                        {t("添加目标")}
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : <div className="empty">{t("当前没有聚合映射。可以开启自动补入，或手动添加映射。")}</div>
+        ) : null}
+      </div>
       <div className="relay-grid compact aggregate-preview">
         <Metric label={t("策略")} value={aggregateStrategyLabel(aggregate.strategy)} />
         <Metric label={t("成员数量")} value={tf("{0} 个", [aggregate.members.length])} />
         <Metric label={t("总权重")} value={`${totalWeight}`} />
-        <Metric label={t("序列化字段")} value="aggregate.strategy / aggregate.members" />
+        <Metric label={t("序列化字段")} value="aggregate.strategy / aggregate.members / aggregate.modelMappings" />
       </div>
       <div className="hint-line relay-protocol-hint">
         <ShieldCheck className="h-4 w-4" />
@@ -7680,6 +7971,8 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         autoCompactLimit: "",
         modelList: "",
         modelWindows: "",
+        modelMappings: profile.modelMappings || {},
+        modelMappingsEnabled: profile.modelMappingsEnabled !== false,
       },
       null,
     );
@@ -7707,6 +8000,8 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     autoCompactLimit: profile.autoCompactLimit || "",
     modelList: profile.modelList || "",
     modelWindows: profile.modelWindows || "",
+    modelMappings: profile.modelMappings || {},
+    modelMappingsEnabled: profile.modelMappingsEnabled !== false,
     userAgent: profile.userAgent || "",
     aggregate: null,
   };
@@ -7721,9 +8016,17 @@ function hydrateAggregateRelayProfile(profile: RelayProfile, aggregate: Aggregat
     relayMode: "aggregate",
     aggregate: {
       strategy: aggregate.strategy,
+      modelMappingsEnabled: aggregate.modelMappingsEnabled !== false,
       members: aggregate.members.map((member) => ({
         profileId: member.relayId,
         weight: clampAggregateWeight(member.weight),
+      })),
+      modelMappings: (aggregate.modelMappings || []).map((mapping) => ({
+        codexModel: mapping.codexModel || "",
+        targets: (mapping.targets || []).map((target) => ({
+          profileId: target.relayId,
+          targetModel: target.targetModel || "",
+        })),
       })),
     },
   };
@@ -8257,9 +8560,17 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
       id: profile.id,
       name: profile.name || t("聚合供应商"),
       strategy: aggregate.strategy,
+      modelMappingsEnabled: aggregate.modelMappingsEnabled !== false,
       members: aggregate.members.map((member) => ({
         relayId: member.profileId,
         weight: clampAggregateWeight(member.weight),
+      })),
+      modelMappings: aggregate.modelMappings.map((mapping) => ({
+        codexModel: mapping.codexModel,
+        targets: mapping.targets.map((target) => ({
+          relayId: target.profileId,
+          targetModel: target.targetModel,
+        })),
       })),
     };
   });
@@ -8350,7 +8661,9 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       userAgent: "",
       aggregate: {
         strategy: "failover",
+        modelMappingsEnabled: true,
         members: candidates.slice(0, 1).map((profile) => ({ profileId: profile.id, weight: 1 })),
+        modelMappings: [],
       },
     },
     settings,
@@ -8451,6 +8764,51 @@ const aggregateStrategyOptions: Array<{ value: RelayAggregateStrategy; label: st
   },
 ];
 
+function aggregateMemberProfileMap(memberProfiles: RelayProfile[]): Map<string, RelayProfile> {
+  return new Map(memberProfiles.map((profile) => [profile.id, profile] as const));
+}
+
+function aggregateSelectedMemberProfiles(
+  aggregate: RelayAggregateConfig,
+  candidates: RelayProfile[],
+): RelayProfile[] {
+  const candidateById = aggregateMemberProfileMap(candidates);
+  return aggregate.members
+    .map((member) => candidateById.get(member.profileId))
+    .filter((profile): profile is RelayProfile => Boolean(profile));
+}
+
+function aggregateMemberWeightMap(aggregate: RelayAggregateConfig): Map<string, number> {
+  return new Map(aggregate.members.map((member) => [member.profileId, clampAggregateWeight(member.weight)] as const));
+}
+
+function nextAggregateMappingKey(mappings: AggregateEffectiveModelMapping[]): string {
+  const used = new Set(mappings.map((mapping) => mapping.codexModel.trim()).filter(Boolean));
+  const defaultKey = CODEX_MODEL_MAPPING_KEYS.find((model) => !used.has(model));
+  if (defaultKey) return defaultKey;
+  let suffix = 1;
+  while (used.has(suffix === 1 ? "custom-model" : `custom-model-${suffix}`)) suffix += 1;
+  return suffix === 1 ? "custom-model" : `custom-model-${suffix}`;
+}
+
+function aggregateUpstreamModelOptions(memberProfiles: RelayProfile[]): Array<{
+  key: string;
+  profileId: string;
+  profileName: string;
+  model: string;
+  label: string;
+}> {
+  return memberProfiles.flatMap((profile) =>
+    relayProfileModels(profile).map((model) => ({
+      key: `${profile.id}::${model}`,
+      profileId: profile.id,
+      profileName: profile.name || profile.id,
+      model,
+      label: aggregateProviderLabel(profile, model),
+    })),
+  );
+}
+
 function isAggregateRelayProfile(profile: Pick<RelayProfile, "relayMode" | "aggregate">): boolean {
   return profile.relayMode === "aggregate" || !!profile.aggregate;
 }
@@ -8458,6 +8816,7 @@ function isAggregateRelayProfile(profile: Pick<RelayProfile, "relayMode" | "aggr
 function normalizeAggregateRelayProfile(profile: RelayProfile, settings: BackendSettings | null): RelayProfile {
   const candidates = settings ? aggregateMemberCandidates(settings, profile.id) : [];
   const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
+  const modelList = inferAggregateModelList({ ...profile, aggregate }, settings);
   return {
     ...profile,
     baseUrl: "",
@@ -8469,7 +8828,25 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     configContents: "",
     authContents: "",
     aggregate,
+    modelList,
+    modelMappings: {},
+    modelMappingsEnabled: aggregate.modelMappingsEnabled !== false,
   };
+}
+
+function inferAggregateModelList(profile: RelayProfile, settings: BackendSettings | null): string {
+  if (!settings) return profile.modelList.trim();
+  const candidates = aggregateMemberCandidates(settings, profile.id);
+  const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
+  const memberProfiles = aggregateSelectedMemberProfiles(aggregate, candidates);
+  const displayModels = aggregateDisplayModelEntries(aggregate, memberProfiles).map((entry) => entry.alias);
+  const seen = new Set(displayModels);
+  const passthroughModels = memberProfiles.flatMap((member) => relayProfileModels(member).filter((model) => {
+    if (seen.has(model)) return false;
+    seen.add(model);
+    return true;
+  }));
+  return [...passthroughModels, ...displayModels].filter(Boolean).join("\n");
 }
 
 function normalizeAggregateConfig(
@@ -8482,6 +8859,7 @@ function normalizeAggregateConfig(
     aggregate?.strategy && aggregateStrategyOptions.some((option) => option.value === aggregate.strategy)
       ? aggregate.strategy
       : "failover";
+  const modelMappingsEnabled = aggregate?.modelMappingsEnabled !== false;
   const members = (aggregate?.members ?? [])
     .filter((member) => member.profileId && !seen.has(member.profileId))
     .filter((member) => !candidateIds.size || candidateIds.has(member.profileId))
@@ -8489,7 +8867,19 @@ function normalizeAggregateConfig(
       seen.add(member.profileId);
       return { profileId: member.profileId, weight: clampAggregateWeight(member.weight) };
     });
-  return { strategy, members };
+  const modelMappings = (aggregate?.modelMappings ?? [])
+    .map((mapping) => ({
+      codexModel: (mapping.codexModel || "").trim(),
+      targets: (mapping.targets ?? [])
+        .map((target) => ({
+          profileId: (target.profileId || "").trim(),
+          targetModel: (target.targetModel || "").trim(),
+        }))
+        .filter((target) => target.profileId && target.targetModel),
+    }))
+    .filter((mapping) => mapping.codexModel)
+    .filter((mapping, index, list) => list.findIndex((item) => item.codexModel === mapping.codexModel) === index);
+  return { strategy, modelMappingsEnabled, members, modelMappings };
 }
 
 function aggregateMemberCandidates(settings: BackendSettings, aggregateId: string): RelayProfile[] {

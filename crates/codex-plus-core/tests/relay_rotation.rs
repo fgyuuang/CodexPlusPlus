@@ -3,8 +3,8 @@ use codex_plus_core::relay_rotation::{
     record_relay_request_failure, select_relay_for_probe, select_relay_for_request,
 };
 use codex_plus_core::settings::{
-    AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    RelayMode, RelayProfile,
+    AggregateRelayDispatchTarget, AggregateRelayMember, AggregateRelayModelMapping,
+    AggregateRelayProfile, AggregateRelayStrategy, BackendSettings, RelayMode, RelayProfile,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -87,6 +87,65 @@ fn settings(strategy: AggregateRelayStrategy) -> BackendSettings {
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()
     }
+}
+
+#[test]
+fn provider_specific_gpt_alias_selects_only_the_requested_member() {
+    let mut settings = settings(AggregateRelayStrategy::Failover);
+    settings.relay_profiles[0].name = "ProviderA".to_string();
+    settings.relay_profiles[0].model = "gpt-5.4".to_string();
+    settings.relay_profiles[0].model_list = "gpt-5.4".to_string();
+    settings.relay_profiles[1].name = "ProviderB".to_string();
+    settings.relay_profiles[1].model = "vendor-gpt-5.4".to_string();
+    settings.relay_profiles[1].model_list = "vendor-gpt-5.4".to_string();
+    settings.aggregate_relay_profiles[0].model_mappings = vec![AggregateRelayModelMapping {
+        codex_model: "gpt-5.4".to_string(),
+        targets: vec![
+            AggregateRelayDispatchTarget {
+                relay_id: "relay-a".to_string(),
+                target_model: "gpt-5.4".to_string(),
+            },
+            AggregateRelayDispatchTarget {
+                relay_id: "relay-b".to_string(),
+                target_model: "vendor-gpt-5.4".to_string(),
+            },
+        ],
+    }];
+    let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
+
+    let selected = selector
+        .select(
+            &settings,
+            RotationContext::default(),
+            Some("gpt-5.4(ProviderB:vendor-gpt-5.4)"),
+        )
+        .unwrap();
+
+    assert_eq!(selected.id, "relay-b");
+}
+
+#[test]
+fn provider_specific_gpt_alias_selects_requested_member_when_implicit_mappings_are_disabled() {
+    let mut settings = settings(AggregateRelayStrategy::Failover);
+    settings.relay_profiles[0].name = "ProviderA".to_string();
+    settings.relay_profiles[0].model = "gpt-5.4".to_string();
+    settings.relay_profiles[0].model_list = "gpt-5.4".to_string();
+    settings.relay_profiles[1].name = "ProviderB".to_string();
+    settings.relay_profiles[1].model = "gpt-5.4".to_string();
+    settings.relay_profiles[1].model_list = "gpt-5.4".to_string();
+    settings.aggregate_relay_profiles[0].model_mappings_enabled = false;
+    settings.aggregate_relay_profiles[0].model_mappings.clear();
+    let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
+
+    let selected = selector
+        .select(
+            &settings,
+            RotationContext::default(),
+            Some("gpt-5.4(ProviderB)"),
+        )
+        .unwrap();
+
+    assert_eq!(selected.id, "relay-b");
 }
 
 #[test]

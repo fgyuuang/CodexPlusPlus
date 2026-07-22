@@ -2258,7 +2258,7 @@ experimental_bearer_token = "sk-existing""#
 
         assert_eq!(
             aggregate.model_list,
-            "gpt-5.5\ngpt-5.4\n中转 A：gpt-5.4\n中转 A：gpt-5.5\n中转 B：deepseek-v4-pro"
+            "gpt-5.5\ngpt-5.5(中转 A)\ngpt-5.4\ngpt-5.4(中转 A)\n中转 B:deepseek-v4-pro"
         );
     }
 

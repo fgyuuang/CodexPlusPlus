@@ -1721,6 +1721,28 @@ fn manager_ui_exposes_pure_api_relay_mode_button() {
 }
 
 #[test]
+fn manager_ui_preserves_provider_and_aggregate_model_mapping_editors() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("core crate should live under crates/codex-plus-core");
+    let source = std::fs::read_to_string(repo.join("apps/codex-plus-manager/src/App.tsx")).unwrap();
+    let mappings =
+        std::fs::read_to_string(repo.join("apps/codex-plus-manager/src/aggregateMappings.ts"))
+            .unwrap();
+
+    assert!(source.contains("启用官方模型映射"));
+    assert!(source.contains("自动补入官方模型"));
+    assert!(source.contains("aggregatePersistedMappingsFromEffective"));
+    assert!(source.contains("modelMappings: aggregate.modelMappings.map"));
+    assert!(source.contains("modelMappingsEnabled: aggregate.modelMappingsEnabled !== false"));
+    assert!(mappings.contains("filter((mapping) => mapping.source === \"explicit\")"));
+    assert!(source.contains("source: \"explicit\" as const"));
+    assert!(source.contains("disabled={mapping.source === \"implicit\"}"));
+    assert!(source.contains("nextAggregateMappingKey"));
+}
+
+#[test]
 fn manager_ui_disables_plugin_auto_expand_in_compatible_mode() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

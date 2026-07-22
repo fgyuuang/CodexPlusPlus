@@ -29,6 +29,9 @@ export type RelayAggregateConfig = {
 };
 
 export const DEFAULT_CODEX_MODEL_MAPPING_KEYS = [
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
   "gpt-5.5",
   "gpt-5.4",
   "gpt-5.4-mini",
@@ -54,7 +57,13 @@ export function aggregateProviderLabel(profile: RelayProfileLike, model: string)
 }
 
 export function aggregateCodexAlias(codexModel: string, profile: RelayProfileLike, targetModel: string): string {
-  return `${codexModel}(${aggregateProviderLabel(profile, targetModel)})`;
+  const normalizedCodexModel = codexModel.trim();
+  const normalizedTargetModel = targetModel.trim();
+  const provider = profile.name || profile.id;
+  if (normalizedCodexModel.toLowerCase() === normalizedTargetModel.toLowerCase()) {
+    return `${normalizedCodexModel}(${provider})`;
+  }
+  return `${normalizedCodexModel}(${aggregateProviderLabel(profile, normalizedTargetModel)})`;
 }
 
 export function looksLikeCodexModelKey(model: string): boolean {
@@ -133,6 +142,7 @@ export function aggregatePersistedMappingsFromEffective(
   mappings: AggregateEffectiveModelMapping[],
 ): RelayAggregateModelMapping[] {
   return mappings
+    .filter((mapping) => mapping.source === "explicit")
     .map((mapping) => ({
       codexModel: mapping.codexModel.trim(),
       targets: mapping.targets

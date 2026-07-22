@@ -299,6 +299,27 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
             .iter()
             .any(|model| model == "gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)")
     );
+    assert!(
+        result["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model == "gpt-5.4(供应商一)")
+    );
+    assert!(
+        result["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model == "gpt-5.4(供应商二:vendor-gpt-5.4)")
+    );
+    assert!(
+        result["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model == "gpt-5.6-sol(供应商一)")
+    );
     assert_eq!(
         result["modelMetadata"]["gpt-5.4"]["displaySuffix"],
         "(供应商一|供应商二:vendor-gpt-5.4)"
@@ -311,6 +332,15 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
         result["modelMetadata"]["gpt-5.6-sol"]["displaySuffix"],
         "(供应商一)"
     );
+    assert_eq!(
+        result["modelMetadata"]["gpt-5.6-sol(供应商一)"]["defaultReasoningEffort"],
+        "low"
+    );
+    assert_eq!(
+        result["modelMetadata"]["gpt-5.6-sol(供应商一)"]["displayName"],
+        "GPT-5.6-Sol(供应商一)"
+    );
+    assert!(result["modelMetadata"]["gpt-5.6-sol(供应商一)"]["displaySuffix"].is_null());
 }
 
 #[tokio::test]
