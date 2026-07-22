@@ -138,7 +138,7 @@ base_url = "https://b.example/v1"
 }
 
 #[test]
-fn switch_backfills_previous_profile_from_live_before_selecting_target() {
+fn switch_preserves_previous_profile_when_live_config_changes_before_selecting_target() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex");
     std::fs::create_dir(&home).unwrap();
@@ -186,7 +186,7 @@ base_url = "https://edited-a.example/v1"
         .iter()
         .find(|profile| profile.id == "a")
         .unwrap();
-    assert!(previous.config_contents.contains("edited-live-model"));
+    assert!(!previous.config_contents.contains("edited-live-model"));
     assert!(
         previous
             .config_contents
@@ -197,11 +197,129 @@ base_url = "https://edited-a.example/v1"
             .config_contents
             .contains("[model_providers.custom]")
     );
-    assert_eq!(previous.api_key, "sk-edited-a");
-    assert_eq!(previous.context_window, "1000000");
-    assert_eq!(previous.auto_compact_limit, "900000");
+    assert_eq!(previous.auth_contents, r#"{"OPENAI_API_KEY":"sk-a"}"#);
+    assert_eq!(previous.api_key, "sk-a");
+    assert!(previous.context_window.is_empty());
+    assert!(previous.auto_compact_limit.is_empty());
     assert_eq!(stored.active_relay_id, "b");
     assert_eq!(stored.launch_mode, LaunchMode::Patch);
+}
+
+#[test]
+fn switch_does_not_backfill_previous_profile_from_aggregate_live_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = false
+base_url = "http://127.0.0.1:57321/v1"
+experimental_bearer_token = "codex-plus-aggregate"
+"#,
+    )
+    .unwrap();
+    std::fs::write(home.join("auth.json"), r#"{"OPENAI_API_KEY":"1234"}"#).unwrap();
+
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let previous = pure_profile("a", "https://a.example/v1", "sk-a");
+    let original = BackendSettings {
+        active_relay_id: "a".to_string(),
+        relay_profiles: vec![
+            previous.clone(),
+            pure_profile("b", "https://b.example/v1", "sk-b"),
+        ],
+        ..BackendSettings::default()
+    };
+    store.save(&original).unwrap();
+    let next = BackendSettings {
+        active_relay_id: "b".to_string(),
+        relay_profiles: original.relay_profiles.clone(),
+        ..BackendSettings::default()
+    };
+
+    switch_relay_profile_in_home(&store, &home, next, "a").unwrap();
+
+    let stored_previous = store
+        .load()
+        .unwrap()
+        .relay_profiles
+        .into_iter()
+        .find(|profile| profile.id == "a")
+        .unwrap();
+    assert!(
+        stored_previous
+            .config_contents
+            .contains("https://a.example/v1")
+    );
+    assert!(stored_previous.config_contents.contains("sk-a"));
+    assert!(!stored_previous.config_contents.contains("1234"));
+    assert!(
+        !stored_previous
+            .config_contents
+            .contains("codex-plus-aggregate")
+    );
+    assert_eq!(stored_previous.auth_contents, previous.auth_contents);
+}
+
+#[test]
+fn switch_does_not_backfill_previous_profile_from_a_different_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = false
+base_url = "https://b.example/v1"
+experimental_bearer_token = "sk-b"
+"#,
+    )
+    .unwrap();
+    std::fs::write(home.join("auth.json"), r#"{"OPENAI_API_KEY":"sk-b"}"#).unwrap();
+
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let previous = pure_profile("a", "https://a.example/v1", "sk-a");
+    let original = BackendSettings {
+        active_relay_id: "a".to_string(),
+        relay_profiles: vec![
+            previous.clone(),
+            pure_profile("b", "https://b.example/v1", "sk-b"),
+        ],
+        ..BackendSettings::default()
+    };
+    store.save(&original).unwrap();
+    let next = BackendSettings {
+        active_relay_id: "b".to_string(),
+        relay_profiles: original.relay_profiles.clone(),
+        ..BackendSettings::default()
+    };
+
+    switch_relay_profile_in_home(&store, &home, next, "a").unwrap();
+
+    let stored_previous = store
+        .load()
+        .unwrap()
+        .relay_profiles
+        .into_iter()
+        .find(|profile| profile.id == "a")
+        .unwrap();
+    assert!(
+        stored_previous
+            .config_contents
+            .contains("https://a.example/v1")
+    );
+    assert!(stored_previous.config_contents.contains("sk-a"));
+    assert!(!stored_previous.config_contents.contains("sk-b"));
+    assert_eq!(stored_previous.auth_contents, previous.auth_contents);
 }
 
 #[test]
@@ -252,7 +370,7 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
 }
 
 #[test]
-fn switch_returns_normalized_previous_official_profile_after_backfill() {
+fn switch_preserves_previous_official_profile_when_selecting_pure_api_provider() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex");
     std::fs::create_dir(&home).unwrap();

@@ -131,7 +131,6 @@ pub fn run() {
             commands::remove_env_conflicts,
             commands::save_relay_file,
             commands::write_diagnostic_event,
-            commands::backfill_relay_profile_from_live,
             commands::list_context_entries,
             commands::read_live_context_entries,
             commands::sync_live_context_entries,

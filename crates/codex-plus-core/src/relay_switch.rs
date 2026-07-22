@@ -3,9 +3,7 @@ use std::path::Path;
 
 use anyhow::Context;
 
-use crate::relay_config::{
-    backfill_relay_profile_from_home_with_common, relay_config_status_from_home,
-};
+use crate::relay_config::relay_config_status_from_home;
 use crate::settings::{BackendSettings, RelayMode, SettingsStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,9 +17,9 @@ pub fn switch_relay_profile_in_home(
     store: &SettingsStore,
     home: &Path,
     next_settings: BackendSettings,
-    previous_active_relay_id: &str,
+    _previous_active_relay_id: &str,
 ) -> anyhow::Result<RelaySwitchResult> {
-    let mut selected_settings = next_settings;
+    let selected_settings = next_settings;
     if !selected_settings.relay_profiles_enabled {
         anyhow::bail!("供应商配置总开关已关闭，未写入 config.toml / auth.json。");
     }
@@ -29,12 +27,6 @@ pub fn switch_relay_profile_in_home(
 
     let original_settings = store.load().unwrap_or_default();
     let live_snapshot = LiveFilesSnapshot::capture(home).context("读取当前 Codex 实时配置失败")?;
-    if !previous_active_relay_id.trim().is_empty()
-        && previous_active_relay_id != selected_settings.active_relay_id
-    {
-        backfill_profile_before_switch(home, &mut selected_settings, previous_active_relay_id)?;
-    }
-
     store
         .save(&selected_settings)
         .context("保存供应商设置失败")?;
@@ -108,24 +100,6 @@ fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> anyhow::Result
             Err(error) => Err(error.into()),
         },
     }
-}
-
-fn backfill_profile_before_switch(
-    home: &Path,
-    settings: &mut BackendSettings,
-    previous_active_relay_id: &str,
-) -> anyhow::Result<()> {
-    let profile = settings
-        .relay_profiles
-        .iter_mut()
-        .find(|profile| profile.id == previous_active_relay_id)
-        .with_context(|| "当前供应商已不在配置列表中，已停止切换以避免覆盖用户改动。")?;
-    backfill_relay_profile_from_home_with_common(
-        home,
-        profile,
-        &mut settings.relay_context_config_contents,
-    )
-    .with_context(|| "回填当前供应商配置失败")
 }
 
 fn apply_selected_relay_profile(

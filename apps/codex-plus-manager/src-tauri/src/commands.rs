@@ -237,12 +237,6 @@ pub struct RelaySwitchPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SettingsBackfillPayload {
-    pub settings: BackendSettings,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ContextEntriesPayload {
     pub settings: BackendSettings,
     pub entries: codex_plus_core::relay_config::CodexContextEntries,
@@ -327,13 +321,6 @@ pub struct RemoveEnvConflictsPayload {
 pub struct SaveRelayFileRequest {
     pub kind: String,
     pub contents: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BackfillRelayProfileRequest {
-    pub settings: BackendSettings,
-    pub profile_id: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2752,70 +2739,6 @@ pub fn write_diagnostic_event(event: String, detail: Value) -> CommandResult<Val
     match codex_plus_core::diagnostic_log::append_diagnostic_log(&event, detail) {
         Ok(()) => ok("诊断日志已写入。", json!({})),
         Err(error) => failed(&format!("写入诊断日志失败：{error}"), json!({})),
-    }
-}
-
-#[tauri::command]
-pub fn backfill_relay_profile_from_live(
-    request: BackfillRelayProfileRequest,
-) -> CommandResult<SettingsBackfillPayload> {
-    let home = codex_plus_core::relay_config::default_codex_home_dir();
-    let mut settings = request.settings;
-    let requested_profile_id = request.profile_id.clone();
-    log_manager_event(
-        "manager.backfill_relay_profile_from_live.start",
-        json!({
-            "profileId": requested_profile_id,
-            "activeRelayId": settings.active_relay_id
-        }),
-    );
-    let Some(profile) = settings
-        .relay_profiles
-        .iter_mut()
-        .find(|profile| profile.id == request.profile_id)
-    else {
-        log_manager_event(
-            "manager.backfill_relay_profile_from_live.missing_profile",
-            json!({
-                "profileId": requested_profile_id
-            }),
-        );
-        return failed(
-            "当前供应商已不在配置列表中，已停止切换以避免覆盖用户改动。",
-            SettingsBackfillPayload { settings },
-        );
-    };
-
-    match codex_plus_core::relay_config::backfill_relay_profile_from_home_with_common(
-        &home,
-        profile,
-        &mut settings.relay_context_config_contents,
-    ) {
-        Ok(()) => {
-            log_manager_event(
-                "manager.backfill_relay_profile_from_live.ok",
-                json!({
-                    "profileId": requested_profile_id
-                }),
-            );
-            ok(
-                "当前供应商配置已从 live 文件回填。",
-                SettingsBackfillPayload { settings },
-            )
-        }
-        Err(error) => {
-            log_manager_event(
-                "manager.backfill_relay_profile_from_live.failed",
-                json!({
-                    "profileId": requested_profile_id,
-                    "error": error.to_string()
-                }),
-            );
-            failed(
-                &format!("回填当前供应商配置失败：{error}"),
-                SettingsBackfillPayload { settings },
-            )
-        }
     }
 }
 

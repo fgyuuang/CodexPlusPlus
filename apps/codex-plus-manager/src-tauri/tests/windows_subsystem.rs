@@ -215,8 +215,8 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
     let commands_rs = manifest_dir.join("src/commands.rs");
     let commands_rs = std::fs::read_to_string(&commands_rs).expect("read manager commands.rs");
 
-    assert!(app_tsx.contains("snapshotActiveRelayFilesBeforeSwitch"));
-    assert!(app_tsx.contains("backfill_relay_profile_from_live"));
+    assert!(!app_tsx.contains("snapshotActiveRelayFilesBeforeSwitch"));
+    assert!(!app_tsx.contains("backfill_relay_profile_from_live"));
     assert!(app_tsx.contains("relayProfileSwitchValidation(selectedBeforeSave)"));
     assert!(app_tsx.contains("缺少独立 config.toml"));
     assert!(app_tsx.contains("const command = relayProfileSwitchCommand(selectedAfterSave)"));
@@ -227,7 +227,7 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
     assert!(app_tsx.contains("onClick={createNewAggregateProfile}"));
     assert!(app_tsx.contains("已打开聚合供应商详情"));
     assert!(!commands_rs.contains("缺少独立 auth.json"));
-    assert!(commands_rs.contains("backfill_relay_profile_from_live"));
+    assert!(!commands_rs.contains("backfill_relay_profile_from_live"));
     assert!(commands_rs.contains("apply_relay_profile_to_home_with_switch_rules"));
 }
 
