@@ -174,7 +174,8 @@ pub fn aggregate_catalog_aliases(
     aggregate: &AggregateRelayProfile,
     members: &[RelayProfile],
 ) -> Vec<AggregateModelAlias> {
-    let dispatch_entries = aggregate_dispatch_entries(aggregate, members);
+    let mut dispatch_entries = aggregate_dispatch_entries(aggregate, members);
+    order_catalog_dispatch_entries_by_member(&mut dispatch_entries, aggregate);
     let mut aliases = Vec::new();
     for entry in dispatch_entries {
         aliases.push(AggregateModelAlias {
@@ -307,6 +308,36 @@ fn aggregate_catalog_tail_rank(alias: &AggregateModelAlias) -> u8 {
         return 1;
     }
     2
+}
+
+// Model selection still follows the target order configured on a mapping. The
+// catalog is display-only, so keep its provider-specific entries aligned with
+// the aggregate member order instead.
+fn order_catalog_dispatch_entries_by_member(
+    entries: &mut [AggregateDispatchEntry],
+    aggregate: &AggregateRelayProfile,
+) {
+    let member_order = aggregate
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| (member.relay_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut start = 0;
+    while start < entries.len() {
+        let codex_model = entries[start].codex_model.clone();
+        let mut end = start + 1;
+        while end < entries.len() && entries[end].codex_model == codex_model {
+            end += 1;
+        }
+        entries[start..end].sort_by_key(|entry| {
+            member_order
+                .get(entry.provider_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        start = end;
+    }
 }
 
 fn explicit_dispatch_entries_for_mapping(

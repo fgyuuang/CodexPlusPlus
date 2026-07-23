@@ -254,12 +254,12 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
                         codex_model: "gpt-5.4".to_string(),
                         targets: vec![
                             codex_plus_core::settings::AggregateRelayDispatchTarget {
-                                relay_id: "provider-a".to_string(),
-                                target_model: "gpt-5.4".to_string(),
-                            },
-                            codex_plus_core::settings::AggregateRelayDispatchTarget {
                                 relay_id: "provider-b".to_string(),
                                 target_model: "vendor-gpt-5.4".to_string(),
+                            },
+                            codex_plus_core::settings::AggregateRelayDispatchTarget {
+                                relay_id: "provider-a".to_string(),
+                                target_model: "gpt-5.4".to_string(),
                             },
                         ],
                     }],
@@ -283,6 +283,16 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
     codex_plus_core::paths::set_settings_path_for_tests(previous_settings_path);
 
     assert_eq!(result["default_model"], "gpt-5.4");
+    assert_eq!(
+        result["models"],
+        json!([
+            "gpt-5.4",
+            "供应商一:gpt-5.4",
+            "供应商二:vendor-gpt-5.4",
+            "gpt-5.6-sol",
+            "供应商一:gpt-5.6-sol"
+        ])
+    );
     assert_eq!(
         result["models"]
             .as_array()

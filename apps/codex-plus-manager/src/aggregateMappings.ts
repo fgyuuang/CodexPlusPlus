@@ -115,9 +115,15 @@ export function aggregateDisplayModelEntries(
   memberProfiles: RelayProfileLike[],
 ): Array<{ alias: string; codexModel: string; target: string; viaMapping: boolean; providerId: string }> {
   const profileById = aggregateMemberProfileMap(memberProfiles);
+  const memberOrder = new Map(aggregate.members.map((member, index) => [member.profileId, index] as const));
   const effectiveMappings = aggregateEffectiveMappings(aggregate, memberProfiles);
   return effectiveMappings.flatMap((mapping) =>
-    mapping.targets.flatMap((target) => {
+    [...mapping.targets]
+      .sort((left, right) => (
+        (memberOrder.get(left.profileId) ?? Number.MAX_SAFE_INTEGER)
+        - (memberOrder.get(right.profileId) ?? Number.MAX_SAFE_INTEGER)
+      ))
+      .flatMap((target) => {
       const profile = profileById.get(target.profileId);
       const codexModel = mapping.codexModel.trim();
       const targetModel = target.targetModel.trim();
@@ -129,7 +135,7 @@ export function aggregateDisplayModelEntries(
         viaMapping: mapping.source === "explicit",
         providerId: profile.id,
       }];
-    }),
+      }),
   );
 }
 
