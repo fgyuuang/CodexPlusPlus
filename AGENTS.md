@@ -8,21 +8,22 @@
 当前版本 v1.2.42，本地分支 `codex/fix-plugin-marketplace-persistence`。
 
 本地扩展了聚合供应商路由与模型别名、认证与会话隔离、插件市场保留等功能，
-详见 `docs/local-features.md` — 每次上游合并后必须逐条确认回归。
+详见 `docs/local-features.md` —— 每次上游合并后必须逐条确认回归。
 
 ## 仓库结构
 
-- `crates/codex-plus-core/` — 核心 Rust 库（配置生成、catalog 解析、数据模型）
-- `apps/codex-plus-manager/` — Tauri 桌面应用，前端 React+TS
-- `crates/codex-plus-data/` — 数据持久化
-- `docs/` — 本地功能维护清单、设计文档、调研、计划
+- `crates/codex-plus-core/` —— 核心 Rust 库（配置生成、catalog 解析、数据模型）
+- `apps/codex-plus-manager/` —— Tauri 桌面应用，前端 React+TS
+- `crates/codex-plus-data/` —— 数据持久化
+- `docs/` —— 本地功能维护清单、设计文档、调研、计划
+- `bin/` —— 已编译的 Release 二进制，由 `.gitignore` 排除
 
 ## 关键代码位置
 
 - 聚合模型别名：`crates/codex-plus-core/src/aggregate_model_alias.rs`
 - 聚合路由：`crates/codex-plus-core/src/relay_rotation.rs`
 - 模型目录：`crates/codex-plus-core/src/model_catalog.rs`
-- 配置生成与人证隔离：`crates/codex-plus-core/src/relay_config.rs`
+- 配置生成与认证隔离：`crates/codex-plus-core/src/relay_config.rs`
 - 切换逻辑：`crates/codex-plus-core/src/relay_switch.rs`
 - 插件市场保留：`crates/codex-plus-core/src/plugin_marketplace.rs`
 - 会话提供者归一：`crates/codex-plus-data/src/provider_sync.rs`
@@ -60,17 +61,87 @@
 
 ## 发布编译
 
+编译完成后将 Release 二进制复制到 `bin/`：
+
 ```powershell
+# 编译
 cargo build --workspace --release
+
+# 复制到 bin/
+Copy-Item -LiteralPath "target\release\codex-plus-plus-manager.exe" -Destination "bin\" -Force
+Copy-Item -LiteralPath "target\release\codex-plus-plus.exe" -Destination "bin\" -Force
+Copy-Item -LiteralPath "target\release\codex-plus-mobile-relay.exe" -Destination "bin\" -Force
+
+# 验证
+Get-ChildItem -LiteralPath "bin" -Filter "codex*" | ForEach-Object {
+  $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+  Write-Output "$($_.Name)  SHA256: $hash"
+}
 ```
 
+`bin/` 已被 `.gitignore` 排除，不纳入版本控制。
+
 Release 配置已在 `Cargo.toml` 中启用 `strip = true`、`lto = "fat"`、`codegen-units = 1`、`panic = "abort"`。
+
+## 空间管理
+
+`target/debug` 易积累到 50 GB+，建议定期清理：
+
+```powershell
+cargo clean          # 清除所有编译缓存
+# 或只清 debug 保留 release
+Remove-Item -LiteralPath "target\debug" -Recurse -Force
+```
+
+## 验收流程
+
+提交前依次完成以下步骤，确认无误后由用户确认：
+
+```powershell
+# 1. 检查未提交文件范围
+git status --short
+
+# 2. Rust 检查
+cargo fmt --all -- --check
+cargo check --workspace
+
+# 3. 关键回归测试（单线程避免 Windows 共享冲突）
+cargo test -p codex-plus-core --tests -- --test-threads=1
+cargo test -p codex-plus-data --tests -- --test-threads=1
+cargo test -p codex-plus-manager --lib -- --test-threads=1
+
+# 4. TypeScript 检查与前端测试
+cd apps/codex-plus-manager
+.\node_modules\.bin\tsc --noEmit -p tsconfig.json
+node --test "src/*.test.ts"
+
+# 5. 生产构建
+cargo build --workspace --release
+
+# 6. 复制到 bin/
+Copy-Item -LiteralPath "target\release\codex-plus-plus-manager.exe" -Destination "bin\" -Force
+Copy-Item -LiteralPath "target\release\codex-plus-plus.exe" -Destination "bin\" -Force
+Copy-Item -LiteralPath "target\release\codex-plus-mobile-relay.exe" -Destination "bin\" -Force
+
+# 7. 出示 SHA-256 供验收确认
+Get-ChildItem -LiteralPath "bin" -Filter "codex*" | ForEach-Object {
+  $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+  Write-Output "$($_.Name)  $hash"
+}
+```
+
+用户确认无误后执行：
+
+```powershell
+git add --update
+git commit -m "合并描述"
+git push -u fork codex/fix-plugin-marketplace-persistence
+```
 
 ## 与上游同步
 
 - `origin` = https://github.com/BigPizzaV3/CodexPlusPlus（fetch）
 - `fork` = https://github.com/fgyuuang/CodexPlusPlus.git（push）
 - 工作分支：`codex/fix-plugin-marketplace-persistence`
-- 合并策略：`git merge --no-commit --no-ff origin/main`，**不以 rebase 方式处理**，保留完整本地提交历史
-- 合并后逐文件核对 `docs/local-features.md` 中标记的模块
-- 关键回归测试后提交并推送 fork 分支
+- 合并策略：`git merge --no-commit --no-ff origin/main`，不以 rebase 方式处理，保留完整本地提交历史
+- 合并后逐文件核对 `docs/local-features.md` 中标记的模块并运行回归测试
