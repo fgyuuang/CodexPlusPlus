@@ -607,6 +607,9 @@ type ProviderSyncTargetOption = {
   isCurrentProvider: boolean;
   isManual: boolean;
   isSaved: boolean;
+  sessionCount: number;
+  rolloutSessionCount: number;
+  sqliteSessionCount: number;
 };
 
 type ProviderSyncTargetsPayload = {
@@ -1953,10 +1956,11 @@ export function App() {
 
   const syncProvidersNow = async () => {
     if (providerSyncProgress.active) return;
+    const targetProvider = selectedProviderSyncTarget || providerSyncTargets?.currentProvider || "openai";
     setProviderSyncProgress({
       active: true,
       percent: 12,
-      message: t("正在统一历史会话到 custom…"),
+      message: tf("正在统一历史会话到 {0}…", [targetProvider]),
       result: null,
     });
     const progressTimer = window.setInterval(() => {
@@ -1970,8 +1974,9 @@ export function App() {
       });
     }, 350);
     try {
-      const targetProvider = selectedProviderSyncTarget || undefined;
-      const result = await run(() => call<CommandResult<ProviderSyncPayload>>("sync_providers_now"));
+      const result = await run(() =>
+        call<CommandResult<ProviderSyncPayload>>("sync_providers_now", { targetProvider }),
+      );
       if (result) {
         let finalResult = result;
         let cleanupFailure: { status: Status; message: string } | null = null;
@@ -2020,16 +2025,14 @@ export function App() {
               : completion.result.message),
           result: completion.result,
         });
-        if (targetProvider) {
-          const next = {
-            ...settingsForm,
-            providerSyncLastSelectedProvider: targetProvider,
-            providerSyncSavedProviders: Array.from(
-              new Set([...(settingsForm.providerSyncSavedProviders ?? []), targetProvider]),
-            ).sort(),
-          };
-          setSettingsForm(next);
-        }
+        const next = {
+          ...settingsForm,
+          providerSyncLastSelectedProvider: targetProvider,
+          providerSyncSavedProviders: Array.from(
+            new Set([...(settingsForm.providerSyncSavedProviders ?? []), targetProvider]),
+          ).sort(),
+        };
+        setSettingsForm(next);
         await refreshProviderSyncTargets(true);
         const noticeTitle =
           completion.noticeKind === "cleanup" ? t("清理幽灵任务索引") : t("历史会话修复");
@@ -4410,6 +4413,10 @@ function SessionsScreen({
   const selectedSessions = useMemo(() => items.filter((session) => selectedSessionIds.has(session.id)), [items, selectedSessionIds]);
   const selectedCount = selectedSessions.length;
   const allSelected = items.length > 0 && selectedCount === items.length;
+  const syncTargets = providerSyncTargets?.targets ?? [];
+  const activeSyncTarget =
+    syncTargets.find((target) => target.id === selectedProviderSyncTarget) ?? syncTargets[0] ?? null;
+  const configuredProvider = providerSyncTargets?.currentProvider ?? "openai";
 
   useEffect(() => {
     const itemIds = new Set(items.map((session) => session.id));
@@ -4461,19 +4468,60 @@ function SessionsScreen({
             <Metric label={t("当前页未归档")} value={tf("{0} 个", [activeCount])} />
             <Metric label={t("当前页已归档")} value={tf("{0} 个", [archivedCount])} />
             <Metric label={t("数据库")} value={sessions?.dbPath ?? "~/.codex/sqlite/*.db"} />
+            <Metric label={t("当前配置 provider")} value={configuredProvider} />
           </div>
           <div className="hint-line">
             <Info className="h-4 w-4" />
-            <span>{t("统一会将 rollout 和 SQLite 中的 provider 元数据改为 custom，并在写入前备份；不会删除会话正文。被占用的 rollout 会跳过并在结果中列出。")}</span>
+            <span>{t("同步会将 rollout 和 SQLite 中的 provider 元数据改为所选目标，并在写入前备份；不会删除会话正文。目标应与接下来启动的模式一致：官方登录使用 openai，聚合或独立 API 使用 custom。")}</span>
           </div>
+          <div className="form-grid">
+            <label className="field">
+              <span>{t("历史会话同步目标")}</span>
+              <select
+                className="field-select"
+                disabled={providerSyncProgress.active || !syncTargets.length}
+                onChange={(event) => actions.setProviderSyncTarget(event.currentTarget.value)}
+                value={selectedProviderSyncTarget}
+              >
+                {syncTargets.map((target) => (
+                  <option key={target.id} value={target.id}>
+                    {target.id} ({target.sessionCount} {t("个会话")})
+                  </option>
+                ))}
+              </select>
+              <small className="field-hint">
+                {activeSyncTarget
+                  ? tf("来源：{0}；rollout {1}，SQLite {2}", [
+                      providerSyncTargetLabel(activeSyncTarget),
+                      activeSyncTarget.rolloutSessionCount,
+                      activeSyncTarget.sqliteSessionCount,
+                    ])
+                  : t("正在读取 provider 统计…")}
+              </small>
+            </label>
+          </div>
+          {syncTargets.length ? (
+            <div className="table">
+              {syncTargets.map((target) => (
+                <div className="table-row" key={target.id}>
+                  <span>{target.id}</span>
+                  <span>{tf("{0} 个唯一会话", [target.sessionCount])}</span>
+                  <span>{tf("rollout {0}", [target.rolloutSessionCount])}</span>
+                  <span>{tf("SQLite {0}", [target.sqliteSessionCount])}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <Toolbar>
             <Button onClick={() => void actions.refreshLocalSessions()}>
               <RefreshCw className="h-4 w-4" />
               {t("刷新会话")}
             </Button>
-            <Button disabled={providerSyncProgress.active} onClick={() => void actions.syncProvidersNow()} variant="outline">
+            <Button disabled={providerSyncProgress.active || !activeSyncTarget} onClick={() => void actions.syncProvidersNow()} variant="outline">
               <RefreshCw className="h-4 w-4" />
-              {providerSyncProgress.active ? t("正在统一…") : t("统一全部历史会话到 custom")}
+              {providerSyncProgress.active
+                ? t("正在同步…")
+                : tf("同步全部历史会话到 {0}", [activeSyncTarget?.id ?? "openai"])}
             </Button>
           </Toolbar>
           <div className="provider-sync-progress" data-active={providerSyncProgress.active}>

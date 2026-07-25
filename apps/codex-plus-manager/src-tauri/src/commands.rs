@@ -1862,6 +1862,9 @@ fn merge_manual_provider_sync_targets(
                     is_current_provider: *id == targets.current_provider,
                     is_manual: settings.provider_sync_manual_providers.contains(id),
                     is_saved: settings.provider_sync_saved_providers.contains(id),
+                    session_count: 0,
+                    rollout_session_count: 0,
+                    sqlite_session_count: 0,
                 });
         }
     }
@@ -1933,11 +1936,11 @@ pub async fn apply_session_index_cleanup(
 }
 
 #[tauri::command]
-pub async fn sync_providers_now() -> CommandResult<Value> {
+pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResult<Value> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     prepare_codex_app_state_before_provider_switch(&home, "manager.sync_providers_now.before");
-    let result = tauri::async_runtime::spawn_blocking(|| {
-        codex_plus_data::normalize_all_session_providers_to_custom(None)
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_data::run_provider_sync_with_target(None, target_provider.as_deref())
     })
     .await
     .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"));

@@ -27,6 +27,7 @@
 - 切换逻辑：`crates/codex-plus-core/src/relay_switch.rs`
 - 插件市场保留：`crates/codex-plus-core/src/plugin_marketplace.rs`
 - 会话提供者归一：`crates/codex-plus-data/src/provider_sync.rs`
+- 会话 provider 统计与切换策略：`crates/codex-plus-data/src/provider_sync.rs` 的 `load_provider_sync_targets`、`provider_sync_target_for_settings`
 - 前端聚合面板与映射：`apps/codex-plus-manager/src/aggregateMappings.ts`
 - 前端聚合编辑器：`apps/codex-plus-manager/src/App.tsx` 的 `AggregateRelayProfileEditor`
 
@@ -58,6 +59,8 @@
 - 断言读 config.toml 文本，如 `assert!(config.contains("model_catalog_json"))`
 - 改行为要同步改/加对应测试
 - Windows 下共享路径的集成测试使用 `--test-threads=1`
+- provider sync 必须同时覆盖 `openai` 与 `custom`：纯官方活动配置同步到 `openai`，聚合、独立 API、官方混入 API 同步到 `custom`
+- 会话管理必须显示各 provider 的唯一会话数、rollout 数和 SQLite 数；不得再次退化为固定同步到 `custom`
 
 ## 发布编译
 
@@ -145,3 +148,4 @@ git push -u fork codex/fix-plugin-marketplace-persistence
 - 工作分支：`codex/fix-plugin-marketplace-persistence`
 - 合并策略：`git merge --no-commit --no-ff origin/main`，不以 rebase 方式处理，保留完整本地提交历史
 - 合并后逐文件核对 `docs/local-features.md` 中标记的模块并运行回归测试
+- 上游若修改登录、`model_provider`、启动顺序、会话索引或 SQLite schema，必须人工确认 `docs/provider-auth-session-switching.md` 的状态机仍成立

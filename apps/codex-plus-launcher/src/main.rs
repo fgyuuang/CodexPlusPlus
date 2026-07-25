@@ -6,6 +6,7 @@ use codex_plus_core::launcher::{
 };
 use codex_plus_core::models::{DeleteResult, ExportResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
+use codex_plus_core::settings::SettingsStore;
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -277,8 +278,10 @@ impl LaunchHooks for LauncherHooks {
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
-        let _ = tokio::task::spawn_blocking(|| {
-            codex_plus_data::normalize_all_session_providers_to_custom(None)
+        let settings = SettingsStore::default().load().unwrap_or_default();
+        let target_provider = codex_plus_data::provider_sync_target_for_settings(&settings);
+        let _ = tokio::task::spawn_blocking(move || {
+            codex_plus_data::run_provider_sync_with_target(None, Some(target_provider))
         })
         .await
         .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"))?;

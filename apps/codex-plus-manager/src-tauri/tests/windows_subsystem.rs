@@ -365,3 +365,21 @@ fn manager_update_install_keeps_visible_progress_bar() {
     assert!(app_tsx.contains("completedTitle={t(\"上次更新结果\")}"));
     assert!(app_tsx.contains("progress={updateInstallProgress}"));
 }
+
+#[test]
+fn provider_sync_ui_keeps_explicit_targets_and_provider_counts() {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
+    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let commands = std::fs::read_to_string(manifest_dir.join("src/commands.rs"))
+        .expect("read manager commands.rs");
+
+    assert!(app_tsx.contains("sessionCount: number"));
+    assert!(app_tsx.contains("rolloutSessionCount: number"));
+    assert!(app_tsx.contains("sqliteSessionCount: number"));
+    assert!(app_tsx.contains("{ targetProvider }"));
+    assert!(app_tsx.contains("同步全部历史会话到 {0}"));
+    assert!(commands.contains("target_provider: Option<String>"));
+    assert!(commands.contains("run_provider_sync_with_target(None, target_provider.as_deref())"));
+    assert!(!commands.contains("normalize_all_session_providers_to_custom(None)"));
+}

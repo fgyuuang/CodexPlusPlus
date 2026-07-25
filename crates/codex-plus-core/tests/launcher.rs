@@ -178,7 +178,12 @@ fn app_paths_resolves_portable_current_link_to_directory_version() {
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("Codex.exe"), "").unwrap();
     std::fs::write(target.join("version"), "42.1.0\n").unwrap();
-    std::os::windows::fs::symlink_dir(&target, &current).unwrap();
+    if let Err(error) = std::os::windows::fs::symlink_dir(&target, &current) {
+        if error.raw_os_error() == Some(1314) {
+            return;
+        }
+        panic!("create portable current symlink: {error}");
+    }
 
     assert_eq!(
         codex_app_version(&current).as_deref(),
@@ -662,12 +667,12 @@ fn launcher_applies_codexplusplus_window_icon_after_packaged_activation() {
 }
 
 #[test]
-fn launcher_no_longer_contains_mobile_control_runtime() {
+fn launcher_runtime_excludes_mobile_control_while_workspace_keeps_companion_binary() {
     let launcher_source = include_str!("../src/launcher.rs");
     let settings_source = include_str!("../src/settings.rs");
     let workspace_toml = include_str!("../../../Cargo.toml");
 
-    assert!(!workspace_toml.contains("apps/codex-plus-mobile-relay"));
+    assert!(workspace_toml.contains("apps/codex-plus-mobile-relay"));
     assert!(!launcher_source.contains("MobileRelay"));
     assert!(!launcher_source.contains("mobile_relay"));
     assert!(!launcher_source.contains("\"/mobile\""));

@@ -39,17 +39,23 @@
 
 ---
 
-## 3. 会话提供者归一（provider sync）
+## 3. 会话提供者统计与自适应归一（provider sync）
 
-历史会话的 `model_provider` 元数据统一写入 `custom`，消除多 provider 残留导致的对话记录混乱。
+历史会话可以按当前使用入口归一：纯官方登录使用 `openai`，聚合、独立 API 和官方混入 API 使用 `custom`。
+Manager 会列出从 config、rollout、SQLite 发现的 provider，并显示唯一会话数、rollout 数和 SQLite 数；用户也可手动选择同步目标。
 
 | 模块 | 文件 | 维护要点 |
 |---|---|---|
-| 核心逻辑 | `crates/codex-plus-data/src/provider_sync.rs` | `normalize_all_session_providers_to_custom()`、备份机制。 |
-| 测试 | `crates/codex-plus-data/tests/provider_sync.rs` | 23 项测试覆盖 rollout/SQLite/backup/rollback。 |
+| 核心逻辑 | `crates/codex-plus-data/src/provider_sync.rs` | `run_provider_sync_with_target()`、`load_provider_sync_targets()`、`provider_sync_target_for_settings()`、唯一会话计数与备份机制。 |
+| Manager 后端 | `apps/codex-plus-manager/src-tauri/src/commands.rs` | `sync_providers_now(target_provider)` 接收显式目标，不得固定为 `custom`。 |
+| Manager 前端 | `apps/codex-plus-manager/src/App.tsx` | 会话页展示 provider 统计、当前配置 provider 和目标选择器。 |
+| 启动器 | `apps/codex-plus-launcher/src/main.rs` | 启动前自动同步跟随活动供应商模式。 |
+| 测试 | `crates/codex-plus-data/tests/provider_sync.rs` | 覆盖 rollout/SQLite/backup/rollback、provider 统计和官方/custom 目标策略。 |
 | 公开 API | `crates/codex-plus-data/src/lib.rs` | 暴露 provider_sync。 |
 
-**合并确认点**：执行"统一全部历史会话到 custom"后，rollout 与 SQLite 均更新为 `custom`，备份不受影响。
+**合并确认点**：纯官方入口启动前目标必须为 `openai`；聚合/独立 API 入口目标必须为 `custom`。Manager 必须同时显示 provider 数量和允许显式选择目标。rollout 与 SQLite 写入前备份，锁定 rollout 必须跳过并报告。
+
+详细状态机与限制见 `docs/provider-auth-session-switching.md`。
 
 ---
 

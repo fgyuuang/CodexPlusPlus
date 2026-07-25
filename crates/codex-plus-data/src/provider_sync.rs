@@ -82,6 +82,9 @@ pub struct ProviderSyncTargetOption {
     pub is_current_provider: bool,
     pub is_manual: bool,
     pub is_saved: bool,
+    pub session_count: usize,
+    pub rollout_session_count: usize,
+    pub sqlite_session_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +165,19 @@ pub fn run_provider_sync(codex_home: Option<&Path>) -> ProviderSyncResult {
 
 pub fn normalize_all_session_providers_to_custom(codex_home: Option<&Path>) -> ProviderSyncResult {
     run_provider_sync_with_target(codex_home, Some(CUSTOM_PROVIDER))
+}
+
+pub fn provider_sync_target_for_settings(
+    settings: &codex_plus_core::settings::BackendSettings,
+) -> &'static str {
+    let relay = settings.active_relay_profile();
+    if relay.relay_mode == codex_plus_core::settings::RelayMode::Official
+        && !relay.official_mix_api_key
+    {
+        DEFAULT_PROVIDER
+    } else {
+        CUSTOM_PROVIDER
+    }
 }
 
 pub fn run_provider_sync_with_target(
@@ -345,6 +361,8 @@ pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTarg
         .unwrap_or_else(|| dirs_home().join(".codex"));
     let current_provider = read_current_provider(&home.join("config.toml"));
     let mut sources: HashMap<String, HashSet<ProviderSyncTargetSource>> = HashMap::new();
+    let rollout_sessions = rollout_provider_thread_ids(&home).unwrap_or_default();
+    let mut sqlite_sessions: HashMap<String, HashSet<String>> = HashMap::new();
 
     fn add_sources(
         sources: &mut HashMap<String, HashSet<ProviderSyncTargetSource>>,
@@ -369,12 +387,19 @@ pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTarg
         [current_provider.clone()],
         ProviderSyncTargetSource::Config,
     );
-    if let Ok(ids) = rollout_provider_ids(&home) {
-        add_sources(&mut sources, ids, ProviderSyncTargetSource::Rollout);
-    }
+    add_sources(
+        &mut sources,
+        rollout_sessions.keys().cloned(),
+        ProviderSyncTargetSource::Rollout,
+    );
     for db_path in codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home) {
-        if let Ok(ids) = sqlite_provider_ids(&db_path) {
-            add_sources(&mut sources, ids, ProviderSyncTargetSource::Sqlite);
+        if let Ok(provider_threads) = sqlite_provider_thread_ids(&db_path) {
+            add_sources(
+                &mut sources,
+                provider_threads.keys().cloned(),
+                ProviderSyncTargetSource::Sqlite,
+            );
+            merge_provider_thread_ids(&mut sqlite_sessions, provider_threads);
         }
     }
 
@@ -383,10 +408,17 @@ pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTarg
         .map(|(id, source_set)| {
             let mut source_list = source_set.into_iter().collect::<Vec<_>>();
             source_list.sort();
+            let rollout_thread_ids = rollout_sessions.get(&id).cloned().unwrap_or_default();
+            let sqlite_thread_ids = sqlite_sessions.get(&id).cloned().unwrap_or_default();
+            let mut session_ids = rollout_thread_ids.clone();
+            session_ids.extend(sqlite_thread_ids.iter().cloned());
             ProviderSyncTargetOption {
                 is_current_provider: id == current_provider,
                 is_manual: source_list.contains(&ProviderSyncTargetSource::Manual),
                 is_saved: false,
+                session_count: session_ids.len(),
+                rollout_session_count: rollout_thread_ids.len(),
+                sqlite_session_count: sqlite_thread_ids.len(),
                 id,
                 sources: source_list,
             }
@@ -946,8 +978,8 @@ fn cleanup_apply_error(
     }
 }
 
-fn rollout_provider_ids(home: &Path) -> anyhow::Result<Vec<String>> {
-    let mut ids = HashSet::new();
+fn rollout_provider_thread_ids(home: &Path) -> anyhow::Result<HashMap<String, HashSet<String>>> {
+    let mut provider_threads: HashMap<String, HashSet<String>> = HashMap::new();
     for path in rollout_files(home)? {
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -962,20 +994,36 @@ fn rollout_provider_ids(home: &Path) -> anyhow::Result<Vec<String>> {
             if record.get("type").and_then(Value::as_str) != Some("session_meta") {
                 continue;
             }
-            let Some(provider) = record
-                .get("payload")
-                .and_then(Value::as_object)
-                .and_then(|payload| payload.get("model_provider"))
-                .and_then(Value::as_str)
-            else {
+            let Some(payload) = record.get("payload").and_then(Value::as_object) else {
+                continue;
+            };
+            let Some(provider) = payload.get("model_provider").and_then(Value::as_str) else {
                 continue;
             };
             if is_valid_provider_id_for_discovery(provider) {
-                ids.insert(provider.to_string());
+                let thread_id = payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                provider_threads
+                    .entry(provider.to_string())
+                    .or_default()
+                    .insert(thread_id);
             }
         }
     }
-    Ok(sorted_provider_ids(ids))
+    Ok(provider_threads)
+}
+
+fn merge_provider_thread_ids(
+    target: &mut HashMap<String, HashSet<String>>,
+    source: HashMap<String, HashSet<String>>,
+) {
+    for (provider, thread_ids) in source {
+        target.entry(provider).or_default().extend(thread_ids);
+    }
 }
 
 fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
@@ -1187,26 +1235,31 @@ fn table_columns(db: &Connection, table: &str) -> anyhow::Result<HashSet<String>
         .collect::<rusqlite::Result<HashSet<_>>>()?)
 }
 
-fn sqlite_provider_ids(path: &Path) -> anyhow::Result<Vec<String>> {
+fn sqlite_provider_thread_ids(path: &Path) -> anyhow::Result<HashMap<String, HashSet<String>>> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(HashMap::new());
     }
     let db = Connection::open(path)?;
     let columns = table_columns(&db, "threads")?;
-    if !columns.contains("model_provider") {
-        return Ok(Vec::new());
+    if !columns.contains("id") || !columns.contains("model_provider") {
+        return Ok(HashMap::new());
     }
     let mut stmt = db.prepare(
-        "SELECT DISTINCT COALESCE(model_provider, '') FROM threads WHERE COALESCE(model_provider, '') <> ''",
+        "SELECT id, COALESCE(model_provider, '') FROM threads WHERE COALESCE(model_provider, '') <> ''",
     )?;
-    let mut ids = HashSet::new();
-    for item in stmt.query_map([], |row| row.get::<_, String>(0))? {
-        let id = item?;
-        if is_valid_provider_id_for_discovery(&id) {
-            ids.insert(id);
+    let mut provider_threads: HashMap<String, HashSet<String>> = HashMap::new();
+    for item in stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (thread_id, provider) = item?;
+        if is_valid_provider_id_for_discovery(&provider) && !thread_id.trim().is_empty() {
+            provider_threads
+                .entry(provider)
+                .or_default()
+                .insert(thread_id);
         }
     }
-    Ok(sorted_provider_ids(ids))
+    Ok(provider_threads)
 }
 
 fn count_sqlite_updates(

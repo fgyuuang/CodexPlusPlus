@@ -1,7 +1,7 @@
 use codex_plus_data::{
     ProviderSyncStatus, ProviderSyncTargetSource, apply_session_index_cleanup,
-    load_provider_sync_targets, preview_session_index_cleanup, run_provider_sync,
-    run_provider_sync_with_target,
+    load_provider_sync_targets, preview_session_index_cleanup, provider_sync_target_for_settings,
+    run_provider_sync, run_provider_sync_with_target,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -9,6 +9,33 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
+
+#[test]
+fn provider_sync_target_tracks_active_official_or_custom_mode() {
+    use codex_plus_core::settings::{BackendSettings, RelayMode, RelayProfile};
+
+    let official = BackendSettings::default();
+    assert_eq!(provider_sync_target_for_settings(&official), "openai");
+
+    let mut aggregate = BackendSettings::default();
+    aggregate.active_relay_id = "aggregate".to_string();
+    aggregate.relay_profiles = vec![RelayProfile {
+        id: "aggregate".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    }];
+    assert_eq!(provider_sync_target_for_settings(&aggregate), "custom");
+
+    let mut official_mix = BackendSettings::default();
+    official_mix.active_relay_id = "official-mix".to_string();
+    official_mix.relay_profiles = vec![RelayProfile {
+        id: "official-mix".to_string(),
+        relay_mode: RelayMode::Official,
+        official_mix_api_key: true,
+        ..RelayProfile::default()
+    }];
+    assert_eq!(provider_sync_target_for_settings(&official_mix), "custom");
+}
 
 fn write_rollout(path: &Path, provider: &str, thread_id: &str, cwd: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -154,12 +181,26 @@ name = "apigather"
     assert!(openai.sources.contains(&ProviderSyncTargetSource::Config));
     assert!(openai.sources.contains(&ProviderSyncTargetSource::Rollout));
     assert!(openai.sources.contains(&ProviderSyncTargetSource::Sqlite));
+    assert_eq!(openai.session_count, 1);
+    assert_eq!(openai.rollout_session_count, 1);
+    assert_eq!(openai.sqlite_session_count, 1);
     let legacy = targets
         .targets
         .iter()
         .find(|target| target.id == "legacy-provider")
         .unwrap();
     assert_eq!(legacy.sources, vec![ProviderSyncTargetSource::Rollout]);
+    assert_eq!(legacy.session_count, 1);
+    assert_eq!(legacy.rollout_session_count, 1);
+    assert_eq!(legacy.sqlite_session_count, 0);
+    let sqlite = targets
+        .targets
+        .iter()
+        .find(|target| target.id == "sqlite-provider")
+        .unwrap();
+    assert_eq!(sqlite.session_count, 1);
+    assert_eq!(sqlite.rollout_session_count, 0);
+    assert_eq!(sqlite.sqlite_session_count, 1);
 }
 
 #[test]
@@ -269,6 +310,15 @@ fn provider_sync_target_discovery_reads_all_session_meta_providers() {
     assert!(ids.contains(&"openai"));
     assert!(ids.contains(&"ccx"));
     assert!(ids.contains(&"CodexPlusPlus"));
+    for provider in ["openai", "ccx", "CodexPlusPlus"] {
+        let target = targets
+            .targets
+            .iter()
+            .find(|target| target.id == provider)
+            .unwrap();
+        assert_eq!(target.session_count, 1);
+        assert_eq!(target.rollout_session_count, 1);
+    }
 }
 
 #[test]
