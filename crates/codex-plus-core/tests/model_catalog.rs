@@ -283,6 +283,7 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
     codex_plus_core::paths::set_settings_path_for_tests(previous_settings_path);
 
     assert_eq!(result["default_model"], "gpt-5.4");
+    assert_eq!(result["model_provider"], "custom");
     assert_eq!(
         result["models"],
         json!([

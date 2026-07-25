@@ -7,13 +7,18 @@ use codex_plus_core::relay_config::{
     backfill_relay_profile_from_home, backfill_relay_profile_from_home_with_common,
     chatgpt_auth_status_from_home, clear_relay_config_to_home,
     clear_relay_config_to_home_with_auth, delete_context_entry_from_common_config,
-    extract_common_config_from_config, filter_common_config_for_selection,
-    list_context_entries_from_common_config, normalize_relay_profile_for_storage,
-    relay_config_status_from_home, sanitize_common_config_contents,
-    set_codex_goals_feature_in_home, strip_common_config_from_config,
-    sync_live_config_context_entries, upsert_context_entry_in_common_config,
+    effective_active_relay_profile_for_codex, extract_common_config_from_config,
+    filter_common_config_for_selection, list_context_entries_from_common_config,
+    normalize_relay_profile_for_storage, relay_config_status_from_home,
+    sanitize_common_config_contents, set_codex_goals_feature_in_home,
+    strip_common_config_from_config, sync_live_config_context_entries,
+    upsert_context_entry_in_common_config,
 };
-use codex_plus_core::settings::{RelayContextSelection, RelayMode, RelayProfile, RelayProtocol};
+use codex_plus_core::settings::{
+    AggregateRelayDispatchTarget, AggregateRelayMember, AggregateRelayModelMapping,
+    AggregateRelayProfile, AggregateRelayStrategy, BackendSettings, RelayContextSelection,
+    RelayMode, RelayProfile, RelayProtocol,
+};
 
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
     let root = home.join(".tmp").join("plugins-remote");
@@ -414,6 +419,91 @@ fn apply_aggregate_relay_points_codex_to_local_responses_proxy_without_snapshot(
     assert!(updated.contains(r#"wire_api = "responses""#));
     assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+}
+
+#[test]
+fn aggregate_startup_profile_uses_first_member_defaults_without_member_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = BackendSettings {
+        active_relay_id: "aggregate".to_string(),
+        active_aggregate_relay_id: "aggregate".to_string(),
+        relay_profiles: vec![
+            RelayProfile {
+                id: "first".to_string(),
+                name: "供应商一".to_string(),
+                model: "vendor-gpt-5.6".to_string(),
+                model_list: "vendor-gpt-5.6".to_string(),
+                api_key: "sk-first-member".to_string(),
+                context_window: "200000".to_string(),
+                auto_compact_limit: "180000".to_string(),
+                relay_mode: RelayMode::PureApi,
+                config_contents: r#"model = "vendor-gpt-5.6"
+model_reasoning_effort = "high"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+base_url = "https://first.example.test/v1"
+experimental_bearer_token = "sk-first-member"
+"#
+                .to_string(),
+                model_mappings: std::collections::HashMap::from([(
+                    "gpt-5.6".to_string(),
+                    "vendor-gpt-5.6".to_string(),
+                )]),
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: "aggregate".to_string(),
+                name: "聚合".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            },
+        ],
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: "aggregate".to_string(),
+            name: "聚合".to_string(),
+            strategy: AggregateRelayStrategy::Failover,
+            model_mappings_enabled: true,
+            members: vec![AggregateRelayMember {
+                relay_id: "first".to_string(),
+                weight: 1,
+            }],
+            model_mappings: vec![AggregateRelayModelMapping {
+                codex_model: "gpt-5.6".to_string(),
+                targets: vec![AggregateRelayDispatchTarget {
+                    relay_id: "first".to_string(),
+                    target_model: "vendor-gpt-5.6".to_string(),
+                }],
+            }],
+        }],
+        ..BackendSettings::default()
+    };
+
+    let profile = effective_active_relay_profile_for_codex(&settings);
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+
+    assert_eq!(profile.relay_mode, RelayMode::Aggregate);
+    assert_eq!(profile.model, "gpt-5.6");
+    assert_eq!(profile.context_window, "200000");
+    assert_eq!(profile.auto_compact_limit, "180000");
+    assert!(config.contains(r#"model = "gpt-5.6""#), "{config}");
+    assert!(
+        config.contains(r#"model_reasoning_effort = "high""#),
+        "{config}"
+    );
+    assert!(config.contains(r#"model_provider = "custom""#), "{config}");
+    assert!(
+        config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#),
+        "{config}"
+    );
+    assert!(
+        config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#),
+        "{config}"
+    );
+    assert!(!config.contains("sk-first-member"), "{config}");
+    assert!(!config.contains("https://first.example.test"), "{config}");
 }
 
 #[test]

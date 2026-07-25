@@ -106,7 +106,7 @@ fn apply_selected_relay_profile(
     home: &Path,
     settings: &BackendSettings,
 ) -> anyhow::Result<RelaySwitchResult> {
-    let relay = settings.active_relay_profile();
+    let relay = crate::relay_config::effective_active_relay_profile_for_codex(settings);
     let common_config = relay_combined_common_config(settings);
     let result = if relay.relay_mode == RelayMode::Official && !relay.official_mix_api_key {
         let auth_contents =

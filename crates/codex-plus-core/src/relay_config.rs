@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
-use crate::settings::{RelayContextSelection, RelayProfile, RelayProtocol};
+use crate::settings::{
+    BackendSettings, RelayContextSelection, RelayMode, RelayProfile, RelayProtocol,
+};
 
 const RELAY_PROVIDER: &str = "custom";
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodexPlusPlus", "CodexPP"];
@@ -1948,9 +1950,124 @@ fn codex_auth_api_key(auth_contents: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// 解析 profile 實際使用的模型：優先取 config.toml 裡的 `model =`，
-/// 否則退回 profile.model 欄位。供應商測試用它做回退，避免串到別家供應商的模型名。
+pub fn effective_active_relay_profile_for_codex(settings: &BackendSettings) -> RelayProfile {
+    let mut active = settings.active_relay_profile();
+    let Some(aggregate) = settings.active_aggregate_relay_profile() else {
+        return active;
+    };
+    let Some(first_member) = aggregate.members.iter().find_map(|member| {
+        settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == member.relay_id)
+    }) else {
+        return active;
+    };
+
+    let member_profiles = aggregate
+        .members
+        .iter()
+        .filter_map(|member| {
+            settings
+                .relay_profiles
+                .iter()
+                .find(|profile| profile.id == member.relay_id)
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    let aliases =
+        crate::aggregate_model_alias::aggregate_catalog_aliases(&aggregate, &member_profiles);
+
+    if active.config_contents.trim().is_empty() {
+        active.config_contents = aggregate_startup_config_contents(&first_member.config_contents);
+    }
+    if active.context_window.trim().is_empty() {
+        active.context_window = first_member.context_window.trim().to_string();
+    }
+    if active.auto_compact_limit.trim().is_empty() {
+        active.auto_compact_limit = first_member.auto_compact_limit.trim().to_string();
+    }
+    if active.model_list.trim().is_empty() {
+        active.model_list = aliases
+            .iter()
+            .map(|alias| alias.alias.trim())
+            .filter(|alias| !alias.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    if active.model.trim().is_empty() {
+        let member_default = relay_profile_model(first_member);
+        active.model = aliases
+            .iter()
+            .find(|alias| {
+                alias.provider_id == first_member.id
+                    && alias.target_model == member_default
+                    && alias.mapping_key.as_deref() == Some(alias.alias.as_str())
+            })
+            .or_else(|| {
+                aliases.iter().find(|alias| {
+                    alias.provider_id == first_member.id && alias.target_model == member_default
+                })
+            })
+            .or_else(|| aliases.first())
+            .map(|alias| alias.alias.clone())
+            .unwrap_or(member_default);
+    }
+    if active.model_windows.trim().is_empty() {
+        active.model_windows = remap_first_member_model_windows(first_member, &aliases);
+    }
+
+    active
+}
+
+fn aggregate_startup_config_contents(config_contents: &str) -> String {
+    let Ok(mut doc) = parse_toml_document(config_contents) else {
+        return String::new();
+    };
+    for key in [
+        "model",
+        "model_provider",
+        "model_catalog_json",
+        "base_url",
+        "experimental_bearer_token",
+        CHAT_UPSTREAM_BASE_URL_KEY,
+        "model_providers",
+        "profiles",
+    ] {
+        doc.as_table_mut().remove(key);
+    }
+    normalize_optional_toml(doc)
+}
+
+fn remap_first_member_model_windows(
+    member: &RelayProfile,
+    aliases: &[crate::aggregate_model_alias::AggregateModelAlias],
+) -> String {
+    let windows =
+        serde_json::from_str::<std::collections::HashMap<String, String>>(&member.model_windows)
+            .unwrap_or_default();
+    if windows.is_empty() {
+        return String::new();
+    }
+
+    let mut remapped = std::collections::HashMap::new();
+    for alias in aliases
+        .iter()
+        .filter(|alias| alias.provider_id == member.id)
+    {
+        if let Some(window) = windows.get(&alias.target_model) {
+            remapped.insert(alias.alias.clone(), window.clone());
+        }
+    }
+    serde_json::to_string(&remapped).unwrap_or_default()
+}
+
+/// 解析 profile 實際使用的模型：聚合 profile 使用已解析的聚合别名，其他供应商优先取
+/// config.toml 里的 `model`，否则退回 profile.model。
 pub fn relay_profile_model(profile: &RelayProfile) -> String {
+    if profile.relay_mode == RelayMode::Aggregate {
+        return profile.model.trim().to_string();
+    }
     root_key_string(&profile.config_contents, "model")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| profile.model.trim().to_string())

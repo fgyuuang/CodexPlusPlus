@@ -72,7 +72,7 @@ pub async fn read_codex_model_catalog() -> Value {
 }
 
 fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) -> Value {
-    let profile = settings.active_relay_profile();
+    let profile = crate::relay_config::effective_active_relay_profile_for_codex(settings);
     if let Some(aggregate) = settings.active_aggregate_relay_profile() {
         return aggregate_relay_model_catalog_value(home, settings, &profile, &aggregate);
     }
@@ -256,7 +256,7 @@ fn aggregate_relay_model_catalog_value(
         "status": if models.is_empty() { "not_configured" } else { "ok" },
         "path": home.join("config.toml").to_string_lossy(),
         "model": profile.model.trim(),
-        "model_provider": profile.id.trim(),
+        "model_provider": "custom",
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,

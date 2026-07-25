@@ -3262,7 +3262,7 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
         );
     }
     prepare_codex_app_state_before_provider_switch(&home, "manager.apply_relay_injection.before");
-    let relay = settings.active_relay_profile();
+    let relay = codex_plus_core::relay_config::effective_active_relay_profile_for_codex(&settings);
     log_relay_apply_request("manager.apply_relay_injection", &settings, &relay);
     if settings.active_aggregate_relay_profile().is_some() {
         let response = apply_aggregate_relay_injection_to_home(&home);
@@ -3376,7 +3376,7 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
 
 fn apply_aggregate_relay_injection_to_home(home: &Path) -> CommandResult<RelayPayload> {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = settings.active_relay_profile();
+    let relay = codex_plus_core::relay_config::effective_active_relay_profile_for_codex(&settings);
     match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
         home,
         &relay,
@@ -4489,7 +4489,7 @@ mod tests {
                     api_key: "sk-api".to_string(),
                     relay_mode: codex_plus_core::settings::RelayMode::PureApi,
                     auth_contents: "{\n  \"OPENAI_API_KEY\": \"sk-api\"\n}\n".to_string(),
-                    config_contents: "model_provider = \"custom\"\nmodel = \"gpt-5.5\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://api.example/v1\"\n".to_string(),
+                    config_contents: "model_provider = \"custom\"\nmodel = \"gpt-5.5\"\nmodel_reasoning_effort = \"high\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://api.example/v1\"\n".to_string(),
                     ..RelayProfile::default()
                 },
                 RelayProfile {
@@ -4527,6 +4527,7 @@ mod tests {
         assert!(config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
         assert!(config.contains(r#"model_provider = "custom""#));
         assert!(config.contains(r#"model = "gpt-5.5""#));
+        assert!(config.contains(r#"model_reasoning_effort = "high""#));
     }
 
     #[test]
