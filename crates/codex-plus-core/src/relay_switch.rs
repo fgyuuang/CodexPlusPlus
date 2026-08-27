@@ -19,8 +19,34 @@ pub fn switch_relay_profile_in_home(
     next_settings: BackendSettings,
     _previous_active_relay_id: &str,
 ) -> anyhow::Result<RelaySwitchResult> {
+    switch_relay_profile_in_home_with_auth_override(store, home, next_settings, None)
+}
+
+pub fn switch_official_account_in_home(
+    store: &SettingsStore,
+    home: &Path,
+    next_settings: BackendSettings,
+    official_auth_contents: &str,
+) -> anyhow::Result<RelaySwitchResult> {
+    if !crate::relay_config::auth_contents_looks_like_chatgpt_auth(official_auth_contents) {
+        anyhow::bail!("目标官方账号凭据无效");
+    }
+    switch_relay_profile_in_home_with_auth_override(
+        store,
+        home,
+        next_settings,
+        Some(official_auth_contents),
+    )
+}
+
+fn switch_relay_profile_in_home_with_auth_override(
+    store: &SettingsStore,
+    home: &Path,
+    next_settings: BackendSettings,
+    official_auth_override: Option<&str>,
+) -> anyhow::Result<RelaySwitchResult> {
     let selected_settings = next_settings;
-    if !selected_settings.relay_profiles_enabled {
+    if !selected_settings.relay_profiles_enabled && official_auth_override.is_none() {
         anyhow::bail!("供应商配置总开关已关闭，未写入 config.toml / auth.json。");
     }
     crate::codex_app_state::capture_app_state_snapshot_nonfatal(home, "relay_switch.before");
@@ -32,7 +58,7 @@ pub fn switch_relay_profile_in_home(
         .context("保存供应商设置失败")?;
     let selected_settings = store.load().context("读取供应商设置失败")?;
 
-    match apply_selected_relay_profile(home, &selected_settings) {
+    match apply_selected_relay_profile(home, &selected_settings, official_auth_override) {
         Ok(result) => {
             crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
                 home,
@@ -105,24 +131,64 @@ fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> anyhow::Result
 fn apply_selected_relay_profile(
     home: &Path,
     settings: &BackendSettings,
+    official_auth_override: Option<&str>,
 ) -> anyhow::Result<RelaySwitchResult> {
+    if !settings.relay_profiles_enabled {
+        let auth_contents = official_auth_override.context("切换官方账号缺少目标凭据")?;
+        let result = crate::relay_config::apply_official_auth_to_home(home, auth_contents)?;
+        return Ok(RelaySwitchResult {
+            settings: settings.clone(),
+            configured: result.configured,
+            backup_path: result.backup_path,
+        });
+    }
     let relay = crate::relay_config::effective_active_relay_profile_for_codex(settings);
     let common_config = relay_combined_common_config(settings);
     let result = if relay.relay_mode == RelayMode::Official && !relay.official_mix_api_key {
-        let auth_contents =
-            (!relay.auth_contents.trim().is_empty()).then_some(relay.auth_contents.as_str());
-        crate::relay_config::clear_relay_config_to_home_with_auth_and_computer_use_guard(
-            home,
-            auth_contents,
-            settings.computer_use_guard_enabled,
-        )?
+        let managed_auth = if official_auth_override.is_none() {
+            selected_official_auth_contents(home, settings, false)?
+        } else {
+            None
+        };
+        let auth_contents = official_auth_override
+            .or(managed_auth.as_deref())
+            .or_else(|| {
+                (!relay.auth_contents.trim().is_empty()).then_some(relay.auth_contents.as_str())
+            });
+        if settings.official_login_mixed_mode {
+            if let Some(auth_contents) = auth_contents {
+                crate::relay_config::clear_relay_config_to_home_with_selected_official_auth(
+                    home,
+                    auth_contents,
+                )?
+            } else {
+                crate::relay_config::clear_relay_config_to_home_with_auth(home, None)?
+            }
+        } else {
+            match auth_contents {
+                Some(auth_contents) => {
+                    crate::relay_config::clear_relay_config_to_home_with_selected_official_auth(
+                        home,
+                        auth_contents,
+                    )?
+                }
+                None => crate::relay_config::clear_relay_config_to_home_with_auth(home, None)?,
+            }
+        }
     } else {
         validate_switch_profile_files(&relay)?;
-        crate::relay_config::apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
+        let official_auth_contents = if let Some(auth) = official_auth_override {
+            Some(auth.to_string())
+        } else if settings.active_relay_uses_official_login_auth() {
+            selected_official_auth_contents(home, settings, true)?
+        } else {
+            None
+        };
+        crate::relay_config::apply_relay_profile_to_home_with_switch_rules_and_optional_auth(
             home,
             &relay,
             &common_config,
-            settings.computer_use_guard_enabled,
+            official_auth_contents.as_deref(),
         )?
     };
     let status = relay_config_status_from_home(home);
@@ -136,6 +202,41 @@ fn apply_selected_relay_profile(
         configured: status.configured,
         backup_path: result.backup_path,
     })
+}
+
+fn selected_official_auth_contents(
+    home: &Path,
+    settings: &BackendSettings,
+    required: bool,
+) -> anyhow::Result<Option<String>> {
+    let account_id = settings.active_official_account_id.trim();
+    if !account_id.is_empty() {
+        let auth = crate::official_accounts::OfficialAccountStore::default()
+            .get_auth_json(account_id)
+            .context("读取活动官方账号凭据失败")?;
+        crate::official_accounts::parse_official_auth(&auth).context("活动官方账号凭据无效")?;
+        return Ok(Some(serde_json::to_string_pretty(&auth)?));
+    }
+
+    if settings.official_login_mixed_mode {
+        if let Some(official) = settings.official_login_relay_profile()
+            && !official.auth_contents.trim().is_empty()
+        {
+            if !crate::relay_config::auth_contents_looks_like_chatgpt_auth(&official.auth_contents)
+            {
+                anyhow::bail!("选定的官方登录供应商没有有效的 ChatGPT 登录凭据");
+            }
+            return Ok(Some(official.auth_contents.clone()));
+        }
+    }
+
+    if crate::relay_config::chatgpt_auth_status_from_home(home).authenticated {
+        return Ok(None);
+    }
+    if required || settings.official_login_mixed_mode {
+        anyhow::bail!("当前没有可用的官方账号；请先在官方账号库登录或选择账号");
+    }
+    Ok(None)
 }
 
 fn validate_switch_profile_files(profile: &crate::settings::RelayProfile) -> anyhow::Result<()> {

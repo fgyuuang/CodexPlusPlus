@@ -62,6 +62,8 @@ fn manager_close_minimizes_to_tray_without_confirmation() {
     assert!(!lib_rs.contains(".dialog()"));
     assert!(!lib_rs.contains("manager://close-requested"));
     assert!(lib_rs.contains("let _ = close_event_window.hide();"));
+    assert!(lib_rs.contains("startup_is_transient()"));
+    assert!(lib_rs.contains("arg == \"--transient\""));
     assert!(!app_tsx.contains("CloseConfirmDialog"));
     assert!(app_tsx.contains("manager_exit_app"));
     assert!(app_tsx.contains("manager_hide_to_tray"));
@@ -93,7 +95,7 @@ fn launcher_binary_embeds_codex_icon_resource() {
 }
 
 #[test]
-fn windows_binaries_request_administrator_privileges() {
+fn windows_binaries_run_as_invoker_without_administrator_privileges() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let manager_build =
         std::fs::read_to_string(manifest_dir.join("build.rs")).expect("read manager build.rs");
@@ -116,9 +118,12 @@ fn windows_binaries_request_administrator_privileges() {
 
     assert!(manager_build.contains("windows-app-manifest.xml"));
     assert!(launcher_build.contains("windows-app-manifest.xml"));
-    assert!(windows_manifest.contains("requireAdministrator"));
+    // Elevated launcher processes also elevate Codex, so Explorer file drops are blocked by UIPI.
+    assert!(windows_manifest.contains("asInvoker"));
+    assert!(!windows_manifest.contains("requireAdministrator"));
     assert!(windows_manifest.contains("Microsoft.Windows.Common-Controls"));
-    assert!(windows_installer.contains("RequestExecutionLevel admin"));
+    assert!(windows_installer.contains("RequestExecutionLevel user"));
+    assert!(!windows_installer.contains("RequestExecutionLevel admin"));
 }
 
 #[test]
@@ -226,9 +231,26 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
     assert!(app_tsx.contains("const createNewAggregateProfile = () =>"));
     assert!(app_tsx.contains("onClick={createNewAggregateProfile}"));
     assert!(app_tsx.contains("已打开聚合供应商详情"));
+    assert!(app_tsx.contains(
+        "buildRelayConfigToml(profile, { includeBearerToken: false, requiresOpenAiAuth: true })"
+    ));
     assert!(!commands_rs.contains("缺少独立 auth.json"));
     assert!(!commands_rs.contains("backfill_relay_profile_from_live"));
     assert!(commands_rs.contains("apply_relay_profile_to_home_with_switch_rules"));
+}
+
+#[test]
+fn manager_exposes_official_login_hybrid_mode_without_adding_official_to_rotation() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
+    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+
+    assert!(app_tsx.contains("officialLoginMixedMode"));
+    assert!(app_tsx.contains("officialLoginRelayId"));
+    assert!(app_tsx.contains("官方登录混合模式"));
+    assert!(app_tsx.contains("官方 API 不加入聚合轮转"));
+    assert!(app_tsx.contains("gpt-5.4(openai;供应商1|供应商2:真实模型)"));
+    assert!(app_tsx.contains("!isAggregateRelayProfile(profile) && isApiRelayProfile(profile)"));
 }
 
 #[test]
@@ -240,12 +262,10 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     let styles = std::fs::read_to_string(&styles).expect("read manager styles.css");
 
     assert!(app_tsx.contains("作为全局配置独立管理"));
+    assert!(app_tsx.contains("label: t(\"MCP&插件\")") || app_tsx.contains("label: \"MCP&插件\""));
     assert!(
-        app_tsx.contains("label: t(\"工具与插件\")") || app_tsx.contains("label: \"工具与插件\"")
-    );
-    assert!(
-        app_tsx.contains("title={t(\"Codex 工具与插件\")}")
-            || app_tsx.contains("title=\"Codex 工具与插件\"")
+        app_tsx.contains("title={t(\"Codex MCP&插件\")}")
+            || app_tsx.contains("title=\"Codex MCP&插件\"")
     );
     assert!(!app_tsx.contains("label: \"上下文配置\""));
     assert!(!app_tsx.contains("title=\"上下文配置\""));
@@ -261,10 +281,18 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     assert!(app_tsx.contains("sync_live_context_entries"));
     assert!(app_tsx.contains("refreshLiveContextEntries"));
     assert!(app_tsx.contains("syncLiveContextEntries(next, true)"));
+    assert!(app_tsx.contains("const syncContextEntries = async (next: BackendSettings) =>"));
+    // 保存 / 启停 / 删除 / JSON 导入，四条写入路径都要把改动同步进 live 配置
+    assert_eq!(app_tsx.matches("await syncContextEntries(next)").count(), 4);
+    assert!(app_tsx.contains("if (!(await syncContextEntries(next))) return;"));
     assert!(app_tsx.contains("function contextEntriesWithLiveEntries"));
     assert!(app_tsx.contains("liveByKind"));
     assert!(app_tsx.contains("mergeLiveContextEntries"));
     assert!(app_tsx.contains("withLiveEntryState"));
+    // live 里没有该条目时必须保留它自身的启停意图，不能强制 false——否则供应商
+    // 关掉「应用通用配置」或条目刚新增时，面板会把所有 MCP 显示成已停用（#1928）。
+    // 后端 context_entry_enabled 的默认同样是「没有 enabled 键即启用」。
+    assert!(!app_tsx.contains("live.enabled } : { ...entry, enabled: false }"));
     assert!(app_tsx.contains("contextEnabledSwitch"));
     assert!(!app_tsx.contains("entry.enabled ? \"已启用\" : \"已禁用\""));
     assert!(!app_tsx.contains("空配置体"));
@@ -292,12 +320,18 @@ fn manager_window_and_relay_detail_header_stay_usable() {
     let tauri_conf =
         std::fs::read_to_string(manifest_dir.join("tauri.conf.json")).expect("read tauri config");
 
-    assert!(app_tsx.contains("relay-detail-sticky"));
+    // 供应商详情的头部要始终可见、正文自己滚动。
+    //
+    // cb3c7fa 把原来的 .relay-detail-sticky（position: sticky）重构成了 flex 布局：
+    // 头部 flex-shrink: 0 不被压缩，正文 flex: 1 + overflow-y: auto 吃掉剩余空间。
+    // 效果一样且比 sticky 可靠，但当时守卫测试没跟着改，CI 一直红着。
+    // 这里改成断言真正保证该行为的属性，而不是已经废弃的实现细节。
+    assert!(app_tsx.contains("relay-detail-header"));
     assert!(!app_tsx.contains("CardHead title=\"供应商详情\""));
-    assert!(styles.contains(".relay-detail-sticky"));
-    assert!(styles.contains("position: sticky"));
-    assert!(styles.contains("top: 0"));
-    assert!(styles.contains("margin: 0"));
+    assert!(styles.contains(".relay-detail-header"));
+    assert!(styles.contains(".relay-detail-body"));
+    assert!(styles.contains("flex-shrink: 0"));
+    assert!(styles.contains("overflow-y: auto"));
     assert!(lib_rs.contains(".inner_size(1180.0, 820.0)"));
     assert!(lib_rs.contains(".min_inner_size(960.0, 720.0)"));
     assert!(tauri_conf.contains("\"width\": 1180"));
@@ -326,7 +360,7 @@ fn provider_presets_include_runapi() {
     assert!(presets.contains("id: \"runapi\""));
     assert!(presets.contains("name: \"RunAPI\""));
     assert!(presets.contains("category: \"aggregator\""));
-    assert!(presets.contains("baseUrl: \"https://runapi.co/v1\""));
+    assert!(presets.contains("baseUrl: \"https://runapi.host/v1\""));
 }
 
 #[test]
@@ -364,6 +398,8 @@ fn manager_update_install_keeps_visible_progress_bar() {
     assert!(app_tsx.contains("安装包更新进度"));
     assert!(app_tsx.contains("completedTitle={t(\"上次更新结果\")}"));
     assert!(app_tsx.contains("progress={updateInstallProgress}"));
+    assert!(app_tsx.contains("current.percent + 0.2"));
+    assert!(app_tsx.contains("下载或启动耗时较长"));
 }
 
 #[test]

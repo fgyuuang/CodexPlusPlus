@@ -57,6 +57,7 @@ pub async fn read_codex_model_catalog() -> Value {
                 "status": "failed",
                 "path": home.join("config.toml").to_string_lossy(),
                 "message": error.to_string(),
+                "service_tier": config_service_tier_value(&home),
                 "model": "",
                 "model_provider": "",
                 "provider_name": "",
@@ -78,6 +79,7 @@ fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) ->
     }
     let models = relay_profile_model_ids(&profile);
     let model = profile.model.trim().to_string();
+    let codex_model_provider = codex_model_provider_for_relay_profile(home, &profile);
     let default_model = models.first().cloned().unwrap_or_default();
     let provider_name = if profile.name.trim().is_empty() {
         profile.id.trim()
@@ -89,8 +91,10 @@ fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) ->
     json!({
         "status": if models.is_empty() { "not_configured" } else { "ok" },
         "path": home.join("config.toml").to_string_lossy(),
+        "service_tier": config_service_tier_value(home),
         "model": model,
         "model_provider": profile.id.trim(),
+        "codex_model_provider": codex_model_provider,
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,
@@ -108,6 +112,20 @@ fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) ->
         ],
         "responses_api": responses_api_status("unknown", "", "")
     })
+}
+
+pub fn codex_model_provider_for_relay_profile(home: &Path, profile: &RelayProfile) -> String {
+    let profile_config = parse_codex_config(&profile.config_contents);
+    let profile_provider = string_value(profile_config.root.get("model_provider"));
+    if !profile_provider.is_empty() {
+        return profile_provider;
+    }
+
+    let (live_config, _, error) = load_codex_config(&home.join("config.toml"));
+    if error.is_some() {
+        return String::new();
+    }
+    string_value(live_config.root.get("model_provider"))
 }
 
 fn relay_profile_model_ids(profile: &RelayProfile) -> Vec<String> {
@@ -212,19 +230,87 @@ fn aggregate_relay_model_catalog_value(
             labels.push(label);
         }
     }
+    let official_auth_first = settings.active_relay_uses_official_login_auth();
     let display_suffixes = display_labels
         .iter()
-        .map(|(model, labels)| (model.clone(), format!("({})", labels.join("|"))))
+        .map(|(model, labels)| {
+            let providers = labels.join("|");
+            let suffix = format!("({providers})");
+            (model.clone(), suffix)
+        })
         .collect::<HashMap<_, _>>();
 
+    let aggregate_models = crate::aggregate_model_alias::aggregate_catalog_model_list(
+        aggregate,
+        &member_profiles,
+        &aliases,
+    );
+    let aggregate_provider_models = aggregate_models
+        .iter()
+        .filter(|model| model.contains(':'))
+        .cloned()
+        .collect::<Vec<_>>();
+    let aggregate_official_models = aggregate_models
+        .iter()
+        .filter(|model| {
+            !model.contains(':')
+                && !model.contains('(')
+                && crate::aggregate_model_alias::looks_like_codex_model_key(model)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let official_models = if official_auth_first {
+        crate::aggregate_model_alias::TRUSTED_OFFICIAL_CODEX_MODELS
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect::<Vec<_>>()
+    } else {
+        aggregate_official_models.clone()
+    };
+    let dedicated_cli_models = official_auth_first
+        .then(|| {
+            crate::aggregate_model_alias::cliproxy_official_api_aliases(&settings.relay_profiles)
+        })
+        .unwrap_or_default();
+    let general_cli_models = crate::aggregate_model_alias::cliproxy_general_api_aliases(
+        &settings.relay_profiles,
+        !dedicated_cli_models.is_empty(),
+    );
     let mut models = Vec::new();
+    let mut seen_models = HashSet::new();
+    for model in official_models {
+        if seen_models.insert(model.clone()) {
+            models.push(model);
+        }
+    }
+    for alias in &dedicated_cli_models {
+        if seen_models.insert(alias.alias.clone()) {
+            models.push(alias.alias.clone());
+        }
+    }
+    if official_auth_first {
+        for display_model in crate::aggregate_model_alias::aggregate_replacement_model_aliases(
+            aggregate,
+            &member_profiles,
+        ) {
+            if seen_models.insert(display_model.clone()) {
+                models.push(display_model);
+            }
+        }
+    }
+    for alias in &general_cli_models {
+        if seen_models.insert(alias.alias.clone()) {
+            models.push(alias.alias.clone());
+        }
+    }
+    for model in aggregate_provider_models {
+        if seen_models.insert(model.clone()) {
+            models.push(model);
+        }
+    }
     let mut model_details = Vec::new();
-    let mut seen = HashSet::new();
     for alias in &aliases {
         let model = alias.alias.clone();
-        if seen.insert(model.clone()) {
-            models.push(model.clone());
-        }
         model_details.push(json!({
             "model": model,
             "raw_model": alias.target_model,
@@ -234,13 +320,41 @@ fn aggregate_relay_model_catalog_value(
             "via_mapping": alias.via_mapping
         }));
     }
+    for alias in &dedicated_cli_models {
+        model_details.push(json!({
+            "model": alias.alias,
+            "raw_model": alias.target_model,
+            "mapping_key": alias.alias,
+            "provider_id": alias.relay_id,
+            "provider_name": crate::aggregate_model_alias::CLIPROXY_OFFICIAL_PROVIDER_LABEL,
+            "via_mapping": true,
+            "dedicated": true
+        }));
+    }
+    for alias in &general_cli_models {
+        model_details.push(json!({
+            "model": alias.alias,
+            "raw_model": alias.target_model,
+            "mapping_key": alias.alias,
+            "provider_id": alias.relay_id,
+            "provider_name": crate::aggregate_model_alias::CLIPROXY_OFFICIAL_PROVIDER_LABEL,
+            "via_mapping": true,
+            "dedicated": true
+        }));
+    }
 
     let profile_model = profile.model.trim();
     let normalized_profile_model =
         crate::aggregate_model_alias::normalize_requested_model_name(profile_model);
-    let default_model = if models.iter().any(|item| item == &normalized_profile_model) {
+    let has_official_models = models
+        .iter()
+        .any(|item| crate::aggregate_model_alias::is_trusted_official_codex_model(item));
+    let default_model = if has_official_models
+        && crate::aggregate_model_alias::looks_like_codex_model_key(&normalized_profile_model)
+        && models.iter().any(|item| item == &normalized_profile_model)
+    {
         normalized_profile_model
-    } else if models.iter().any(|item| item == profile_model) {
+    } else if !has_official_models && models.iter().any(|item| item == profile_model) {
         profile_model.to_string()
     } else {
         models.first().cloned().unwrap_or_default()
@@ -250,7 +364,54 @@ fn aggregate_relay_model_catalog_value(
     } else {
         profile.name.trim()
     };
-    let model_metadata = aggregate_model_ui_metadata_map(&aliases, &display_suffixes);
+    let mut model_metadata = aggregate_model_ui_metadata_map(&aliases, &HashMap::new());
+    if let Some(metadata) = model_metadata.as_object_mut() {
+        for alias in dedicated_cli_models.iter().chain(general_cli_models.iter()) {
+            let base_model =
+                crate::aggregate_model_alias::cliproxy_official_model_name(&alias.target_model)
+                    .unwrap_or(alias.target_model.trim());
+            let Some(mut value) = crate::model_suffix::model_ui_metadata(base_model)
+                .and_then(|value| value.as_object().cloned())
+            else {
+                continue;
+            };
+            value.insert(
+                "displayName".to_string(),
+                Value::String(alias.alias.clone()),
+            );
+            value.remove("displaySuffix");
+            metadata.insert(alias.alias.clone(), Value::Object(value));
+        }
+    }
+    if official_auth_first {
+        let trusted_official_models = crate::aggregate_model_alias::TRUSTED_OFFICIAL_CODEX_MODELS
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect::<Vec<_>>();
+        if let Some(metadata) = model_ui_metadata_map(&trusted_official_models).as_object() {
+            if let Some(target) = model_metadata.as_object_mut() {
+                for (model, value) in metadata {
+                    target.entry(model.clone()).or_insert(value.clone());
+                }
+            }
+        }
+        if let Some(target) = model_metadata.as_object_mut() {
+            for (model, suffix) in &display_suffixes {
+                let display_model = format!("{model}{suffix}");
+                let mut value = target
+                    .get(model)
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                value.insert(
+                    "displayName".to_string(),
+                    Value::String(display_model.clone()),
+                );
+                value.remove("displaySuffix");
+                target.insert(display_model, Value::Object(value));
+            }
+        }
+    }
 
     json!({
         "status": if models.is_empty() { "not_configured" } else { "ok" },
@@ -302,6 +463,7 @@ pub async fn read_codex_model_catalog_from_home(
             "status": "failed",
             "path": config_path.to_string_lossy(),
             "message": error,
+            "service_tier": service_tier_value(&effective),
             "model": model,
             "model_provider": model_provider,
             "provider_name": provider_name,
@@ -366,6 +528,7 @@ pub async fn read_codex_model_catalog_from_home(
     json!({
         "status": status,
         "path": config_path.to_string_lossy(),
+        "service_tier": service_tier_value(&effective),
         "model": model,
         "model_provider": model_provider,
         "provider_name": provider_name,
@@ -379,6 +542,21 @@ pub async fn read_codex_model_catalog_from_home(
 
 fn codex_home_dir() -> PathBuf {
     crate::codex_home::default_codex_home_dir()
+}
+
+// 读取 config.toml（含 profile 覆盖）里生效的 service_tier；未配置时返回 null。
+fn service_tier_value(effective: &HashMap<String, String>) -> Value {
+    let tier = string_value(effective.get("service_tier"));
+    if tier.is_empty() {
+        Value::Null
+    } else {
+        Value::String(tier)
+    }
+}
+
+fn config_service_tier_value(home: &Path) -> Value {
+    let (_, effective, _) = load_codex_config(&home.join("config.toml"));
+    service_tier_value(&effective)
 }
 
 fn load_codex_config(path: &Path) -> (CodexConfig, HashMap<String, String>, Option<String>) {

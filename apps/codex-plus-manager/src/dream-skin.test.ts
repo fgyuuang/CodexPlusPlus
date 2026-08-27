@@ -96,8 +96,99 @@ describe("dream skin theme helpers", () => {
     assert.match(renderer, /codex-dream-skin-companion/);
     assert.match(renderer, /theme\.companion/);
     assert.match(renderer, /\.composer-footer/);
+    assert.match(renderer, /\.composer-surface-chrome/);
     assert.match(renderer, /data:image\/(?:png|jpeg|webp|gif);base64/);
     assert.match(renderer, /removeDreamSkinCompanion/);
+    assert.match(renderer, /ensureDreamSkinCompanion\(\s*window\.__CODEX_PLUS_DREAM_SKIN_THEME__/);
+  });
+
+  it("aligns tall companion images by rendered height with a wider vertical offset range", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+
+    assert.match(renderer, /companion\.naturalWidth/);
+    assert.match(renderer, /companion\.naturalHeight/);
+    assert.match(renderer, /composer\.rect\.bottom - renderedHeight \+ config\.offsetY/);
+    assert.match(renderer, /window\.innerHeight - renderedHeight - edge/);
+    assert.match(renderer, /const offsetY = Math\.max\(-160, Math\.min\(Number\(companion\.offsetY\) \|\| 0, 160\)\)/);
+    assert.match(app, /min=\{-160\}/);
+    assert.match(app, /max=\{160\}/);
+    assert.match(app, /Math\.max\(-160, Math\.min\(160, Number\(event\.currentTarget\.value\) \|\| 0\)\)/);
+  });
+
+  it("keeps the Windows skin active when the sidebar is hidden", async () => {
+    const renderer = await readFile(
+      new URL("../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js", import.meta.url),
+      "utf8",
+    );
+    const compatibility = await readFile(
+      new URL("../../../assets/inject/renderer-inject.js", import.meta.url),
+      "utf8",
+    );
+    const assets = await readFile(
+      new URL("../../../crates/codex-plus-core/src/assets.rs", import.meta.url),
+      "utf8",
+    );
+
+    assert.match(renderer, /const ensureShellMain = \(\) =>/);
+    assert.match(renderer, /main\[class\*="MainContentSurface"\]/);
+    assert.match(renderer, /data-codex-plus-dream-surface/);
+    assert.doesNotMatch(renderer, /!shellMain\s*\|\|\s*!shellSidebar/);
+    assert.match(compatibility, /main\[class\*="_MainContentSurface_"\]/);
+    assert.match(compatibility, /shellMain\.classList\.add\("main-surface"\)/);
+    assert.match(compatibility, /data-codex-plus-dream-skin-main-surface/);
+    assert.match(compatibility, /clearDreamSkinMainSurfaceCompatibility\(\)/);
+    assert.match(assets, /DREAM_SKIN_RENDERER_REVISION: &str = "20-modern-main-surface"/);
+  });
+
+  it("extends the Windows wallpaper treatment to right and bottom dock panels", async () => {
+    const renderer = await readFile(
+      new URL("../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js", import.meta.url),
+      "utf8",
+    );
+    const css = await readFile(
+      new URL("../../../assets/inject/upstream/dream-skin/windows/dream-skin.css", import.meta.url),
+      "utf8",
+    );
+
+    assert.match(renderer, /\[data-app-shell-tabs="true"\]/);
+    assert.match(renderer, /dream-aux-panel-layer/);
+    assert.match(renderer, /dream-aux-panel-right/);
+    assert.match(renderer, /dream-aux-panel-bottom/);
+    assert.match(renderer, /clearAuxiliaryPanelClasses/);
+    assert.match(css, /\.dream-aux-panel-layer/);
+    assert.match(css, /\.dream-aux-panel-right/);
+    assert.match(css, /\.dream-aux-panel-bottom/);
+    assert.match(css, /\[data-codex-terminal="true"\]/);
+  });
+
+  it("keeps transient new-chat drafts on native geometry", async () => {
+    const renderer = await readFile(
+      new URL("../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js", import.meta.url),
+      "utf8",
+    );
+    const css = await readFile(
+      new URL("../../../assets/inject/upstream/dream-skin/windows/dream-skin.css", import.meta.url),
+      "utf8",
+    );
+
+    assert.match(renderer, /homeHasClassicChrome/);
+    assert.match(renderer, /data-dream-home-layout/);
+    assert.match(renderer, /data-dream-home-layout.*soft/);
+    assert.match(css, /data-dream-home-layout.*structured/);
+    assert.match(css, /overflow-y: auto !important/);
+    assert.match(css, /\.composer-surface-chrome/);
+  });
+
+  it("exposes companion image controls in the theme editor", async () => {
+    const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+
+    assert.match(app, /dream-skin-companion-controls/);
+    assert.match(app, /FileReader/);
+    assert.match(app, /companion\.dataUrl/);
+    assert.match(app, /companion\?\.offsetX/);
+    assert.match(app, /companion\?\.offsetY/);
+    assert.match(app, /companionEnabled/);
   });
 
   it("detects text, color, and image draft changes", () => {

@@ -2,11 +2,12 @@
 
 use anyhow::{Context, Result};
 use codex_plus_core::launcher::{
-    DefaultLaunchHooks, LaunchHooks, LaunchOptions, launch_and_inject_with_hooks,
+    BridgeReinjector, DefaultLaunchHooks, LaunchHooks, LaunchOptions, launch_and_inject_with_hooks,
 };
 use codex_plus_core::models::{DeleteResult, ExportResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
 use codex_plus_core::settings::SettingsStore;
+use codex_plus_core::status::LaunchStatus;
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ struct LauncherHooks {
     core: Arc<DefaultLaunchHooks>,
     data: Arc<LauncherDataService>,
     runtime: Arc<LauncherRuntimeService>,
+    bridge_context: Arc<Mutex<Option<BridgeContext>>>,
 }
 
 impl Default for LauncherHooks {
@@ -28,7 +30,18 @@ impl Default for LauncherHooks {
                 9229,
                 default_user_script_manager(),
             )),
+            bridge_context: Arc::new(Mutex::new(None)),
         }
+    }
+}
+
+impl LauncherHooks {
+    fn watchdog_bridge_context(&self) -> anyhow::Result<BridgeContext> {
+        self.bridge_context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("bridge context lock poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("bridge context is not initialized"))
     }
 }
 
@@ -37,6 +50,31 @@ async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
     let options = parse_launch_options(args.iter());
+    if let Err(error) = launcher_main(args, helper_only, options.clone()).await {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.failed",
+            json!({
+                "message": error.to_string()
+            }),
+        );
+        if !helper_only {
+            let _ = options.status_store.save_latest(&LaunchStatus {
+                status: "failed".to_string(),
+                message: error.to_string(),
+                started_at_ms: current_timestamp_ms(),
+                debug_port: Some(options.debug_port),
+                helper_port: Some(options.helper_port),
+                codex_app: options
+                    .app_dir
+                    .map(|path| path.to_string_lossy().to_string()),
+            });
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOptions) -> Result<()> {
     if helper_only {
         let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
@@ -45,7 +83,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
-        activate_existing_codex_app(&options).await?;
+        let helper_port = activate_existing_codex_app(&options).await?;
+        options.status_store.save_latest(&LaunchStatus {
+            status: "running".to_string(),
+            message: "Existing Codex instance activated".to_string(),
+            started_at_ms: current_timestamp_ms(),
+            debug_port: Some(options.debug_port),
+            helper_port: Some(helper_port),
+            codex_app: options
+                .app_dir
+                .map(|path| path.to_string_lossy().to_string()),
+        })?;
         return Ok(());
     };
     tokio::spawn(async {
@@ -55,6 +103,13 @@ async fn main() -> Result<()> {
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
     Ok(())
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn acquire_single_instance_guard(
@@ -132,45 +187,183 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
     recover
 }
 
-async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
+fn helper_port_from_running_status(options: &LaunchOptions) -> Option<u16> {
+    let status = options.status_store.load_latest().ok().flatten()?;
+    if status.debug_port != Some(options.debug_port)
+        || !matches!(status.status.as_str(), "running" | "running_degraded")
+    {
+        return None;
+    }
+    status.helper_port.filter(|port| *port != 0)
+}
+
+async fn helper_runtime_available(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await;
+    let Ok(Ok(mut stream)) = connect else {
+        return false;
+    };
+    if stream
+        .write_all(b"GET /backend/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = [0u8; 256];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.read(&mut response),
+    )
+    .await;
+    matches!(read, Ok(Ok(size)) if String::from_utf8_lossy(&response[..size]).starts_with("HTTP/1.1 200 OK"))
+}
+
+fn helper_port_candidates(
+    fixed: bool,
+    status_port: Option<u16>,
+    requested: u16,
+    fallback: u16,
+) -> Vec<u16> {
+    let mut candidates = Vec::new();
+    if let Some(port) = status_port {
+        candidates.push(port);
+    }
+    if !candidates.contains(&requested) {
+        candidates.push(requested);
+    }
+    if !candidates.contains(&fallback) {
+        candidates.push(fallback);
+    }
+    if fixed {
+        vec![codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT]
+    } else {
+        candidates
+    }
+}
+
+async fn select_existing_helper_port(
+    options: &LaunchOptions,
+    settings: &codex_plus_core::settings::BackendSettings,
+    hooks: &LauncherHooks,
+) -> (u16, bool) {
+    let fixed = codex_plus_core::launcher::helper_port_requires_fixed_binding(settings);
+    let status_port = helper_port_from_running_status(options).filter(|port| {
+        !fixed || *port == codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    });
+    let fallback = if fixed {
+        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    } else {
+        hooks.select_helper_port(options.helper_port)
+    };
+    let requested = if fixed {
+        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    } else {
+        options.helper_port
+    };
+    for port in helper_port_candidates(fixed, status_port, requested, fallback) {
+        if helper_runtime_available(port).await {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.existing_helper_reused",
+                json!({
+                    "helper_port": port,
+                    "fixed_binding": fixed,
+                    "source": if Some(port) == status_port { "latest_status" } else { "probe" }
+                }),
+            );
+            return (port, false);
+        }
+    }
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "launcher.existing_helper_not_available",
+        json!({
+            "helper_port": fallback,
+            "fixed_binding": fixed,
+            "status_helper_port": status_port
+        }),
+    );
+    (fallback, true)
+}
+
+async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<u16> {
     let hooks = LauncherHooks::default();
     let settings = hooks.load_settings().await?;
+    let helper_needed = settings.enhancements_enabled
+        || codex_plus_core::launcher::helper_port_requires_fixed_binding(&settings);
+    let (helper_port, helper_started) = if helper_needed {
+        select_existing_helper_port(options, &settings, &hooks).await
+    } else {
+        (options.helper_port, false)
+    };
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
-    let launch_result = hooks
+    let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
+    let blocking_process_ids = if has_pending_recovery {
+        codex_plus_core::watcher::find_session_index_cleanup_blocking_processes()
+    } else {
+        Vec::new()
+    };
+    if should_finalize_pending_remote_control_recovery(has_pending_recovery, &blocking_process_ids)
+    {
+        hooks.run_remote_control_session_recovery().await?;
+    } else if has_pending_recovery {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.remote_control_session_finalization_deferred_existing_app",
+            json!({"blocking_process_ids": blocking_process_ids}),
+        );
+    }
+    if helper_started {
+        hooks.start_helper(helper_port).await?;
+    }
+    let launch = match hooks
         .launch_codex(
             &app_dir,
             options.debug_port,
             &settings,
             &settings.codex_extra_args,
         )
-        .await;
-    if settings.enhancements_enabled {
-        hooks.start_helper(options.helper_port).await?;
-    }
-    let process_ids = codex_plus_core::watcher::find_codex_processes();
-    let mut activated = false;
-    #[cfg(windows)]
+        .await
     {
-        for process_id in &process_ids {
-            if codex_plus_core::windows_activate_process_window(*process_id) {
-                activated = true;
-                break;
+        Ok(launch) => launch,
+        Err(error) => {
+            if helper_started {
+                hooks.shutdown_helper(helper_port).await;
             }
+            return Err(error);
         }
-    }
+    };
+    let process_ids = codex_plus_core::watcher::find_codex_processes();
+    #[cfg(windows)]
+    let activated = process_ids
+        .iter()
+        .copied()
+        .any(codex_plus_core::windows_activate_process_window);
+    #[cfg(not(windows))]
+    let activated = false;
     let injection_ready = if settings.enhancements_enabled {
         hooks
-            .ensure_injection(options.debug_port, options.helper_port, &app_dir)
+            .ensure_injection(options.debug_port, helper_port, &app_dir)
             .await
     } else {
         false
     };
     if injection_ready {
-        hooks
-            .start_bridge_watchdog(options.debug_port, options.helper_port)
-            .await?;
+        if helper_started {
+            hooks
+                .start_bridge_watchdog(options.debug_port, helper_port)
+                .await?;
+        }
         hooks.write_status("running").await;
     } else if settings.enhancements_enabled {
+        if helper_started {
+            hooks
+                .start_bridge_watchdog(options.debug_port, helper_port)
+                .await?;
+        }
         hooks.write_status("running_degraded").await;
     }
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -178,15 +371,29 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         json!({
             "app_dir": app_dir.to_string_lossy(),
             "debug_port": options.debug_port,
-            "helper_port": options.helper_port,
+            "helper_port": helper_port,
+            "requested_helper_port": options.helper_port,
             "process_ids": process_ids,
             "activated": activated,
             "injection_ready": injection_ready,
-            "launch_ok": launch_result.is_ok(),
-            "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
+            "helper_started": helper_started,
+            "launch_ok": true,
         }),
     );
-    launch_result.map(|_| ())
+    if helper_started {
+        hooks
+            .wait_for_codex_exit(&launch, options.debug_port)
+            .await?;
+        hooks.shutdown_helper(helper_port).await;
+    }
+    Ok(helper_port)
+}
+
+fn should_finalize_pending_remote_control_recovery(
+    has_pending_recovery: bool,
+    blocking_process_ids: &[u32],
+) -> bool {
+    has_pending_recovery && blocking_process_ids.is_empty()
 }
 
 fn log_launcher_already_running(debug_port: u16) {
@@ -277,6 +484,10 @@ impl LaunchHooks for LauncherHooks {
         self.core.load_settings().await
     }
 
+    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
+        self.core.cleanup_unsupported_config()
+    }
+
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
         let settings = SettingsStore::default().load().unwrap_or_default();
         let target_provider = codex_plus_data::provider_sync_target_for_settings(&settings);
@@ -288,18 +499,150 @@ impl LaunchHooks for LauncherHooks {
         Ok(())
     }
 
+    fn has_pending_remote_control_session_recoveries(&self) -> bool {
+        codex_plus_core::paths::default_pending_remote_control_recovery_path().exists()
+    }
+
+    fn remote_control_session_recovery_is_safe_to_run(&self) -> bool {
+        codex_plus_core::watcher::find_session_index_cleanup_blocking_processes().is_empty()
+    }
+
+    async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
+        let outcomes = tokio::task::spawn_blocking(|| {
+            let requests = codex_plus_core::remote_control_recovery::load_pending_remote_control_recoveries(None)?;
+            let settings = codex_plus_core::settings::SettingsStore::default()
+                .load()?;
+            let mut outcomes = Vec::with_capacity(requests.len());
+            for request in requests {
+                let current_profile = settings
+                    .relay_profiles
+                    .iter()
+                    .find(|profile| profile.id == request.profile_id);
+                if remote_control_recovery_is_superseded_by_openai(&settings, &request) {
+                    let completion_error =
+                        codex_plus_core::remote_control_recovery::complete_pending_remote_control_recovery(
+                            None,
+                            &request.thread_id,
+                        )
+                        .err()
+                        .map(|error| error.to_string());
+                    let completed = completion_error.is_none();
+                    outcomes.push((
+                        request,
+                        codex_plus_data::ProviderSyncResult {
+                            status: if completed {
+                                codex_plus_data::ProviderSyncStatus::Synced
+                            } else {
+                                codex_plus_data::ProviderSyncStatus::Skipped
+                            },
+                            message: if completed {
+                                "Remote Control session finalization discarded after switching to OpenAI session identity".to_string()
+                            } else {
+                                "Remote Control session finalization could not discard the superseded recovery request".to_string()
+                            },
+                            target_provider: "openai".to_string(),
+                            backup_dir: None,
+                            changed_session_files: 0,
+                            sqlite_rows_updated: 0,
+                            sqlite_provider_rows_updated: 0,
+                            sqlite_user_event_rows_updated: 0,
+                            sqlite_cwd_rows_updated: 0,
+                            sqlite_catalog_rows_inserted: 0,
+                            sqlite_catalog_rows_removed: 0,
+                            updated_workspace_roots: 0,
+                            skipped_locked_rollout_files: Vec::new(),
+                            encrypted_content_warning: None,
+                            repair_audit: codex_plus_data::ProviderSyncAudit::default(),
+                        },
+                        completion_error,
+                    ));
+                    continue;
+                }
+                let request_is_current = settings.active_relay_id == request.profile_id
+                    && current_profile.is_some_and(|profile| {
+                    codex_plus_core::remote_control_recovery::config_generation(
+                        profile,
+                        &request.target_provider,
+                    ) == request.config_generation
+                });
+                if !request_is_current {
+                    outcomes.push((
+                        request,
+                        codex_plus_data::ProviderSyncResult {
+                            status: codex_plus_data::ProviderSyncStatus::Skipped,
+                            message: "Remote Control session finalization deferred after relay profile changed".to_string(),
+                            target_provider: String::new(),
+                            backup_dir: None,
+                            changed_session_files: 0,
+                            sqlite_rows_updated: 0,
+                            sqlite_provider_rows_updated: 0,
+                            sqlite_user_event_rows_updated: 0,
+                            sqlite_cwd_rows_updated: 0,
+                            sqlite_catalog_rows_inserted: 0,
+                            sqlite_catalog_rows_removed: 0,
+                            updated_workspace_roots: 0,
+                            skipped_locked_rollout_files: Vec::new(),
+                            encrypted_content_warning: None,
+                            repair_audit: codex_plus_data::ProviderSyncAudit::default(),
+                        },
+                        None,
+                    ));
+                    continue;
+                }
+                let result = codex_plus_data::run_remote_control_session_finalization_for_thread_with_target(
+                    None,
+                    &request.thread_id,
+                    &request.target_provider,
+                );
+                let completed = result.status == codex_plus_data::ProviderSyncStatus::Synced;
+                let completion_error = if completed {
+                    codex_plus_core::remote_control_recovery::complete_pending_remote_control_recovery(
+                        None,
+                        &request.thread_id,
+                    )
+                    .err()
+                    .map(|error| error.to_string())
+                } else {
+                    None
+                };
+                outcomes.push((request, result, completion_error));
+            }
+            Ok::<_, anyhow::Error>(outcomes)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("Remote Control session recovery task failed: {error}"))?;
+        match outcomes {
+            Ok(outcomes) => {
+                for (request, result, completion_error) in outcomes {
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "launcher.remote_control_session_finalization",
+                        json!({
+                            "thread_id": request.thread_id,
+                            "profile_id": request.profile_id,
+                            "target_provider": request.target_provider,
+                            "config_generation": request.config_generation,
+                            "status": result.status,
+                            "message": result.message,
+                            "completion_error": completion_error
+                        }),
+                    );
+                }
+            }
+            Err(error) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "launcher.remote_control_session_finalization_failed_nonfatal",
+                    json!({"message": error.to_string()}),
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_active_relay_profile(
         &self,
         settings: &codex_plus_core::settings::BackendSettings,
     ) -> anyhow::Result<()> {
         self.core.apply_active_relay_profile(settings).await
-    }
-
-    async fn ensure_computer_use_config(
-        &self,
-        settings: &codex_plus_core::settings::BackendSettings,
-    ) -> anyhow::Result<()> {
-        self.core.ensure_computer_use_config(settings).await
     }
 
     async fn ensure_plugin_marketplace_config(
@@ -331,11 +674,16 @@ impl LaunchHooks for LauncherHooks {
         app_dir: &Path,
     ) -> anyhow::Result<Option<BridgeContext>> {
         self.runtime.set_debug_port(debug_port);
-        Ok(Some(BridgeContext::core_with_data_and_app_dir(
+        let ctx = BridgeContext::core_with_data_and_app_dir(
             self.runtime.clone(),
             self.data.clone(),
             app_dir.to_path_buf(),
-        )))
+        );
+        *self
+            .bridge_context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("bridge context lock poisoned"))? = Some(ctx.clone());
+        Ok(Some(ctx))
     }
 
     async fn inject_bridge(
@@ -352,16 +700,19 @@ impl LaunchHooks for LauncherHooks {
     }
 
     async fn start_bridge_watchdog(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
+        let ctx = self.watchdog_bridge_context()?;
+        let runtime = self.runtime.clone();
+        let reinjector: BridgeReinjector = Arc::new(move || {
+            let ctx = ctx.clone();
+            let runtime = runtime.clone();
+            Box::pin(
+                async move { inject_with_context(debug_port, helper_port, ctx, runtime).await },
+            )
+        });
+        self.core.set_bridge_reinjector(reinjector).await;
         self.core
             .start_bridge_watchdog(debug_port, helper_port)
             .await
-    }
-
-    async fn start_computer_use_guard_watchdog(
-        &self,
-        settings: &codex_plus_core::settings::BackendSettings,
-    ) -> anyhow::Result<()> {
-        self.core.start_computer_use_guard_watchdog(settings).await
     }
 
     async fn write_status(&self, status: &str) {
@@ -371,8 +722,9 @@ impl LaunchHooks for LauncherHooks {
     async fn wait_for_codex_exit(
         &self,
         launch: &codex_plus_core::launcher::CodexLaunch,
+        debug_port: u16,
     ) -> anyhow::Result<()> {
-        self.core.wait_for_codex_exit(launch).await
+        self.core.wait_for_codex_exit(launch, debug_port).await
     }
 
     async fn shutdown_helper(&self, helper_port: u16) {
@@ -405,7 +757,12 @@ impl BridgeDataService for LauncherDataService {
         let db_paths = self.candidate_db_paths();
         let backup_store = codex_plus_data::BackupStore::new(self.backup_dir.clone());
         tokio::task::spawn_blocking(move || {
-            codex_plus_data::delete_local_from_paths(db_paths, backup_store, &session)
+            codex_plus_data::delete_local_from_paths(
+                db_paths,
+                backup_store,
+                &session,
+                Some(&codex_plus_core::codex_sqlite::default_codex_home_dir()),
+            )
         })
         .await
         .map_err(|error| anyhow::anyhow!("delete task failed: {error}"))
@@ -444,37 +801,80 @@ impl BridgeDataService for LauncherDataService {
             .map_err(|error| anyhow::anyhow!("archived lookup task failed: {error}"))
     }
 
-    async fn move_thread_workspace(
-        &self,
-        session: SessionRef,
-        target_cwd: String,
-    ) -> anyhow::Result<Value> {
-        let db_paths = self.candidate_db_paths();
-        let backup_store = codex_plus_data::BackupStore::new(self.backup_dir.clone());
-        tokio::task::spawn_blocking(move || {
-            codex_plus_data::move_codex_thread_workspace_from_paths(
-                db_paths,
-                backup_store,
-                &session,
-                &target_cwd,
+    async fn recover_remote_control_session(&self, thread_id: String) -> anyhow::Result<Value> {
+        let settings = codex_plus_core::settings::SettingsStore::default()
+            .load()
+            .unwrap_or_default();
+        let profile = settings.active_relay_profile();
+        if !settings.relay_profiles_enabled
+            || profile.relay_mode != codex_plus_core::settings::RelayMode::Official
+            || !profile.official_mix_api_key
+        {
+            return Ok(json!({
+                "status": "skipped",
+                "message": "Remote Control session recovery is disabled for the active profile"
+            }));
+        }
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        let target_provider =
+            codex_plus_core::model_catalog::codex_model_provider_for_relay_profile(&home, &profile);
+        if target_provider.trim().is_empty() || target_provider == "openai" {
+            return Ok(json!({
+                "status": "skipped",
+                "message": "Remote Control session recovery requires a non-openai target provider"
+            }));
+        }
+        let candidate_thread_id = thread_id.clone();
+        let candidate = tokio::task::spawn_blocking(move || {
+            codex_plus_data::remote_control_session_recovery_candidate_exists(
+                None,
+                &candidate_thread_id,
             )
         })
         .await
-        .map_err(|error| anyhow::anyhow!("move thread workspace task failed: {error}"))
+        .map_err(|error| anyhow::anyhow!("Remote Control candidate check failed: {error}"))??;
+        if !candidate {
+            return Ok(json!({
+                "status": "skipped",
+                "message": "Remote Control session recovery is waiting for a recent openai thread"
+            }));
+        }
+        let request = codex_plus_core::remote_control_recovery::PendingRemoteControlRecovery {
+            thread_id: thread_id.clone(),
+            profile_id: profile.id.clone(),
+            target_provider: target_provider.clone(),
+            config_generation: codex_plus_core::remote_control_recovery::config_generation(
+                &profile,
+                &target_provider,
+            ),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+        };
+        codex_plus_core::remote_control_recovery::enqueue_pending_remote_control_recovery(
+            None, request,
+        )?;
+        tokio::task::spawn_blocking(move || {
+            serde_json::to_value(
+                codex_plus_data::run_remote_control_session_catalog_recovery_for_thread_with_target(
+                    None,
+                    &thread_id,
+                    &target_provider,
+                ),
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("Remote Control session recovery task failed: {error}"))?
     }
 
-    async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value> {
-        let adapter = self.storage_adapter();
-        tokio::task::spawn_blocking(move || adapter.codex_thread_sort_key(&session))
-            .await
-            .map_err(|error| anyhow::anyhow!("thread sort key task failed: {error}"))
+    async fn export_session_file(&self, session: SessionRef) -> anyhow::Result<Value> {
+        LauncherDataService::export_session_file(self, session).await
     }
 
-    async fn thread_sort_keys(&self, sessions: Vec<SessionRef>) -> anyhow::Result<Value> {
-        let adapter = self.storage_adapter();
-        tokio::task::spawn_blocking(move || adapter.codex_thread_sort_keys(&sessions))
-            .await
-            .map_err(|error| anyhow::anyhow!("thread sort keys task failed: {error}"))
+    async fn import_session_file(&self, payload: Value) -> anyhow::Result<Value> {
+        LauncherDataService::import_session_file(self, payload).await
     }
 }
 
@@ -498,6 +898,25 @@ impl LauncherDataService {
             codex_plus_data::BackupStore::new(self.backup_dir.clone()),
         )
         .with_allowed_db_paths(allowed_db_paths)
+        .with_codex_home(codex_plus_core::codex_sqlite::default_codex_home_dir())
+    }
+
+    async fn export_session_file(&self, session: SessionRef) -> anyhow::Result<Value> {
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_core::session_share::export_rollout(&home, &session.session_id)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("session export task failed: {error}"))?
+    }
+
+    async fn import_session_file(&self, payload: Value) -> anyhow::Result<Value> {
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_core::session_share::import_rollout(&home, &payload)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("session import task failed: {error}"))?
     }
 }
 
@@ -529,6 +948,14 @@ impl LauncherRuntimeService {
 impl BridgeRuntimeService for LauncherRuntimeService {
     async fn user_script_inventory(&self) -> anyhow::Result<Value> {
         self.user_scripts.inventory()
+    }
+
+    async fn user_script_inventory_with_runtime_status(
+        &self,
+        payload: Value,
+    ) -> anyhow::Result<Value> {
+        self.user_scripts
+            .inventory_with_runtime_status(payload.get("runtime_status"))
     }
 
     async fn set_user_scripts_enabled(&self, enabled: bool) -> anyhow::Result<Value> {
@@ -572,6 +999,18 @@ impl BridgeRuntimeService for LauncherRuntimeService {
         let target = codex_plus_core::install::spawn_companion(
             codex_plus_core::install::MANAGER_BINARY,
             std::iter::empty::<&str>(),
+        )
+        .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))?;
+        Ok(json!({
+            "status": "ok",
+            "path": target
+        }))
+    }
+
+    async fn open_transient_manager(&self) -> anyhow::Result<Value> {
+        let target = codex_plus_core::install::spawn_companion(
+            codex_plus_core::install::MANAGER_BINARY,
+            ["--transient"],
         )
         .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))?;
         Ok(json!({
@@ -655,17 +1094,16 @@ async fn inject_with_context(
     ctx: BridgeContext,
     runtime: Arc<LauncherRuntimeService>,
 ) -> anyhow::Result<()> {
-    let mut last_error = None;
-    for _ in 0..20 {
-        match try_inject_with_context(debug_port, helper_port, ctx.clone(), runtime.clone()).await {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Codex injection failed")))
+    try_inject_with_context(debug_port, helper_port, ctx, runtime).await
+}
+
+fn remote_control_recovery_is_superseded_by_openai(
+    settings: &codex_plus_core::settings::BackendSettings,
+    request: &codex_plus_core::remote_control_recovery::PendingRemoteControlRecovery,
+) -> bool {
+    settings.active_relay_id == request.profile_id
+        && settings.active_relay_session_provider()
+            == codex_plus_core::settings::RelaySessionProvider::Openai
 }
 
 async fn try_inject_with_context(
@@ -798,27 +1236,138 @@ mod tests {
     }
 
     #[test]
+    fn fixed_helper_port_candidates_do_not_fall_back_to_a_random_port() {
+        assert_eq!(
+            helper_port_candidates(true, Some(58123), 58123, 58124),
+            vec![codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT]
+        );
+        assert_eq!(
+            helper_port_candidates(false, Some(58123), 58123, 58124),
+            vec![58123, 58124]
+        );
+    }
+
+    #[test]
     fn launcher_uses_single_instance_guard_before_launching() {
         let source = include_str!("main.rs");
 
         assert!(source.contains("acquire_single_instance_guard(options.debug_port)?"));
         assert!(source.contains("launcher_guard_port"));
         assert!(source.contains("launcher.already_running"));
+        assert!(source.contains("Existing Codex instance activated"));
+        assert!(source.contains("status: \"failed\".to_string()"));
     }
 
     #[test]
-    fn launcher_hooks_forward_runtime_watchdogs_and_computer_use_guard_methods() {
+    fn existing_launcher_path_drains_pending_remote_control_recovery_before_activation() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn activate_existing_codex_app")
+            .expect("existing launcher activation function");
+        let body = &source[start..];
+        let recovery = body
+            .find(
+                "let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries()",
+            )
+            .expect("pending recovery guard");
+        let launch = body
+            .find("let launch_result = hooks")
+            .expect("Codex activation");
+
+        assert!(recovery < launch);
+        assert!(body[recovery..launch].contains("find_session_index_cleanup_blocking_processes"));
+        assert!(body[recovery..launch].contains("should_finalize_pending_remote_control_recovery"));
+        assert!(
+            body[recovery..launch].contains("hooks.run_remote_control_session_recovery().await?")
+        );
+    }
+
+    #[test]
+    fn pending_remote_control_finalization_requires_an_idle_desktop() {
+        assert!(should_finalize_pending_remote_control_recovery(true, &[]));
+        assert!(!should_finalize_pending_remote_control_recovery(false, &[]));
+        assert!(!should_finalize_pending_remote_control_recovery(
+            true,
+            &[42]
+        ));
+    }
+
+    #[test]
+    fn openai_session_identity_supersedes_only_its_active_pending_recovery() {
+        let request = codex_plus_core::remote_control_recovery::PendingRemoteControlRecovery {
+            thread_id: "mobile".to_string(),
+            profile_id: "relay".to_string(),
+            target_provider: "custom".to_string(),
+            config_generation: "old-generation".to_string(),
+            created_at: 1,
+        };
+        let mut settings = codex_plus_core::settings::BackendSettings {
+            active_relay_id: "relay".to_string(),
+            relay_profiles: vec![codex_plus_core::settings::RelayProfile {
+                id: "relay".to_string(),
+                config_contents: "model_provider = \"openai\"\n".to_string(),
+                ..codex_plus_core::settings::RelayProfile::default()
+            }],
+            ..codex_plus_core::settings::BackendSettings::default()
+        };
+
+        assert!(remote_control_recovery_is_superseded_by_openai(
+            &settings, &request
+        ));
+
+        settings.relay_profiles[0].config_contents = "model_provider = \"custom\"\n".to_string();
+        assert!(!remote_control_recovery_is_superseded_by_openai(
+            &settings, &request
+        ));
+
+        settings.relay_profiles[0].config_contents = "model_provider = \"openai\"\n".to_string();
+        settings.active_relay_id = "other".to_string();
+        assert!(!remote_control_recovery_is_superseded_by_openai(
+            &settings, &request
+        ));
+    }
+
+    #[test]
+    fn launcher_hooks_forward_runtime_watchdog_and_marketplace_methods() {
         let source = include_str!("main.rs");
 
         assert!(source.contains("async fn start_bridge_watchdog"));
-        assert!(source.contains(".start_bridge_watchdog(debug_port, helper_port)"));
-        assert!(source.contains("async fn ensure_computer_use_config"));
-        assert!(source.contains("self.core.ensure_computer_use_config(settings).await"));
+        assert!(source.contains("self.watchdog_bridge_context()?"));
+        assert!(source.contains("set_bridge_reinjector(reinjector)"));
+        assert!(source.contains("inject_with_context(debug_port, helper_port, ctx, runtime)"));
         assert!(source.contains("async fn ensure_plugin_marketplace_config"));
         assert!(source.contains("self.core.ensure_plugin_marketplace_config(settings).await"));
-        assert!(source.contains("async fn start_computer_use_guard_watchdog"));
-        assert!(source.contains("self.core"));
-        assert!(source.contains(".start_computer_use_guard_watchdog(settings)"));
+    }
+
+    #[tokio::test]
+    async fn watchdog_reuses_bridge_context_with_data_service() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "codex-plus-launcher-watchdog-test-{}",
+            std::process::id()
+        ));
+        let hooks = LauncherHooks {
+            core: Arc::new(DefaultLaunchHooks::default()),
+            data: Arc::new(LauncherDataService {
+                db_path: test_dir.join("state.sqlite"),
+                backup_dir: test_dir.join("backups"),
+            }),
+            runtime: Arc::new(LauncherRuntimeService::new(
+                9229,
+                UserScriptManager::new(
+                    test_dir.join("builtin"),
+                    test_dir.join("user"),
+                    test_dir.join("settings.json"),
+                ),
+            )),
+            bridge_context: Arc::new(Mutex::new(None)),
+        };
+
+        hooks.bridge_context(9229, &test_dir).await.unwrap();
+        let ctx = hooks.watchdog_bridge_context().unwrap();
+        let result =
+            codex_plus_core::routes::handle_bridge_request(ctx, "/backend/status", json!({})).await;
+
+        assert_ne!(result["message"], "Unknown bridge path");
     }
 }
 

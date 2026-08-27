@@ -113,7 +113,80 @@ experimental_bearer_token = "ark-key"
 }
 
 #[tokio::test]
-async fn model_catalog_uses_active_relay_profile_model_list_for_display() {
+async fn model_catalog_reports_effective_service_tier_from_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_models_server(json!({
+        "data": [
+            {"id": "qwen3-coder"}
+        ]
+    }));
+    write_config(
+        temp.path(),
+        &format!(
+            r#"
+model = "qwen3-coder"
+model_provider = "relay"
+service_tier = "fast"
+
+[model_providers.relay]
+name = "Relay"
+base_url = "{}"
+experimental_bearer_token = "relay-key"
+"#,
+            server.base_url
+        ),
+    );
+
+    let result = read_codex_model_catalog_from_home(
+        temp.path(),
+        &HashMap::new(),
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    )
+    .await;
+
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["service_tier"], "fast");
+    server.finish();
+}
+
+#[tokio::test]
+async fn model_catalog_service_tier_is_null_when_config_does_not_set_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_models_server(json!({
+        "data": [
+            {"id": "qwen3-coder"}
+        ]
+    }));
+    write_config(
+        temp.path(),
+        &format!(
+            r#"
+model = "qwen3-coder"
+model_provider = "relay"
+
+[model_providers.relay]
+name = "Relay"
+base_url = "{}"
+experimental_bearer_token = "relay-key"
+"#,
+            server.base_url
+        ),
+    );
+
+    let result = read_codex_model_catalog_from_home(
+        temp.path(),
+        &HashMap::new(),
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    )
+    .await;
+
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["service_tier"], serde_json::Value::Null);
+    server.finish();
+}
+
+#[tokio::test]
+async fn model_catalog_uses_active_relay_models_and_normalized_transport_provider() {
     let temp = tempfile::tempdir().unwrap();
     let codex_home = temp.path().join("codex-home");
     std::fs::create_dir_all(&codex_home).unwrap();
@@ -125,27 +198,38 @@ async fn model_catalog_uses_active_relay_profile_model_list_for_display() {
         std::env::set_var("CODEX_HOME", &codex_home);
     }
 
-    let result = async {
-        SettingsStore::new(settings_path)
-            .save(&BackendSettings {
-                active_relay_id: "relay-a".to_string(),
-                relay_profiles: vec![RelayProfile {
-                    id: "relay-a".to_string(),
-                    name: "Relay A".to_string(),
-                    model: "qwen3-coder".to_string(),
-                    base_url: "https://example.test/v1".to_string(),
-                    protocol: RelayProtocol::Responses,
-                    relay_mode: RelayMode::MixedApi,
-                    model_list: "deepseek-coder\nqwen3-coder\nclaude-compatible\ngpt-5.6-sol"
-                        .to_string(),
-                    config_contents: "model = \"qwen3-coder\"\n".to_string(),
-                    ..RelayProfile::default()
-                }],
-                ..BackendSettings::default()
-            })
-            .unwrap();
+    let (result, live_fallback_result) = async {
+        write_config(
+            &codex_home,
+            "model = \"qwen3-coder\"\nmodel_provider = \"live_vendor\"\n",
+        );
+        let store = SettingsStore::new(settings_path);
+        let mut settings = BackendSettings {
+            active_relay_id: "relay-a".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "relay-a".to_string(),
+                name: "Relay A".to_string(),
+                model: "qwen3-coder".to_string(),
+                base_url: "https://example.test/v1".to_string(),
+                protocol: RelayProtocol::Responses,
+                relay_mode: RelayMode::MixedApi,
+                model_list: "deepseek-coder\nqwen3-coder\nclaude-compatible\ngpt-5.6-sol"
+                    .to_string(),
+                config_contents: "model = \"qwen3-coder\"\nmodel_provider = \"vendor_alpha\"\n"
+                    .to_string(),
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+        store.save(&settings).unwrap();
+        let result = read_codex_model_catalog().await;
 
-        read_codex_model_catalog().await
+        settings.relay_profiles[0].relay_mode = RelayMode::Official;
+        settings.relay_profiles[0].official_mix_api_key = false;
+        settings.relay_profiles[0].config_contents = "model = \"qwen3-coder\"\n".to_string();
+        store.save(&settings).unwrap();
+        let live_fallback_result = read_codex_model_catalog().await;
+        (result, live_fallback_result)
     }
     .await;
 
@@ -161,6 +245,8 @@ async fn model_catalog_uses_active_relay_profile_model_list_for_display() {
 
     assert_eq!(result["status"], "ok");
     assert_eq!(result["model_provider"], "relay-a");
+    assert_eq!(result["codex_model_provider"], "custom");
+    assert_eq!(live_fallback_result["codex_model_provider"], "live_vendor");
     assert_eq!(result["provider_name"], "Relay A");
     assert_eq!(result["default_model"], "qwen3-coder");
     assert_eq!(
@@ -189,7 +275,7 @@ async fn model_catalog_uses_active_relay_profile_model_list_for_display() {
 }
 
 #[tokio::test]
-async fn model_catalog_displays_aggregate_provider_targets_without_repeating_matching_names() {
+async fn model_catalog_displays_official_auth_before_aggregate_provider_targets() {
     let temp = tempfile::tempdir().unwrap();
     let codex_home = temp.path().join("codex-home");
     std::fs::create_dir_all(&codex_home).unwrap();
@@ -206,12 +292,46 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
             .save(&BackendSettings {
                 active_relay_id: "aggregate".to_string(),
                 active_aggregate_relay_id: "aggregate".to_string(),
+                official_login_mixed_mode: true,
+                official_login_relay_id: "official".to_string(),
                 relay_profiles: vec![
+                    RelayProfile {
+                        id: "official".to_string(),
+                        name: "OpenAI".to_string(),
+                        relay_mode: RelayMode::Official,
+                        model_list: "gpt-5.6-sol\ngpt-5.6-terra\ngpt-5.6-luna".to_string(),
+                        auth_contents:
+                            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#
+                                .to_string(),
+                        ..RelayProfile::default()
+                    },
+                    RelayProfile {
+                        id: "managed-cliproxy-official".to_string(),
+                        name: "CLIProxyAPI 官方模型".to_string(),
+                        integration_type: "cliproxy-official".to_string(),
+                        model: "account-2/gpt-5.6-sol".to_string(),
+                        model_list: "account-2/gpt-5.6-sol".to_string(),
+                        base_url: "http://127.0.0.1:8317/v1".to_string(),
+                        api_key: "cli-key".to_string(),
+                        relay_mode: RelayMode::PureApi,
+                        ..RelayProfile::default()
+                    },
+                    RelayProfile {
+                        id: "managed-cliproxy".to_string(),
+                        name: "CLIProxyAPI".to_string(),
+                        integration_type: "cliproxy".to_string(),
+                        model: "gemini-2.5-pro".to_string(),
+                        model_list: "account-2/gpt-5.6-sol\ngemini-2.5-pro".to_string(),
+                        base_url: "http://127.0.0.1:8317/v1".to_string(),
+                        api_key: "cli-key".to_string(),
+                        relay_mode: RelayMode::PureApi,
+                        ..RelayProfile::default()
+                    },
                     RelayProfile {
                         id: "provider-a".to_string(),
                         name: "供应商一".to_string(),
                         model: "gpt-5.4".to_string(),
-                        model_list: "gpt-5.4\ngpt-5.6-sol".to_string(),
+                        model_list: "gpt-5.4\ngpt-5.6-sol\ngpt-5.2".to_string(),
                         base_url: "https://a.example.test/v1".to_string(),
                         api_key: "key-a".to_string(),
                         relay_mode: RelayMode::PureApi,
@@ -238,6 +358,7 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
                 aggregate_relay_profiles: vec![codex_plus_core::settings::AggregateRelayProfile {
                     id: "aggregate".to_string(),
                     name: "聚合".to_string(),
+                    session_provider: codex_plus_core::settings::RelaySessionProvider::Custom,
                     strategy: codex_plus_core::settings::AggregateRelayStrategy::Failover,
                     model_mappings_enabled: true,
                     members: vec![
@@ -282,16 +403,27 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
     }
     codex_plus_core::paths::set_settings_path_for_tests(previous_settings_path);
 
-    assert_eq!(result["default_model"], "gpt-5.4");
+    assert_eq!(result["default_model"], "gpt-5.6-sol");
     assert_eq!(result["model_provider"], "custom");
     assert_eq!(
         result["models"],
         json!([
-            "gpt-5.4",
-            "供应商一:gpt-5.4",
-            "供应商二:vendor-gpt-5.4",
             "gpt-5.6-sol",
-            "供应商一:gpt-5.6-sol"
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "CLIProxyAPI:gpt-5.6-sol",
+            "gpt-5.6-sol(供应商一)",
+            "gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)",
+            "gpt-5.2(供应商一)",
+            "CLIProxyAPI:gemini-2.5-pro",
+            "供应商一:gpt-5.4",
+            "供应商一:gpt-5.6-sol",
+            "供应商一:gpt-5.2",
+            "供应商二:vendor-gpt-5.4"
         ])
     );
     assert_eq!(
@@ -299,7 +431,7 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
             .as_array()
             .unwrap()
             .iter()
-            .filter(|model| *model == "gpt-5.4")
+            .filter(|model| *model == "gpt-5.6-sol")
             .count(),
         1
     );
@@ -324,17 +456,35 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
             .iter()
             .any(|model| model == "供应商一:gpt-5.6-sol")
     );
-    assert_eq!(
-        result["modelMetadata"]["gpt-5.4"]["displaySuffix"],
-        "(供应商一|供应商二:vendor-gpt-5.4)"
-    );
+    assert!(result["modelMetadata"]["gpt-5.4"]["displaySuffix"].is_null());
     assert_eq!(
         result["modelMetadata"]["gpt-5.6-sol"]["defaultReasoningEffort"],
         "low"
     );
+    assert!(result["modelMetadata"]["gpt-5.6-sol"]["displaySuffix"].is_null());
     assert_eq!(
-        result["modelMetadata"]["gpt-5.6-sol"]["displaySuffix"],
-        "(供应商一)"
+        result["modelMetadata"]["gpt-5.6-sol(供应商一)"]["displayName"],
+        "gpt-5.6-sol(供应商一)"
+    );
+    assert_eq!(
+        result["modelMetadata"]["CLIProxyAPI:gpt-5.6-sol"]["displayName"],
+        "CLIProxyAPI:gpt-5.6-sol"
+    );
+    assert_eq!(
+        result["modelMetadata"]["CLIProxyAPI:gpt-5.6-sol"]["supportedReasoningEfforts"][5]["reasoningEffort"],
+        "ultra"
+    );
+    assert_eq!(
+        result["modelMetadata"]["CLIProxyAPI:gpt-5.6-sol"]["additionalSpeedTiers"][0],
+        "fast"
+    );
+    assert_eq!(
+        result["modelMetadata"]["CLIProxyAPI:gpt-5.6-sol"]["serviceTiers"][0]["id"],
+        "priority"
+    );
+    assert_eq!(
+        result["modelMetadata"]["gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)"]["displayName"],
+        "gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)"
     );
     assert_eq!(
         result["modelMetadata"]["供应商一:gpt-5.6-sol"]["defaultReasoningEffort"],
@@ -345,6 +495,13 @@ async fn model_catalog_displays_aggregate_provider_targets_without_repeating_mat
         "供应商一:gpt-5.6-sol"
     );
     assert!(result["modelMetadata"]["供应商一:gpt-5.6-sol"]["displaySuffix"].is_null());
+    assert!(
+        !result["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model == "gpt-5.2")
+    );
 }
 
 #[tokio::test]

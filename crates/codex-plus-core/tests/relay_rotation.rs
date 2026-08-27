@@ -1,10 +1,12 @@
 use codex_plus_core::relay_rotation::{
-    RelayRotationSelector, RotationContext, RotationEvent, SelectionError, fallback_relays_after,
-    record_relay_request_failure, select_relay_for_probe, select_relay_for_request,
+    MixedModelRoute, RelayRotationSelector, RotationContext, RotationEvent, SelectionError,
+    classify_mixed_model_route, fallback_relays_after, record_relay_request_failure,
+    select_dedicated_relay_for_model, select_relay_for_probe, select_relay_for_request,
 };
 use codex_plus_core::settings::{
     AggregateRelayDispatchTarget, AggregateRelayMember, AggregateRelayModelMapping,
     AggregateRelayProfile, AggregateRelayStrategy, BackendSettings, RelayMode, RelayProfile,
+    RelaySessionProvider,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -29,6 +31,7 @@ fn aggregate(strategy: AggregateRelayStrategy) -> AggregateRelayProfile {
     AggregateRelayProfile {
         id: "agg".to_string(),
         name: "聚合".to_string(),
+        session_provider: RelaySessionProvider::Custom,
         strategy,
         model_mappings_enabled: true,
         members: vec![
@@ -53,6 +56,7 @@ fn aggregate_with_id(id: &str, strategy: AggregateRelayStrategy) -> AggregateRel
     AggregateRelayProfile {
         id: id.to_string(),
         name: "聚合".to_string(),
+        session_provider: RelaySessionProvider::Custom,
         strategy,
         model_mappings_enabled: true,
         members: vec![
@@ -125,6 +129,45 @@ fn provider_specific_gpt_alias_selects_only_the_requested_member() {
 }
 
 #[test]
+fn cliproxy_official_channel_is_rejected_as_an_aggregate_member() {
+    let mut settings = settings(AggregateRelayStrategy::Failover);
+    settings.relay_profiles[0].id = "managed-cliproxy-official".to_string();
+    settings.relay_profiles[0].integration_type = "cliproxy-official".to_string();
+    settings.aggregate_relay_profiles[0].members[0].relay_id =
+        "managed-cliproxy-official".to_string();
+
+    match RelayRotationSelector::from_settings(&settings) {
+        Err(error) => assert_eq!(
+            error,
+            SelectionError::ExcludedMemberRelay {
+                aggregate_id: "agg".to_string(),
+                relay_id: "managed-cliproxy-official".to_string(),
+            }
+        ),
+        Ok(_) => panic!("专用官方通道不应成为聚合成员"),
+    }
+}
+
+#[test]
+fn cliproxy_integration_is_rejected_as_an_aggregate_member() {
+    let mut settings = settings(AggregateRelayStrategy::Failover);
+    settings.relay_profiles[0].id = "managed-cliproxy".to_string();
+    settings.relay_profiles[0].integration_type = "cliproxy".to_string();
+    settings.aggregate_relay_profiles[0].members[0].relay_id = "managed-cliproxy".to_string();
+
+    match RelayRotationSelector::from_settings(&settings) {
+        Err(error) => assert_eq!(
+            error,
+            SelectionError::ExcludedMemberRelay {
+                aggregate_id: "agg".to_string(),
+                relay_id: "managed-cliproxy".to_string(),
+            }
+        ),
+        Ok(_) => panic!("CLIProxyAPI 接入不应成为聚合成员"),
+    }
+}
+
+#[test]
 fn provider_specific_gpt_alias_selects_requested_member_when_implicit_mappings_are_disabled() {
     let mut settings = settings(AggregateRelayStrategy::Failover);
     settings.relay_profiles[0].name = "ProviderA".to_string();
@@ -146,6 +189,173 @@ fn provider_specific_gpt_alias_selects_requested_member_when_implicit_mappings_a
         .unwrap();
 
     assert_eq!(selected.id, "relay-b");
+}
+
+#[test]
+fn official_mixed_mode_classifies_models_without_supplier_leakage() {
+    let mut settings = settings(AggregateRelayStrategy::Failover);
+    settings.official_login_mixed_mode = true;
+    settings.official_login_relay_id = "official".to_string();
+    settings.relay_profiles.push(RelayProfile {
+        id: "official".to_string(),
+        name: "OpenAI".to_string(),
+        relay_mode: RelayMode::Official,
+        auth_contents:
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"token","account_id":"account"}}"#
+                .to_string(),
+        ..RelayProfile::default()
+    });
+    settings.relay_profiles[0].name = "ProviderA".to_string();
+    settings.relay_profiles[0].model_list = "gpt-5.6-sol\ngpt-5.2".to_string();
+
+    assert_eq!(
+        classify_mixed_model_route(&settings, Some("gpt-5.6-sol")),
+        MixedModelRoute::Official
+    );
+    assert_eq!(
+        classify_mixed_model_route(&settings, Some("gpt-5.6-sol(ProviderA)")),
+        MixedModelRoute::Aggregate
+    );
+    assert_eq!(
+        classify_mixed_model_route(&settings, Some("ProviderA:gpt-5.6-sol")),
+        MixedModelRoute::Aggregate
+    );
+    assert_eq!(
+        classify_mixed_model_route(&settings, Some("gpt-5.2")),
+        MixedModelRoute::Reject
+    );
+    assert_eq!(
+        classify_mixed_model_route(&settings, Some("unknown:model")),
+        MixedModelRoute::Reject
+    );
+}
+
+#[test]
+fn cliproxy_official_alias_uses_dedicated_relay_and_keeps_raw_target_model() {
+    let mut settings = settings(AggregateRelayStrategy::Failover);
+    settings.official_login_mixed_mode = true;
+    settings.official_login_relay_id = "official".to_string();
+    settings.relay_profiles.push(RelayProfile {
+        id: "official".to_string(),
+        name: "OpenAI".to_string(),
+        relay_mode: RelayMode::Official,
+        auth_contents:
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"token","account_id":"account"}}"#
+                .to_string(),
+        ..RelayProfile::default()
+    });
+    settings.relay_profiles.push(RelayProfile {
+        id: "managed-cliproxy-official".to_string(),
+        name: "CLIProxyAPI 官方模型".to_string(),
+        integration_type: "cliproxy-official".to_string(),
+        base_url: "http://127.0.0.1:8317/v1".to_string(),
+        api_key: "cli-key".to_string(),
+        model: "account-2/gpt-5.6-sol".to_string(),
+        model_list: "account-2/gpt-5.6-sol".to_string(),
+        ..RelayProfile::default()
+    });
+    settings.relay_profiles.push(RelayProfile {
+        id: "managed-cliproxy".to_string(),
+        name: "CLIProxyAPI".to_string(),
+        integration_type: "cliproxy".to_string(),
+        base_url: "http://127.0.0.1:8317/v1".to_string(),
+        api_key: "cli-key".to_string(),
+        model: "gemini-2.5-pro".to_string(),
+        model_list: "account-2/gpt-5.6-sol\ngemini-2.5-pro".to_string(),
+        ..RelayProfile::default()
+    });
+
+    assert_eq!(
+        classify_mixed_model_route(&settings, Some("CLIProxyAPI:gpt-5.6-sol")),
+        MixedModelRoute::DedicatedRelay
+    );
+    let relay =
+        select_dedicated_relay_for_model(&settings, Some("CLIProxyAPI:gpt-5.6-sol")).unwrap();
+    assert_eq!(relay.id, "managed-cliproxy-official");
+    assert_eq!(
+        relay
+            .model_mappings
+            .get("CLIProxyAPI:gpt-5.6-sol")
+            .map(String::as_str),
+        Some("account-2/gpt-5.6-sol")
+    );
+    assert_eq!(
+        classify_mixed_model_route(&settings, Some("CLIProxyAPI:gemini-2.5-pro")),
+        MixedModelRoute::DedicatedRelay
+    );
+    let relay =
+        select_dedicated_relay_for_model(&settings, Some("CLIProxyAPI:gemini-2.5-pro")).unwrap();
+    assert_eq!(relay.id, "managed-cliproxy");
+    assert_eq!(
+        relay
+            .model_mappings
+            .get("CLIProxyAPI:gemini-2.5-pro")
+            .map(String::as_str),
+        Some("gemini-2.5-pro")
+    );
+}
+
+#[test]
+fn cliproxy_general_alias_remains_direct_without_official_auth() {
+    let mut settings = settings(AggregateRelayStrategy::Failover);
+    settings.relay_profiles.push(RelayProfile {
+        id: "managed-cliproxy".to_string(),
+        name: "CLIProxyAPI".to_string(),
+        integration_type: "cliproxy".to_string(),
+        base_url: "http://127.0.0.1:8317/v1".to_string(),
+        api_key: "cli-key".to_string(),
+        model: "gemini-2.5-pro".to_string(),
+        model_list: "gpt-5.6-sol\ngemini-2.5-pro".to_string(),
+        ..RelayProfile::default()
+    });
+
+    assert_eq!(
+        classify_mixed_model_route(&settings, Some("CLIProxyAPI:gpt-5.6-sol")),
+        MixedModelRoute::DedicatedRelay
+    );
+    assert_eq!(
+        classify_mixed_model_route(&settings, Some("CLIProxyAPI:gemini-2.5-pro")),
+        MixedModelRoute::DedicatedRelay
+    );
+    let relay =
+        select_dedicated_relay_for_model(&settings, Some("CLIProxyAPI:gemini-2.5-pro")).unwrap();
+    assert_eq!(relay.id, "managed-cliproxy");
+}
+
+#[test]
+fn combined_aggregate_alias_keeps_all_explicit_mapping_targets() {
+    let mut settings = settings(AggregateRelayStrategy::Failover);
+    settings.relay_profiles[0].name = "ProviderA".to_string();
+    settings.relay_profiles[0].model_list = "gpt-5.4".to_string();
+    settings.relay_profiles[1].name = "ProviderB".to_string();
+    settings.relay_profiles[1].model_list = "vendor-gpt-5.4".to_string();
+    settings.aggregate_relay_profiles[0].model_mappings = vec![AggregateRelayModelMapping {
+        codex_model: "gpt-5.4".to_string(),
+        targets: vec![
+            AggregateRelayDispatchTarget {
+                relay_id: "relay-a".to_string(),
+                target_model: "gpt-5.4".to_string(),
+            },
+            AggregateRelayDispatchTarget {
+                relay_id: "relay-b".to_string(),
+                target_model: "vendor-gpt-5.4".to_string(),
+            },
+        ],
+    }];
+    let alias = "gpt-5.4(ProviderA|ProviderB:vendor-gpt-5.4)";
+
+    let first =
+        select_relay_for_request(&settings, RotationContext::default(), Some(alias)).unwrap();
+    let fallbacks = fallback_relays_after(&settings, &first.id, Some(alias)).unwrap();
+
+    assert_eq!(first.id, "relay-a");
+    assert_eq!(
+        fallbacks
+            .iter()
+            .map(|relay| relay.id.as_str())
+            .collect::<Vec<_>>(),
+        ["relay-b"]
+    );
 }
 
 #[test]

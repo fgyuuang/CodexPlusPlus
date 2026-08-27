@@ -16,13 +16,28 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait = "0.1"
+base64.workspace = true
 codex-plus-core = { path = "../../../crates/codex-plus-core" }
 codex-plus-data = { path = "../../../crates/codex-plus-data" }
 directories.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = "0.9"
+sha2.workspace = true
 tauri = { version = "2", features = ["protocol-asset", "custom-protocol", "tray-icon"] }
 tauri-plugin-dialog = "2"
+toml_edit.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
+uuid.workspace = true
+zip.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+  "Win32_System_Threading",
+] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

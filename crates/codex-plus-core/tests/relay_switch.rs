@@ -1,7 +1,9 @@
-use codex_plus_core::relay_switch::switch_relay_profile_in_home;
+use codex_plus_core::relay_switch::{
+    switch_official_account_in_home, switch_relay_profile_in_home,
+};
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    LaunchMode, RelayMode, RelayProfile, SettingsStore,
+    LaunchMode, RelayMode, RelayProfile, RelaySessionProvider, SettingsStore,
 };
 
 #[test]
@@ -349,6 +351,7 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
         aggregate_relay_profiles: vec![AggregateRelayProfile {
             id: "agg".to_string(),
             name: "聚合供应商 1".to_string(),
+            session_provider: RelaySessionProvider::Custom,
             strategy: AggregateRelayStrategy::Failover,
             model_mappings_enabled: true,
             members: vec![AggregateRelayMember {
@@ -367,6 +370,211 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
     assert!(result.configured);
     assert_eq!(store.load().unwrap().active_relay_id, "agg");
     assert!(live.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+}
+
+#[test]
+fn official_login_mixed_mode_restores_official_auth_before_aggregate_api_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        r#"{"auth_mode":"apikey","OPENAI_API_KEY":"stale"}"#,
+    )
+    .unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let official_auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official-account"}}"#;
+    let official = RelayProfile {
+        id: "official".to_string(),
+        name: "OpenAI".to_string(),
+        relay_mode: RelayMode::Official,
+        auth_contents: official_auth.to_string(),
+        ..RelayProfile::default()
+    };
+    let api = pure_profile("api", "https://api.example/v1", "sk-api");
+    let aggregate = RelayProfile {
+        id: "agg".to_string(),
+        name: "聚合供应商".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        model: "gpt-5.4".to_string(),
+        ..RelayProfile::default()
+    };
+    let next = BackendSettings {
+        active_relay_id: "agg".to_string(),
+        relay_profiles: vec![official, api, aggregate],
+        official_login_mixed_mode: true,
+        official_login_relay_id: "official".to_string(),
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: "agg".to_string(),
+            name: "聚合供应商".to_string(),
+            strategy: AggregateRelayStrategy::Failover,
+            session_provider: RelaySessionProvider::Custom,
+            model_mappings_enabled: true,
+            members: vec![AggregateRelayMember {
+                relay_id: "api".to_string(),
+                weight: 1,
+            }],
+            model_mappings: Vec::new(),
+        }],
+        active_aggregate_relay_id: "agg".to_string(),
+        ..BackendSettings::default()
+    };
+
+    let result = switch_relay_profile_in_home(&store, &home, next, "official").unwrap();
+    let live_config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    let live_auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
+
+    assert!(result.configured);
+    assert!(live_config.contains(r#"model_provider = "custom""#));
+    assert!(live_config.contains(r#"model = "gpt-5.6-sol""#));
+    assert!(live_config.contains("requires_openai_auth = true"));
+    assert!(live_config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&live_auth).unwrap(),
+        serde_json::from_str::<serde_json::Value>(official_auth).unwrap()
+    );
+    assert_eq!(result.settings.aggregate_relay_profiles[0].members.len(), 1);
+    assert_eq!(
+        result.settings.aggregate_relay_profiles[0].members[0].relay_id,
+        "api"
+    );
+}
+
+#[test]
+fn official_login_mixed_mode_applies_single_provider_after_official_auth() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let official = RelayProfile {
+        id: "official".to_string(),
+        name: "OpenAI".to_string(),
+        relay_mode: RelayMode::Official,
+        auth_contents: r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official-account"}}"#
+            .to_string(),
+        ..RelayProfile::default()
+    };
+    let api = pure_profile("api", "https://api.example/v1", "sk-api");
+    let next = BackendSettings {
+        active_relay_id: "api".to_string(),
+        relay_profiles: vec![official, api],
+        official_login_mixed_mode: true,
+        official_login_relay_id: "official".to_string(),
+        ..BackendSettings::default()
+    };
+
+    switch_relay_profile_in_home(&store, &home, next, "official").unwrap();
+    let live_config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    let live_auth: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+
+    assert!(live_config.contains(r#"base_url = "https://api.example/v1""#));
+    assert!(live_config.contains("requires_openai_auth = true"));
+    assert!(live_config.contains(r#"experimental_bearer_token = "sk-api""#));
+    assert_eq!(live_auth["auth_mode"], "chatgpt");
+    assert_eq!(live_auth["tokens"]["access_token"], "official-account");
+}
+
+#[test]
+fn official_login_mixed_mode_can_switch_selected_official_account() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"account-a"}}"#,
+    )
+    .unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let account_a = RelayProfile {
+        id: "official-a".to_string(),
+        name: "OpenAI A".to_string(),
+        relay_mode: RelayMode::Official,
+        auth_contents: r#"{"auth_mode":"chatgpt","tokens":{"access_token":"account-a"}}"#
+            .to_string(),
+        ..RelayProfile::default()
+    };
+    let account_b = RelayProfile {
+        id: "official-b".to_string(),
+        name: "OpenAI B".to_string(),
+        relay_mode: RelayMode::Official,
+        auth_contents: r#"{"auth_mode":"chatgpt","tokens":{"access_token":"account-b"}}"#
+            .to_string(),
+        ..RelayProfile::default()
+    };
+    let next = BackendSettings {
+        active_relay_id: "official-a".to_string(),
+        relay_profiles: vec![account_a, account_b],
+        official_login_mixed_mode: true,
+        official_login_relay_id: "official-b".to_string(),
+        ..BackendSettings::default()
+    };
+
+    switch_relay_profile_in_home(&store, &home, next, "official-a").unwrap();
+    let live_auth: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+
+    assert_eq!(live_auth["tokens"]["access_token"], "account-b");
+}
+
+#[test]
+fn explicit_official_account_switch_updates_auth_while_pure_api_remains_active() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"account-a"}}"#,
+    )
+    .unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let next = BackendSettings {
+        active_relay_id: "api".to_string(),
+        active_official_account_id: "account-b".to_string(),
+        relay_profiles: vec![pure_profile("api", "https://api.example/v1", "sk-api")],
+        ..BackendSettings::default()
+    };
+    let target_auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"account-b"}}"#;
+
+    switch_official_account_in_home(&store, &home, next, target_auth).unwrap();
+    let live_config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    let live_auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
+
+    assert!(live_config.contains(r#"base_url = "https://api.example/v1""#));
+    assert!(live_config.contains(r#"experimental_bearer_token = "sk-api""#));
+    assert!(live_auth.contains("account-b"));
+    assert_eq!(
+        store.load().unwrap().active_official_account_id,
+        "account-b"
+    );
+}
+
+#[test]
+fn explicit_official_account_switch_still_works_when_provider_switching_is_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    let original_config = "model_provider = \"untouched\"\n";
+    std::fs::write(home.join("config.toml"), original_config).unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let next = BackendSettings {
+        relay_profiles_enabled: false,
+        active_official_account_id: "account-b".to_string(),
+        ..BackendSettings::default()
+    };
+    let target_auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"account-b"}}"#;
+
+    switch_official_account_in_home(&store, &home, next, target_auth).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(home.join("config.toml")).unwrap(),
+        original_config
+    );
+    assert!(
+        std::fs::read_to_string(home.join("auth.json"))
+            .unwrap()
+            .contains("account-b")
+    );
 }
 
 #[test]
@@ -402,6 +610,7 @@ goals = true
         name: "官方".to_string(),
         relay_mode: RelayMode::Official,
         official_mix_api_key: false,
+        hide_official_usage_alert: false,
         auth_contents: r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#
             .to_string(),
         ..RelayProfile::default()

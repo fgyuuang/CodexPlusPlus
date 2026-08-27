@@ -20,30 +20,15 @@ pub enum LaunchMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RelayContextSelection {
-    #[serde(default)]
-    pub mcp_servers: Vec<String>,
-    #[serde(default)]
-    pub skills: Vec<String>,
-    #[serde(default)]
-    pub plugins: Vec<String>,
-}
-
-impl Default for RelayContextSelection {
-    fn default() -> Self {
-        Self {
-            mcp_servers: Vec::new(),
-            skills: Vec::new(),
-            plugins: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RelayProfile {
     pub id: String,
     pub name: String,
+    #[serde(
+        rename = "integrationType",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub integration_type: String,
     #[serde(default, skip_serializing)]
     pub model: String,
     #[serde(default = "default_relay_base_url", skip_serializing)]
@@ -62,6 +47,8 @@ pub struct RelayProfile {
     pub relay_mode: RelayMode,
     #[serde(rename = "officialMixApiKey", default)]
     pub official_mix_api_key: bool,
+    #[serde(rename = "hideOfficialUsageAlert", default)]
+    pub hide_official_usage_alert: bool,
     #[serde(rename = "testModel", default)]
     pub test_model: String,
     #[serde(rename = "configContents", default)]
@@ -70,10 +57,6 @@ pub struct RelayProfile {
     pub auth_contents: String,
     #[serde(rename = "useCommonConfig", default = "default_true")]
     pub use_common_config: bool,
-    #[serde(rename = "contextSelection", default)]
-    pub context_selection: RelayContextSelection,
-    #[serde(rename = "contextSelectionInitialized", default)]
-    pub context_selection_initialized: bool,
     #[serde(rename = "contextWindow", default)]
     pub context_window: String,
     #[serde(rename = "autoCompactLimit", default)]
@@ -110,6 +93,30 @@ pub struct RelayProfile {
         skip_serializing_if = "String::is_empty"
     )]
     pub user_agent: String,
+    #[serde(rename = "sub2apiEnabled", default)]
+    pub sub2api_enabled: bool,
+    #[serde(
+        rename = "sub2apiMultiplier",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub sub2api_multiplier: String,
+    #[serde(rename = "modelRoutes", default, skip_serializing_if = "Vec::is_empty")]
+    pub model_routes: Vec<RelayModelRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayModelRoute {
+    pub model: String,
+    #[serde(rename = "targetRelayId")]
+    pub target_relay_id: String,
+    #[serde(
+        rename = "targetModel",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub target_model: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -129,6 +136,23 @@ pub struct AggregateRelayMember {
     pub relay_id: String,
     #[serde(default = "default_aggregate_member_weight")]
     pub weight: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RelaySessionProvider {
+    #[default]
+    Custom,
+    Openai,
+}
+
+impl RelaySessionProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Custom => "custom",
+            Self::Openai => "openai",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -155,6 +179,8 @@ pub struct AggregateRelayProfile {
     pub id: String,
     pub name: String,
     #[serde(default)]
+    pub session_provider: RelaySessionProvider,
+    #[serde(default)]
     pub strategy: AggregateRelayStrategy,
     #[serde(default = "default_true")]
     pub model_mappings_enabled: bool,
@@ -169,6 +195,7 @@ impl Default for RelayProfile {
         Self {
             id: "default".to_string(),
             name: "默认中转".to_string(),
+            integration_type: String::new(),
             model: String::new(),
             base_url: default_relay_base_url(),
             upstream_base_url: String::new(),
@@ -176,12 +203,11 @@ impl Default for RelayProfile {
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),
             auth_contents: String::new(),
             use_common_config: true,
-            context_selection: RelayContextSelection::default(),
-            context_selection_initialized: false,
             context_window: String::new(),
             auto_compact_limit: String::new(),
             model_insert_mode: RelayModelInsertMode::Patch,
@@ -194,7 +220,18 @@ impl Default for RelayProfile {
             vlm_model: String::new(),
             vlm_base_url: String::new(),
             user_agent: String::new(),
+            sub2api_enabled: false,
+            sub2api_multiplier: String::new(),
+            model_routes: Vec::new(),
         }
+    }
+}
+
+impl RelayProfile {
+    pub fn has_model_routes(&self) -> bool {
+        self.model_routes
+            .iter()
+            .any(|route| !route.model.trim().is_empty() && !route.target_relay_id.trim().is_empty())
     }
 }
 
@@ -363,12 +400,8 @@ pub struct BackendSettings {
     pub relay_profiles_enabled: bool,
     #[serde(rename = "enhancementsEnabled", default = "default_true")]
     pub enhancements_enabled: bool,
-    #[serde(rename = "computerUseGuardEnabled", default)]
-    pub computer_use_guard_enabled: bool,
     #[serde(rename = "codexAppPluginMarketplaceUnlock", default = "default_true")]
     pub codex_app_plugin_marketplace_unlock: bool,
-    #[serde(rename = "codexAppPluginAutoExpand", default = "default_true")]
-    pub codex_app_plugin_auto_expand: bool,
     #[serde(rename = "codexAppModelWhitelistUnlock", default = "default_true")]
     pub codex_app_model_whitelist_unlock: bool,
     #[serde(rename = "codexAppSessionDelete", default = "default_true")]
@@ -381,6 +414,14 @@ pub struct BackendSettings {
     pub codex_app_force_chinese_locale: bool,
     #[serde(rename = "codexAppFastStartup", default)]
     pub codex_app_fast_startup: bool,
+    #[serde(rename = "codexAppCapacityRetry", default)]
+    pub codex_app_capacity_retry: bool,
+    #[serde(
+        rename = "codexAppCapacityRetryMaxAttempts",
+        default = "default_capacity_retry_max_attempts",
+        deserialize_with = "deserialize_capacity_retry_max_attempts"
+    )]
+    pub codex_app_capacity_retry_max_attempts: u8,
     #[serde(rename = "codexAppProjectMove", default = "default_true")]
     pub codex_app_project_move: bool,
     #[serde(rename = "codexAppThreadIdBadge", default)]
@@ -421,6 +462,12 @@ pub struct BackendSettings {
         deserialize_with = "empty_as_default_stepwise_api_key_env"
     )]
     pub codex_app_stepwise_api_key_env: String,
+    #[serde(
+        rename = "codexAppStepwiseProtocol",
+        default = "default_stepwise_protocol",
+        deserialize_with = "deserialize_stepwise_protocol"
+    )]
+    pub codex_app_stepwise_protocol: String,
     #[serde(rename = "codexAppStepwiseModel", default)]
     pub codex_app_stepwise_model: String,
     #[serde(
@@ -479,6 +526,32 @@ pub struct BackendSettings {
     pub codex_app_dream_skin_image_path: String,
     #[serde(rename = "codexGoalsEnabled", default)]
     pub codex_goals_enabled: bool,
+    #[serde(rename = "weixinConnectEnabled", default)]
+    pub weixin_connect_enabled: bool,
+    #[serde(
+        rename = "weixinConnectBaseUrl",
+        default = "default_weixin_connect_base_url"
+    )]
+    pub weixin_connect_base_url: String,
+    #[serde(rename = "weixinConnectToken", default)]
+    pub weixin_connect_token: String,
+    #[serde(rename = "weixinConnectAccountId", default)]
+    pub weixin_connect_account_id: String,
+    #[serde(rename = "weixinConnectAllowFrom", default)]
+    pub weixin_connect_allow_from: String,
+    #[serde(rename = "weixinConnectRouteTag", default)]
+    pub weixin_connect_route_tag: String,
+    #[serde(rename = "weixinConnectWorkDir", default)]
+    pub weixin_connect_work_dir: String,
+    #[serde(rename = "weixinConnectModel", default)]
+    pub weixin_connect_model: String,
+    #[serde(
+        rename = "weixinConnectSandbox",
+        default = "default_weixin_connect_sandbox"
+    )]
+    pub weixin_connect_sandbox: String,
+    #[serde(rename = "weixinConnectCodexPath", default)]
+    pub weixin_connect_codex_path: String,
     #[serde(rename = "launchMode", default)]
     pub launch_mode: LaunchMode,
     #[serde(rename = "relayBaseUrl", default = "default_relay_base_url")]
@@ -487,6 +560,12 @@ pub struct BackendSettings {
     pub relay_api_key: String,
     #[serde(rename = "relayProfiles", default = "default_relay_profiles")]
     pub relay_profiles: Vec<RelayProfile>,
+    #[serde(rename = "officialLoginMixedMode", default)]
+    pub official_login_mixed_mode: bool,
+    #[serde(rename = "officialLoginRelayId", default)]
+    pub official_login_relay_id: String,
+    #[serde(rename = "activeOfficialAccountId", default)]
+    pub active_official_account_id: String,
     #[serde(rename = "relayCommonConfigContents", default)]
     pub relay_common_config_contents: String,
     #[serde(rename = "relayContextConfigContents", default)]
@@ -512,15 +591,15 @@ impl Default for BackendSettings {
             provider_sync_last_selected_provider: String::new(),
             relay_profiles_enabled: true,
             enhancements_enabled: true,
-            computer_use_guard_enabled: false,
             codex_app_plugin_marketplace_unlock: true,
-            codex_app_plugin_auto_expand: true,
             codex_app_model_whitelist_unlock: true,
             codex_app_session_delete: true,
             codex_app_markdown_export: true,
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: true,
             codex_app_fast_startup: false,
+            codex_app_capacity_retry: false,
+            codex_app_capacity_retry_max_attempts: default_capacity_retry_max_attempts(),
             codex_app_project_move: true,
             codex_app_thread_id_badge: false,
             codex_app_conversation_view: false,
@@ -539,6 +618,7 @@ impl Default for BackendSettings {
             codex_app_stepwise_base_url: String::new(),
             codex_app_stepwise_api_key: String::new(),
             codex_app_stepwise_api_key_env: default_stepwise_api_key_env(),
+            codex_app_stepwise_protocol: default_stepwise_protocol(),
             codex_app_stepwise_model: String::new(),
             codex_app_stepwise_max_items: default_stepwise_max_items(),
             codex_app_stepwise_max_input_chars: default_stepwise_max_input_chars(),
@@ -554,10 +634,23 @@ impl Default for BackendSettings {
             codex_app_dream_skin_theme_config: DreamSkinThemeConfig::default(),
             codex_app_dream_skin_image_path: String::new(),
             codex_goals_enabled: false,
+            weixin_connect_enabled: false,
+            weixin_connect_base_url: default_weixin_connect_base_url(),
+            weixin_connect_token: String::new(),
+            weixin_connect_account_id: String::new(),
+            weixin_connect_allow_from: String::new(),
+            weixin_connect_route_tag: String::new(),
+            weixin_connect_work_dir: String::new(),
+            weixin_connect_model: String::new(),
+            weixin_connect_sandbox: default_weixin_connect_sandbox(),
+            weixin_connect_codex_path: String::new(),
             launch_mode: LaunchMode::Patch,
             relay_base_url: default_relay_base_url(),
             relay_api_key: String::new(),
             relay_profiles: default_relay_profiles(),
+            official_login_mixed_mode: false,
+            official_login_relay_id: String::new(),
+            active_official_account_id: String::new(),
             relay_common_config_contents: String::new(),
             relay_context_config_contents: String::new(),
             active_relay_id: default_active_relay_id(),
@@ -578,6 +671,7 @@ impl BackendSettings {
             return RelayProfile {
                 id: default_active_relay_id(),
                 name: "默认中转".to_string(),
+                integration_type: String::new(),
                 model: String::new(),
                 base_url: if self.relay_base_url.is_empty() {
                     default_relay_base_url()
@@ -593,12 +687,11 @@ impl BackendSettings {
                 protocol: RelayProtocol::Responses,
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
+                hide_official_usage_alert: false,
                 test_model: String::new(),
                 config_contents: String::new(),
                 auth_contents: String::new(),
                 use_common_config: true,
-                context_selection: RelayContextSelection::default(),
-                context_selection_initialized: false,
                 context_window: String::new(),
                 auto_compact_limit: String::new(),
                 model_insert_mode: RelayModelInsertMode::Patch,
@@ -611,6 +704,9 @@ impl BackendSettings {
                 vlm_model: String::new(),
                 vlm_base_url: String::new(),
                 user_agent: String::new(),
+                sub2api_enabled: false,
+                sub2api_multiplier: String::new(),
+                model_routes: Vec::new(),
             };
         }
 
@@ -629,6 +725,7 @@ impl BackendSettings {
                 self.active_relay_id.clone()
             },
             name: "默认中转".to_string(),
+            integration_type: String::new(),
             model: String::new(),
             base_url: if self.relay_base_url.is_empty() {
                 default_relay_base_url()
@@ -644,12 +741,11 @@ impl BackendSettings {
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),
             auth_contents: String::new(),
             use_common_config: true,
-            context_selection: RelayContextSelection::default(),
-            context_selection_initialized: false,
             context_window: String::new(),
             auto_compact_limit: String::new(),
             model_insert_mode: RelayModelInsertMode::Patch,
@@ -662,6 +758,9 @@ impl BackendSettings {
             vlm_model: String::new(),
             vlm_base_url: String::new(),
             user_agent: String::new(),
+            sub2api_enabled: false,
+            sub2api_multiplier: String::new(),
+            model_routes: Vec::new(),
         }
     }
 
@@ -690,14 +789,73 @@ impl BackendSettings {
             .cloned()
     }
 
+    pub fn active_relay_session_provider(&self) -> RelaySessionProvider {
+        if let Some(profile) = self.active_aggregate_relay_profile() {
+            return profile.session_provider;
+        }
+        if self
+            .active_relay_profile()
+            .config_contents
+            .parse::<DocumentMut>()
+            .ok()
+            .is_some_and(|doc| {
+                doc.get("model_provider")
+                    .and_then(Item::as_str)
+                    .map(str::trim)
+                    .is_some_and(|provider| provider == "openai")
+            })
+        {
+            RelaySessionProvider::Openai
+        } else {
+            RelaySessionProvider::Custom
+        }
+    }
+
+    pub fn official_login_relay_profile(&self) -> Option<&RelayProfile> {
+        let selected_id = self.official_login_relay_id.trim();
+        self.relay_profiles
+            .iter()
+            .find(|profile| {
+                !selected_id.is_empty()
+                    && profile.id == selected_id
+                    && profile.relay_mode == RelayMode::Official
+                    && !profile.official_mix_api_key
+            })
+            .or_else(|| {
+                self.relay_profiles.iter().find(|profile| {
+                    profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key
+                })
+            })
+    }
+
+    pub fn active_relay_uses_official_login_auth(&self) -> bool {
+        self.official_login_mixed_mode
+            && self.active_relay_profile().relay_mode != RelayMode::Official
+    }
+
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
         self.active_aggregate_relay_profile().is_some()
             || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
+            || self.active_relay_profile().has_model_routes()
+            || self.active_relay_session_provider() == RelaySessionProvider::Openai
     }
 }
 
 pub fn default_stepwise_api_key_env() -> String {
     "CODEX_STEPWISE_API_KEY".to_string()
+}
+
+pub fn default_stepwise_protocol() -> String {
+    "chat_completions".to_string()
+}
+
+pub fn normalize_stepwise_protocol(value: &str) -> String {
+    match value.trim() {
+        "chat_completions" | "responses" | "anthropic_messages" | "auto" => {
+            value.trim().to_string()
+        }
+        _ => default_stepwise_protocol(),
+    }
 }
 
 pub fn default_stepwise_max_items() -> u8 {
@@ -714,6 +872,14 @@ pub fn default_stepwise_max_output_tokens() -> u32 {
 
 pub fn default_stepwise_timeout_ms() -> u64 {
     8000
+}
+
+pub fn default_capacity_retry_max_attempts() -> u8 {
+    5
+}
+
+pub fn clamp_capacity_retry_max_attempts(value: u8) -> u8 {
+    value.clamp(1, 20)
 }
 
 fn default_image_overlay_opacity() -> u8 {
@@ -862,6 +1028,14 @@ pub fn default_relay_base_url() -> String {
     String::new()
 }
 
+fn default_weixin_connect_base_url() -> String {
+    crate::connect::DEFAULT_WEIXIN_BASE_URL.to_string()
+}
+
+fn default_weixin_connect_sandbox() -> String {
+    "read-only".to_string()
+}
+
 pub fn default_active_relay_id() -> String {
     "default".to_string()
 }
@@ -886,6 +1060,15 @@ where
     Ok(value
         .filter(|value| !value.is_empty())
         .unwrap_or_else(default_stepwise_api_key_env))
+}
+
+fn deserialize_stepwise_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .map(|value| normalize_stepwise_protocol(&value))
+        .unwrap_or_else(default_stepwise_protocol))
 }
 
 fn deserialize_image_overlay_opacity<'de, D>(deserializer: D) -> Result<u8, D::Error>
@@ -949,6 +1132,15 @@ where
     Ok(Option::<u64>::deserialize(deserializer)?
         .map(clamp_stepwise_timeout_ms)
         .unwrap_or_else(default_stepwise_timeout_ms))
+}
+
+fn deserialize_capacity_retry_max_attempts<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u8>::deserialize(deserializer)?
+        .map(clamp_capacity_retry_max_attempts)
+        .unwrap_or_else(default_capacity_retry_max_attempts))
 }
 
 fn deserialize_profile_api_key<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -1049,6 +1241,8 @@ impl SettingsStore {
 }
 
 fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    target.remove("codexAppPluginAutoExpand");
+    target.remove("computerUseGuardEnabled");
     if let Some(value) = source.get("codexAppPath").and_then(Value::as_str) {
         target.insert("codexAppPath".to_string(), Value::String(value.to_string()));
     }
@@ -1077,20 +1271,26 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("enhancementsEnabled").and_then(Value::as_bool) {
         target.insert("enhancementsEnabled".to_string(), Value::Bool(value));
     }
-    if let Some(value) = source
-        .get("computerUseGuardEnabled")
-        .and_then(Value::as_bool)
-    {
-        target.insert("computerUseGuardEnabled".to_string(), Value::Bool(value));
-    }
     merge_bool_setting(target, source, "codexAppPluginMarketplaceUnlock");
-    merge_bool_setting(target, source, "codexAppPluginAutoExpand");
     merge_bool_setting(target, source, "codexAppModelWhitelistUnlock");
     merge_bool_setting(target, source, "codexAppSessionDelete");
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppPasteFix");
     merge_bool_setting(target, source, "codexAppForceChineseLocale");
     merge_bool_setting(target, source, "codexAppFastStartup");
+    merge_bool_setting(target, source, "codexAppCapacityRetry");
+    if let Some(value) = source
+        .get("codexAppCapacityRetryMaxAttempts")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+    {
+        target.insert(
+            "codexAppCapacityRetryMaxAttempts".to_string(),
+            Value::Number(serde_json::Number::from(clamp_capacity_retry_max_attempts(
+                value,
+            ))),
+        );
+    }
     merge_bool_setting(target, source, "codexAppProjectMove");
     merge_bool_setting(target, source, "codexAppThreadIdBadge");
     merge_bool_setting(target, source, "codexAppConversationView");
@@ -1136,6 +1336,15 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
             } else {
                 value.trim().to_string()
             }),
+        );
+    }
+    if let Some(value) = source
+        .get("codexAppStepwiseProtocol")
+        .and_then(Value::as_str)
+    {
+        target.insert(
+            "codexAppStepwiseProtocol".to_string(),
+            Value::String(normalize_stepwise_protocol(value)),
         );
     }
     if let Some(value) = source.get("codexAppStepwiseModel").and_then(Value::as_str) {
@@ -1241,6 +1450,22 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("codexGoalsEnabled").and_then(Value::as_bool) {
         target.insert("codexGoalsEnabled".to_string(), Value::Bool(value));
     }
+    merge_bool_setting(target, source, "weixinConnectEnabled");
+    for key in [
+        "weixinConnectBaseUrl",
+        "weixinConnectToken",
+        "weixinConnectAccountId",
+        "weixinConnectAllowFrom",
+        "weixinConnectRouteTag",
+        "weixinConnectWorkDir",
+        "weixinConnectModel",
+        "weixinConnectSandbox",
+        "weixinConnectCodexPath",
+    ] {
+        if let Some(value) = source.get(key).and_then(Value::as_str) {
+            target.insert(key.to_string(), Value::String(value.trim().to_string()));
+        }
+    }
     if let Some(value) = source.get("launchMode").and_then(Value::as_str) {
         if matches!(value, "patch" | "relay") {
             target.insert("launchMode".to_string(), Value::String(value.to_string()));
@@ -1259,6 +1484,27 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert(
             "relayProfiles".to_string(),
             serde_json::to_value(profiles).unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+    }
+    if let Some(value) = source
+        .get("officialLoginMixedMode")
+        .and_then(Value::as_bool)
+    {
+        target.insert("officialLoginMixedMode".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = source.get("officialLoginRelayId").and_then(Value::as_str) {
+        target.insert(
+            "officialLoginRelayId".to_string(),
+            Value::String(value.trim().to_string()),
+        );
+    }
+    if let Some(value) = source
+        .get("activeOfficialAccountId")
+        .and_then(Value::as_str)
+    {
+        target.insert(
+            "activeOfficialAccountId".to_string(),
+            Value::String(value.trim().to_string()),
         );
     }
     if let Some(value) = source
@@ -1359,9 +1605,15 @@ fn preserve_official_mix_bearer_tokens(
 
 fn set_or_replace_experimental_bearer_token(contents: &str, token: &str) -> String {
     let mut doc = parse_toml_document(contents).unwrap_or_else(|_| DocumentMut::new());
-    let provider_id = active_provider_id(&doc).unwrap_or_else(|| "codex-plus-relay".to_string());
-    doc["model_provider"] = toml_edit::value(provider_id.as_str());
-    doc["model_providers"][provider_id.as_str()]["experimental_bearer_token"] =
+    let session_provider_id =
+        active_provider_id(&doc).unwrap_or_else(|| "codex-plus-relay".to_string());
+    let transport_provider_id = if session_provider_id == "openai" {
+        "custom"
+    } else {
+        session_provider_id.as_str()
+    };
+    doc["model_provider"] = toml_edit::value(session_provider_id.as_str());
+    doc["model_providers"][transport_provider_id]["experimental_bearer_token"] =
         toml_edit::value(token.trim());
     ensure_text_newline(doc.to_string())
 }
@@ -1376,15 +1628,22 @@ fn ensure_text_newline(mut value: String) -> String {
 fn experimental_bearer_token_from_config_text(contents: &str) -> Option<String> {
     let doc = parse_toml_document(contents).ok()?;
     let provider_id = active_provider_id(&doc)?;
-    doc.get("model_providers")
-        .and_then(Item::as_table)
-        .and_then(|providers| providers.get(&provider_id))
-        .and_then(Item::as_table)
-        .and_then(|provider| provider.get("experimental_bearer_token"))
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+    let token_from = |provider_id: &str| {
+        doc.get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(provider_id))
+            .and_then(Item::as_table)
+            .and_then(|provider| provider.get("experimental_bearer_token"))
+            .and_then(Item::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+    token_from(&provider_id).or_else(|| {
+        (provider_id == "openai")
+            .then(|| token_from("custom"))
+            .flatten()
+    })
 }
 
 fn active_provider_id(doc: &DocumentMut) -> Option<String> {
@@ -1421,7 +1680,10 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         extracted_context.as_str(),
     ]);
     settings.relay_common_config_contents = crate::relay_config::normalize_config_text(&common);
-    settings.relay_context_config_contents = crate::relay_config::normalize_config_text(&context);
+    settings.relay_context_config_contents = crate::relay_config::strip_legacy_skill_tables(
+        &crate::relay_config::normalize_config_text(&context),
+    );
+    prune_excluded_aggregate_members(&mut settings);
     hydrate_aggregate_profile_model_lists(&mut settings);
     for profile in &mut settings.relay_profiles {
         let _ = crate::relay_config::normalize_relay_profile_for_storage(profile);
@@ -1451,7 +1713,30 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         } else {
             settings.codex_app_stepwise_api_key_env.trim().to_string()
         };
+    settings.codex_app_stepwise_protocol =
+        normalize_stepwise_protocol(&settings.codex_app_stepwise_protocol);
     settings.codex_app_stepwise_model = settings.codex_app_stepwise_model.trim().to_string();
+    settings.weixin_connect_base_url = settings
+        .weixin_connect_base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if settings.weixin_connect_base_url.is_empty() {
+        settings.weixin_connect_base_url = default_weixin_connect_base_url();
+    }
+    settings.weixin_connect_token = settings.weixin_connect_token.trim().to_string();
+    settings.weixin_connect_account_id = settings.weixin_connect_account_id.trim().to_string();
+    settings.weixin_connect_allow_from = settings.weixin_connect_allow_from.trim().to_string();
+    settings.weixin_connect_route_tag = settings.weixin_connect_route_tag.trim().to_string();
+    settings.weixin_connect_work_dir = settings.weixin_connect_work_dir.trim().to_string();
+    settings.weixin_connect_model = settings.weixin_connect_model.trim().to_string();
+    settings.weixin_connect_sandbox = match settings.weixin_connect_sandbox.trim() {
+        "workspace-write" => "workspace-write",
+        "danger-full-access" => "danger-full-access",
+        _ => "read-only",
+    }
+    .to_string();
+    settings.weixin_connect_codex_path = settings.weixin_connect_codex_path.trim().to_string();
     settings.codex_app_stepwise_max_items =
         clamp_stepwise_max_items(settings.codex_app_stepwise_max_items);
     settings.codex_app_stepwise_max_input_chars =
@@ -1460,7 +1745,45 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         clamp_stepwise_max_output_tokens(settings.codex_app_stepwise_max_output_tokens);
     settings.codex_app_stepwise_timeout_ms =
         clamp_stepwise_timeout_ms(settings.codex_app_stepwise_timeout_ms);
+    settings.official_login_relay_id = settings.official_login_relay_id.trim().to_string();
+    settings.active_official_account_id = settings.active_official_account_id.trim().to_string();
+    if settings.official_login_mixed_mode {
+        settings.official_login_relay_id = settings
+            .official_login_relay_profile()
+            .map(|profile| profile.id.clone())
+            .unwrap_or_default();
+    }
     settings
+}
+
+fn prune_excluded_aggregate_members(settings: &mut BackendSettings) {
+    let excluded_ids = settings
+        .relay_profiles
+        .iter()
+        .filter(|profile| {
+            crate::aggregate_model_alias::integration_is_excluded_from_aggregate(
+                &profile.integration_type,
+            )
+        })
+        .map(|profile| profile.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if excluded_ids.is_empty() {
+        return;
+    }
+
+    for aggregate in &mut settings.aggregate_relay_profiles {
+        aggregate
+            .members
+            .retain(|member| !excluded_ids.contains(member.relay_id.as_str()));
+        for mapping in &mut aggregate.model_mappings {
+            mapping
+                .targets
+                .retain(|target| !excluded_ids.contains(target.relay_id.as_str()));
+        }
+        aggregate
+            .model_mappings
+            .retain(|mapping| !mapping.targets.is_empty());
+    }
 }
 
 fn hydrate_aggregate_profile_model_lists(settings: &mut BackendSettings) {
@@ -1656,11 +1979,10 @@ mod tests {
         assert!(!settings.provider_sync_enabled);
         assert!(settings.relay_profiles_enabled);
         assert!(settings.enhancements_enabled);
-        assert!(!settings.computer_use_guard_enabled);
         assert!(settings.codex_app_plugin_marketplace_unlock);
-        assert!(settings.codex_app_plugin_auto_expand);
         assert!(!settings.codex_app_thread_id_badge);
         assert!(settings.codex_app_force_chinese_locale);
+        assert!(!settings.codex_app_capacity_retry);
         assert!(!settings.codex_goals_enabled);
         assert!(settings.codex_app_path.is_empty());
         assert!(settings.codex_extra_args.is_empty());
@@ -1685,11 +2007,44 @@ mod tests {
             settings.codex_app_stepwise_api_key_env,
             "CODEX_STEPWISE_API_KEY"
         );
+        assert_eq!(settings.codex_app_stepwise_protocol, "chat_completions");
         assert!(settings.codex_app_stepwise_model.is_empty());
         assert_eq!(settings.codex_app_stepwise_max_items, 6);
         assert_eq!(settings.codex_app_stepwise_max_input_chars, 6000);
         assert_eq!(settings.codex_app_stepwise_max_output_tokens, 500);
         assert_eq!(settings.codex_app_stepwise_timeout_ms, 8000);
+        assert!(!settings.weixin_connect_enabled);
+        assert_eq!(
+            settings.weixin_connect_base_url,
+            crate::connect::DEFAULT_WEIXIN_BASE_URL
+        );
+        assert!(settings.weixin_connect_token.is_empty());
+        assert_eq!(settings.weixin_connect_sandbox, "read-only");
+    }
+
+    #[test]
+    fn settings_deserialize_normalizes_stepwise_protocol_and_supports_legacy_missing_field() {
+        let defaults: BackendSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.codex_app_stepwise_protocol, "chat_completions");
+
+        for protocol in [
+            "chat_completions",
+            "responses",
+            "anthropic_messages",
+            "auto",
+        ] {
+            let settings: BackendSettings = serde_json::from_value(json!({
+                "codexAppStepwiseProtocol": format!(" {protocol} ")
+            }))
+            .unwrap();
+            assert_eq!(settings.codex_app_stepwise_protocol, protocol);
+        }
+
+        let invalid: BackendSettings = serde_json::from_value(json!({
+            "codexAppStepwiseProtocol": "unsupported"
+        }))
+        .unwrap();
+        assert_eq!(invalid.codex_app_stepwise_protocol, "chat_completions");
     }
 
     #[test]
@@ -1721,7 +2076,8 @@ mod tests {
         .unwrap();
 
         assert!(settings.codex_app_plugin_marketplace_unlock);
-        assert!(!settings.codex_app_plugin_auto_expand);
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert!(saved.get("codexAppPluginAutoExpand").is_none());
 
         let legacy_settings: BackendSettings = serde_json::from_str(
             r#"{
@@ -1731,7 +2087,6 @@ mod tests {
         .unwrap();
 
         assert!(legacy_settings.codex_app_plugin_marketplace_unlock);
-        assert!(legacy_settings.codex_app_plugin_auto_expand);
     }
 
     #[test]
@@ -1758,6 +2113,7 @@ mod tests {
 
         assert_eq!(profile.relay_mode, RelayMode::Official);
         assert!(!profile.official_mix_api_key);
+        assert!(!profile.hide_official_usage_alert);
         assert!(profile.test_model.is_empty());
     }
 
@@ -1765,17 +2121,43 @@ mod tests {
     fn relay_profile_context_fields_default_to_empty() {
         let profile = RelayProfile::default();
 
-        assert!(profile.context_selection.mcp_servers.is_empty());
-        assert!(profile.context_selection.skills.is_empty());
-        assert!(profile.context_selection.plugins.is_empty());
         assert!(profile.use_common_config);
-        assert!(!profile.context_selection_initialized);
         assert!(profile.context_window.is_empty());
         assert!(profile.auto_compact_limit.is_empty());
         assert_eq!(profile.model_insert_mode, RelayModelInsertMode::Patch);
         assert!(profile.model_list.is_empty());
+        assert!(profile.model_routes.is_empty());
+        assert!(!profile.has_model_routes());
     }
 
+    #[test]
+    fn relay_profile_model_routes_roundtrip_in_camel_case() {
+        let profile: RelayProfile = serde_json::from_str(
+            r#"{
+                "id":"relay-a",
+                "name":"供应商 A",
+                "modelRoutes":[{
+                    "model":"gpt-5.6-luna",
+                    "targetRelayId":"relay-b",
+                    "targetModel":"provider-luna"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(profile.has_model_routes());
+        assert_eq!(profile.model_routes[0].model, "gpt-5.6-luna");
+        assert_eq!(profile.model_routes[0].target_relay_id, "relay-b");
+        assert_eq!(profile.model_routes[0].target_model, "provider-luna");
+
+        let saved = serde_json::to_value(profile).unwrap();
+        assert_eq!(saved["modelRoutes"][0]["targetRelayId"], "relay-b");
+        assert_eq!(saved["modelRoutes"][0]["targetModel"], "provider-luna");
+    }
+
+    /// 旧版按供应商勾选上下文条目的 `contextSelection` / `contextSelectionInitialized`
+    /// 已被上下文条目自身的 `enabled` 开关取代。历史 settings.json 里仍会带着这两个键，
+    /// 反序列化必须容忍它们，否则老用户一升级配置就读不出来。
     #[test]
     fn relay_profile_context_fields_deserialize_from_camel_case() {
         let profile: RelayProfile = serde_json::from_str(
@@ -1797,11 +2179,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(profile.context_selection.mcp_servers, vec!["context7"]);
-        assert_eq!(profile.context_selection.skills, vec!["writer"]);
-        assert_eq!(profile.context_selection.plugins, vec!["local"]);
         assert!(!profile.use_common_config);
-        assert!(profile.context_selection_initialized);
         assert_eq!(profile.context_window, "200000");
         assert_eq!(profile.auto_compact_limit, "160000");
         assert_eq!(profile.model_insert_mode, RelayModelInsertMode::Patch);
@@ -1896,6 +2274,7 @@ base_url = "http://127.0.0.1:57321/v1"
                 name: "官方".to_string(),
                 relay_mode: RelayMode::Official,
                 official_mix_api_key: false,
+                hide_official_usage_alert: false,
                 model: "gpt-5.5".to_string(),
                 base_url: "https://relay.example/v1".to_string(),
                 api_key: "sk-test".to_string(),
@@ -1934,6 +2313,7 @@ requires_openai_auth = true
                 name: "官方混入".to_string(),
                 relay_mode: RelayMode::Official,
                 official_mix_api_key: true,
+                hide_official_usage_alert: false,
                 model: "gpt-5.5".to_string(),
                 base_url: "https://relay.example/v1".to_string(),
                 api_key: "sk-mix".to_string(),
@@ -1996,6 +2376,7 @@ experimental_bearer_token = "sk-mix"
                     name: "官方混入".to_string(),
                     relay_mode: RelayMode::Official,
                     official_mix_api_key: true,
+                    hide_official_usage_alert: false,
                     config_contents: r#"model_provider = "custom"
 
 [model_providers.other]
@@ -2134,6 +2515,82 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
+    fn settings_store_model_routes_restore_target_credentials() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let profile = |id: &str, base_url: &str, api_key: &str| RelayProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            relay_mode: RelayMode::PureApi,
+            upstream_base_url: base_url.to_string(),
+            config_contents: format!(
+                "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"{base_url}\"\n"
+            ),
+            auth_contents: format!(r#"{{"OPENAI_API_KEY":"{api_key}"}}"#),
+            ..RelayProfile::default()
+        };
+        let mut source = profile("source", "https://source.example/v1", "sk-source");
+        source.model_routes = vec![RelayModelRoute {
+            model: "gpt-5.6-luna".to_string(),
+            target_relay_id: "target".to_string(),
+            target_model: String::new(),
+        }];
+        let settings = BackendSettings {
+            active_relay_id: "source".to_string(),
+            relay_profiles: vec![
+                source,
+                profile("target", "https://target.example/v1", "sk-target"),
+            ],
+            ..BackendSettings::default()
+        };
+
+        store.save(&settings).unwrap();
+        let loaded = store.load().unwrap();
+
+        assert!(loaded.active_relay_uses_protocol_proxy());
+        assert_eq!(
+            loaded.relay_profiles[0].base_url,
+            "https://source.example/v1"
+        );
+        assert_eq!(
+            loaded.relay_profiles[1].base_url,
+            "https://target.example/v1"
+        );
+        assert_eq!(loaded.relay_profiles[1].api_key, "sk-target");
+        assert_eq!(
+            loaded.relay_profiles[0].model_routes[0].target_relay_id,
+            "target"
+        );
+    }
+
+    #[test]
+    fn settings_store_persists_and_normalizes_stepwise_protocol() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+
+        let updated = store
+            .update(json!({
+                "codexAppStepwiseProtocol": "responses"
+            }))
+            .unwrap();
+        assert_eq!(updated.codex_app_stepwise_protocol, "responses");
+        assert_eq!(
+            store.load().unwrap().codex_app_stepwise_protocol,
+            "responses"
+        );
+
+        let invalid = store
+            .update(json!({
+                "codexAppStepwiseProtocol": "not-a-protocol"
+            }))
+            .unwrap();
+        assert_eq!(invalid.codex_app_stepwise_protocol, "chat_completions");
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(store.path).unwrap()).unwrap();
+        assert_eq!(saved["codexAppStepwiseProtocol"], "chat_completions");
+    }
+
+    #[test]
     fn settings_store_save_load_roundtrip_preserves_aggregate_relay_settings() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
@@ -2160,6 +2617,7 @@ experimental_bearer_token = "sk-existing""#
             aggregate_relay_profiles: vec![AggregateRelayProfile {
                 id: "agg".to_string(),
                 name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Openai,
                 strategy: AggregateRelayStrategy::WeightedRoundRobin,
                 members: vec![
                     AggregateRelayMember {
@@ -2190,7 +2648,71 @@ experimental_bearer_token = "sk-existing""#
         );
         assert_eq!(active_aggregate.members[1].relay_id, "relay-b");
         assert_eq!(active_aggregate.members[1].weight, 3);
+        assert_eq!(
+            active_aggregate.session_provider,
+            RelaySessionProvider::Openai
+        );
+        assert_eq!(
+            loaded.active_relay_session_provider(),
+            RelaySessionProvider::Openai
+        );
         assert!(loaded.active_relay_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn normalize_settings_removes_cliproxy_official_channel_from_aggregates() {
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "managed-cliproxy-official".to_string(),
+                    integration_type: "cliproxy-official".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "relay-a".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
+                strategy: AggregateRelayStrategy::Failover,
+                members: vec![
+                    AggregateRelayMember {
+                        relay_id: "managed-cliproxy-official".to_string(),
+                        weight: 1,
+                    },
+                    AggregateRelayMember {
+                        relay_id: "relay-a".to_string(),
+                        weight: 1,
+                    },
+                ],
+                model_mappings_enabled: true,
+                model_mappings: vec![AggregateRelayModelMapping {
+                    codex_model: "gpt-5.4".to_string(),
+                    targets: vec![
+                        AggregateRelayDispatchTarget {
+                            relay_id: "managed-cliproxy-official".to_string(),
+                            target_model: "gpt-5.4".to_string(),
+                        },
+                        AggregateRelayDispatchTarget {
+                            relay_id: "relay-a".to_string(),
+                            target_model: "gpt-5.4".to_string(),
+                        },
+                    ],
+                }],
+            }],
+            ..BackendSettings::default()
+        };
+
+        let normalized = normalize_settings_config_sections(settings);
+        let aggregate = &normalized.aggregate_relay_profiles[0];
+        assert_eq!(aggregate.members.len(), 1);
+        assert_eq!(aggregate.members[0].relay_id, "relay-a");
+        assert_eq!(aggregate.model_mappings.len(), 1);
+        assert_eq!(aggregate.model_mappings[0].targets.len(), 1);
+        assert_eq!(aggregate.model_mappings[0].targets[0].relay_id, "relay-a");
     }
 
     #[test]
@@ -2231,6 +2753,7 @@ experimental_bearer_token = "sk-existing""#
             aggregate_relay_profiles: vec![AggregateRelayProfile {
                 id: "agg".to_string(),
                 name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
                 strategy: AggregateRelayStrategy::Failover,
                 members: vec![
                     AggregateRelayMember {
@@ -2259,6 +2782,28 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(
             aggregate.model_list,
             "gpt-5.5\n中转 A:gpt-5.5\ngpt-5.4\n中转 A:gpt-5.4\n中转 B:deepseek-v4-pro"
+        );
+    }
+
+    #[test]
+    fn active_relay_session_provider_reads_standard_profile_config() {
+        let mut settings = BackendSettings {
+            relay_profiles: vec![RelayProfile {
+                config_contents: "model_provider = \"openai\"\n".to_string(),
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+
+        assert_eq!(
+            settings.active_relay_session_provider(),
+            RelaySessionProvider::Openai
+        );
+
+        settings.relay_profiles[0].config_contents = "model_provider = \"custom\"\n".to_string();
+        assert_eq!(
+            settings.active_relay_session_provider(),
+            RelaySessionProvider::Custom
         );
     }
 
@@ -2439,6 +2984,42 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(updated.codex_app_stepwise_max_input_chars, 24000);
         assert_eq!(updated.codex_app_stepwise_max_output_tokens, 100);
         assert_eq!(updated.codex_app_stepwise_timeout_ms, 60000);
+        assert_eq!(store.load().unwrap(), updated);
+    }
+
+    #[test]
+    fn settings_store_update_persists_weixin_connect_settings() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+
+        let updated = store
+            .update(json!({
+                "weixinConnectEnabled": true,
+                "weixinConnectBaseUrl": "https://ilink.example.test/",
+                "weixinConnectToken": " token ",
+                "weixinConnectAccountId": " bot-1 ",
+                "weixinConnectAllowFrom": " user@im.wechat ",
+                "weixinConnectRouteTag": " route ",
+                "weixinConnectWorkDir": " /workspace ",
+                "weixinConnectModel": " gpt-test ",
+                "weixinConnectSandbox": "workspace-write",
+                "weixinConnectCodexPath": " /usr/local/bin/codex "
+            }))
+            .unwrap();
+
+        assert!(updated.weixin_connect_enabled);
+        assert_eq!(
+            updated.weixin_connect_base_url,
+            "https://ilink.example.test"
+        );
+        assert_eq!(updated.weixin_connect_token, "token");
+        assert_eq!(updated.weixin_connect_account_id, "bot-1");
+        assert_eq!(updated.weixin_connect_allow_from, "user@im.wechat");
+        assert_eq!(updated.weixin_connect_route_tag, "route");
+        assert_eq!(updated.weixin_connect_work_dir, "/workspace");
+        assert_eq!(updated.weixin_connect_model, "gpt-test");
+        assert_eq!(updated.weixin_connect_sandbox, "workspace-write");
+        assert_eq!(updated.weixin_connect_codex_path, "/usr/local/bin/codex");
         assert_eq!(store.load().unwrap(), updated);
     }
 
@@ -2662,6 +3243,29 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(saved["providerSyncEnabled"], json!(true));
         assert_eq!(saved["codexExtraArgs"], Value::Null);
         assert_eq!(saved["customField"], json!({"nested": true}));
+    }
+
+    #[test]
+    fn settings_store_update_removes_obsolete_setting_fields() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        std::fs::write(
+            &path,
+            r#"{"providerSyncEnabled":false,"codexAppPluginAutoExpand":true,"computerUseGuardEnabled":true,"customField":1}"#,
+        )
+        .unwrap();
+
+        store
+            .update(json!({
+                "providerSyncEnabled": true
+            }))
+            .unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert!(saved.get("codexAppPluginAutoExpand").is_none());
+        assert!(saved.get("computerUseGuardEnabled").is_none());
+        assert_eq!(saved["customField"], json!(1));
     }
 
     #[test]
