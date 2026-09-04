@@ -240,6 +240,20 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
 }
 
 #[test]
+fn manager_exposes_official_login_hybrid_mode_without_adding_official_to_rotation() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
+    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+
+    assert!(app_tsx.contains("officialLoginMixedMode"));
+    assert!(app_tsx.contains("officialLoginRelayId"));
+    assert!(app_tsx.contains("官方登录混合模式"));
+    assert!(app_tsx.contains("官方 API 不加入聚合轮转"));
+    assert!(app_tsx.contains("gpt-5.4(openai;供应商1|供应商2:真实模型)"));
+    assert!(app_tsx.contains("!isAggregateRelayProfile(profile) && isApiRelayProfile(profile)"));
+}
+
+#[test]
 fn relay_context_management_is_global_not_supplier_scoped() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");

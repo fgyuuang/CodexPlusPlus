@@ -421,6 +421,16 @@ pub fn stop_codex_processes() {
     }
 }
 
+#[cfg(windows)]
+pub fn codex_processes_running() -> bool {
+    !find_codex_processes().is_empty()
+}
+
+#[cfg(not(windows))]
+pub fn codex_processes_running() -> bool {
+    false
+}
+
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn stop_codex_processes() {}
 

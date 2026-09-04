@@ -31,6 +31,8 @@ import {
   Download,
   Edit3,
   Eye,
+  EyeOff,
+  FolderOpen,
   GripVertical,
   Info,
   ImagePlus,
@@ -42,6 +44,7 @@ import {
   LayoutGrid,
   LayoutDashboard,
   List,
+  LogIn,
   Palette,
   Play,
   MessageCircle,
@@ -68,6 +71,8 @@ import {
   Sun,
   TestTube,
   Trash2,
+  Upload,
+  UserRound,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
@@ -86,6 +91,7 @@ import {
   aggregateDisplayModelEntries,
   aggregateEffectiveMappings,
   aggregateMappingKeyOptions,
+  aggregateOrderedModelList,
   aggregatePersistedMappingsFromEffective,
   aggregateProviderLabel,
   DEFAULT_CODEX_MODEL_MAPPING_KEYS,
@@ -215,6 +221,59 @@ type RemotePluginMarketplaceResult = CommandResult<{
   skillCount: number;
 }>;
 
+type OfficialUsageWindow = {
+  usedPercent: number | null;
+  windowMinutes: number | null;
+  resetsAt: number | null;
+};
+
+type OfficialUsageSnapshot = {
+  fetchedAt: number;
+  primary: OfficialUsageWindow | null;
+  secondary: OfficialUsageWindow | null;
+  credits: unknown;
+  additionalRateLimits: unknown[];
+  error: string | null;
+};
+
+type OfficialAccount = {
+  id: string;
+  name: string;
+  email: string;
+  group: string;
+  tags: string[];
+  sort: number;
+  enabled: boolean;
+  status: string;
+  chatgptAccountId: string;
+  workspaceId: string;
+  planType: string;
+  createdAt: number;
+  updatedAt: number;
+  lastRefreshAt: number | null;
+  lastUsedAt: number | null;
+  usage: OfficialUsageSnapshot | null;
+};
+
+type OfficialAccountsResult = CommandResult<{
+  accounts: OfficialAccount[];
+  activeAccountId: string;
+  codexRunning: boolean;
+  restartRequired: boolean;
+}>;
+
+type OfficialLoginSessionResult = CommandResult<{
+  loginId: string;
+  method: "browser" | "device" | string;
+  status: string;
+  authUrl: string;
+  verificationUrl: string;
+  userCode: string;
+  expiresAt: number;
+  account: OfficialAccount | null;
+  error: string | null;
+}>;
+
 type BackendSettings = {
   codexAppPath: string;
   codexExtraArgs: string[];
@@ -231,6 +290,9 @@ type BackendSettings = {
   codexAppPasteFix: boolean;
   codexAppForceChineseLocale: boolean;
   codexAppFastStartup: boolean;
+  codexAppCapacityRetry: boolean;
+  codexAppCapacityRetryMaxAttempts: number;
+  codexAppProjectMove: boolean;
   codexAppThreadIdBadge: boolean;
   codexAppConversationView: boolean;
   codexAppThreadScrollRestore: boolean;
@@ -277,6 +339,9 @@ type BackendSettings = {
   relayBaseUrl: string;
   relayApiKey: string;
   relayProfiles: RelayProfile[];
+  officialLoginMixedMode: boolean;
+  officialLoginRelayId: string;
+  activeOfficialAccountId: string;
   aggregateRelayProfiles: AggregateRelayProfile[];
   activeAggregateRelayId: string;
   relayCommonConfigContents: string;
@@ -292,6 +357,7 @@ type ImageOverlayFitMode = "fill" | "fit" | "stretch" | "tile" | "center";
 export type RelayProfile = {
   id: string;
   name: string;
+  integrationType?: string;
   model: string;
   baseUrl: string;
   upstreamBaseUrl: string;
@@ -305,6 +371,8 @@ export type RelayProfile = {
   configContents: string;
   authContents: string;
   useCommonConfig: boolean;
+  contextSelection?: RelayContextSelection;
+  contextSelectionInitialized?: boolean;
   contextWindow: string;
   autoCompactLimit: string;
   modelList: string;
@@ -320,6 +388,12 @@ export type RelayProfile = {
   sub2apiMultiplier: string;
   modelRoutes?: RelayModelRoute[];
   aggregate?: RelayAggregateConfig | null;
+};
+
+type RelayContextSelection = {
+  mcpServers: string[];
+  skills: string[];
+  plugins: string[];
 };
 
 type RelayAggregateStrategy = "failover" | "conversationRoundRobin" | "requestRoundRobin" | "weightedRoundRobin";
@@ -639,6 +713,83 @@ type StepwiseTestResult = CommandResult<{
 type RelayProfileModelsResult = CommandResult<{
   models: string[];
   endpoint: string;
+}>;
+
+type CliproxyStatusResult = CommandResult<{
+  installed: boolean;
+  running: boolean;
+  healthy: boolean;
+  managedProcess: boolean;
+  pid: number | null;
+  startedAt: number | null;
+  version: string;
+  installRoot: string;
+  binaryPath: string;
+  configPath: string;
+  baseUrl: string;
+  managementUrl: string;
+  apiKey: string;
+  managementKey: string;
+  profileInstalled: boolean;
+  officialProfileInstalled: boolean;
+  generalProfileInstalled: boolean;
+}>;
+
+type CliproxyModelsResult = CommandResult<{
+  models: string[];
+  endpoint: string;
+}>;
+
+type CliproxyTestResult = CommandResult<{
+  httpStatus: number;
+  endpoint: string;
+  model: string;
+}>;
+
+type CliproxyApplyResult = CommandResult<{
+  settings: BackendSettings;
+  profileId: string;
+  created: boolean;
+}>;
+
+type NewapiStatusResult = CommandResult<{
+  configured: boolean;
+  dockerAvailable: boolean;
+  daemonAvailable: boolean;
+  composeAvailable: boolean;
+  running: boolean;
+  healthy: boolean;
+  version: string;
+  systemName: string;
+  startedAt: number | null;
+  setup: boolean | null;
+  projectRoot: string;
+  composeFile: string;
+  dockerExecutable: string;
+  apiServiceName: string;
+  baseUrl: string;
+  managementUrl: string;
+  apiKey: string;
+  profileInstalled: boolean;
+  serviceCount: number;
+  runningServiceCount: number;
+}>;
+
+type NewapiModelsResult = CommandResult<{
+  models: string[];
+  endpoint: string;
+}>;
+
+type NewapiTestResult = CommandResult<{
+  httpStatus: number;
+  endpoint: string;
+  model: string;
+}>;
+
+type NewapiApplyResult = CommandResult<{
+  settings: BackendSettings;
+  profileId: string;
+  created: boolean;
 }>;
 
 type Sub2ApiBillingResult = CommandResult<{
@@ -1047,6 +1198,9 @@ const defaultSettings: BackendSettings = {
   codexAppPasteFix: false,
   codexAppForceChineseLocale: true,
   codexAppFastStartup: false,
+  codexAppCapacityRetry: false,
+  codexAppCapacityRetryMaxAttempts: 5,
+  codexAppProjectMove: true,
   codexAppThreadIdBadge: false,
   codexAppConversationView: false,
   codexAppThreadScrollRestore: true,
@@ -1108,6 +1262,8 @@ const defaultSettings: BackendSettings = {
       configContents: "",
       authContents: "",
       useCommonConfig: true,
+      contextSelection: { mcpServers: [], skills: [], plugins: [] },
+      contextSelectionInitialized: false,
       contextWindow: "",
       autoCompactLimit: "",
       modelList: "",
@@ -1123,6 +1279,9 @@ const defaultSettings: BackendSettings = {
       sub2apiMultiplier: "",
     },
   ],
+  officialLoginMixedMode: false,
+  officialLoginRelayId: "",
+  activeOfficialAccountId: "",
   relayCommonConfigContents: "",
   relayContextConfigContents: "",
   activeRelayId: "default",
@@ -1151,6 +1310,13 @@ export function App() {
   const [weixinStatus, setWeixinStatus] = useState<WeixinConnectStatusResult | null>(null);
   const [weixinQr, setWeixinQr] = useState<WeixinQrResult | null>(null);
   const [relay, setRelay] = useState<RelayResult | null>(null);
+  const [officialAccounts, setOfficialAccounts] = useState<OfficialAccountsResult | null>(null);
+  const [cliproxy, setCliproxy] = useState<CliproxyStatusResult | null>(null);
+  const [cliproxyModels, setCliproxyModels] = useState<CliproxyModelsResult | null>(null);
+  const [cliproxyTest, setCliproxyTest] = useState<CliproxyTestResult | null>(null);
+  const [newapi, setNewapi] = useState<NewapiStatusResult | null>(null);
+  const [newapiModels, setNewapiModels] = useState<NewapiModelsResult | null>(null);
+  const [newapiTest, setNewapiTest] = useState<NewapiTestResult | null>(null);
   const [relayFiles, setRelayFiles] = useState<RelayFilesResult | null>(null);
   const [envConflicts, setEnvConflicts] = useState<EnvConflictsResult | null>(null);
   const [relayEnvironment, setRelayEnvironment] = useState<RelayEnvironmentResult | null>(null);
@@ -1430,6 +1596,464 @@ export function App() {
       if (!silent) showResultNotice(t("登录状态"), result, { silentSuccess: true });
     }
   };
+
+  const refreshOfficialAccounts = async (silent = false) => {
+    const result = await run(() => call<OfficialAccountsResult>("list_official_accounts"));
+    if (result) {
+      setOfficialAccounts(result);
+      if (!silent || !isSuccessStatus(result.status)) {
+        showResultNotice(t("官方账号"), result, { silentSuccess: true });
+      }
+    }
+    return result;
+  };
+
+  const startOfficialAccountLogin = async (method: "browser" | "device", accountId = "") => {
+    const result = await run(() =>
+      call<OfficialLoginSessionResult>("start_official_account_login", { request: { method, accountId } }),
+    );
+    if (result && !isSuccessStatus(result.status)) showResultNotice(t("官方账号登录"), result);
+    return result;
+  };
+
+  const officialAccountLoginStatus = (loginId: string) =>
+    run(() => call<OfficialLoginSessionResult>("official_account_login_status", { loginId }));
+
+  const cancelOfficialAccountLogin = async (loginId: string) => {
+    const result = await run(() => call<OfficialLoginSessionResult>("cancel_official_account_login", { loginId }));
+    if (result) showResultNotice(t("官方账号登录"), result, { silentSuccess: true });
+  };
+
+  const updateOfficialAccount = async (
+    accountId: string,
+    patch: Partial<Pick<OfficialAccount, "name" | "group" | "tags" | "sort" | "enabled">>,
+  ) => {
+    const result = await run(() =>
+      call<OfficialAccountsResult>("update_official_account", { request: { accountId, patch } }),
+    );
+    if (result) {
+      setOfficialAccounts(result);
+      showResultNotice(t("官方账号"), result, { silentSuccess: true });
+    }
+    return result;
+  };
+
+  const refreshOfficialAccount = async (accountId: string) => {
+    const result = await run(() =>
+      call<OfficialAccountsResult>("refresh_official_account", { request: { accountId } }),
+    );
+    if (result) {
+      setOfficialAccounts(result);
+      showResultNotice(t("刷新官方账号"), result);
+    }
+    return result;
+  };
+
+  const switchOfficialAccount = async (accountId: string) => {
+    let confirmRestart = false;
+    let discardLiveConflict = false;
+    let result = await run(() =>
+      call<OfficialAccountsResult>("switch_official_account", {
+        request: { accountId, confirmRestart, discardLiveConflict },
+      }),
+    );
+    if (!result) return null;
+    if (result.status === "needs_confirmation") {
+      if (!window.confirm(result.message)) return result;
+      confirmRestart = true;
+      result = await run(() =>
+        call<OfficialAccountsResult>("switch_official_account", {
+          request: { accountId, confirmRestart, discardLiveConflict },
+        }),
+      );
+      if (!result) return null;
+    }
+    if (result.status === "conflict") {
+      if (window.confirm(`${result.message}\n\n${t("忽略当前 auth.json 的身份冲突并继续切换？")}`)) {
+        discardLiveConflict = true;
+        result = await run(() =>
+          call<OfficialAccountsResult>("switch_official_account", {
+            request: { accountId, confirmRestart: true, discardLiveConflict },
+          }),
+        );
+        if (!result) return null;
+      }
+    }
+    setOfficialAccounts(result);
+    if (isSuccessStatus(result.status)) {
+      await refreshSettings(true);
+      await refreshRelayFiles(true);
+    }
+    showResultNotice(t("切换官方账号"), result);
+    if (confirmRestart && result.restartRequired) await restart();
+    return result;
+  };
+
+  const deleteOfficialAccount = async (account: OfficialAccount) => {
+    if (!window.confirm(tf("删除官方账号“{0}”？此操作会同时删除本机保存的加密登录信息。", [account.name || account.email]))) return;
+    const result = await run(() =>
+      call<OfficialAccountsResult>("delete_official_account", { request: { accountId: account.id } }),
+    );
+    if (result) {
+      setOfficialAccounts(result);
+      showResultNotice(t("删除官方账号"), result);
+    }
+  };
+
+  const importOfficialAccounts = async (password: string) => {
+    let selected: unknown;
+    try {
+      selected = await open({
+        directory: false,
+        multiple: true,
+        title: t("导入官方账号"),
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+    } catch (error) {
+      showNotice(t("导入官方账号"), stringifyError(error), "failed");
+      return null;
+    }
+    const paths = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
+    if (!paths.length) return null;
+    const result = await run(() =>
+      call<OfficialAccountsResult>("import_official_accounts", { request: { paths, password } }),
+    );
+    if (result) {
+      setOfficialAccounts(result);
+      showResultNotice(t("导入官方账号"), result);
+    }
+    return result;
+  };
+
+  const exportOfficialAccounts = async (accountIds: string[], password: string) => {
+    let path: string | null;
+    try {
+      path = await saveDialog({
+        title: t("导出官方账号加密备份"),
+        defaultPath: "codex-plus-plus-official-accounts.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+    } catch (error) {
+      showNotice(t("导出官方账号"), stringifyError(error), "failed");
+      return null;
+    }
+    if (!path) return null;
+    const result = await run(() =>
+      call<OfficialAccountsResult>("export_official_accounts", {
+        request: { accountIds, path, password },
+      }),
+    );
+    if (result) showResultNotice(t("导出官方账号"), result);
+    return result;
+  };
+  const refreshCliproxy = async (silent = false) => {
+    const result = await run(() => call<CliproxyStatusResult>("cliproxy_status"));
+    if (result) {
+      setCliproxy(result);
+      if (!silent || !isSuccessStatus(result.status)) {
+        showResultNotice(t("CLIProxyAPI 状态"), result, { silentSuccess: true });
+      }
+    }
+    return result;
+  };
+
+  const runCliproxyStatusAction = async (
+    command: "cliproxy_install" | "cliproxy_start" | "cliproxy_stop" | "cliproxy_restart",
+    title: string,
+  ) => {
+    const result = await run(() => call<CliproxyStatusResult>(command));
+    if (result) {
+      setCliproxy(result);
+      showResultNotice(title, result);
+    }
+    return result;
+  };
+
+  const openCliproxyManagement = async () => {
+    const result = await run(() => call<CommandResult<Record<string, unknown>>>("cliproxy_open_management"));
+    if (result && !isSuccessStatus(result.status)) showResultNotice(t("CLIProxyAPI 管理页面"), result);
+  };
+
+  const refreshCliproxyModels = async (silent = false) => {
+    const result = await run(() => call<CliproxyModelsResult>("cliproxy_list_models"));
+    if (result) {
+      setCliproxyModels(result);
+      if (!silent || !isSuccessStatus(result.status)) {
+        showResultNotice(t("CLIProxyAPI 模型"), result, { silentSuccess: true });
+      }
+    }
+    return result;
+  };
+
+  const testCliproxyApi = async (model: string) => {
+    const result = await run(() =>
+      call<CliproxyTestResult>("cliproxy_test_api", { request: { model } }),
+    );
+    if (result) {
+      setCliproxyTest(result);
+      showResultNotice(t("CLIProxyAPI 测试"), result);
+    }
+    return result;
+  };
+
+  const saveCliproxyApiKey = async (apiKey: string, managementKey: string) => {
+    const result = await run(() =>
+      call<CliproxyStatusResult>("cliproxy_save_api_key", { request: { apiKey, managementKey } }),
+    );
+    if (result) {
+      setCliproxy(result);
+      setCliproxyModels(null);
+      setCliproxyTest(null);
+      showResultNotice(t("CLIProxyAPI API Key"), result);
+    }
+    return result;
+  };
+
+  const saveCliproxyConnection = async (
+    installRoot: string,
+    binaryPath: string,
+    configPath: string,
+    baseUrl: string,
+  ) => {
+    const result = await run(() =>
+      call<CliproxyStatusResult>("cliproxy_save_connection", {
+        request: { installRoot, binaryPath, configPath, baseUrl },
+      }),
+    );
+    if (result) {
+      setCliproxy(result);
+      setCliproxyModels(null);
+      setCliproxyTest(null);
+      showResultNotice(t("CLIProxyAPI 启动与连接位置"), result);
+    }
+    return result;
+  };
+
+  const applyCliproxyProfile = async (
+    channel: "officialCodex" | "generalRelay",
+    model: string,
+    models: string[],
+  ) => {
+    const result = await run(() =>
+      call<CliproxyApplyResult>("cliproxy_apply_profile", {
+        request: { channel, model, models },
+      }),
+    );
+    if (result) {
+      const normalized = normalizeSettings(result.settings);
+      setSettingsForm(normalized);
+      setSettings((current) => current ? { ...current, settings: normalized } : current);
+      setCliproxy((current) => current ? {
+        ...current,
+        profileInstalled: current.profileInstalled || isSuccessStatus(result.status),
+        officialProfileInstalled: channel === "officialCodex" ? isSuccessStatus(result.status) : current.officialProfileInstalled,
+        generalProfileInstalled: channel === "generalRelay" ? isSuccessStatus(result.status) : current.generalProfileInstalled,
+      } : current);
+      showResultNotice(t("CLIProxyAPI 供应商"), result);
+    }
+    return result;
+  };
+
+  const setCliproxyIntegrationEnabled = async (enabled: boolean) => {
+    if (enabled) {
+      const modelsResult = cliproxyModels && isSuccessStatus(cliproxyModels.status)
+        ? cliproxyModels
+        : await refreshCliproxyModels(true);
+      if (!modelsResult || !isSuccessStatus(modelsResult.status)) return null;
+      if (!modelsResult.models.length) {
+        showNotice(
+          t("CLIProxyAPI 接入"),
+          t("CLIProxyAPI 未返回可接入模型，请先在管理页面完成账号登录后刷新模型。"),
+          "failed",
+        );
+        return null;
+      }
+      return applyCliproxyProfile("generalRelay", modelsResult.models[0], modelsResult.models);
+    }
+
+    const result = await run(() => call<CliproxyApplyResult>("cliproxy_disable_integration"));
+    if (result) {
+      const normalized = normalizeSettings(result.settings);
+      setSettingsForm(normalized);
+      setSettings((current) => current ? { ...current, settings: normalized } : current);
+      setCliproxy((current) => current ? {
+        ...current,
+        profileInstalled: false,
+        officialProfileInstalled: false,
+        generalProfileInstalled: false,
+      } : current);
+      showResultNotice(t("CLIProxyAPI 接入"), result);
+    }
+    return result;
+  };
+
+  const setCliproxyOfficialModelsEnabled = async (enabled: boolean) => {
+    if (enabled) {
+      if (!cliproxy?.generalProfileInstalled) {
+        showNotice(t("CLIProxyAPI 官方登录"), t("请先启用 CLIProxyAPI 接入。"), "failed");
+        return null;
+      }
+      const modelsResult = cliproxyModels && isSuccessStatus(cliproxyModels.status)
+        ? cliproxyModels
+        : await refreshCliproxyModels(true);
+      if (!modelsResult || !isSuccessStatus(modelsResult.status)) return null;
+      const officialModels = modelsResult.models.filter(isCliproxyOfficialModel);
+      if (!officialModels.length) {
+        showNotice(
+          t("CLIProxyAPI 官方模型"),
+          t("CLIProxyAPI 未返回可信官方 Codex 模型，请先在 CLIProxyAPI 管理页面完成账号登录后刷新模型。"),
+          "failed",
+        );
+        return null;
+      }
+      return applyCliproxyProfile("officialCodex", officialModels[0], officialModels);
+    }
+
+    const result = await run(() => call<CliproxyApplyResult>("cliproxy_disable_official_profile"));
+    if (result) {
+      const normalized = normalizeSettings(result.settings);
+      setSettingsForm(normalized);
+      setSettings((current) => current ? { ...current, settings: normalized } : current);
+      setCliproxy((current) => current ? {
+        ...current,
+        profileInstalled: current.generalProfileInstalled,
+        officialProfileInstalled: false,
+      } : current);
+      showResultNotice(t("CLIProxyAPI 官方模型"), result);
+    }
+    return result;
+  };
+
+  const refreshNewapi = async (silent = false) => {
+    const result = await run(() => call<NewapiStatusResult>("newapi_status"));
+    if (result) {
+      setNewapi(result);
+      if (!silent || !isSuccessStatus(result.status)) {
+        showResultNotice(t("NewAPI 状态"), result, { silentSuccess: true });
+      }
+    }
+    return result;
+  };
+
+  const runNewapiStatusAction = async (
+    command: "newapi_start" | "newapi_stop" | "newapi_restart",
+    title: string,
+  ) => {
+    const result = await run(() => call<NewapiStatusResult>(command));
+    if (result) {
+      setNewapi(result);
+      if (command === "newapi_stop") {
+        setNewapiModels(null);
+        setNewapiTest(null);
+      }
+      showResultNotice(title, result);
+    }
+    return result;
+  };
+
+  const openNewapiPage = async (command: "newapi_open_management" | "newapi_open_channels" | "newapi_open_tokens") => {
+    const result = await run(() => call<CommandResult<Record<string, unknown>>>(command));
+    if (result && !isSuccessStatus(result.status)) showResultNotice(t("NewAPI 管理页面"), result);
+  };
+
+  const refreshNewapiModels = async (silent = false) => {
+    const result = await run(() => call<NewapiModelsResult>("newapi_list_models"));
+    if (result) {
+      setNewapiModels(result);
+      if (!silent || !isSuccessStatus(result.status)) {
+        showResultNotice(t("NewAPI 模型"), result, { silentSuccess: true });
+      }
+    }
+    return result;
+  };
+
+  const testNewapiApi = async (model: string) => {
+    const result = await run(() => call<NewapiTestResult>("newapi_test_api", { request: { model } }));
+    if (result) {
+      setNewapiTest(result);
+      showResultNotice(t("NewAPI 测试"), result);
+    }
+    return result;
+  };
+
+  const saveNewapiApiKey = async (apiKey: string) => {
+    const result = await run(() => call<NewapiStatusResult>("newapi_save_api_key", { request: { apiKey } }));
+    if (result) {
+      setNewapi(result);
+      setNewapiModels(null);
+      setNewapiTest(null);
+      showResultNotice(t("NewAPI API Token"), result);
+    }
+    return result;
+  };
+
+  const saveNewapiConnection = async (
+    projectRoot: string,
+    composeFile: string,
+    dockerExecutable: string,
+    apiServiceName: string,
+    baseUrl: string,
+  ) => {
+    const result = await run(() =>
+      call<NewapiStatusResult>("newapi_save_connection", {
+        request: { projectRoot, composeFile, dockerExecutable, apiServiceName, baseUrl },
+      }),
+    );
+    if (result) {
+      setNewapi(result);
+      setNewapiModels(null);
+      setNewapiTest(null);
+      showResultNotice(t("NewAPI 启动与连接位置"), result);
+    }
+    return result;
+  };
+
+  const applyNewapiProfile = async (model: string, models: string[]) => {
+    const result = await run(() => call<NewapiApplyResult>("newapi_apply_profile", { request: { model, models } }));
+    if (result) {
+      const normalized = normalizeSettings(result.settings);
+      setSettingsForm(normalized);
+      setSettings((current) => current ? { ...current, settings: normalized } : current);
+      setNewapi((current) => current ? {
+        ...current,
+        profileInstalled: current.profileInstalled || isSuccessStatus(result.status),
+      } : current);
+      showResultNotice(t("NewAPI 供应商"), result);
+    }
+    return result;
+  };
+
+  const setNewapiIntegrationEnabled = async (enabled: boolean) => {
+    if (enabled) {
+      const modelsResult = newapiModels && isSuccessStatus(newapiModels.status)
+        ? newapiModels
+        : await refreshNewapiModels(true);
+      if (!modelsResult || !isSuccessStatus(modelsResult.status)) return null;
+      if (!modelsResult.models.length) {
+        showNotice(
+          t("NewAPI 接入"),
+          t("NewAPI 未返回可接入模型，请先配置渠道与用户令牌后刷新模型。"),
+          "failed",
+        );
+        return null;
+      }
+      return applyNewapiProfile(modelsResult.models[0], modelsResult.models);
+    }
+
+    const result = await run(() => call<NewapiApplyResult>("newapi_disable_integration"));
+    if (result) {
+      const normalized = normalizeSettings(result.settings);
+      setSettingsForm(normalized);
+      setSettings((current) => current ? { ...current, settings: normalized } : current);
+      setNewapi((current) => current ? {
+        ...current,
+        profileInstalled: isSuccessStatus(result.status) ? false : current.profileInstalled,
+      } : current);
+      showResultNotice(t("NewAPI 接入"), result);
+    }
+    return result;
+  };
+
   const refreshRelayFiles = async (silent = false) => {
     const result = await run(() => call<RelayFilesResult>("read_relay_files"));
     if (result) {
@@ -2146,6 +2770,9 @@ export function App() {
       await refreshSettings(true);
       await refreshWeixinStatus(true);
       await refreshRelay(true);
+      await refreshOfficialAccounts(true);
+      await refreshCliproxy(true);
+      await refreshNewapi(true);
       await refreshRelayFiles(true);
       await refreshEnvConflicts(true);
       await refreshCcsProviders(true);
@@ -3352,6 +3979,42 @@ export function App() {
         await saveLaunchMode(launchMode);
       },
       refreshRelay,
+      refreshOfficialAccounts,
+      startOfficialAccountLogin,
+      officialAccountLoginStatus,
+      cancelOfficialAccountLogin,
+      updateOfficialAccount,
+      refreshOfficialAccount,
+      switchOfficialAccount,
+      deleteOfficialAccount,
+      importOfficialAccounts,
+      exportOfficialAccounts,
+      refreshCliproxy,
+      installCliproxy: () => runCliproxyStatusAction("cliproxy_install", t("安装 CLIProxyAPI")),
+      startCliproxy: () => runCliproxyStatusAction("cliproxy_start", t("启动 CLIProxyAPI")),
+      stopCliproxy: () => runCliproxyStatusAction("cliproxy_stop", t("停止 CLIProxyAPI")),
+      restartCliproxy: () => runCliproxyStatusAction("cliproxy_restart", t("重启 CLIProxyAPI")),
+      openCliproxyManagement,
+      refreshCliproxyModels,
+      testCliproxyApi,
+      saveCliproxyApiKey,
+      saveCliproxyConnection,
+      applyCliproxyProfile,
+      setCliproxyIntegrationEnabled,
+      setCliproxyOfficialModelsEnabled,
+      refreshNewapi,
+      startNewapi: () => runNewapiStatusAction("newapi_start", t("启动 NewAPI")),
+      stopNewapi: () => runNewapiStatusAction("newapi_stop", t("停止 NewAPI")),
+      restartNewapi: () => runNewapiStatusAction("newapi_restart", t("重启 NewAPI")),
+      openNewapiManagement: () => openNewapiPage("newapi_open_management"),
+      openNewapiChannels: () => openNewapiPage("newapi_open_channels"),
+      openNewapiTokens: () => openNewapiPage("newapi_open_tokens"),
+      refreshNewapiModels,
+      testNewapiApi,
+      saveNewapiApiKey,
+      saveNewapiConnection,
+      applyNewapiProfile,
+      setNewapiIntegrationEnabled,
       refreshRelayFiles,
       refreshEnvConflicts,
       refreshRelayEnvironment,
@@ -3427,7 +4090,7 @@ export function App() {
       disableWatcher: () => watcherAction("disable_watcher"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, sessionShareUrl, importSessionUrl, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, officialAccounts, cliproxy, cliproxyModels, newapi, newapiModels, localSessions, sessionShareUrl, importSessionUrl, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
   );
   const hasUpdate = update?.updateAvailable === true;
 
@@ -3526,10 +4189,18 @@ export function App() {
           {route === "relay" ? (
             <RelayScreen
               settings={settings}
+              officialAccounts={officialAccounts}
+              cliproxy={cliproxy}
+              cliproxyModels={cliproxyModels}
+              cliproxyTest={cliproxyTest}
+              newapi={newapi}
+              newapiModels={newapiModels}
+              newapiTest={newapiTest}
               relayFiles={relayFiles}
               envConflicts={envConflicts}
               ccsProviders={ccsProviders}
               form={settingsForm}
+              onFormChange={setSettingsForm}
               actions={actions}
             />
           ) : null}
@@ -3769,6 +4440,60 @@ type Actions = {
   setProviderSyncTarget: (provider: string) => void;
   setLaunchMode: (launchMode: LaunchMode) => Promise<void>;
   refreshRelay: () => Promise<void>;
+  refreshOfficialAccounts: (silent?: boolean) => Promise<OfficialAccountsResult | null>;
+  startOfficialAccountLogin: (method: "browser" | "device", accountId?: string) => Promise<OfficialLoginSessionResult | null>;
+  officialAccountLoginStatus: (loginId: string) => Promise<OfficialLoginSessionResult | null>;
+  cancelOfficialAccountLogin: (loginId: string) => Promise<void>;
+  updateOfficialAccount: (
+    accountId: string,
+    patch: Partial<Pick<OfficialAccount, "name" | "group" | "tags" | "sort" | "enabled">>,
+  ) => Promise<OfficialAccountsResult | null>;
+  refreshOfficialAccount: (accountId: string) => Promise<OfficialAccountsResult | null>;
+  switchOfficialAccount: (accountId: string) => Promise<OfficialAccountsResult | null>;
+  deleteOfficialAccount: (account: OfficialAccount) => Promise<void>;
+  importOfficialAccounts: (password: string) => Promise<OfficialAccountsResult | null>;
+  exportOfficialAccounts: (accountIds: string[], password: string) => Promise<OfficialAccountsResult | null>;
+  refreshCliproxy: (silent?: boolean) => Promise<CliproxyStatusResult | null>;
+  installCliproxy: () => Promise<CliproxyStatusResult | null>;
+  startCliproxy: () => Promise<CliproxyStatusResult | null>;
+  stopCliproxy: () => Promise<CliproxyStatusResult | null>;
+  restartCliproxy: () => Promise<CliproxyStatusResult | null>;
+  openCliproxyManagement: () => Promise<void>;
+  refreshCliproxyModels: (silent?: boolean) => Promise<CliproxyModelsResult | null>;
+  testCliproxyApi: (model: string) => Promise<CliproxyTestResult | null>;
+  saveCliproxyApiKey: (apiKey: string, managementKey: string) => Promise<CliproxyStatusResult | null>;
+  saveCliproxyConnection: (
+    installRoot: string,
+    binaryPath: string,
+    configPath: string,
+    baseUrl: string,
+  ) => Promise<CliproxyStatusResult | null>;
+  applyCliproxyProfile: (
+    channel: "officialCodex" | "generalRelay",
+    model: string,
+    models: string[],
+  ) => Promise<CliproxyApplyResult | null>;
+  setCliproxyIntegrationEnabled: (enabled: boolean) => Promise<CliproxyApplyResult | null>;
+  setCliproxyOfficialModelsEnabled: (enabled: boolean) => Promise<CliproxyApplyResult | null>;
+  refreshNewapi: (silent?: boolean) => Promise<NewapiStatusResult | null>;
+  startNewapi: () => Promise<NewapiStatusResult | null>;
+  stopNewapi: () => Promise<NewapiStatusResult | null>;
+  restartNewapi: () => Promise<NewapiStatusResult | null>;
+  openNewapiManagement: () => Promise<void>;
+  openNewapiChannels: () => Promise<void>;
+  openNewapiTokens: () => Promise<void>;
+  refreshNewapiModels: (silent?: boolean) => Promise<NewapiModelsResult | null>;
+  testNewapiApi: (model: string) => Promise<NewapiTestResult | null>;
+  saveNewapiApiKey: (apiKey: string) => Promise<NewapiStatusResult | null>;
+  saveNewapiConnection: (
+    projectRoot: string,
+    composeFile: string,
+    dockerExecutable: string,
+    apiServiceName: string,
+    baseUrl: string,
+  ) => Promise<NewapiStatusResult | null>;
+  applyNewapiProfile: (model: string, models: string[]) => Promise<NewapiApplyResult | null>;
+  setNewapiIntegrationEnabled: (enabled: boolean) => Promise<NewapiApplyResult | null>;
   refreshRelayFiles: () => Promise<RelayFilesResult | null>;
   refreshEnvConflicts: (silent?: boolean) => Promise<EnvConflictsResult | null>;
   refreshRelayEnvironment: (silent?: boolean) => Promise<RelayEnvironmentResult | null>;
@@ -4848,20 +5573,41 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
 
 function RelayScreen({
   settings: _settings,
+  officialAccounts,
+  cliproxy,
+  cliproxyModels,
+  cliproxyTest,
+  newapi,
+  newapiModels,
+  newapiTest,
   relayFiles,
   envConflicts,
   ccsProviders,
   form,
+  onFormChange,
   actions,
 }: {
   settings: SettingsResult | null;
+  officialAccounts: OfficialAccountsResult | null;
+  cliproxy: CliproxyStatusResult | null;
+  cliproxyModels: CliproxyModelsResult | null;
+  cliproxyTest: CliproxyTestResult | null;
+  newapi: NewapiStatusResult | null;
+  newapiModels: NewapiModelsResult | null;
+  newapiTest: NewapiTestResult | null;
   relayFiles: RelayFilesResult | null;
   envConflicts: EnvConflictsResult | null;
   ccsProviders: CcsProvidersResult | null;
   form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
   actions: Actions;
 }) {
   const normalized = normalizeSettings(form);
+  const activeOfficialAccount = officialAccounts?.accounts.find(
+    (account) => account.id === officialAccounts.activeAccountId,
+  ) ?? null;
+  const selectedRequestTarget = activeRelayProfile(normalized);
+  const [relayView, setRelayView] = useState<"providers" | "official" | "cliproxy" | "newapi">("providers");
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
@@ -4870,6 +5616,7 @@ function RelayScreen({
     : null);
   const isNewProfile = !!newProfileDraft;
   const saveRelaySettings = async (next: BackendSettings) => {
+    onFormChange(next);
     return actions.saveSettingsValue(next, true);
   };
   const createNewAggregateProfile = () => {
@@ -4928,8 +5675,58 @@ function RelayScreen({
 
   return (
     <>
+      <div className="relay-section-tabs segmented">
+        <button className={relayView === "providers" ? "active" : ""} onClick={() => setRelayView("providers")} type="button">
+          <Network className="h-4 w-4" />
+          {t("供应商配置")}
+        </button>
+        <button className={relayView === "official" ? "active" : ""} onClick={() => setRelayView("official")} type="button">
+          <UserRound className="h-4 w-4" />
+          {t("官方账号")}
+          <small>{officialAccounts?.accounts.length ?? 0}</small>
+        </button>
+        <button className={relayView === "cliproxy" ? "active" : ""} onClick={() => setRelayView("cliproxy")} type="button">
+          <Power className="h-4 w-4" />
+          CLIProxyAPI
+          <small>{cliproxy?.running ? t("运行中") : t("已停止")}</small>
+        </button>
+        <button
+          className={relayView === "newapi" ? "active" : ""}
+          onClick={() => {
+            setRelayView("newapi");
+            void actions.refreshNewapi(true);
+          }}
+          type="button"
+        >
+          <LayoutDashboard className="h-4 w-4" />
+          NewAPI
+          <small>{!newapi ? t("未检查") : newapi.healthy ? t("运行中") : newapi.running ? t("启动中") : newapi.configured ? t("已停止") : t("未配置")}</small>
+        </button>
+      </div>
+      {relayView === "official" ? (
+        <OfficialAccountsPanel result={officialAccounts} actions={actions} />
+      ) : relayView === "cliproxy" ? (
+        <CliproxyPanel
+          models={cliproxyModels}
+          result={cliproxy}
+          test={cliproxyTest}
+          actions={actions}
+        />
+      ) : relayView === "newapi" ? (
+        <NewapiPanel
+          models={newapiModels}
+          result={newapi}
+          test={newapiTest}
+          actions={actions}
+        />
+      ) : (
       <Panel>
-        <CardHead title={t("供应商列表")} detail={tf("{0} 个供应商配置；可拖动排序，点编辑进入详情", [normalized.relayProfiles.length])} />
+        <CardHead
+          title={t("供应商列表")}
+          detail={tf("{0} 个供应商配置；可拖动排序，点编辑进入详情", [
+            normalized.relayProfiles.filter((profile) => !isCliproxyOfficialProfile(profile)).length,
+          ])}
+        />
         <CardContent>
           <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
           <label className="switch-row relay-master-switch">
@@ -4947,6 +5744,52 @@ function RelayScreen({
             </span>
             <ToggleVisual />
           </label>
+          <div className="official-login-mixed-panel">
+            <label className="switch-row relay-master-switch">
+              <input
+                checked={normalized.officialLoginMixedMode}
+                disabled={!normalized.relayProfilesEnabled || !activeOfficialAccount}
+                onChange={(event) => {
+                  const next = {
+                    ...normalized,
+                    officialLoginMixedMode: event.currentTarget.checked,
+                  };
+                  void actions.switchRelayProfile(next, normalized.activeRelayId);
+                }}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("官方登录混合模式")}</strong>
+                <small>{t("官方账号只负责优先认证；选择第三方或聚合供应商后，由其 API 配置覆盖实际请求，官方 API 不加入聚合轮转。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+            {normalized.officialLoginMixedMode ? (
+              <div className="relay-fields official-login-mixed-fields">
+                <Field className="relay-field-official-login" label={t("认证账号")}>
+                  <select
+                    className="field-select"
+                    value={officialAccounts?.activeAccountId || ""}
+                    onChange={(event) => {
+                      void actions.switchOfficialAccount(event.currentTarget.value);
+                    }}
+                  >
+                    {(officialAccounts?.accounts ?? []).filter((account) => account.enabled).map((account) => (
+                      <option key={account.id} value={account.id}>{account.name || account.email || account.id}</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field className="relay-field-request-target" label={t("请求目标")}>
+                  <Input readOnly value={selectedRequestTarget.name || selectedRequestTarget.id} />
+                  <p className="field-hint">
+                    {isOfficialLoginProfile(selectedRequestTarget)
+                      ? t("当前使用官方 API；点击其他供应商的“使用”即可覆写请求目标。")
+                      : tf("认证顺序：{0} → {1}。", [activeOfficialAccount?.name || activeOfficialAccount?.email || "openai", selectedRequestTarget.name || selectedRequestTarget.id])}
+                  </p>
+                </Field>
+              </div>
+            ) : null}
+          </div>
           <div className="relay-add-row">
             <Button
               variant="secondary"
@@ -4999,15 +5842,966 @@ function RelayScreen({
           </div>
           <RelayProfileList
             form={normalized}
-            onEdit={(profileId) => void editRelayProfile(profileId)}
+            onEdit={(profileId) => {
+              const profile = normalized.relayProfiles.find((item) => item.id === profileId);
+              if (profile && isCliproxyManagedProfile(profile)) {
+                setRelayView("cliproxy");
+                return;
+              }
+              if (profile && isNewapiManagedProfile(profile)) {
+                setRelayView("newapi");
+                void actions.refreshNewapi(true);
+                return;
+              }
+              void editRelayProfile(profileId);
+            }}
             onFormChange={saveRelaySettings}
             disabled={!normalized.relayProfilesEnabled || actions.relaySwitching}
             actions={actions}
           />
         </CardContent>
       </Panel>
+      )}
     </>
   );
+}
+
+function CliproxyPanel({
+  result,
+  models,
+  test,
+  actions,
+}: {
+  result: CliproxyStatusResult | null;
+  models: CliproxyModelsResult | null;
+  test: CliproxyTestResult | null;
+  actions: Actions;
+}) {
+  const [busy, setBusy] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [showManagementKey, setShowManagementKey] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [managementKey, setManagementKey] = useState("");
+  const [installRoot, setInstallRoot] = useState("");
+  const [binaryPath, setBinaryPath] = useState("");
+  const [configPath, setConfigPath] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
+  const modelIds = models?.models ?? [];
+  const modelIdsKey = modelIds.join("\n");
+
+  useEffect(() => {
+    setApiKey(result?.apiKey ?? "");
+  }, [result?.apiKey]);
+
+  useEffect(() => {
+    setManagementKey(result?.managementKey ?? "");
+  }, [result?.managementKey]);
+
+  useEffect(() => {
+    setInstallRoot(result?.installRoot ?? "");
+    setBinaryPath(result?.binaryPath ?? "");
+    setConfigPath(result?.configPath ?? "");
+    setBaseUrl(result?.baseUrl ?? "");
+  }, [result?.installRoot, result?.binaryPath, result?.configPath, result?.baseUrl]);
+
+  useEffect(() => {
+    if (!modelIds.length) {
+      setSelectedModel("");
+      return;
+    }
+    if (!modelIds.includes(selectedModel)) setSelectedModel(modelIds[0]);
+  }, [modelIdsKey, selectedModel]);
+
+  const runAction = async (name: string, action: () => Promise<unknown>) => {
+    if (busy) return;
+    setBusy(name);
+    try {
+      await action();
+    } finally {
+      setBusy("");
+    }
+  };
+  const copyValue = async (value: string, label: string) => {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      await actions.showMessage(label, t("已复制到剪贴板。"), "ok");
+    } catch (error) {
+      await actions.showMessage(label, stringifyError(error), "failed");
+    }
+  };
+  const updateInstallRoot = (nextRoot: string) => {
+    const previous = installRoot.trim().replace(/[\\/]+$/, "");
+    const next = nextRoot.trim().replace(/[\\/]+$/, "");
+    const relocate = (current: string) => {
+      if (!previous || !next) return current;
+      const normalizedCurrent = current.toLowerCase();
+      const normalizedPrevious = previous.toLowerCase();
+      const boundary = current.charAt(previous.length);
+      if (!normalizedCurrent.startsWith(normalizedPrevious) || (boundary !== "\\" && boundary !== "/")) {
+        return current;
+      }
+      return `${next}${current.slice(previous.length)}`;
+    };
+    setBinaryPath((current) => relocate(current));
+    setConfigPath((current) => relocate(current));
+    setInstallRoot(nextRoot);
+  };
+  const chooseCliproxyPath = async (kind: "root" | "binary" | "config") => {
+    try {
+      const selected = await open({
+        directory: kind === "root",
+        multiple: false,
+        title: kind === "root"
+          ? t("选择 CLIProxyAPI 安装目录")
+          : kind === "binary" ? t("选择 CLIProxyAPI 可执行文件") : t("选择 CLIProxyAPI 配置文件"),
+        ...(kind === "binary"
+          ? { filters: [{ name: "Executable", extensions: ["exe"] }] }
+          : kind === "config" ? { filters: [{ name: "YAML", extensions: ["yaml", "yml"] }] } : {}),
+      });
+      if (typeof selected !== "string") return;
+      if (kind === "root") updateInstallRoot(selected);
+      else if (kind === "binary") setBinaryPath(selected);
+      else setConfigPath(selected);
+    } catch (error) {
+      await actions.showMessage(t("CLIProxyAPI 启动与连接位置"), stringifyError(error), "failed");
+    }
+  };
+  const installed = result?.installed === true;
+  const running = result?.running === true;
+  const managed = result?.managedProcess === true;
+  const integrationEnabled = result?.generalProfileInstalled === true;
+  const officialLoginEnabled = result?.officialProfileInstalled === true;
+  const integrationToggleDisabled = !!busy || (!integrationEnabled && (!running || !apiKey.trim()));
+  const officialLoginToggleDisabled = !!busy
+    || !integrationEnabled
+    || (!officialLoginEnabled && (!running || !apiKey.trim()));
+  const statusLabel = !result
+    ? t("未检查")
+    : running
+      ? result.healthy ? t("运行正常") : t("运行异常")
+      : installed ? t("已停止") : t("未安装");
+  const startedAt = result?.startedAt
+    ? new Date(result.startedAt * 1000).toLocaleString()
+    : t("无");
+
+  return (
+    <Panel>
+      <CardHead title="CLIProxyAPI" detail={statusLabel} />
+      <CardContent>
+        <div className="cliproxy-status-grid">
+          <Metric label={t("服务状态")} value={statusLabel} />
+          <Metric label={t("版本")} value={result?.version || t("未知")} />
+          <Metric label={t("进程 ID")} value={result?.pid ? String(result.pid) : t("无")} />
+          <Metric label={t("启动时间")} value={startedAt} />
+        </div>
+
+        <div className="cliproxy-toolbar">
+          {!installed ? (
+            <Button disabled={!!busy} onClick={() => void runAction("install", actions.installCliproxy)}>
+              <Download className="h-4 w-4" />
+              {busy === "install" ? t("安装中") : t("安装")}
+            </Button>
+          ) : null}
+          <Button disabled={!!busy || !installed || running} onClick={() => void runAction("start", actions.startCliproxy)}>
+            <Play className="h-4 w-4" />
+            {busy === "start" ? t("启动中") : t("启动")}
+          </Button>
+          <Button disabled={!!busy || !running || !managed} onClick={() => void runAction("stop", actions.stopCliproxy)} variant="outline">
+            <PowerOff className="h-4 w-4" />
+            {busy === "stop" ? t("停止中") : t("停止")}
+          </Button>
+          <Button disabled={!!busy || !running || !managed} onClick={() => void runAction("restart", actions.restartCliproxy)} variant="outline">
+            <RotateCcw className="h-4 w-4" />
+            {busy === "restart" ? t("重启中") : t("重启")}
+          </Button>
+          <Button disabled={!!busy} onClick={() => void runAction("status", () => actions.refreshCliproxy())} size="icon" title={t("刷新状态")} variant="outline">
+            <RefreshCw className={`h-4 w-4 ${busy === "status" ? "spin" : ""}`} />
+          </Button>
+          <Button disabled={!running} onClick={() => void actions.openCliproxyManagement()} variant="secondary">
+            <ExternalLink className="h-4 w-4" />
+            {t("管理页面")}
+          </Button>
+        </div>
+
+        <div className="cliproxy-section">
+          <div className="cliproxy-section-head">
+            <strong>{t("启动与连接位置")}</strong>
+            {running && managed ? <span>{t("修改启动位置前请先停止 Manager 启动的服务")}</span> : null}
+          </div>
+          <div className="cliproxy-location-grid">
+            <Field label={t("安装目录")}>
+              <div className="cliproxy-input-action">
+                <Input onChange={(event) => updateInstallRoot(event.currentTarget.value)} value={installRoot} />
+                <Button onClick={() => void chooseCliproxyPath("root")} size="icon" title={t("选择 CLIProxyAPI 安装目录")} variant="outline">
+                  <FolderOpen className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+            <Field label={t("可执行文件")}>
+              <div className="cliproxy-input-action">
+                <Input onChange={(event) => setBinaryPath(event.currentTarget.value)} value={binaryPath} />
+                <Button onClick={() => void chooseCliproxyPath("binary")} size="icon" title={t("选择 CLIProxyAPI 可执行文件")} variant="outline">
+                  <FileCode2 className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+            <Field label={t("配置文件")}>
+              <div className="cliproxy-input-action">
+                <Input onChange={(event) => setConfigPath(event.currentTarget.value)} value={configPath} />
+                <Button onClick={() => void chooseCliproxyPath("config")} size="icon" title={t("选择 CLIProxyAPI 配置文件")} variant="outline">
+                  <FileCode2 className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+            <Field label="API Base URL">
+              <div className="cliproxy-input-action cliproxy-url-row">
+                <Input onChange={(event) => setBaseUrl(event.currentTarget.value)} value={baseUrl} />
+                <Button onClick={() => void copyValue(baseUrl, "API Base URL")} size="icon" title={t("复制 Base URL")} variant="outline">
+                  <Copy className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+          </div>
+          <Toolbar>
+            <Button
+              disabled={!!busy || (running && managed) || !installRoot.trim() || !baseUrl.trim()}
+              onClick={() => void runAction("saveConnection", () => actions.saveCliproxyConnection(installRoot, binaryPath, configPath, baseUrl))}
+            >
+              <Save className="h-4 w-4" />
+              {busy === "saveConnection" ? t("保存中") : t("保存启动与连接位置")}
+            </Button>
+          </Toolbar>
+        </div>
+
+        <div className="cliproxy-section">
+          <div className="cliproxy-section-head">
+            <strong>{t("API 连接")}</strong>
+            <UiBadge variant={result?.profileInstalled ? "secondary" : "outline"}>
+              {result?.profileInstalled ? t("已添加供应商") : t("未添加供应商")}
+            </UiBadge>
+          </div>
+          <div className="cliproxy-connection-grid">
+            <Field label="API Key">
+              <div className="cliproxy-input-action cliproxy-api-key-row">
+                <Input
+                  autoComplete="off"
+                  onChange={(event) => setApiKey(event.currentTarget.value)}
+                  type={showApiKey ? "text" : "password"}
+                  value={apiKey}
+                />
+                <Button onClick={() => setShowApiKey((value) => !value)} size="icon" title={showApiKey ? t("隐藏 API Key") : t("显示 API Key")} variant="outline">
+                  {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </Button>
+                <Button onClick={() => void copyValue(apiKey, "API Key")} size="icon" title={t("复制 API Key")} variant="outline">
+                  <Copy className="h-4 w-4" />
+                </Button>
+                <Button disabled={!!busy || !apiKey.trim()} onClick={() => void runAction("saveKey", () => actions.saveCliproxyApiKey(apiKey, managementKey))} size="icon" title={t("保存连接密钥")} variant="outline">
+                  <Save className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+            <Field label="Management Key">
+              <div className="cliproxy-input-action cliproxy-api-key-row">
+                <Input
+                  autoComplete="off"
+                  onChange={(event) => setManagementKey(event.currentTarget.value)}
+                  type={showManagementKey ? "text" : "password"}
+                  value={managementKey}
+                />
+                <Button onClick={() => setShowManagementKey((value) => !value)} size="icon" title={showManagementKey ? t("隐藏 Management Key") : t("显示 Management Key")} variant="outline">
+                  {showManagementKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </Button>
+                <Button onClick={() => void copyValue(managementKey, "Management Key")} size="icon" title={t("复制 Management Key")} variant="outline">
+                  <Copy className="h-4 w-4" />
+                </Button>
+                <Button disabled={!!busy || !managementKey.trim()} onClick={() => void runAction("saveKey", () => actions.saveCliproxyApiKey(apiKey, managementKey))} size="icon" title={t("保存连接密钥")} variant="outline">
+                  <Save className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+          </div>
+        </div>
+
+        <div className="cliproxy-section">
+          <div className="cliproxy-section-head">
+            <strong>{t("模型与调用")}</strong>
+            <span>{tf("{0} 个模型", [modelIds.length])}</span>
+          </div>
+          <div className="cliproxy-model-row">
+            <select className="field-select" disabled={!modelIds.length} onChange={(event) => setSelectedModel(event.currentTarget.value)} value={selectedModel}>
+              {modelIds.length ? modelIds.map((model) => <option key={model} value={model}>{model}</option>) : <option value="">{t("尚未读取模型")}</option>}
+            </select>
+            <Button disabled={!!busy || !running} onClick={() => void runAction("models", () => actions.refreshCliproxyModels())} variant="outline">
+              <RefreshCw className={`h-4 w-4 ${busy === "models" ? "spin" : ""}`} />
+              {t("刷新模型")}
+            </Button>
+            <Button disabled={!!busy || !running || !selectedModel} onClick={() => void runAction("test", () => actions.testCliproxyApi(selectedModel))} variant="outline">
+              <TestTube className="h-4 w-4" />
+              {busy === "test" ? t("测试中") : t("测试 API")}
+            </Button>
+          </div>
+          {test ? (
+            <div className={`cliproxy-test-result ${isSuccessStatus(test.status) ? "ok" : "failed"}`}>
+              <strong>{test.model || selectedModel}</strong>
+              <span>{test.httpStatus ? `HTTP ${test.httpStatus}` : test.message}</span>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="cliproxy-section cliproxy-apply-section">
+          <div className="cliproxy-section-head">
+            <strong>{t("Codex++ 接入")}</strong>
+            <span>{t("受管 CLIProxyAPI 接入不会加入聚合供应商")}</span>
+          </div>
+          <div className="cliproxy-integration-switches">
+            <label className="switch-row relay-master-switch">
+              <input
+                checked={integrationEnabled}
+                disabled={integrationToggleDisabled}
+                onChange={(event) => {
+                  const enabled = event.currentTarget.checked;
+                  void runAction("integration", () => actions.setCliproxyIntegrationEnabled(enabled));
+                }}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("CLIProxyAPI 接入")}</strong>
+                <small>{t("将 CLIProxyAPI 作为受管直连供应商接入，包含官方和其他模型，不参与聚合调度。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+            <label className="switch-row relay-master-switch">
+              <input
+                checked={officialLoginEnabled}
+                disabled={officialLoginToggleDisabled}
+                onChange={(event) => {
+                  const enabled = event.currentTarget.checked;
+                  void runAction("officialLogin", () => actions.setCliproxyOfficialModelsEnabled(enabled));
+                }}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("CLIProxyAPI 官方登录")}</strong>
+                <small>{t("在官方混合登录的模型列表中，于原生官方模型下方显示 CLIProxyAPI:模型名。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+          </div>
+        </div>
+
+      </CardContent>
+    </Panel>
+  );
+}
+
+function NewapiPanel({
+  result,
+  models,
+  test,
+  actions,
+}: {
+  result: NewapiStatusResult | null;
+  models: NewapiModelsResult | null;
+  test: NewapiTestResult | null;
+  actions: Actions;
+}) {
+  const [busy, setBusy] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [projectRoot, setProjectRoot] = useState("");
+  const [composeFile, setComposeFile] = useState("");
+  const [dockerExecutable, setDockerExecutable] = useState("");
+  const [apiServiceName, setApiServiceName] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
+  const modelIds = models?.models ?? [];
+  const modelIdsKey = modelIds.join("\n");
+
+  useEffect(() => {
+    setApiKey(result?.apiKey ?? "");
+  }, [result?.apiKey]);
+
+  useEffect(() => {
+    setProjectRoot(result?.projectRoot ?? "");
+    setComposeFile(result?.composeFile ?? "");
+    setDockerExecutable(result?.dockerExecutable ?? "");
+    setApiServiceName(result?.apiServiceName ?? "");
+    setBaseUrl(result?.baseUrl ?? "");
+  }, [result?.projectRoot, result?.composeFile, result?.dockerExecutable, result?.apiServiceName, result?.baseUrl]);
+
+  useEffect(() => {
+    if (!modelIds.length) {
+      setSelectedModel("");
+      return;
+    }
+    if (!modelIds.includes(selectedModel)) setSelectedModel(modelIds[0]);
+  }, [modelIdsKey, selectedModel]);
+
+  const runAction = async (name: string, action: () => Promise<unknown>) => {
+    if (busy) return;
+    setBusy(name);
+    try {
+      await action();
+    } finally {
+      setBusy("");
+    }
+  };
+  const copyValue = async (value: string, label: string) => {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      await actions.showMessage(label, t("已复制到剪贴板。"), "ok");
+    } catch (error) {
+      await actions.showMessage(label, stringifyError(error), "failed");
+    }
+  };
+  const updateProjectRoot = (nextRoot: string) => {
+    const previous = projectRoot.trim().replace(/[\\/]+$/, "");
+    const next = nextRoot.trim().replace(/[\\/]+$/, "");
+    if (previous && next) {
+      const normalizedCompose = composeFile.toLowerCase();
+      const normalizedPrevious = previous.toLowerCase();
+      const boundary = composeFile.charAt(previous.length);
+      if (normalizedCompose.startsWith(normalizedPrevious) && (boundary === "\\" || boundary === "/")) {
+        setComposeFile(`${next}${composeFile.slice(previous.length)}`);
+      }
+    }
+    setProjectRoot(nextRoot);
+  };
+  const chooseNewapiPath = async (kind: "root" | "compose" | "docker") => {
+    try {
+      const selected = await open({
+        directory: kind === "root",
+        multiple: false,
+        title: kind === "root"
+          ? t("选择 NewAPI 项目目录")
+          : kind === "compose" ? t("选择 Docker Compose 文件") : t("选择 Docker 可执行文件"),
+        ...(kind === "compose"
+          ? { filters: [{ name: "Docker Compose", extensions: ["yml", "yaml"] }] }
+          : kind === "docker" ? { filters: [{ name: "Executable", extensions: ["exe"] }] } : {}),
+      });
+      if (typeof selected !== "string") return;
+      if (kind === "root") updateProjectRoot(selected);
+      else if (kind === "compose") setComposeFile(selected);
+      else setDockerExecutable(selected);
+    } catch (error) {
+      await actions.showMessage(t("NewAPI 启动与连接位置"), stringifyError(error), "failed");
+    }
+  };
+
+  const configured = result?.configured === true;
+  const localRunning = result?.running === true;
+  const hasRunningServices = (result?.runningServiceCount ?? 0) > 0;
+  const healthy = result?.healthy === true;
+  const integrationEnabled = result?.profileInstalled === true;
+  const statusLabel = !result
+    ? t("未检查")
+    : healthy
+      ? t("运行正常")
+      : localRunning || hasRunningServices
+        ? t("API 未就绪")
+        : !configured
+          ? t("项目未配置")
+          : !result.dockerAvailable
+            ? t("未找到 Docker")
+            : !result.daemonAvailable
+              ? t("Docker 未运行")
+              : !result.composeAvailable
+                ? t("Compose 不可用")
+                : t("已停止");
+  const dockerLabel = !result
+    ? t("未检查")
+    : !result.dockerAvailable
+      ? t("未找到")
+      : result.daemonAvailable ? t("可用") : t("守护进程未运行");
+  const startedAt = result?.startedAt
+    ? new Date(result.startedAt * 1000).toLocaleString()
+    : t("无");
+  const integrationToggleDisabled = !!busy || (!integrationEnabled && (!healthy || !apiKey.trim()));
+
+  return (
+    <Panel>
+      <CardHead title="NewAPI" detail={statusLabel} />
+      <CardContent>
+        <div className="cliproxy-status-grid">
+          <Metric label={t("服务状态")} value={statusLabel} />
+          <Metric label="Docker" value={dockerLabel} />
+          <Metric label={t("Compose 服务")} value={`${result?.runningServiceCount ?? 0}/${result?.serviceCount ?? 0}`} />
+          <Metric label={t("版本")} value={result?.version || t("未知")} />
+        </div>
+
+        <div className="cliproxy-toolbar">
+          <Button disabled={!!busy || !configured || !result?.dockerAvailable || !result?.daemonAvailable || !result?.composeAvailable || localRunning || healthy} onClick={() => void runAction("start", actions.startNewapi)}>
+            <Play className="h-4 w-4" />
+            {busy === "start" ? t("启动中") : t("启动")}
+          </Button>
+          <Button disabled={!!busy || !result?.daemonAvailable || !result?.composeAvailable || !hasRunningServices} onClick={() => void runAction("stop", actions.stopNewapi)} variant="outline">
+            <PowerOff className="h-4 w-4" />
+            {busy === "stop" ? t("停止中") : t("停止")}
+          </Button>
+          <Button disabled={!!busy || !result?.daemonAvailable || !result?.composeAvailable || !hasRunningServices} onClick={() => void runAction("restart", actions.restartNewapi)} variant="outline">
+            <RotateCcw className="h-4 w-4" />
+            {busy === "restart" ? t("重启中") : t("重启")}
+          </Button>
+          <Button disabled={!!busy} onClick={() => void runAction("status", () => actions.refreshNewapi())} size="icon" title={t("刷新状态")} variant="outline">
+            <RefreshCw className={`h-4 w-4 ${busy === "status" ? "spin" : ""}`} />
+          </Button>
+          <Button disabled={!result?.managementUrl} onClick={() => void actions.openNewapiManagement()} variant="secondary">
+            <ExternalLink className="h-4 w-4" />
+            {t("控制台")}
+          </Button>
+          <Button disabled={!result?.managementUrl} onClick={() => void actions.openNewapiChannels()} variant="outline">
+            <Network className="h-4 w-4" />
+            {t("渠道")}
+          </Button>
+          <Button disabled={!result?.managementUrl} onClick={() => void actions.openNewapiTokens()} variant="outline">
+            <KeyRound className="h-4 w-4" />
+            {t("令牌")}
+          </Button>
+        </div>
+
+        <div className="cliproxy-section">
+          <div className="cliproxy-section-head">
+            <strong>{t("Docker Compose 与连接")}</strong>
+            <span>{t("路径与 API 地址独立保存")}</span>
+          </div>
+          <div className="cliproxy-location-grid">
+            <Field label={t("项目目录")}>
+              <div className="cliproxy-input-action">
+                <Input onChange={(event) => updateProjectRoot(event.currentTarget.value)} value={projectRoot} />
+                <Button onClick={() => void chooseNewapiPath("root")} size="icon" title={t("选择 NewAPI 项目目录")} variant="outline">
+                  <FolderOpen className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+            <Field label={t("Compose 文件")}>
+              <div className="cliproxy-input-action">
+                <Input onChange={(event) => setComposeFile(event.currentTarget.value)} value={composeFile} />
+                <Button onClick={() => void chooseNewapiPath("compose")} size="icon" title={t("选择 Docker Compose 文件")} variant="outline">
+                  <FileCode2 className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+            <Field label={t("Docker 可执行文件")}>
+              <div className="cliproxy-input-action">
+                <Input onChange={(event) => setDockerExecutable(event.currentTarget.value)} value={dockerExecutable} />
+                <Button onClick={() => void chooseNewapiPath("docker")} size="icon" title={t("选择 Docker 可执行文件")} variant="outline">
+                  <FileCode2 className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+            <Field label={t("API 服务名")}>
+              <Input onChange={(event) => setApiServiceName(event.currentTarget.value)} value={apiServiceName} />
+            </Field>
+            <Field label="API Base URL">
+              <div className="cliproxy-input-action">
+                <Input onChange={(event) => setBaseUrl(event.currentTarget.value)} value={baseUrl} />
+                <Button onClick={() => void copyValue(baseUrl, "API Base URL")} size="icon" title={t("复制 Base URL")} variant="outline">
+                  <Copy className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+          </div>
+          <Toolbar>
+            <Button
+              disabled={!!busy || !projectRoot.trim() || !composeFile.trim() || !dockerExecutable.trim() || !apiServiceName.trim() || !baseUrl.trim()}
+              onClick={() => void runAction("saveConnection", () => actions.saveNewapiConnection(projectRoot, composeFile, dockerExecutable, apiServiceName, baseUrl))}
+            >
+              <Save className="h-4 w-4" />
+              {busy === "saveConnection" ? t("保存中") : t("保存启动与连接位置")}
+            </Button>
+          </Toolbar>
+        </div>
+
+        <div className="cliproxy-section">
+          <div className="cliproxy-section-head">
+            <strong>{t("API 连接")}</strong>
+            <UiBadge variant={integrationEnabled ? "secondary" : "outline"}>
+              {integrationEnabled ? t("已添加供应商") : t("未添加供应商")}
+            </UiBadge>
+          </div>
+          <div className="cliproxy-connection-grid">
+            <Field label={t("用户 API Token")}>
+              <div className="cliproxy-input-action cliproxy-api-key-row">
+                <Input
+                  autoComplete="off"
+                  onChange={(event) => setApiKey(event.currentTarget.value)}
+                  type={showApiKey ? "text" : "password"}
+                  value={apiKey}
+                />
+                <Button onClick={() => setShowApiKey((value) => !value)} size="icon" title={showApiKey ? t("隐藏 API Token") : t("显示 API Token")} variant="outline">
+                  {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </Button>
+                <Button onClick={() => void copyValue(apiKey, "API Token")} size="icon" title={t("复制 API Token")} variant="outline">
+                  <Copy className="h-4 w-4" />
+                </Button>
+                <Button disabled={!!busy || !apiKey.trim()} onClick={() => void runAction("saveKey", () => actions.saveNewapiApiKey(apiKey))} size="icon" title={t("保存 API Token")} variant="outline">
+                  <Save className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+          </div>
+        </div>
+
+        <div className="cliproxy-section">
+          <div className="cliproxy-section-head">
+            <strong>{t("模型与调用")}</strong>
+            <span>{tf("{0} 个模型", [modelIds.length])}</span>
+          </div>
+          <div className="cliproxy-model-row">
+            <select className="field-select" disabled={!modelIds.length} onChange={(event) => setSelectedModel(event.currentTarget.value)} value={selectedModel}>
+              {modelIds.length ? modelIds.map((model) => <option key={model} value={model}>{model}</option>) : <option value="">{t("尚未读取模型")}</option>}
+            </select>
+            <Button disabled={!!busy || !healthy || !apiKey.trim()} onClick={() => void runAction("models", () => actions.refreshNewapiModels())} variant="outline">
+              <RefreshCw className={`h-4 w-4 ${busy === "models" ? "spin" : ""}`} />
+              {t("刷新模型")}
+            </Button>
+            <Button disabled={!!busy || !healthy || !selectedModel} onClick={() => void runAction("test", () => actions.testNewapiApi(selectedModel))} variant="outline">
+              <TestTube className="h-4 w-4" />
+              {busy === "test" ? t("测试中") : t("测试 API")}
+            </Button>
+          </div>
+          {test ? (
+            <div className={`cliproxy-test-result ${isSuccessStatus(test.status) ? "ok" : "failed"}`}>
+              <strong>{test.model || selectedModel}</strong>
+              <span>{test.httpStatus ? `HTTP ${test.httpStatus}` : test.message}</span>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="cliproxy-section cliproxy-apply-section">
+          <div className="cliproxy-section-head">
+            <strong>{t("Codex++ 接入")}</strong>
+            <span>{t("NewAPI 内部聚合保持独立")}</span>
+          </div>
+          <div className="cliproxy-integration-switches">
+            <label className="switch-row relay-master-switch">
+              <input
+                checked={integrationEnabled}
+                disabled={integrationToggleDisabled}
+                onChange={(event) => {
+                  const enabled = event.currentTarget.checked;
+                  void runAction("integration", () => actions.setNewapiIntegrationEnabled(enabled));
+                }}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("NewAPI 接入")}</strong>
+                <small>{t("将 NewAPI 保存为一个受管 API 供应商，模型与渠道调度由 NewAPI 自身维护。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+          </div>
+          <Toolbar>
+            <Button
+              disabled={!!busy || !healthy || !apiKey.trim()}
+              onClick={() => void runAction("integrationUpdate", () => actions.setNewapiIntegrationEnabled(true))}
+              variant="outline"
+            >
+              <Save className="h-4 w-4" />
+              {busy === "integrationUpdate" ? t("保存中") : t("添加或更新供应商")}
+            </Button>
+          </Toolbar>
+        </div>
+
+        <div className="cliproxy-paths">
+          <span><strong>{t("系统名称")}</strong>{result?.systemName || t("未知")}</span>
+          <span><strong>{t("启动时间")}</strong>{startedAt}</span>
+          <span><strong>{t("初始化")}</strong>{!healthy || result?.setup == null ? t("未知") : result.setup ? t("已完成") : t("未完成")}</span>
+        </div>
+      </CardContent>
+    </Panel>
+  );
+}
+
+function OfficialAccountsPanel({ result, actions }: { result: OfficialAccountsResult | null; actions: Actions }) {
+  const accounts = result?.accounts ?? [];
+  const [loginSession, setLoginSession] = useState<OfficialLoginSessionResult | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState({ name: "", group: "", tags: "", sort: "0" });
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [passwordOperation, setPasswordOperation] = useState<"import" | "export" | null>(null);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!loginSession || loginSession.status !== "pending") return;
+    let disposed = false;
+    const timer = window.setInterval(() => {
+      void actions.officialAccountLoginStatus(loginSession.loginId).then((next) => {
+        if (disposed || !next) return;
+        setLoginSession(next);
+        if (next.status === "success") {
+          void actions.refreshOfficialAccounts(true);
+          void actions.showMessage(
+            t("官方账号登录"),
+            tf("账号“{0}”已保存。", [next.account?.name || next.account?.email || "OpenAI"]),
+            "ok",
+          );
+        }
+      });
+    }, 1000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [loginSession?.loginId, loginSession?.status]);
+
+  useEffect(() => {
+    setSelectedIds((current) => {
+      const known = new Set(accounts.map((account) => account.id));
+      return new Set(Array.from(current).filter((id) => known.has(id)));
+    });
+  }, [accounts.map((account) => account.id).join("|")]);
+
+  const startLogin = async (method: "browser" | "device", accountId = "") => {
+    setBusy(true);
+    try {
+      const session = await actions.startOfficialAccountLogin(method, accountId);
+      if (!session || !isSuccessStatus(session.status)) return;
+      setLoginSession(session);
+      if (method === "device" && session.verificationUrl) {
+        await actions.openExternalUrl(session.verificationUrl);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const beginEdit = (account: OfficialAccount) => {
+    setEditingId(account.id);
+    setDraft({
+      name: account.name,
+      group: account.group,
+      tags: account.tags.join(", "),
+      sort: String(account.sort),
+    });
+  };
+
+  const saveEdit = async (accountId: string) => {
+    setBusy(true);
+    try {
+      const saved = await actions.updateOfficialAccount(accountId, {
+        name: draft.name.trim(),
+        group: draft.group.trim(),
+        tags: draft.tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
+        sort: Number.parseInt(draft.sort, 10) || 0,
+      });
+      if (saved && isSuccessStatus(saved.status)) setEditingId(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitPasswordOperation = async () => {
+    if (passwordOperation === "export" && password.length < 8) {
+      await actions.showMessage(t("导出官方账号"), t("导出密码至少需要 8 个字符。"), "failed");
+      return;
+    }
+    setBusy(true);
+    try {
+      const operation = passwordOperation;
+      const ids = selectedIds.size ? Array.from(selectedIds) : accounts.map((account) => account.id);
+      const completed = operation === "import"
+        ? await actions.importOfficialAccounts(password)
+        : await actions.exportOfficialAccounts(ids, password);
+      if (completed) {
+        setPasswordOperation(null);
+        setPassword("");
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Panel>
+      <CardHead
+        title={t("官方账号库")}
+        detail={result
+          ? tf("{0} 个账号；登录信息由本机当前用户加密保护", [accounts.length])
+          : t("正在读取官方账号")}
+      />
+      <CardContent>
+        <div className="official-account-toolbar">
+          <Toolbar>
+            <Button disabled={busy} onClick={() => void startLogin("browser")}>
+              <LogIn className="h-4 w-4" />
+              {t("浏览器登录")}
+            </Button>
+            <Button disabled={busy} onClick={() => void startLogin("device")} variant="secondary">
+              <KeyRound className="h-4 w-4" />
+              {t("设备码登录")}
+            </Button>
+            <Button disabled={busy} onClick={() => setPasswordOperation("import")} variant="secondary">
+              <Upload className="h-4 w-4" />
+              {t("导入")}
+            </Button>
+            <Button disabled={busy || accounts.length === 0} onClick={() => setPasswordOperation("export")} variant="secondary">
+              <Download className="h-4 w-4" />
+              {t("导出")}
+            </Button>
+          </Toolbar>
+          <Button onClick={() => void actions.refreshOfficialAccounts()} size="icon" title={t("刷新账号列表")} variant="outline">
+            <RefreshCw className="h-4 w-4" />
+          </Button>
+        </div>
+
+        {loginSession ? (
+          <div className={`official-login-session ${loginSession.status}`}>
+            <div>
+              <strong>{loginSession.method === "device" ? t("设备码登录") : t("浏览器登录")}</strong>
+              <span>{officialLoginStatusText(loginSession)}</span>
+            </div>
+            {loginSession.userCode ? (
+              <button
+                className="official-device-code"
+                onClick={() => void navigator.clipboard.writeText(loginSession.userCode)}
+                title={t("复制设备码")}
+                type="button"
+              >
+                {loginSession.userCode}
+                <Copy className="h-4 w-4" />
+              </button>
+            ) : null}
+            {loginSession.status === "pending" ? (
+              <Button onClick={() => {
+                void actions.cancelOfficialAccountLogin(loginSession.loginId);
+                setLoginSession(null);
+              }} variant="ghost">
+                {t("取消")}
+              </Button>
+            ) : (
+              <Button onClick={() => setLoginSession(null)} variant="ghost">{t("关闭")}</Button>
+            )}
+          </div>
+        ) : null}
+
+        {accounts.length ? (
+          <div className="official-account-list">
+            {accounts.map((account) => {
+              const active = account.id === result?.activeAccountId;
+              const editing = editingId === account.id;
+              return (
+                <div className={`official-account-row ${active ? "active" : ""} ${account.enabled ? "" : "disabled"}`} key={account.id}>
+                  <label className="official-account-select" title={t("选择用于导出")}>
+                    <input
+                      checked={selectedIds.has(account.id)}
+                      onChange={(event) => setSelectedIds((current) => {
+                        const next = new Set(current);
+                        if (event.currentTarget.checked) next.add(account.id);
+                        else next.delete(account.id);
+                        return next;
+                      })}
+                      type="checkbox"
+                    />
+                  </label>
+                  <div className="official-account-main">
+                    <div className="official-account-title">
+                      <strong>{account.name || account.email || t("未命名账号")}</strong>
+                      {active ? <span className="official-account-active">{t("当前")}</span> : null}
+                      {account.planType ? <span>{account.planType}</span> : null}
+                      {account.group ? <span>{account.group}</span> : null}
+                    </div>
+                    <div className="official-account-email">{account.email || account.chatgptAccountId || account.id}</div>
+                    <div className="official-account-meta">
+                      {account.tags.map((tag) => <span key={tag}>{tag}</span>)}
+                      <span>{officialUsageText(account.usage)}</span>
+                      <span>{account.lastRefreshAt ? tf("刷新于 {0}", [formatUnixTime(account.lastRefreshAt)]) : t("尚未刷新")}</span>
+                    </div>
+                    {editing ? (
+                      <div className="official-account-edit-grid">
+                        <Field label={t("名称")}><Input value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.currentTarget.value }))} /></Field>
+                        <Field label={t("分组")}><Input value={draft.group} onChange={(event) => setDraft((current) => ({ ...current, group: event.currentTarget.value }))} /></Field>
+                        <Field label={t("标签")}><Input value={draft.tags} onChange={(event) => setDraft((current) => ({ ...current, tags: event.currentTarget.value }))} /></Field>
+                        <Field label={t("排序")}><Input inputMode="numeric" value={draft.sort} onChange={(event) => setDraft((current) => ({ ...current, sort: event.currentTarget.value }))} /></Field>
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="official-account-actions">
+                    {editing ? (
+                      <>
+                        <Button disabled={busy} onClick={() => void saveEdit(account.id)} size="icon" title={t("保存")}><Save className="h-4 w-4" /></Button>
+                        <Button onClick={() => setEditingId(null)} size="icon" title={t("取消")} variant="ghost"><RotateCcw className="h-4 w-4" /></Button>
+                      </>
+                    ) : (
+                      <>
+                        {!active ? <Button disabled={busy || !account.enabled} onClick={() => void actions.switchOfficialAccount(account.id)}>{t("切换")}</Button> : null}
+                        <Button disabled={busy} onClick={() => void actions.refreshOfficialAccount(account.id)} size="icon" title={t("刷新令牌与用量")} variant="outline"><RefreshCw className="h-4 w-4" /></Button>
+                        <Button disabled={busy} onClick={() => void startLogin("browser", account.id)} size="icon" title={t("重新登录")} variant="outline"><KeyRound className="h-4 w-4" /></Button>
+                        <Button onClick={() => beginEdit(account)} size="icon" title={t("编辑")} variant="outline"><Edit3 className="h-4 w-4" /></Button>
+                        <Button disabled={active} onClick={() => void actions.updateOfficialAccount(account.id, { enabled: !account.enabled })} size="icon" title={account.enabled ? t("禁用") : t("启用")} variant="outline">
+                          {account.enabled ? <PowerOff className="h-4 w-4" /> : <Power className="h-4 w-4" />}
+                        </Button>
+                        <Button disabled={active} onClick={() => void actions.deleteOfficialAccount(account)} size="icon" title={t("删除")} variant="ghost"><Trash2 className="h-4 w-4" /></Button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="official-account-empty">
+            <UserRound className="h-6 w-6" />
+            <strong>{t("尚未保存官方账号")}</strong>
+            <span>{t("使用浏览器登录、设备码登录，或导入现有 auth.json。")}</span>
+          </div>
+        )}
+      </CardContent>
+      {passwordOperation ? (
+        <div className="modal-backdrop" role="dialog" aria-modal="true">
+          <div className="modal-card official-account-password-modal">
+            <div className="modal-head">
+              <div>
+                <h2>{passwordOperation === "import" ? t("导入官方账号") : t("导出加密备份")}</h2>
+                <p>{passwordOperation === "import"
+                  ? t("导入普通 auth.json 时密码可以留空；导入加密备份时请输入备份密码。")
+                  : t("备份使用 Argon2id 和 AES-256-GCM 加密，密码至少 8 个字符。")}</p>
+              </div>
+              <button className="toast-close" onClick={() => {
+                setPasswordOperation(null);
+                setPassword("");
+              }} type="button">×</button>
+            </div>
+            <Field label={t("备份密码")}>
+              <Input autoFocus onChange={(event) => setPassword(event.currentTarget.value)} type="password" value={password} />
+            </Field>
+            <Toolbar>
+              <Button disabled={busy} onClick={() => void submitPasswordOperation()}>
+                {passwordOperation === "import" ? <Upload className="h-4 w-4" /> : <Download className="h-4 w-4" />}
+                {passwordOperation === "import" ? t("选择文件并导入") : t("选择位置并导出")}
+              </Button>
+              <Button onClick={() => {
+                setPasswordOperation(null);
+                setPassword("");
+              }} variant="secondary">{t("取消")}</Button>
+            </Toolbar>
+          </div>
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
+
+function officialLoginStatusText(session: OfficialLoginSessionResult) {
+  if (session.status === "pending") return session.method === "device" ? t("请在打开的页面输入设备码") : t("请在登录窗口完成 OpenAI 登录");
+  if (session.status === "success") return t("登录成功，账号已安全保存");
+  if (session.status === "cancelled") return t("登录已取消");
+  return session.error || t("登录失败，请重试");
+}
+
+function officialUsageText(usage: OfficialUsageSnapshot | null) {
+  if (!usage) return t("用量未查询");
+  if (usage.error) return t("用量查询失败");
+  if (usage.primary?.usedPercent != null) return tf("主额度已用 {0}%", [Math.round(usage.primary.usedPercent)]);
+  return t("用量已更新");
+}
+
+function formatUnixTime(timestamp: number) {
+  return new Date(timestamp * 1000).toLocaleString();
 }
 
 function EnvConflictNotice({
@@ -5135,7 +6929,7 @@ function EnhanceScreen({
             <FeatureGroup title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
               <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled || !patchMode} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
               <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
-              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
+              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5 / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
               <div className="feature-action-row">
                 <div>
                   <strong>{t("官方远端插件缓存")}</strong>
@@ -5167,6 +6961,23 @@ function EnhanceScreen({
               <FeatureToggle title={t("会话 ID 标识")} detail={t("在侧边栏会话标题前显示短 ID 和 UUIDv7 创建时间，方便定位历史会话。")} checked={form.codexAppThreadIdBadge} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadIdBadge", value)} />
               <FeatureToggle title={t("对话居中宽度")} detail={t("把主对话和输入框限制到固定最大宽度，适合大屏阅读。")} checked={form.codexAppConversationView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppConversationView", value)} />
               <FeatureToggle title={t("切换对话保留位置")} detail={t("切换 thread 时恢复上一次浏览位置。")} checked={form.codexAppThreadScrollRestore} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadScrollRestore", value)} />
+              <FeatureToggle title={t("会话项目移动")} detail={t("把会话移动到普通对话或其他本地项目。")} checked={form.codexAppProjectMove} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppProjectMove", value)} />
+              <FeatureToggle title={t("capacity 重试")} detail={t("检测到容量错误后，由 Codex++ 代理重发原请求；达到上限后才返回原始容量错误。")} checked={form.codexAppCapacityRetry} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppCapacityRetry", value)} />
+              <div className="feature-select-row">
+                <Field label={t("capacity 重试次数")}>
+                  <Input
+                    disabled={!masterEnabled || !form.codexAppCapacityRetry}
+                    max={20}
+                    min={1}
+                    onChange={(event) => onFormChange({
+                      ...form,
+                      codexAppCapacityRetryMaxAttempts: clampNumber(Number(event.currentTarget.value), 1, 20),
+                    })}
+                    type="number"
+                    value={form.codexAppCapacityRetryMaxAttempts}
+                  />
+                </Field>
+              </div>
             </FeatureGroup>
             <FeatureGroup title="Stepwise" detail={t("基于当前对话生成下一步建议，使用独立 API 配置。")}>
               <FeatureToggle title="Stepwise" detail={t("在 Codex 页面显示可拖动的后续建议浮层；建议由单独配置的 Stepwise API 生成。启停后需重启 Codex++ 生效。")} checked={form.codexAppStepwiseEnabled} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppStepwiseEnabled", value)} />
@@ -7602,6 +9413,7 @@ function RelayProfileList({
   disabled?: boolean;
   actions: Actions;
 }) {
+  const visibleProfiles = form.relayProfiles.filter((profile) => !isCliproxyOfficialProfile(profile));
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: { distance: 8 },
@@ -7618,9 +9430,9 @@ function RelayProfileList({
   };
   return (
     <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-      <SortableContext items={form.relayProfiles.map((profile) => profile.id)} strategy={verticalListSortingStrategy}>
+      <SortableContext items={visibleProfiles.map((profile) => profile.id)} strategy={verticalListSortingStrategy}>
         <div className="relay-profile-list">
-          {form.relayProfiles.map((profile, index) => (
+          {visibleProfiles.map((profile, index) => (
             <SortableRelayProfileCard
               actions={actions}
               form={form}
@@ -7657,6 +9469,12 @@ function SortableRelayProfileCard({
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: profile.id });
   const active = profile.id === form.activeRelayId;
+  const managedCliproxy = isCliproxyManagedProfile(profile);
+  const managedNewapi = isNewapiManagedProfile(profile);
+  const managedIntegration = managedCliproxy || managedNewapi;
+  const managedIntegrationTitle = managedNewapi
+    ? t("请在 NewAPI 页面管理")
+    : t("请在 CLIProxyAPI 页面管理");
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -7727,35 +9545,40 @@ function SortableRelayProfileCard({
             <TestTube className="h-4 w-4" />
           </Button>
           <Button
+            disabled={managedIntegration}
             onClick={(event) => {
               event.stopPropagation();
+              if (managedIntegration) return;
               onEdit(profile.id);
             }}
             size="icon"
-            title={t("编辑")}
+            title={managedIntegration ? managedIntegrationTitle : t("编辑")}
             variant="ghost"
           >
             <Edit3 className="h-4 w-4" />
           </Button>
           <Button
+            disabled={managedIntegration}
             onClick={(event) => {
               event.stopPropagation();
+              if (managedIntegration) return;
               onFormChange(duplicateRelayProfile(form, profile.id));
             }}
             size="icon"
-            title={t("复制")}
+            title={managedIntegration ? managedIntegrationTitle : t("复制")}
             variant="ghost"
           >
             <Copy className="h-4 w-4" />
           </Button>
           <Button
-            disabled={form.relayProfiles.length <= 1}
+            disabled={managedIntegration || form.relayProfiles.length <= 1}
             onClick={(event) => {
               event.stopPropagation();
+              if (managedIntegration) return;
               onFormChange(removeRelayProfile(form, profile.id));
             }}
             size="icon"
-            title={t("删除供应商")}
+            title={managedIntegration ? managedIntegrationTitle : t("删除供应商")}
             variant="ghost"
           >
             <Trash2 className="h-4 w-4" />
@@ -11343,6 +13166,10 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   const activeRelayId = profiles.some((profile) => profile.id === settings.activeRelayId)
     ? settings.activeRelayId
     : profiles[0]?.id || "default";
+  const officialLoginProfiles = profiles.filter(isOfficialLoginProfile);
+  const officialLoginRelayId = officialLoginProfiles.some((profile) => profile.id === settings.officialLoginRelayId)
+    ? settings.officialLoginRelayId
+    : officialLoginProfiles[0]?.id || "";
   return syncLegacyRelayFields({
     ...defaultSettings,
     ...settings,
@@ -11352,6 +13179,9 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     codexAppDreamSkinPaused: settings.codexAppDreamSkinPaused === true,
     codexAppDreamSkinThemeConfig: normalizeDreamSkinTheme(settings.codexAppDreamSkinThemeConfig),
     codexAppDreamSkinImagePath: (settings.codexAppDreamSkinImagePath || "").trim(),
+    codexAppCapacityRetry: settings.codexAppCapacityRetry === true,
+    codexAppCapacityRetryMaxAttempts: clampNumber(settings.codexAppCapacityRetryMaxAttempts ?? 5, 1, 20),
+    codexAppProjectMove: settings.codexAppProjectMove !== false,
     codexAppStepwiseMaxItems: clampNumber(settings.codexAppStepwiseMaxItems ?? 6, 0, 6),
     codexAppStepwiseMaxInputChars: clampNumber(settings.codexAppStepwiseMaxInputChars || 6000, 1000, 24000),
     codexAppStepwiseMaxOutputTokens: clampNumber(settings.codexAppStepwiseMaxOutputTokens || 500, 100, 4000),
@@ -11360,6 +13190,9 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     relayContextConfigContents,
     relayProfiles: profiles,
     activeRelayId,
+    officialLoginMixedMode: settings.officialLoginMixedMode === true,
+    officialLoginRelayId,
+    activeOfficialAccountId: (settings.activeOfficialAccountId || "").trim(),
   });
 }
 
@@ -12406,10 +14239,45 @@ function isAggregateRelayProfile(profile: Pick<RelayProfile, "relayMode" | "aggr
   return profile.relayMode === "aggregate" || !!profile.aggregate;
 }
 
+function isCliproxyManagedProfile(profile: Pick<RelayProfile, "id" | "integrationType">): boolean {
+  return profile.integrationType === "cliproxy"
+    || profile.integrationType === "cliproxy-official"
+    || profile.id === "managed-cliproxy"
+    || profile.id === "managed-cliproxy-official";
+}
+
+function isNewapiManagedProfile(profile: Pick<RelayProfile, "id" | "integrationType">): boolean {
+  return profile.integrationType === "newapi" || profile.id === "managed-newapi";
+}
+
+function isCliproxyOfficialProfile(profile: Pick<RelayProfile, "id" | "integrationType">): boolean {
+  return profile.integrationType === "cliproxy-official" || profile.id === "managed-cliproxy-official";
+}
+
+function isCliproxyGeneralProfile(profile: Pick<RelayProfile, "id" | "integrationType">): boolean {
+  return profile.integrationType === "cliproxy" || profile.id === "managed-cliproxy";
+}
+
+function isCliproxyOfficialModel(model: string): boolean {
+  const baseModel = model.trim().split("/").at(-1)?.trim().toLowerCase() ?? "";
+  return DEFAULT_CODEX_MODEL_MAPPING_KEYS.some((candidate) => candidate === baseModel);
+}
+
+function isOfficialLoginProfile(profile: RelayProfile): boolean {
+  return profile.relayMode === "official" && !profile.officialMixApiKey && !isAggregateRelayProfile(profile);
+}
+
 function normalizeAggregateRelayProfile(profile: RelayProfile, settings: BackendSettings | null): RelayProfile {
   const candidates = settings ? aggregateMemberCandidates(settings, profile.id) : [];
   const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
+  const officialModelList = settings ? officialLoginModelList(settings) : [];
   const modelList = inferAggregateModelList({ ...profile, aggregate }, settings);
+  const selectedModel = profile.model.trim();
+  const model = settings?.officialLoginMixedMode && officialModelList.length > 0
+    ? (officialModelList.some((item) => item.toLowerCase() === selectedModel.toLowerCase())
+      ? selectedModel
+      : officialModelList[0])
+    : selectedModel;
   return {
     ...profile,
     baseUrl: "",
@@ -12417,6 +14285,7 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     apiKey: "",
     protocol: "responses",
     relayMode: "aggregate",
+    model,
     sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
     officialMixApiKey: false,
     hideOfficialUsageAlert: false,
@@ -12436,14 +14305,51 @@ function inferAggregateModelList(profile: RelayProfile, settings: BackendSetting
   const candidates = aggregateMemberCandidates(settings, profile.id);
   const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
   const memberProfiles = aggregateSelectedMemberProfiles(aggregate, candidates);
-  const displayModels = aggregateDisplayModelEntries(aggregate, memberProfiles).map((entry) => entry.alias);
-  const seen = new Set(displayModels);
-  const passthroughModels = memberProfiles.flatMap((member) => relayProfileModels(member).filter((model) => {
-    if (seen.has(model)) return false;
-    seen.add(model);
-    return true;
-  }));
-  return [...passthroughModels, ...displayModels].filter(Boolean).join("\n");
+  const officialCliproxyModels = settings.officialLoginMixedMode
+    ? cliproxyOfficialModelAliases(settings)
+    : [];
+  return aggregateOrderedModelList(
+    aggregate,
+    memberProfiles,
+    officialLoginModelList(settings),
+    settings.officialLoginMixedMode,
+    officialCliproxyModels,
+    cliproxyGeneralModelAliases(settings, officialCliproxyModels.length > 0),
+  ).filter(Boolean).join("\n");
+}
+
+function officialLoginModelList(settings: BackendSettings): string[] {
+  if (settings.activeOfficialAccountId) return [...DEFAULT_CODEX_MODEL_MAPPING_KEYS];
+  const official = settings.relayProfiles.find((profile) => profile.id === settings.officialLoginRelayId)
+    ?? settings.relayProfiles.find((profile) => isOfficialLoginProfile(profile));
+  return official && isOfficialLoginProfile(official) ? [...DEFAULT_CODEX_MODEL_MAPPING_KEYS] : [];
+}
+
+function cliproxyOfficialModelAliases(settings: BackendSettings): string[] {
+  const profile = settings.relayProfiles.find(isCliproxyOfficialProfile);
+  if (!profile) return [];
+  const models = relayProfileModels(profile);
+  return DEFAULT_CODEX_MODEL_MAPPING_KEYS.flatMap((officialModel) => {
+    const candidates = models
+      .filter((model) => model.trim().split("/").at(-1)?.trim().toLowerCase() === officialModel)
+      .sort((left, right) => Number(left.includes("/")) - Number(right.includes("/")) || left.localeCompare(right));
+    return candidates.length ? [`CLIProxyAPI:${officialModel}`] : [];
+  });
+}
+
+function cliproxyGeneralModelAliases(settings: BackendSettings, excludeOfficialModels: boolean): string[] {
+  const seen = new Set<string>();
+  return settings.relayProfiles
+    .filter(isCliproxyGeneralProfile)
+    .flatMap(relayProfileModels)
+    .filter((model) => !excludeOfficialModels || !isCliproxyOfficialModel(model))
+    .map((model) => `CLIProxyAPI:${model.trim()}`)
+    .filter((model) => {
+      const key = model.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 }
 
 function normalizeAggregateConfig(
@@ -12481,7 +14387,11 @@ function normalizeAggregateConfig(
 
 function aggregateMemberCandidates(settings: BackendSettings, aggregateId: string): RelayProfile[] {
   return settings.relayProfiles.filter(
-    (profile) => profile.id !== aggregateId && !isAggregateRelayProfile(profile) && isApiRelayProfile(profile),
+    (profile) => profile.id !== aggregateId
+      && !isAggregateRelayProfile(profile)
+      && !isCliproxyManagedProfile(profile)
+      && !isNewapiManagedProfile(profile)
+      && isApiRelayProfile(profile),
   );
 }
 

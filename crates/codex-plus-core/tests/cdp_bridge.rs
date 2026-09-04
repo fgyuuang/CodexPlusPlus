@@ -70,6 +70,41 @@ fn injection_script_prefixes_helper_url_and_metadata() {
     assert!(script.contains("data-codex-plus-discord"));
 }
 
+/// 注入永远早于 Codex 渲染左侧面板：注入时 readyState 已是 complete，但
+/// aside.app-shell-left-panel 还不存在，所以首次 scan 装不上侧边栏入口，
+/// 之后要等 MutationObserver 观察到侧边栏挂载（实测 2.6~3.1 秒）。
+///
+/// 那条路径把入口的出现押在单次 DOM 变更上，变更被过滤掉就再无触发。
+/// 这里钉住不依赖 DOM 事件的有界重试兜底。
+#[test]
+fn injection_script_retries_sidebar_nav_after_startup() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("scheduleSidebarNavStartupRetry"));
+    // 必须在首次 scan 之后调用，否则等于重复第一次必然失败的尝试
+    let scan_at = script.find("\n  scan();").expect("startup scan call");
+    let retry_at = script
+        .find("\n  scheduleSidebarNavStartupRetry();")
+        .expect("startup retry call");
+    assert!(retry_at > scan_at);
+    // 有界：插上就停、超时就放弃，不留常驻定时器
+    assert!(script.contains("clearInterval(window.__codexPlusSidebarNavRetryTimer)"));
+    assert!(script.contains("attempts > 20"));
+}
+
+/// 内置插件包的注册名从 openai-curated-remote 换成了 codex-plus-curated
+/// （前者是 codex 保留名，注册后会被静默忽略）。显示名映射要跟着认新名，
+/// 否则插件市场里会显示原始名而不是友好名。
+#[test]
+fn injection_script_maps_the_renamed_bundled_marketplace_display_name() {
+    let script = assets::injection_script(57321);
+
+    assert!(
+        script.contains(r#"name === "codex-plus-curated" || name === "openai-curated-remote""#)
+    );
+    assert!(script.contains("OpenAI插件5(Codex++)"));
+}
+
 #[test]
 fn injection_script_omits_stepwise_runtime_when_disabled() {
     let script = assets::injection_script_with_settings(57321, &BackendSettings::default());
@@ -87,6 +122,18 @@ fn injection_script_includes_stepwise_runtime_when_enabled() {
     let script = assets::injection_script_with_settings(57321, &settings);
 
     assert!(script.contains("const API_KEY = \"__codexStepwisePanel\";"));
+}
+
+#[test]
+fn injection_script_replaces_the_legacy_menu_with_sidebar_navigation() {
+    let script = assets::injection_script(57321);
+
+    assert!(!script.contains("function installCodexPlusMenu()"));
+    assert!(!script.contains("function findNativeMenuInsertionPoint()"));
+    assert!(script.contains("function installCodexPlusSidebarNavigation()"));
+    assert!(script.contains(
+        "document.querySelectorAll(`#${codexPlusMenuId}, [data-codex-plus-menu=\"true\"]`)"
+    ));
 }
 
 #[test]
@@ -1063,9 +1110,11 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     );
     assert!(script.contains("restored === \"openai-api-curated\""));
     assert!(script.contains("restored === \"openai-curated-remote\""));
-    assert!(
-        script.contains("if (name === \"openai-curated-remote\") return \"OpenAI插件5(Codex++)\"")
-    );
+    // 内置包的注册名已从 openai-curated-remote 换成 codex-plus-curated（前者是
+    // codex 保留名会被静默忽略），显示名映射同时认新旧两个名字。
+    assert!(script.contains(
+        "if (name === \"codex-plus-curated\" || name === \"openai-curated-remote\") return \"OpenAI插件5(Codex++)\""
+    ));
     assert!(script.contains(
         "if (name === \"codex-plus-openai-curated-remote\") return \"openai-curated-remote\""
     ));
@@ -1657,6 +1706,9 @@ fn injection_script_exposes_fast_service_tier_control() {
     assert!(script.contains("data-codex-service-tier-controls"));
     assert!(script.contains("removeCodexServiceTierBadges"));
     assert!(script.contains("installCodexServiceTierDispatcherPatch"));
+    assert!(script.contains("installCodexModelRequestBridgePatch"));
+    assert!(script.contains("model_reasoning_effort_normalized"));
+    assert!(script.contains("\"thread/settings/update\""));
     assert!(script.contains("服务模式"));
     assert!(script.contains("data-codex-service-tier-status"));
     assert!(script.contains("data-codex-service-tier-inherit"));
@@ -1856,6 +1908,11 @@ fn injection_script_applies_fast_service_tier_contract() {
         "priority"
     );
     assert_eq!(cases["solFastAvailability"]["supported"], true);
+    assert_eq!(cases["cliSolFastAvailability"]["supported"], true);
+    assert_eq!(cases["cliTerraFastAvailability"]["supported"], true);
+    assert_eq!(cases["cliGeminiFastAvailability"]["supported"], false);
+    assert_eq!(cases["supplierSolFastAvailability"]["supported"], false);
+    assert_eq!(cases["cliSolFastRequest"]["serviceTier"], "priority");
     assert_eq!(cases["solDescriptor"]["defaultReasoningEffort"], "low");
     assert_eq!(
         cases["solDescriptor"]["supportedReasoningEfforts"][4]["reasoningEffort"],
@@ -1864,6 +1921,16 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(
         cases["solDescriptor"]["supportedReasoningEfforts"][5]["reasoningEffort"],
         "ultra"
+    );
+    assert_eq!(cases["cliSolDescriptor"]["defaultReasoningEffort"], "low");
+    assert_eq!(
+        cases["cliSolDescriptor"]["supportedReasoningEfforts"][5]["reasoningEffort"],
+        "ultra"
+    );
+    assert_eq!(cases["cliSolDescriptor"]["additionalSpeedTiers"][0], "fast");
+    assert_eq!(
+        cases["cliSolDescriptor"]["serviceTiers"][0]["id"],
+        "priority"
     );
     assert_eq!(cases["officialModels"].as_array().unwrap().len(), 2);
     assert_eq!(
@@ -1876,6 +1943,33 @@ fn injection_script_applies_fast_service_tier_contract() {
     );
     assert_eq!(cases["firstOfficialPatchChanged"], true);
     assert_eq!(cases["secondOfficialPatchChanged"], false);
+    assert_eq!(cases["supplierEffortFallback"]["reasoningEffort"], "medium");
+    assert_eq!(cases["officialEffortPreserved"]["reasoningEffort"], "xhigh");
+    assert_eq!(cases["officialEffortFallback"]["reasoningEffort"], "low");
+    assert_eq!(
+        cases["fetchSupplierFallback"]["params"]["reasoningEffort"],
+        "medium"
+    );
+    assert_eq!(
+        cases["solFallbackWithoutCatalog"]["reasoningEffort"],
+        "ultra"
+    );
+    assert_eq!(
+        cases["lunaFallbackWithoutCatalog"]["reasoningEffort"],
+        "medium"
+    );
+    assert_eq!(
+        cases["cliSolFallbackWithoutCatalog"]["reasoningEffort"],
+        "ultra"
+    );
+    assert_eq!(
+        cases["cliLunaFallbackWithoutCatalog"]["reasoningEffort"],
+        "medium"
+    );
+    assert_eq!(
+        cases["cliGeminiFallbackWithoutCatalog"]["reasoningEffort"],
+        "low"
+    );
     assert_eq!(cases["dispatcherFromSingleton"], true);
     assert_eq!(cases["dispatcherFromCurrentSingleton"], true);
     assert_eq!(cases["dispatcherFromClass"], true);
@@ -2135,6 +2229,32 @@ api.setModelCatalog({{
 const solDescriptor = api.modelDescriptor("gpt-5.6-sol");
 api.setModelCatalog({{
   status: "ok",
+  model: "CLIProxyAPI:gpt-5.6-sol",
+  default_model: "CLIProxyAPI:gpt-5.6-sol",
+  models: ["CLIProxyAPI:gpt-5.6-sol", "CLIProxyAPI:gpt-5.6-terra", "CLIProxyAPI:gemini-2.5-pro"],
+  modelMetadata: {{
+    "CLIProxyAPI:gpt-5.6-sol": {{
+      displayName: "CLIProxyAPI:gpt-5.6-sol",
+      description: "Latest frontier agentic coding model through CLIProxyAPI.",
+      defaultReasoningEffort: "low",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({{ reasoningEffort }})),
+      additionalSpeedTiers: ["fast"],
+      serviceTiers: [{{ id: "priority", name: "Fast" }}],
+    }},
+  }},
+}});
+const cliSolFastAvailability = api.fastAvailability("CLIProxyAPI:gpt-5.6-sol");
+const cliTerraFastAvailability = api.fastAvailability("CLIProxyAPI:gpt-5.6-terra");
+const cliGeminiFastAvailability = api.fastAvailability("CLIProxyAPI:gemini-2.5-pro");
+const supplierSolFastAvailability = api.fastAvailability("供应商一:gpt-5.6-sol");
+const cliSolFastRequest = api.applyServiceTierOverride("turn/start", {{
+  threadId: "thread-12345678",
+  model: "CLIProxyAPI:gpt-5.6-sol",
+  service_tier: null,
+}}, "");
+const cliSolDescriptor = api.modelDescriptor("CLIProxyAPI:gpt-5.6-sol");
+api.setModelCatalog({{
+  status: "ok",
   model: "gpt-5.4",
   default_model: "gpt-5.4",
   models: ["gpt-5.4", "gpt-5.6-sol"],
@@ -2150,9 +2270,78 @@ const officialModels = [
   {{ model: "gpt-5.4", displayName: "GPT-5.4", hidden: false }},
   {{ model: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", hidden: false }},
 ];
-const firstOfficialPatchChanged = api.patchModelArray(officialModels);
-const secondOfficialPatchChanged = api.patchModelArray(officialModels);
-const singletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
+    const firstOfficialPatchChanged = api.patchModelArray(officialModels);
+    const secondOfficialPatchChanged = api.patchModelArray(officialModels);
+    api.setModelCatalog({{
+      status: "ok",
+      model: "gpt-5.6-sol",
+      default_model: "gpt-5.6-sol",
+      models: ["gpt-5.6-sol", "供应商一:model-a"],
+      modelMetadata: {{
+        "gpt-5.6-sol": {{
+          defaultReasoningEffort: "low",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({{ reasoningEffort }})),
+        }},
+        "供应商一:model-a": {{
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({{ reasoningEffort }})),
+        }},
+      }},
+    }});
+    const supplierEffortFallback = api.normalizeReasoningParams("thread/settings/update", {{
+      threadId: "thread-12345678",
+      model: "供应商一:model-a",
+      reasoningEffort: "ultra",
+    }});
+    const officialEffortPreserved = api.normalizeReasoningParams("thread/settings/update", {{
+      threadId: "thread-12345678",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "xhigh",
+    }});
+    const officialEffortFallback = api.normalizeReasoningParams("thread/settings/update", {{
+      threadId: "thread-12345678",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "unsupported",
+    }});
+    const fetchSupplierFallback = api.patchReasoningMessage({{
+      type: "fetch",
+      url: "vscode://codex/thread/settings/update",
+      body: JSON.stringify({{
+        params: {{
+          threadId: "thread-12345678",
+          model: "供应商一:model-a",
+          reasoningEffort: "max",
+        }},
+      }}),
+    }});
+    api.setModelCatalog({{
+      status: "ok",
+      model: "gpt-5.6-sol",
+      default_model: "gpt-5.6-sol",
+      models: ["gpt-5.6-sol", "gpt-5.6-luna"],
+      modelMetadata: {{}},
+    }});
+    const solFallbackWithoutCatalog = api.normalizeReasoningParams("thread/settings/update", {{
+      model: "gpt-5.6-sol",
+      reasoningEffort: "ultra",
+    }});
+    const lunaFallbackWithoutCatalog = api.normalizeReasoningParams("thread/settings/update", {{
+      model: "gpt-5.6-luna",
+      reasoningEffort: "ultra",
+    }});
+    const cliSolFallbackWithoutCatalog = api.normalizeReasoningParams("thread/settings/update", {{
+      model: "CLIProxyAPI:gpt-5.6-sol",
+      reasoningEffort: "ultra",
+    }});
+    const cliLunaFallbackWithoutCatalog = api.normalizeReasoningParams("thread/settings/update", {{
+      model: "CLIProxyAPI:gpt-5.6-luna",
+      reasoningEffort: "ultra",
+    }});
+    const cliGeminiFallbackWithoutCatalog = api.normalizeReasoningParams("thread/settings/update", {{
+      model: "CLIProxyAPI:gemini-2.5-pro",
+      reasoningEffort: "ultra",
+    }});
+    const singletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
 const dispatcherFromSingleton = api.dispatcherFromModule({{ current: singletonDispatcher }}) === singletonDispatcher;
 const currentSingletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
 const dispatcherFromCurrentSingleton = api.dispatcherFromModule({{
@@ -2554,11 +2743,26 @@ process.stdout.write(JSON.stringify({{
   fetchSendCliRequest,
   solFastAvailability,
   solDescriptor,
+  cliSolFastAvailability,
+  cliTerraFastAvailability,
+  cliGeminiFastAvailability,
+  supplierSolFastAvailability,
+  cliSolFastRequest,
+  cliSolDescriptor,
   officialModels,
   firstOfficialPatchChanged,
   secondOfficialPatchChanged,
   dispatcherFromSingleton,
   dispatcherFromCurrentSingleton,
+  supplierEffortFallback,
+  officialEffortPreserved,
+  officialEffortFallback,
+  fetchSupplierFallback: JSON.parse(fetchSupplierFallback.body),
+  solFallbackWithoutCatalog,
+  lunaFallbackWithoutCatalog,
+  cliSolFallbackWithoutCatalog,
+  cliLunaFallbackWithoutCatalog,
+  cliGeminiFallbackWithoutCatalog,
   dispatcherFromClass,
   legacySettingStorage,
   currentSettingStorage,

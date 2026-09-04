@@ -23,6 +23,12 @@ pub enum LaunchMode {
 pub struct RelayProfile {
     pub id: String,
     pub name: String,
+    #[serde(
+        rename = "integrationType",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub integration_type: String,
     #[serde(default, skip_serializing)]
     pub model: String,
     #[serde(default = "default_relay_base_url", skip_serializing)]
@@ -189,6 +195,7 @@ impl Default for RelayProfile {
         Self {
             id: "default".to_string(),
             name: "默认中转".to_string(),
+            integration_type: String::new(),
             model: String::new(),
             base_url: default_relay_base_url(),
             upstream_base_url: String::new(),
@@ -407,6 +414,16 @@ pub struct BackendSettings {
     pub codex_app_force_chinese_locale: bool,
     #[serde(rename = "codexAppFastStartup", default)]
     pub codex_app_fast_startup: bool,
+    #[serde(rename = "codexAppCapacityRetry", default)]
+    pub codex_app_capacity_retry: bool,
+    #[serde(
+        rename = "codexAppCapacityRetryMaxAttempts",
+        default = "default_capacity_retry_max_attempts",
+        deserialize_with = "deserialize_capacity_retry_max_attempts"
+    )]
+    pub codex_app_capacity_retry_max_attempts: u8,
+    #[serde(rename = "codexAppProjectMove", default = "default_true")]
+    pub codex_app_project_move: bool,
     #[serde(rename = "codexAppThreadIdBadge", default)]
     pub codex_app_thread_id_badge: bool,
     #[serde(rename = "codexAppConversationView", default)]
@@ -543,6 +560,12 @@ pub struct BackendSettings {
     pub relay_api_key: String,
     #[serde(rename = "relayProfiles", default = "default_relay_profiles")]
     pub relay_profiles: Vec<RelayProfile>,
+    #[serde(rename = "officialLoginMixedMode", default)]
+    pub official_login_mixed_mode: bool,
+    #[serde(rename = "officialLoginRelayId", default)]
+    pub official_login_relay_id: String,
+    #[serde(rename = "activeOfficialAccountId", default)]
+    pub active_official_account_id: String,
     #[serde(rename = "relayCommonConfigContents", default)]
     pub relay_common_config_contents: String,
     #[serde(rename = "relayContextConfigContents", default)]
@@ -575,6 +598,9 @@ impl Default for BackendSettings {
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: true,
             codex_app_fast_startup: false,
+            codex_app_capacity_retry: false,
+            codex_app_capacity_retry_max_attempts: default_capacity_retry_max_attempts(),
+            codex_app_project_move: true,
             codex_app_thread_id_badge: false,
             codex_app_conversation_view: false,
             codex_app_thread_scroll_restore: true,
@@ -622,6 +648,9 @@ impl Default for BackendSettings {
             relay_base_url: default_relay_base_url(),
             relay_api_key: String::new(),
             relay_profiles: default_relay_profiles(),
+            official_login_mixed_mode: false,
+            official_login_relay_id: String::new(),
+            active_official_account_id: String::new(),
             relay_common_config_contents: String::new(),
             relay_context_config_contents: String::new(),
             active_relay_id: default_active_relay_id(),
@@ -642,6 +671,7 @@ impl BackendSettings {
             return RelayProfile {
                 id: default_active_relay_id(),
                 name: "默认中转".to_string(),
+                integration_type: String::new(),
                 model: String::new(),
                 base_url: if self.relay_base_url.is_empty() {
                     default_relay_base_url()
@@ -695,6 +725,7 @@ impl BackendSettings {
                 self.active_relay_id.clone()
             },
             name: "默认中转".to_string(),
+            integration_type: String::new(),
             model: String::new(),
             base_url: if self.relay_base_url.is_empty() {
                 default_relay_base_url()
@@ -780,6 +811,28 @@ impl BackendSettings {
         }
     }
 
+    pub fn official_login_relay_profile(&self) -> Option<&RelayProfile> {
+        let selected_id = self.official_login_relay_id.trim();
+        self.relay_profiles
+            .iter()
+            .find(|profile| {
+                !selected_id.is_empty()
+                    && profile.id == selected_id
+                    && profile.relay_mode == RelayMode::Official
+                    && !profile.official_mix_api_key
+            })
+            .or_else(|| {
+                self.relay_profiles.iter().find(|profile| {
+                    profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key
+                })
+            })
+    }
+
+    pub fn active_relay_uses_official_login_auth(&self) -> bool {
+        self.official_login_mixed_mode
+            && self.active_relay_profile().relay_mode != RelayMode::Official
+    }
+
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
         self.active_aggregate_relay_profile().is_some()
             || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
@@ -819,6 +872,14 @@ pub fn default_stepwise_max_output_tokens() -> u32 {
 
 pub fn default_stepwise_timeout_ms() -> u64 {
     8000
+}
+
+pub fn default_capacity_retry_max_attempts() -> u8 {
+    5
+}
+
+pub fn clamp_capacity_retry_max_attempts(value: u8) -> u8 {
+    value.clamp(1, 20)
 }
 
 fn default_image_overlay_opacity() -> u8 {
@@ -1073,6 +1134,15 @@ where
         .unwrap_or_else(default_stepwise_timeout_ms))
 }
 
+fn deserialize_capacity_retry_max_attempts<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u8>::deserialize(deserializer)?
+        .map(clamp_capacity_retry_max_attempts)
+        .unwrap_or_else(default_capacity_retry_max_attempts))
+}
+
 fn deserialize_profile_api_key<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1208,6 +1278,20 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppPasteFix");
     merge_bool_setting(target, source, "codexAppForceChineseLocale");
     merge_bool_setting(target, source, "codexAppFastStartup");
+    merge_bool_setting(target, source, "codexAppCapacityRetry");
+    if let Some(value) = source
+        .get("codexAppCapacityRetryMaxAttempts")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+    {
+        target.insert(
+            "codexAppCapacityRetryMaxAttempts".to_string(),
+            Value::Number(serde_json::Number::from(clamp_capacity_retry_max_attempts(
+                value,
+            ))),
+        );
+    }
+    merge_bool_setting(target, source, "codexAppProjectMove");
     merge_bool_setting(target, source, "codexAppThreadIdBadge");
     merge_bool_setting(target, source, "codexAppConversationView");
     merge_bool_setting(target, source, "codexAppThreadScrollRestore");
@@ -1403,6 +1487,27 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         );
     }
     if let Some(value) = source
+        .get("officialLoginMixedMode")
+        .and_then(Value::as_bool)
+    {
+        target.insert("officialLoginMixedMode".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = source.get("officialLoginRelayId").and_then(Value::as_str) {
+        target.insert(
+            "officialLoginRelayId".to_string(),
+            Value::String(value.trim().to_string()),
+        );
+    }
+    if let Some(value) = source
+        .get("activeOfficialAccountId")
+        .and_then(Value::as_str)
+    {
+        target.insert(
+            "activeOfficialAccountId".to_string(),
+            Value::String(value.trim().to_string()),
+        );
+    }
+    if let Some(value) = source
         .get("relayCommonConfigContents")
         .and_then(Value::as_str)
     {
@@ -1578,6 +1683,7 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings.relay_context_config_contents = crate::relay_config::strip_legacy_skill_tables(
         &crate::relay_config::normalize_config_text(&context),
     );
+    prune_excluded_aggregate_members(&mut settings);
     hydrate_aggregate_profile_model_lists(&mut settings);
     for profile in &mut settings.relay_profiles {
         let _ = crate::relay_config::normalize_relay_profile_for_storage(profile);
@@ -1639,7 +1745,45 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         clamp_stepwise_max_output_tokens(settings.codex_app_stepwise_max_output_tokens);
     settings.codex_app_stepwise_timeout_ms =
         clamp_stepwise_timeout_ms(settings.codex_app_stepwise_timeout_ms);
+    settings.official_login_relay_id = settings.official_login_relay_id.trim().to_string();
+    settings.active_official_account_id = settings.active_official_account_id.trim().to_string();
+    if settings.official_login_mixed_mode {
+        settings.official_login_relay_id = settings
+            .official_login_relay_profile()
+            .map(|profile| profile.id.clone())
+            .unwrap_or_default();
+    }
     settings
+}
+
+fn prune_excluded_aggregate_members(settings: &mut BackendSettings) {
+    let excluded_ids = settings
+        .relay_profiles
+        .iter()
+        .filter(|profile| {
+            crate::aggregate_model_alias::integration_is_excluded_from_aggregate(
+                &profile.integration_type,
+            )
+        })
+        .map(|profile| profile.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if excluded_ids.is_empty() {
+        return;
+    }
+
+    for aggregate in &mut settings.aggregate_relay_profiles {
+        aggregate
+            .members
+            .retain(|member| !excluded_ids.contains(member.relay_id.as_str()));
+        for mapping in &mut aggregate.model_mappings {
+            mapping
+                .targets
+                .retain(|target| !excluded_ids.contains(target.relay_id.as_str()));
+        }
+        aggregate
+            .model_mappings
+            .retain(|mapping| !mapping.targets.is_empty());
+    }
 }
 
 fn hydrate_aggregate_profile_model_lists(settings: &mut BackendSettings) {
@@ -1838,6 +1982,7 @@ mod tests {
         assert!(settings.codex_app_plugin_marketplace_unlock);
         assert!(!settings.codex_app_thread_id_badge);
         assert!(settings.codex_app_force_chinese_locale);
+        assert!(!settings.codex_app_capacity_retry);
         assert!(!settings.codex_goals_enabled);
         assert!(settings.codex_app_path.is_empty());
         assert!(settings.codex_extra_args.is_empty());
@@ -2515,6 +2660,62 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
+    fn normalize_settings_removes_cliproxy_official_channel_from_aggregates() {
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "managed-cliproxy-official".to_string(),
+                    integration_type: "cliproxy-official".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "relay-a".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
+                strategy: AggregateRelayStrategy::Failover,
+                members: vec![
+                    AggregateRelayMember {
+                        relay_id: "managed-cliproxy-official".to_string(),
+                        weight: 1,
+                    },
+                    AggregateRelayMember {
+                        relay_id: "relay-a".to_string(),
+                        weight: 1,
+                    },
+                ],
+                model_mappings_enabled: true,
+                model_mappings: vec![AggregateRelayModelMapping {
+                    codex_model: "gpt-5.4".to_string(),
+                    targets: vec![
+                        AggregateRelayDispatchTarget {
+                            relay_id: "managed-cliproxy-official".to_string(),
+                            target_model: "gpt-5.4".to_string(),
+                        },
+                        AggregateRelayDispatchTarget {
+                            relay_id: "relay-a".to_string(),
+                            target_model: "gpt-5.4".to_string(),
+                        },
+                    ],
+                }],
+            }],
+            ..BackendSettings::default()
+        };
+
+        let normalized = normalize_settings_config_sections(settings);
+        let aggregate = &normalized.aggregate_relay_profiles[0];
+        assert_eq!(aggregate.members.len(), 1);
+        assert_eq!(aggregate.members[0].relay_id, "relay-a");
+        assert_eq!(aggregate.model_mappings.len(), 1);
+        assert_eq!(aggregate.model_mappings[0].targets.len(), 1);
+        assert_eq!(aggregate.model_mappings[0].targets[0].relay_id, "relay-a");
+    }
+
+    #[test]
     fn normalize_settings_config_sections_restores_aggregate_model_list_from_members() {
         let settings = BackendSettings {
             relay_profiles: vec![
@@ -2552,6 +2753,7 @@ experimental_bearer_token = "sk-existing""#
             aggregate_relay_profiles: vec![AggregateRelayProfile {
                 id: "agg".to_string(),
                 name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
                 strategy: AggregateRelayStrategy::Failover,
                 members: vec![
                     AggregateRelayMember {

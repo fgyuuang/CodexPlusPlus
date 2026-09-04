@@ -409,7 +409,6 @@
   const styleId = "codex-delete-style";
   const codexDeleteStyleVersion = "17";
   const codexPlusMenuId = "codex-plus-menu";
-  const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
   const codexPlusPageClass = "codex-plus-page-overlay";
   const codexDeleteVersion = "7";
@@ -476,6 +475,7 @@
   const codexAppServerModelRequestPatchVersion = "6";
   const codexRemoteSessionRecoveryVersion = "5";
   const codexPluginMarketplaceUnlockVersion = "15";
+  const codexModelRequestBridgePatchVersion = "1";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -1395,7 +1395,7 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, capacityRetry: false, capacityRetryMaxAttempts: 5, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
@@ -1413,6 +1413,8 @@
     petRealMouseLook: "codexAppPetRealMouseLook",
     stepwise: "codexAppStepwiseEnabled",
     pasteFix: "codexAppPasteFix",
+    capacityRetry: "codexAppCapacityRetry",
+    capacityRetryMaxAttempts: "codexAppCapacityRetryMaxAttempts",
     dreamSkinEnabled: "codexAppDreamSkinEnabled",
     dreamSkinPaused: "codexAppDreamSkinPaused",
     dreamSkinThemeConfig: "codexAppDreamSkinThemeConfig",
@@ -1424,7 +1426,7 @@
     const settings = {};
     Object.entries(codexPlusBackendSettingMap).forEach(([localKey, backendKey]) => {
       const value = codexPlusBackendSettings[backendKey];
-      if (typeof value === "boolean" || typeof value === "string" || (value && typeof value === "object" && !Array.isArray(value))) {
+      if (typeof value === "boolean" || typeof value === "number" || typeof value === "string" || (value && typeof value === "object" && !Array.isArray(value))) {
         settings[localKey] = value;
       }
     });
@@ -1440,6 +1442,9 @@
         sessionDelete: false,
         markdownExport: false,
         pasteFix: false,
+        capacityRetry: false,
+        capacityRetryMaxAttempts: 5,
+        projectMove: false,
         threadIdBadge: false,
         conversationView: false,
         conversationViewMaxWidth: conversationViewDefaultWidth,
@@ -1469,6 +1474,256 @@
       }
       return settings;
     }
+  }
+
+  const codexCapacityRetryProbeLimit = 8 * 1024 * 1024;
+
+  function codexCapacityRetryTextHasMarker(text) {
+    const lower = String(text || "").toLowerCase();
+    return lower.includes("selected model is at capacity")
+      || lower.includes("model is at capacity")
+      || lower.includes("model_at_capacity")
+      || lower.includes("model-at-capacity")
+      || lower.includes("model_capacity")
+      || lower.includes("model-capacity")
+      || (lower.includes("capacity") && lower.includes("different model"));
+  }
+
+  function codexCapacityRetryValueContainsMarker(value, depth = 0) {
+    if (depth > 12 || value === null || value === undefined) return false;
+    if (typeof value === "string") return codexCapacityRetryTextHasMarker(value);
+    if (Array.isArray(value)) {
+      return value.some((entry) => codexCapacityRetryValueContainsMarker(entry, depth + 1));
+    }
+    if (typeof value !== "object") return false;
+    return Object.values(value).some((entry) => codexCapacityRetryValueContainsMarker(entry, depth + 1));
+  }
+
+  function codexCapacityRetryValueIsErrorEnvelope(value, depth = 0) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || depth > 6) return false;
+    if (Object.prototype.hasOwnProperty.call(value, "error")) return true;
+    const type = String(value.type || "").toLowerCase();
+    const status = String(value.status || "").toLowerCase();
+    if (type === "error" || type === "response.failed" || status === "failed") return true;
+    return codexCapacityRetryValueIsErrorEnvelope(value.response, depth + 1);
+  }
+
+  function isCodexCapacityRetryError(text) {
+    const raw = String(text || "");
+    try {
+      const value = JSON.parse(raw);
+      if (codexCapacityRetryValueIsErrorEnvelope(value)
+        && codexCapacityRetryValueContainsMarker(value)) return true;
+    } catch (_) {}
+
+    const normalized = raw.replace(/\r\n/g, "\n");
+    const blocks = normalized.split("\n\n");
+    let sawSseBlock = false;
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      const eventLine = lines.find((line) => line.startsWith("event:"));
+      const dataLines = lines.filter((line) => line.startsWith("data:"));
+      if (!eventLine && dataLines.length === 0) continue;
+      sawSseBlock = true;
+      const eventType = String(eventLine?.slice(6).trim() || "").toLowerCase();
+      const eventIsError = eventType === "error" || eventType === "response.failed";
+      const data = dataLines.map((line) => line.slice(5).trimStart()).join("\n");
+      try {
+        const value = JSON.parse(data);
+        if ((eventIsError || codexCapacityRetryValueIsErrorEnvelope(value))
+          && codexCapacityRetryValueContainsMarker(value)) return true;
+      } catch (_) {
+        if (eventIsError && codexCapacityRetryTextHasMarker(data)) return true;
+      }
+    }
+
+    if (!codexCapacityRetryTextHasMarker(raw)) return false;
+    if (!sawSseBlock) return true;
+    const lower = raw.toLowerCase();
+    return lower.includes("event: error")
+      || lower.includes("response.failed")
+      || lower.includes('"error"')
+      || lower.includes('"status":"failed"');
+  }
+
+  function codexCapacityRetryMaxAttempts() {
+    const configured = Number(codexPlusSettings().capacityRetryMaxAttempts);
+    return Number.isFinite(configured) ? Math.min(20, Math.max(1, Math.round(configured))) : 5;
+  }
+
+  let codexCapacityRetryNoticeSequence = 0;
+
+  function observeCodexCapacityRetryStatus(status) {
+    const sequence = Math.max(0, Number(status?.sequence) || 0);
+    if (sequence <= codexCapacityRetryNoticeSequence) return;
+    codexCapacityRetryNoticeSequence = sequence;
+    if (!codexPlusSettings().capacityRetry) return;
+
+    const lastRetryAtMs = Math.max(0, Number(status?.lastRetryAtMs) || 0);
+    if (!lastRetryAtMs || Date.now() - lastRetryAtMs > 30000) return;
+    const attempt = Math.max(1, Number(status?.attempt) || 1);
+    const maxAttempts = Math.max(attempt, Number(status?.maxAttempts) || attempt);
+    if (status?.phase === "retrying") {
+      showToast(`模型容量不足，Codex++ 正在重试（${attempt}/${maxAttempts}）`, null);
+    } else if (status?.phase === "recovered") {
+      showToast(`模型容量已恢复，任务继续（Codex++ 已重试 ${attempt} 次）`, null);
+    }
+  }
+
+  function isCodexResponsesFetchRequest(input, init) {
+    const method = String(init?.method || input?.method || "GET").toUpperCase();
+    if (method !== "POST") return false;
+    try {
+      const rawUrl = typeof input === "string" ? input : input?.url || "";
+      return new URL(rawUrl, window.location.href).pathname.toLowerCase().replace(/\/+$/, "").endsWith("/responses");
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isCodexLocalProtocolProxyRequest(input, init) {
+    if (!isCodexResponsesFetchRequest(input, init)) return false;
+    try {
+      const rawUrl = typeof input === "string" ? input : input?.url || "";
+      const url = new URL(rawUrl, window.location.href);
+      return url.hostname === "127.0.0.1" || url.hostname === "localhost";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function codexCapacityRetryHasNormalSseProgress(text) {
+    const blocks = String(text || "").replace(/\r\n/g, "\n").split("\n\n");
+    blocks.pop();
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      const eventLine = lines.find((line) => line.startsWith("event:"));
+      const data = lines
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n");
+      let parsedData = null;
+      try {
+        parsedData = JSON.parse(data);
+      } catch (_) {}
+      const dataType = String(parsedData?.type || "");
+      const eventType = String(eventLine?.slice(6).trim() || dataType);
+      if (data.trim() === "[DONE]") return true;
+      if (eventType && (
+        eventType === "response.completed"
+        || eventType === "response.failed"
+        || eventType === "response.incomplete"
+        || eventType === "error"
+        || eventType === "message"
+        || eventType.endsWith(".delta")
+        || eventType.endsWith(".done")
+      )) {
+        return true;
+      }
+      if (parsedData && typeof parsedData === "object" && "choices" in parsedData) return true;
+      if (!eventType && lines.some((line) => line.trim() && !line.trim().startsWith(":"))) return true;
+    }
+    return false;
+  }
+
+  function codexCapacityRetryHasCompleteJson(text) {
+    try {
+      JSON.parse(text);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function codexCapacityRetryResponseContainsError(response) {
+    if (!response?.body || typeof response.clone !== "function") return false;
+    const probe = response.clone();
+    const reader = probe.body?.getReader?.();
+    if (!reader) return false;
+    const isSse = (probe.headers.get("content-type") || "").toLowerCase().includes("text/event-stream");
+    const decoder = new TextDecoder();
+    let byteLength = 0;
+    let text = "";
+    try {
+      while (byteLength < codexCapacityRetryProbeLimit) {
+        const { done, value } = await reader.read();
+        if (done || !value) {
+          text += decoder.decode();
+          break;
+        }
+        byteLength += value.byteLength;
+        text += decoder.decode(value, { stream: true });
+        if (isCodexCapacityRetryError(text)) return true;
+        if (isSse && codexCapacityRetryHasNormalSseProgress(text)) return false;
+        if (!isSse && codexCapacityRetryHasCompleteJson(text)) return false;
+      }
+    } catch (_) {
+      return false;
+    } finally {
+      void reader.cancel();
+    }
+    return false;
+  }
+
+  function installCodexCapacityRetry() {
+    if (window.__codexCapacityRetryFetchInstalled || typeof window.fetch !== "function") return;
+    const originalFetch = window.fetch.bind(window);
+    const patchedFetch = async (input, init = undefined) => {
+      const settings = codexPlusSettings();
+      if (!settings.capacityRetry
+        || typeof Response !== "function"
+        || !isCodexResponsesFetchRequest(input, init)
+        || isCodexLocalProtocolProxyRequest(input, init)) {
+        return originalFetch(input, init);
+      }
+
+      const maxAttempts = codexCapacityRetryMaxAttempts();
+      let attempt = 0;
+      while (true) {
+        let response;
+        try {
+          const requestInput = input && typeof input === "object" && typeof input.clone === "function"
+            ? input.clone()
+            : input;
+          response = await originalFetch(requestInput, init);
+        } catch (error) {
+          throw error;
+        }
+        if (!(await codexCapacityRetryResponseContainsError(response))) {
+          if (attempt > 0) {
+            showToast(`模型容量已恢复，任务继续（Codex++ 已重试 ${attempt} 次）`, null);
+          }
+          return response;
+        }
+
+        attempt += 1;
+        if (attempt > maxAttempts) {
+          showToast(`模型持续容量不足，已达到 Codex++ 重试上限（${maxAttempts} 次）`, null);
+          sendCodexPlusDiagnostic("capacity_error_passthrough", {
+            source: "renderer_fetch",
+            attempt,
+            maxAttempts,
+            internalRetry: true,
+          });
+          return response;
+        }
+        try {
+          await response.body?.cancel();
+        } catch (_) {}
+        showToast(`模型容量不足，Codex++ 正在重试（${attempt}/${maxAttempts}）`, null);
+        sendCodexPlusDiagnostic("capacity_error_retried", {
+          source: "renderer_fetch",
+          upstreamStatus: response.status,
+          attempt,
+          maxAttempts,
+          internalRetry: true,
+        });
+        await new Promise((resolve) => window.setTimeout(resolve, Math.min(2000, 250 * attempt)));
+      }
+    };
+    patchedFetch.__codexCapacityRetryFetchPatched = true;
+    window.fetch = patchedFetch;
+    window.__codexCapacityRetryFetchInstalled = true;
   }
 
   // Dream skin runtime is adapted from Fei-Away/Codex-Dream-Skin's renderer injection.
@@ -2397,10 +2652,23 @@
   const codexAppModuleFailures = new Map();
   const codexAppModuleRetryCooldownMs = 30000;
   const codexAppModuleMaxAttempts = 8;
+  const codexTrustedOfficialCapabilityModels = new Set([
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+  ]);
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
-  ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v3", "gpt-5.4", "gpt-5.5"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
+  // 这里只放确认支持 priority service tier 的官方模型——这个集合同时用于生成
+  // 「Fast 仅支持 …」的提示文案，塞进没验证过的模型等于对用户做出错误承诺。
+  // 第三方模型（deepseek 等）走下面 codexServiceTierFastSupportedForModel 里的
+  // 模型元数据判定：上游自己声明了 priority 才认。
+  ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
 
   function uniqueCodexAppAssetUrls(urls) {
     return Array.from(new Set((urls || []).filter((url) => typeof url === "string" && url.includes("/assets/") && url.split("?")[0].endsWith(".js"))));
@@ -2656,7 +2924,12 @@
   }
 
   function normalizeCodexServiceTierModelName(model) {
-    return String(model || "").trim().toLowerCase();
+    const normalized = String(model || "").trim().toLowerCase();
+    if (codexTrustedOfficialCapabilityModels.has(normalized)) return normalized;
+    const cliPrefix = "cliproxyapi:";
+    if (!normalized.startsWith(cliPrefix)) return normalized;
+    const cliModel = normalized.slice(cliPrefix.length);
+    return codexTrustedOfficialCapabilityModels.has(cliModel) ? cliModel : normalized;
   }
 
   function codexServiceTierModelFromValue(value, visited = new WeakSet(), depth = 0) {
@@ -2686,7 +2959,8 @@
     const normalized = normalizeCodexServiceTierModelName(modelName);
     if (!normalized) return false;
     if (codexServiceTierSupportedFastModels.has(normalized)) return true;
-    if (normalized.includes("deepseek") || normalized.includes("1m")) return true;
+    // 不按名字猜：模型叫 deepseek 不代表它的中转站支持 priority tier。
+    // 只认上游模型元数据里明确声明的 priority。
     try {
       const metadata = typeof codexPlusModelMetadata === "function" ? codexPlusModelMetadata(modelName) : null;
       if (metadata && Array.isArray(metadata.serviceTiers) && metadata.serviceTiers.some((t) => String(t.id || t).toLowerCase() === "priority")) return true;
@@ -3897,6 +4171,7 @@
     const seq = ++codexPlusBackendCheckSeq;
     const nextStatus = await withBackendTimeout(postJson("/backend/status", {}));
     if (seq !== codexPlusBackendCheckSeq) return;
+    observeCodexCapacityRetryStatus(nextStatus?.capacityRetry);
     codexPlusBackendStatus = nextStatus;
     if (nextStatus?.status === "ok" && typeof nextStatus.hideOfficialUsageAlert === "boolean") {
       window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus.hideOfficialUsageAlert;
@@ -4606,7 +4881,10 @@
     if (name === "openai-curated") return "OpenAI插件2(Codex++)";
     if (name === "openai-primary-runtime") return "OpenAI插件3(Codex++)";
     if (name === "openai-api-curated") return "OpenAI插件4(Codex++)";
-    if (name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
+    // 内置插件包的注册名。曾经叫 openai-curated-remote，但那是 codex 的保留名，
+    // 注册在它下面会被静默忽略，已改为 codex-plus-curated；旧名保留以兼容
+    // 尚未升级的配置。
+    if (name === "codex-plus-curated" || name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
     return fallback;
   }
 
@@ -6402,6 +6680,8 @@
       currentModelName: () => codexServiceTierCurrentModelName(),
       fastAvailability: (modelName = codexServiceTierCurrentModelName()) => codexServiceTierFastAvailability(modelName),
       modelDescriptor: (modelName) => codexPlusModelDescriptor(modelName),
+      normalizeReasoningParams: (method, params) => normalizeCodexModelReasoningParams(method, params),
+      patchReasoningMessage: (message) => patchCodexModelReasoningRequestMessage(message),
       patchModelArray: (models, allowEmpty = false) => patchModelArray(models, allowEmpty),
       setModelCatalog: (catalog = {}) => {
         codexModelCatalog = {
@@ -6514,17 +6794,146 @@
   function modelReasoningEfforts(modelName) {
     const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
     if (Array.isArray(supported) && supported.length > 0) {
-      const efforts = supported.map((entry) => ({ ...entry }));
-      const hasMax = efforts.some((e) => e.reasoningEffort === "max");
-      const hasUltra = efforts.some((e) => e.reasoningEffort === "ultra");
-      if (!hasMax) efforts.push({ reasoningEffort: "max", description: "Maximum reasoning depth for the hardest problems" });
-      if (!hasUltra) {
-        const shouldAddUltra = /sol|terra|gpt-5\.6|gpt-5\.5|gpt-5\.4|deepseek/i.test(String(modelName || ""));
-        if (shouldAddUltra || efforts.length >= 4) efforts.push({ reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation" });
-      }
-      return efforts;
+      return supported.map((entry) => typeof entry === "string" ? entry : { ...entry });
     }
-    return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+    const builtIn = codexBuiltInReasoningMetadata(modelName);
+    if (builtIn) {
+      return builtIn.supported.map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+    }
+    return ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+  }
+
+  function codexBuiltInReasoningMetadata(modelName) {
+    switch (normalizeCodexServiceTierModelName(modelName)) {
+      case "gpt-5.6-sol":
+        return { defaultEffort: "low", supported: ["low", "medium", "high", "xhigh", "max", "ultra"] };
+      case "gpt-5.6-terra":
+        return { defaultEffort: "medium", supported: ["low", "medium", "high", "xhigh", "max", "ultra"] };
+      case "gpt-5.6-luna":
+        return { defaultEffort: "medium", supported: ["low", "medium", "high", "xhigh", "max"] };
+      default:
+        return null;
+    }
+  }
+
+  function codexModelReasoningEffortValues(modelName) {
+    return modelReasoningEfforts(modelName)
+      .map((entry) => typeof entry === "string" ? entry : entry?.reasoningEffort)
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean);
+  }
+
+  function codexModelRequestMethodSupportsReasoning(method) {
+    return new Set(["thread/settings/update", "thread/start", "thread/resume", "turn/start"]).has(String(method || ""));
+  }
+
+  function codexModelReasoningTarget(method, params) {
+    const requestMethod = appServerModelRequestMethod(String(method || ""), params);
+    if (requestMethod === "send-cli-request-for-host"
+        && params?.params
+        && typeof params.params === "object") {
+      return codexModelReasoningTarget(params.method, params.params);
+    }
+    if (!codexModelRequestMethodSupportsReasoning(requestMethod)
+        || !params
+        || typeof params !== "object") {
+      return null;
+    }
+    if (params.params && typeof params.params === "object") {
+      return {
+        method: requestMethod,
+        params: params.params,
+        apply: (nextParams) => ({ ...params, params: nextParams }),
+      };
+    }
+    return { method: requestMethod, params, apply: (nextParams) => nextParams };
+  }
+
+  function normalizeCodexModelReasoningParams(method, params) {
+    const target = codexModelReasoningTarget(method, params);
+    if (!target) return params;
+    const modelKey = ["model", "modelId", "model_id"].find((key) => typeof target.params[key] === "string" && target.params[key].trim());
+    if (!modelKey) return params;
+    const modelName = target.params[modelKey].trim();
+    const supported = codexModelReasoningEffortValues(modelName);
+    if (!supported.length) return params;
+    const effortKey = ["reasoningEffort", "reasoning_effort", "effort"].find((key) => Object.prototype.hasOwnProperty.call(target.params, key));
+    const current = effortKey ? String(target.params[effortKey] || "").trim() : "";
+    if (current && supported.includes(current)) return params;
+    const configuredDefault = String(
+      codexPlusModelMetadata(modelName)?.defaultReasoningEffort
+      || codexBuiltInReasoningMetadata(modelName)?.defaultEffort
+      || ""
+    ).trim();
+    const nextEffort = supported.includes(configuredDefault) ? configuredDefault : supported[0];
+    if (!effortKey && target.method !== "thread/settings/update") return params;
+    const nextParams = {
+      ...target.params,
+      [effortKey || "reasoningEffort"]: nextEffort,
+    };
+    sendCodexPlusDiagnostic("model_reasoning_effort_normalized", {
+      method: target.method,
+      model: modelName,
+      previousEffort: current || null,
+      nextEffort,
+    });
+    return target.apply(nextParams);
+  }
+
+  function patchCodexModelReasoningRequestMessage(message) {
+    if (!message || typeof message !== "object") return message;
+    if (message.type === "fetch" && typeof message.url === "string") {
+      let body = message.body;
+      let parsed = body;
+      if (typeof body === "string" && body.trim()) {
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return message;
+        }
+      }
+      const nextBody = normalizeCodexModelReasoningParams(message.url, parsed);
+      if (nextBody === parsed) return message;
+      return { ...message, body: typeof body === "string" ? JSON.stringify(nextBody) : nextBody };
+    }
+    if ((message.type === "mcp-request" || message.type === "worker-request")
+        && message.request
+        && typeof message.request === "object") {
+      const params = normalizeCodexModelReasoningParams(message.request.method, message.request.params);
+      if (params === message.request.params) return message;
+      return { ...message, request: { ...message.request, params } };
+    }
+    if (message.type === "send-cli-request-for-host") {
+      const params = normalizeCodexModelReasoningParams(message.method, message.params);
+      return params === message.params ? message : { ...message, params };
+    }
+    if (message.type === "start-turn-for-host" && message.params && typeof message.params === "object") {
+      const params = normalizeCodexModelReasoningParams("turn/start", message.params);
+      return params === message.params ? message : { ...message, params };
+    }
+    return message;
+  }
+
+  function installCodexModelRequestBridgePatch() {
+    if (!codexPlusModelUnlockEnabled()) return;
+    const bridge = window.electronBridge;
+    if (!bridge || typeof bridge.sendMessageFromView !== "function") return;
+    if (bridge.__codexPlusModelRequestBridgePatch === codexModelRequestBridgePatchVersion) return;
+    const originalSendMessageFromView = bridge.sendMessageFromView.bind(bridge);
+    bridge.sendMessageFromView = function codexPlusModelPatchedSendMessageFromView(message) {
+      let nextMessage = message;
+      try {
+        nextMessage = patchCodexModelReasoningRequestMessage(message);
+      } catch (error) {
+        sendCodexPlusDiagnostic("model_reasoning_bridge_patch_failed", {
+          errorName: error?.name || "",
+          errorMessage: error?.message || String(error),
+        });
+      }
+      return originalSendMessageFromView(nextMessage);
+    };
+    bridge.__codexPlusModelRequestBridgePatch = codexModelRequestBridgePatchVersion;
+    sendCodexPlusDiagnostic("model_reasoning_bridge_patch_installed", {});
   }
 
   function applyCodexPlusModelMetadata(descriptor, modelName) {
@@ -6555,6 +6964,14 @@
         changed = true;
       }
     }
+    for (const key of ["additionalSpeedTiers", "serviceTiers"]) {
+      if (!Array.isArray(metadata[key])) continue;
+      const nextValue = metadata[key].map((entry) => entry && typeof entry === "object" ? { ...entry } : entry);
+      if (JSON.stringify(descriptor[key] || []) !== JSON.stringify(nextValue)) {
+        descriptor[key] = nextValue;
+        changed = true;
+      }
+    }
     return changed;
   }
 
@@ -6573,6 +6990,12 @@
       isDefault: (codexModelCatalog.default_model || codexModelCatalog.model) === modelName,
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "medium",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
+      ...(Array.isArray(metadata?.additionalSpeedTiers)
+        ? { additionalSpeedTiers: metadata.additionalSpeedTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry) }
+        : {}),
+      ...(Array.isArray(metadata?.serviceTiers)
+        ? { serviceTiers: metadata.serviceTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry) }
+        : {}),
     };
   }
 
@@ -6844,10 +7267,13 @@
     if (method === "vscode://codex/list-plugins") return "list-plugins";
     if (method === "vscode://codex/plugin/install") return "install-plugin";
     if (method === "vscode://codex/plugin/uninstall") return "uninstall-plugin";
-    if (method === "plugin/list") return "list-plugins";
-    if (method === "plugin/install") return "install-plugin";
-    if (method === "plugin/uninstall") return "uninstall-plugin";
-    return String(method || "");
+    const requestMethod = String(method || "").startsWith("vscode://codex/")
+      ? String(method).slice("vscode://codex/".length)
+      : String(method || "");
+    if (requestMethod === "list-plugins" || requestMethod === "plugin/list") return "list-plugins";
+    if (requestMethod === "plugin/install") return "install-plugin";
+    if (requestMethod === "plugin/uninstall") return "uninstall-plugin";
+    return requestMethod;
   }
 
   function patchAppServerModelResult(method, result) {
@@ -9928,7 +10354,7 @@
 
   function looksLikeSessionActionMenu(menu) {
     if (!(menu instanceof HTMLElement) || menu.hidden) return false;
-    if (menu.matches(`.${moreMenuClass}, .${codexPlusMenuFloatingClass}, #${codexPlusMenuId}`)) return false;
+    if (menu.matches(`.${moreMenuClass}, #${codexPlusMenuId}`)) return false;
     const text = normalizedElementText(menu);
     const hasRename = /(?:重命名|rename)/i.test(text);
     const hasOtherSessionAction = /(?:置顶|取消置顶|pin|unpin|归档|archive|删除|delete|移动|move)/i.test(text);
@@ -10207,7 +10633,7 @@
   function refreshSessionCopyMenuItems(scope = document) {
     sessionCopyMenuScopes(scope).forEach((menu) => {
       if (!(menu instanceof HTMLElement) || isExtensionUiNode(menu)) return;
-      if (menu.matches(`.${moreMenuClass}, .${codexPlusMenuFloatingClass}, #${codexPlusMenuId}`)) {
+      if (menu.matches(`.${moreMenuClass}, #${codexPlusMenuId}`)) {
         menu.querySelectorAll(`.${sessionCopyMenuItemClass}`).forEach((item) => item.remove());
         return;
       }
@@ -10279,6 +10705,8 @@
   }
 
   function scanDeferred() {
+    installCodexCapacityRetry();
+    installCodexModelRequestBridgePatch();
     if (pluginPatchDisabledInRelayMode()) {
       clearPluginPatchArtifacts();
     } else {
@@ -10408,10 +10836,41 @@
     window.__codexSessionDeleteScanTimer = setTimeout(runScheduledScan, 200);
   }
 
+  /**
+   * 侧边栏入口的启动补扫。
+   *
+   * 注入永远早于 Codex 把左侧面板渲染出来：注入那一刻 readyState 已是 complete，
+   * 但 aside.app-shell-left-panel 还不存在（实测 anyNav: 0），所以首次 scan 里的
+   * installCodexPlusSidebarNavigation 必然走 `if (!navigation) return`。
+   *
+   * 之后全靠 MutationObserver 观察到侧边栏挂载再补一次，实测要 2.6~3.1 秒。
+   * 但那把入口的出现押在了单次 DOM 变更上——那次变更若被 shouldScheduleScan
+   * 过滤掉，就没有下一次触发，入口会一直缺失到用户手动操作产生新的变更为止。
+   *
+   * 这里加一个不依赖 DOM 事件的有界重试作为兜底：插上就停，超时就放弃，
+   * 不留常驻定时器，也不影响 observer 那条正常路径。
+   */
+  function scheduleSidebarNavStartupRetry() {
+    clearInterval(window.__codexPlusSidebarNavRetryTimer);
+    let attempts = 0;
+    window.__codexPlusSidebarNavRetryTimer = setInterval(() => {
+      attempts += 1;
+      if (document.getElementById(codexPlusSidebarNavId) || attempts > 20) {
+        clearInterval(window.__codexPlusSidebarNavRetryTimer);
+        window.__codexPlusSidebarNavRetryTimer = null;
+        return;
+      }
+      try {
+        installCodexPlusSidebarNavigation();
+      } catch {}
+    }, 300);
+  }
+
   void loadBackendSettingsForStartup();
   installUpstreamBranchDropdownAdapter();
   installUpstreamWorktreeNativeAdapter();
   scan();
+  scheduleSidebarNavStartupRetry();
   window.removeEventListener("resize", window.__codexPlusResizeHandler);
   let codexPlusResizeRafId = 0;
   window.__codexPlusResizeHandler = () => {

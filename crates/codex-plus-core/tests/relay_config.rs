@@ -16,7 +16,7 @@ use codex_plus_core::relay_config::{
 use codex_plus_core::settings::{
     AggregateRelayDispatchTarget, AggregateRelayMember, AggregateRelayModelMapping,
     AggregateRelayProfile, AggregateRelayStrategy, BackendSettings, RelayMode, RelayModelRoute,
-    RelayProfile, RelayProtocol,
+    RelayProfile, RelayProtocol, RelaySessionProvider,
 };
 
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
@@ -431,7 +431,7 @@ base_url = "https://relay.example.test/v1"
 }
 
 #[test]
-fn managed_openai_identity_accepts_auth_api_key_for_custom_transport() {
+fn managed_openai_identity_rejects_auth_api_key_for_custom_transport() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("config.toml"),
@@ -453,13 +453,13 @@ base_url = "https://relay.example.test/v1"
 
     let status = relay_config_status_from_home(temp.path());
 
-    assert!(status.configured);
+    assert!(!status.configured);
     assert!(!status.requires_openai_auth);
     assert!(!status.has_bearer_token);
 }
 
 #[test]
-fn reports_pure_api_configured_from_auth_api_key_without_bearer_token() {
+fn reports_pure_api_unconfigured_from_auth_api_key_without_bearer_token() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("config.toml"),
@@ -481,7 +481,7 @@ base_url = "http://127.0.0.1:57321/v1"
 
     let status = relay_config_status_from_home(temp.path());
 
-    assert!(status.configured);
+    assert!(!status.configured);
     assert!(!status.requires_openai_auth);
     assert!(!status.has_bearer_token);
 }
@@ -523,7 +523,7 @@ model = "gpt-5-mini"
     assert!(updated.contains("[model_providers.custom]"));
     assert!(updated.contains(r#"name = "custom""#));
     assert!(updated.contains(r#"wire_api = "responses""#));
-    assert!(updated.contains("requires_openai_auth = false"));
+    assert!(updated.contains("requires_openai_auth = true"));
     assert!(updated.contains(r#"base_url = "https://relay.example.test/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "sk-test-redacted""#));
 }
@@ -651,7 +651,7 @@ experimental_bearer_token = "sk-test-redacted"
     assert!(
         profile
             .config_contents
-            .contains(r#"model_provider = "openai""#)
+            .contains(r#"model_provider = "custom""#)
     );
     assert!(
         profile
@@ -668,7 +668,7 @@ experimental_bearer_token = "sk-test-redacted"
 
     apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
     let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(live.contains(r#"model_provider = "openai""#));
+    assert!(live.contains(r#"model_provider = "custom""#));
     assert!(live.contains(r#"openai_base_url = "http://127.0.0.1:57321/v1""#));
     assert!(live.contains("[model_providers.custom]"));
     assert!(!live.contains("[model_providers.openai]"));
@@ -834,6 +834,107 @@ experimental_bearer_token = "sk-first-member"
     );
     assert!(!config.contains("sk-first-member"), "{config}");
     assert!(!config.contains("https://first.example.test"), "{config}");
+}
+
+#[test]
+fn aggregate_startup_profile_orders_cliproxy_direct_models_by_special_official_switch() {
+    let mut settings = BackendSettings {
+        active_relay_id: "aggregate".to_string(),
+        active_aggregate_relay_id: "aggregate".to_string(),
+        official_login_mixed_mode: true,
+        relay_profiles: vec![
+            RelayProfile {
+                id: "provider-a".to_string(),
+                name: "供应商一".to_string(),
+                model: "gpt-5.4".to_string(),
+                model_list: "gpt-5.4".to_string(),
+                base_url: "https://provider.example.test/v1".to_string(),
+                api_key: "provider-key".to_string(),
+                relay_mode: RelayMode::PureApi,
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: "aggregate".to_string(),
+                name: "聚合".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: "managed-cliproxy".to_string(),
+                name: "CLIProxyAPI".to_string(),
+                integration_type: "cliproxy".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                model_list: "gpt-5.6-sol\ngemini-2.5-pro".to_string(),
+                base_url: "http://127.0.0.1:8317/v1".to_string(),
+                api_key: "cli-key".to_string(),
+                relay_mode: RelayMode::PureApi,
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: "managed-cliproxy-official".to_string(),
+                name: "CLIProxyAPI 官方模型".to_string(),
+                integration_type: "cliproxy-official".to_string(),
+                model: "account-2/gpt-5.6-sol".to_string(),
+                model_list: "account-2/gpt-5.6-sol".to_string(),
+                base_url: "http://127.0.0.1:8317/v1".to_string(),
+                api_key: "cli-key".to_string(),
+                relay_mode: RelayMode::PureApi,
+                ..RelayProfile::default()
+            },
+        ],
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: "aggregate".to_string(),
+            name: "聚合".to_string(),
+            strategy: AggregateRelayStrategy::Failover,
+            session_provider: RelaySessionProvider::Custom,
+            model_mappings_enabled: true,
+            members: vec![AggregateRelayMember {
+                relay_id: "provider-a".to_string(),
+                weight: 1,
+            }],
+            model_mappings: vec![],
+        }],
+        ..BackendSettings::default()
+    };
+
+    let with_special = effective_active_relay_profile_for_codex(&settings);
+    assert_eq!(
+        with_special.model_list.lines().collect::<Vec<_>>(),
+        [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "CLIProxyAPI:gpt-5.6-sol",
+            "gpt-5.4(供应商一)",
+            "CLIProxyAPI:gemini-2.5-pro",
+            "供应商一:gpt-5.4",
+        ]
+    );
+
+    settings
+        .relay_profiles
+        .retain(|profile| profile.integration_type != "cliproxy-official");
+    let without_special = effective_active_relay_profile_for_codex(&settings);
+    assert_eq!(
+        without_special.model_list.lines().collect::<Vec<_>>(),
+        [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "gpt-5.4(供应商一)",
+            "CLIProxyAPI:gpt-5.6-sol",
+            "CLIProxyAPI:gemini-2.5-pro",
+            "供应商一:gpt-5.4",
+        ]
+    );
 }
 
 #[test]
@@ -2159,7 +2260,12 @@ model_provider = "vendor_alpha"
             .config_contents
             .contains(r#"model_provider = "vendor_alpha""#)
     );
-    assert_eq!(profile.api_key, "sk-new");
+    assert_eq!(profile.api_key, "old");
+    assert!(
+        profile
+            .config_contents
+            .contains(r#"experimental_bearer_token = "old""#)
+    );
     assert!(profile.auth_contents.is_empty());
 }
 
@@ -2674,10 +2780,15 @@ base_url = "https://relay.example/v1"
     backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
 
     let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
-    assert_eq!(auth["OPENAI_API_KEY"], "sk-provider");
+    assert!(auth.get("OPENAI_API_KEY").is_none());
     assert_eq!(auth["vendor"], "stored");
     assert!(auth.get("tokens").is_none());
     assert_eq!(relay_profile_api_key(&profile), "sk-provider");
+    assert!(
+        profile
+            .config_contents
+            .contains(r#"experimental_bearer_token = "sk-provider""#)
+    );
 }
 
 #[test]
@@ -2891,12 +3002,11 @@ experimental_bearer_token = "sk-old"
 
     backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
 
-    let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
-    assert_eq!(auth["OPENAI_API_KEY"], "sk-old");
+    assert!(profile.auth_contents.is_empty());
     assert!(
-        !profile
+        profile
             .config_contents
-            .contains("experimental_bearer_token")
+            .contains(r#"experimental_bearer_token = "sk-old""#)
     );
 }
 
@@ -2951,8 +3061,7 @@ model = "gpt-5.4"
             .config_contents
             .contains(r#"experimental_bearer_token = "aihubmix-key""#)
     );
-    let auth: serde_json::Value = serde_json::from_str(&provider_b.auth_contents).unwrap();
-    assert!(auth.get("OPENAI_API_KEY").is_none());
+    assert!(provider_b.auth_contents.is_empty());
 }
 
 #[test]
@@ -3009,8 +3118,12 @@ requires_openai_auth = true
     );
     assert!(current.config_contents.contains(r#"name = "Manual Edit""#));
     assert!(!current.config_contents.contains("old_snapshot"));
-    let auth: serde_json::Value = serde_json::from_str(&current.auth_contents).unwrap();
-    assert_eq!(auth["OPENAI_API_KEY"], "sk-old");
+    assert!(current.auth_contents.is_empty());
+    assert!(
+        current
+            .config_contents
+            .contains(r#"experimental_bearer_token = "sk-old""#)
+    );
 }
 
 #[test]
@@ -3642,7 +3755,7 @@ base_url = "http://192.168.188.245:3001/v1"
     assert!(config.contains(r#"model_provider = "custom""#));
     assert!(config.contains("[model_providers.custom]"));
     assert!(config.contains(r#"base_url = "http://192.168.188.245:3001/v1""#));
-    assert!(config.contains("requires_openai_auth = true"));
+    assert!(config.contains("requires_openai_auth = false"));
 }
 
 #[test]
@@ -4883,12 +4996,10 @@ experimental_bearer_token = "sk-new"
     assert!(!windows.contains_key("deepseek-v4-pro"));
 }
 
-/// issue #1965：PureApi 会把 config.toml 里的 `experimental_bearer_token` 移除，
-/// 只留 auth.json 一个落点。旧实现要求 auth.json 为空才回填，于是退出 ChatGPT 登录后
-/// 残留的 `{"last_refresh": ...}` 会把回填挡掉，key 两边都没有，
-/// Codex CLI 只能读 OPENAI_API_KEY 环境变量，上游返回 401。
+/// PureApi 必须把第三方 key 留在 provider 配置中，并让 auth.json 只保留
+/// 与第三方传输凭据无关的历史字段。
 #[test]
-fn pure_api_backfills_api_key_into_a_non_empty_auth_json_without_openai_api_key() {
+fn pure_api_keeps_api_key_in_provider_and_preserves_non_key_auth_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let mut profile = RelayProfile {
         id: "deepseek".to_string(),
@@ -4913,19 +5024,13 @@ experimental_bearer_token = "sk-test-redacted"
 
     normalize_relay_profile_for_storage(&mut profile).unwrap();
 
-    // config.toml 依旧不带 token，key 必须出现在 auth.json 里。
     assert!(
-        !profile
+        profile
             .config_contents
-            .contains("experimental_bearer_token")
+            .contains(r#"experimental_bearer_token = "sk-test-redacted""#)
     );
     let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
-    assert_eq!(
-        auth.get("OPENAI_API_KEY")
-            .and_then(serde_json::Value::as_str),
-        Some("sk-test-redacted")
-    );
-    // 回填不应吃掉 auth.json 里其他字段。
+    assert!(auth.get("OPENAI_API_KEY").is_none());
     assert_eq!(
         auth.get("last_refresh").and_then(serde_json::Value::as_str),
         Some("2026-08-01T00:00:00Z")
@@ -4933,20 +5038,12 @@ experimental_bearer_token = "sk-test-redacted"
     assert_eq!(relay_profile_api_key(&profile), "sk-test-redacted");
 
     apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
-    let live_auth: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
-            .unwrap();
-    assert_eq!(
-        live_auth
-            .get("OPENAI_API_KEY")
-            .and_then(serde_json::Value::as_str),
-        Some("sk-test-redacted")
-    );
+    assert!(!temp.path().join("auth.json").exists());
 }
 
-/// auth.json 已经不是合法 JSON 时也不能把 key 丢掉，否则同样退化成 401。
+/// 损坏的第三方 auth 快照不得覆盖官方 auth.json；传输 key 仍由 provider 保存。
 #[test]
-fn pure_api_rebuilds_a_corrupt_auth_json_rather_than_dropping_the_api_key() {
+fn pure_api_keeps_provider_key_without_writing_corrupt_auth_snapshot() {
     let mut profile = RelayProfile {
         id: "deepseek".to_string(),
         relay_mode: RelayMode::PureApi,
@@ -4960,10 +5057,14 @@ fn pure_api_rebuilds_a_corrupt_auth_json_rather_than_dropping_the_api_key() {
 
     normalize_relay_profile_for_storage(&mut profile).unwrap();
 
-    let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
-    assert_eq!(
-        auth.get("OPENAI_API_KEY")
-            .and_then(serde_json::Value::as_str),
-        Some("sk-test-redacted")
+    assert_eq!(profile.auth_contents, "not json at all");
+    assert!(
+        profile
+            .config_contents
+            .contains(r#"experimental_bearer_token = "sk-test-redacted""#)
     );
+
+    let temp = tempfile::tempdir().unwrap();
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    assert!(!temp.path().join("auth.json").exists());
 }

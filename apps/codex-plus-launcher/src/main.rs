@@ -83,13 +83,13 @@ async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOpti
         return Ok(());
     }
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
-        activate_existing_codex_app(&options).await?;
+        let helper_port = activate_existing_codex_app(&options).await?;
         options.status_store.save_latest(&LaunchStatus {
             status: "running".to_string(),
             message: "Existing Codex instance activated".to_string(),
             started_at_ms: current_timestamp_ms(),
             debug_port: Some(options.debug_port),
-            helper_port: Some(options.helper_port),
+            helper_port: Some(helper_port),
             codex_app: options
                 .app_dir
                 .map(|path| path.to_string_lossy().to_string()),
@@ -187,10 +187,119 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
     recover
 }
 
-async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
+fn helper_port_from_running_status(options: &LaunchOptions) -> Option<u16> {
+    let status = options.status_store.load_latest().ok().flatten()?;
+    if status.debug_port != Some(options.debug_port)
+        || !matches!(status.status.as_str(), "running" | "running_degraded")
+    {
+        return None;
+    }
+    status.helper_port.filter(|port| *port != 0)
+}
+
+async fn helper_runtime_available(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await;
+    let Ok(Ok(mut stream)) = connect else {
+        return false;
+    };
+    if stream
+        .write_all(b"GET /backend/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = [0u8; 256];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.read(&mut response),
+    )
+    .await;
+    matches!(read, Ok(Ok(size)) if String::from_utf8_lossy(&response[..size]).starts_with("HTTP/1.1 200 OK"))
+}
+
+fn helper_port_candidates(
+    fixed: bool,
+    status_port: Option<u16>,
+    requested: u16,
+    fallback: u16,
+) -> Vec<u16> {
+    let mut candidates = Vec::new();
+    if let Some(port) = status_port {
+        candidates.push(port);
+    }
+    if !candidates.contains(&requested) {
+        candidates.push(requested);
+    }
+    if !candidates.contains(&fallback) {
+        candidates.push(fallback);
+    }
+    if fixed {
+        vec![codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT]
+    } else {
+        candidates
+    }
+}
+
+async fn select_existing_helper_port(
+    options: &LaunchOptions,
+    settings: &codex_plus_core::settings::BackendSettings,
+    hooks: &LauncherHooks,
+) -> (u16, bool) {
+    let fixed = codex_plus_core::launcher::helper_port_requires_fixed_binding(settings);
+    let status_port = helper_port_from_running_status(options).filter(|port| {
+        !fixed || *port == codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    });
+    let fallback = if fixed {
+        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    } else {
+        hooks.select_helper_port(options.helper_port)
+    };
+    let requested = if fixed {
+        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    } else {
+        options.helper_port
+    };
+    for port in helper_port_candidates(fixed, status_port, requested, fallback) {
+        if helper_runtime_available(port).await {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.existing_helper_reused",
+                json!({
+                    "helper_port": port,
+                    "fixed_binding": fixed,
+                    "source": if Some(port) == status_port { "latest_status" } else { "probe" }
+                }),
+            );
+            return (port, false);
+        }
+    }
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "launcher.existing_helper_not_available",
+        json!({
+            "helper_port": fallback,
+            "fixed_binding": fixed,
+            "status_helper_port": status_port
+        }),
+    );
+    (fallback, true)
+}
+
+async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<u16> {
     let hooks = LauncherHooks::default();
-    let helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
+    let helper_needed = settings.enhancements_enabled
+        || codex_plus_core::launcher::helper_port_requires_fixed_binding(&settings);
+    let (helper_port, helper_started) = if helper_needed {
+        select_existing_helper_port(options, &settings, &hooks).await
+    } else {
+        (options.helper_port, false)
+    };
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
     let blocking_process_ids = if has_pending_recovery {
@@ -207,17 +316,26 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             json!({"blocking_process_ids": blocking_process_ids}),
         );
     }
-    let launch_result = hooks
+    if helper_started {
+        hooks.start_helper(helper_port).await?;
+    }
+    let launch = match hooks
         .launch_codex(
             &app_dir,
             options.debug_port,
             &settings,
             &settings.codex_extra_args,
         )
-        .await;
-    if settings.enhancements_enabled {
-        hooks.start_helper(helper_port).await?;
-    }
+        .await
+    {
+        Ok(launch) => launch,
+        Err(error) => {
+            if helper_started {
+                hooks.shutdown_helper(helper_port).await;
+            }
+            return Err(error);
+        }
+    };
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     #[cfg(windows)]
     let activated = process_ids
@@ -234,11 +352,18 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         false
     };
     if injection_ready {
-        hooks
-            .start_bridge_watchdog(options.debug_port, helper_port)
-            .await?;
+        if helper_started {
+            hooks
+                .start_bridge_watchdog(options.debug_port, helper_port)
+                .await?;
+        }
         hooks.write_status("running").await;
     } else if settings.enhancements_enabled {
+        if helper_started {
+            hooks
+                .start_bridge_watchdog(options.debug_port, helper_port)
+                .await?;
+        }
         hooks.write_status("running_degraded").await;
     }
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -251,11 +376,17 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             "process_ids": process_ids,
             "activated": activated,
             "injection_ready": injection_ready,
-            "launch_ok": launch_result.is_ok(),
-            "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
+            "helper_started": helper_started,
+            "launch_ok": true,
         }),
     );
-    launch_result.map(|_| ())
+    if helper_started {
+        hooks
+            .wait_for_codex_exit(&launch, options.debug_port)
+            .await?;
+        hooks.shutdown_helper(helper_port).await;
+    }
+    Ok(helper_port)
 }
 
 fn should_finalize_pending_remote_control_recovery(
@@ -963,18 +1094,7 @@ async fn inject_with_context(
     ctx: BridgeContext,
     runtime: Arc<LauncherRuntimeService>,
 ) -> anyhow::Result<()> {
-    let mut last_error = None;
-    for _ in 0..20 {
-        match try_inject_with_context(debug_port, helper_port, ctx.clone(), runtime.clone()).await {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Codex injection failed")))
+    try_inject_with_context(debug_port, helper_port, ctx, runtime).await
 }
 
 fn remote_control_recovery_is_superseded_by_openai(
@@ -1113,6 +1233,18 @@ mod tests {
 
         assert_eq!(options.debug_port, LaunchOptions::default().debug_port);
         assert_eq!(options.helper_port, LaunchOptions::default().helper_port);
+    }
+
+    #[test]
+    fn fixed_helper_port_candidates_do_not_fall_back_to_a_random_port() {
+        assert_eq!(
+            helper_port_candidates(true, Some(58123), 58123, 58124),
+            vec![codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT]
+        );
+        assert_eq!(
+            helper_port_candidates(false, Some(58123), 58123, 58124),
+            vec![58123, 58124]
+        );
     }
 
     #[test]

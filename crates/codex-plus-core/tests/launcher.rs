@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use codex_plus_core::app_paths::{
@@ -1507,6 +1508,7 @@ async fn launch_lifecycle_enters_degraded_mode_and_retries_when_injection_fails(
     let status = status_store.load_latest().unwrap().unwrap();
     assert_eq!(status.status, "running_degraded");
     assert!(status.message.contains("Codex launched"));
+    assert_eq!(hooks.watchdog_starts.load(Ordering::SeqCst), 1);
 
     handle.wait_for_codex_exit().await.unwrap();
     let events = events.lock().unwrap().clone();
@@ -1563,6 +1565,7 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
         relay_profiles: vec![RelayProfile {
             id: "relay-chat".to_string(),
             name: "Chat".to_string(),
+            integration_type: String::new(),
             model: String::new(),
             base_url: "https://chat-only.example.test/v1".to_string(),
             upstream_base_url: "https://chat-only.example.test/v1".to_string(),
@@ -1890,6 +1893,7 @@ struct FakeHooks {
     provider_sync_unsupported: bool,
     plugin_marketplace_error: Option<String>,
     has_pending_remote_control_session_recoveries: bool,
+    watchdog_starts: Arc<AtomicUsize>,
     /// 还需要让 `start_helper` 报几次「端口被占用」，用来模拟旧 helper 尚未交还监听。
     remaining_helper_bind_conflicts: Arc<Mutex<u32>>,
 }
@@ -1909,6 +1913,7 @@ impl FakeHooks {
             provider_sync_unsupported: false,
             plugin_marketplace_error: None,
             has_pending_remote_control_session_recoveries: false,
+            watchdog_starts: Arc::new(AtomicUsize::new(0)),
             remaining_helper_bind_conflicts: Arc::new(Mutex::new(0)),
         }
     }
@@ -2084,6 +2089,7 @@ impl LaunchHooks for FakeHooks {
         _debug_port: u16,
         _helper_port: u16,
     ) -> anyhow::Result<()> {
+        self.watchdog_starts.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 

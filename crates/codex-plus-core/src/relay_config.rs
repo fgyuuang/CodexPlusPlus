@@ -452,6 +452,20 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
     profile: &RelayProfile,
     common_config_contents: &str,
 ) -> anyhow::Result<RelayApplyResult> {
+    apply_relay_profile_to_home_with_switch_rules_and_optional_auth(
+        home,
+        profile,
+        common_config_contents,
+        None,
+    )
+}
+
+pub fn apply_relay_profile_to_home_with_switch_rules_and_optional_auth(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+    official_auth_contents: Option<&str>,
+) -> anyhow::Result<RelayApplyResult> {
     let selected_common = if profile.use_common_config {
         prepare_common_config_for_apply(common_config_contents)?
     } else {
@@ -469,7 +483,14 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
     let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
     let config_with_catalog = enable_response_storage_for_relay(profile, &config_with_catalog)?;
     let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
-    apply_relay_config_file_to_home(home, &compatible_config)
+    if let Some(auth_contents) = official_auth_contents {
+        if !auth_contents_looks_like_chatgpt_auth(auth_contents) {
+            anyhow::bail!("选定的官方登录配置不是有效的 ChatGPT 登录状态");
+        }
+        apply_relay_files_to_home(home, &compatible_config, auth_contents)
+    } else {
+        apply_relay_config_file_to_home(home, &compatible_config)
+    }
 }
 
 pub fn apply_relay_profile_config_to_home_with_context(
@@ -721,9 +742,42 @@ pub fn clear_relay_config_to_home_with_auth(
     home: &Path,
     auth_contents: Option<&str>,
 ) -> anyhow::Result<RelayApplyResult> {
-    std::fs::create_dir_all(home)?;
     let _ = auth_contents;
-    let auth_bytes: Option<Vec<u8>> = None;
+    clear_relay_config_to_home_with_verified_auth(home, None)
+}
+
+pub fn clear_relay_config_to_home_with_selected_official_auth(
+    home: &Path,
+    auth_contents: &str,
+) -> anyhow::Result<RelayApplyResult> {
+    if !auth_contents_looks_like_chatgpt_auth(auth_contents) {
+        anyhow::bail!("选定的官方登录配置不是有效的 ChatGPT 登录状态");
+    }
+    clear_relay_config_to_home_with_verified_auth(home, Some(auth_contents.as_bytes()))
+}
+
+pub fn apply_official_auth_to_home(
+    home: &Path,
+    auth_contents: &str,
+) -> anyhow::Result<RelayApplyResult> {
+    if !auth_contents_looks_like_chatgpt_auth(auth_contents) {
+        anyhow::bail!("目标官方账号凭据无效");
+    }
+    std::fs::create_dir_all(home)?;
+    let backup_path = write_codex_live_atomic(home, None, Some(auth_contents.as_bytes()))?;
+    let status = relay_config_status_from_home(home);
+    Ok(RelayApplyResult {
+        config_path: status.config_path,
+        backup_path,
+        configured: status.configured,
+    })
+}
+
+fn clear_relay_config_to_home_with_verified_auth(
+    home: &Path,
+    auth_bytes: Option<&[u8]>,
+) -> anyhow::Result<RelayApplyResult> {
+    std::fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     let mut without_tables = existing;
@@ -747,7 +801,7 @@ pub fn clear_relay_config_to_home_with_auth(
     }
     updated = remove_model_provider_auth_fields(&updated, RELAY_PROVIDER)?;
     updated = remove_managed_remote_control_openai_base_url(&updated)?;
-    let backup_path = write_codex_live_atomic(home, Some(&updated), auth_bytes.as_deref())?;
+    let backup_path = write_codex_live_atomic(home, Some(&updated), auth_bytes)?;
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
         config_path: status.config_path,
@@ -2332,6 +2386,9 @@ fn codex_auth_api_key(auth_contents: &str) -> Option<String> {
 
 pub fn effective_active_relay_profile_for_codex(settings: &BackendSettings) -> RelayProfile {
     let mut active = settings.active_relay_profile();
+    if settings.active_relay_uses_official_login_auth() {
+        active.official_mix_api_key = true;
+    }
     let Some(aggregate) = settings.active_aggregate_relay_profile() else {
         return active;
     };
@@ -2357,6 +2414,69 @@ pub fn effective_active_relay_profile_for_codex(settings: &BackendSettings) -> R
         .collect::<Vec<_>>();
     let aliases =
         crate::aggregate_model_alias::aggregate_catalog_aliases(&aggregate, &member_profiles);
+    let aggregate_models = crate::aggregate_model_alias::aggregate_catalog_model_list(
+        &aggregate,
+        &member_profiles,
+        &aliases,
+    );
+    let official_auth_first = settings.active_relay_uses_official_login_auth();
+    let native_official_models = official_auth_first
+        .then(|| {
+            crate::aggregate_model_alias::TRUSTED_OFFICIAL_CODEX_MODELS
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let dedicated_cli_models = official_auth_first
+        .then(|| {
+            crate::aggregate_model_alias::cliproxy_official_api_aliases(&settings.relay_profiles)
+        })
+        .unwrap_or_default();
+    let general_cli_models = crate::aggregate_model_alias::cliproxy_general_api_aliases(
+        &settings.relay_profiles,
+        !dedicated_cli_models.is_empty(),
+    );
+    let replacement_models = official_auth_first
+        .then(|| {
+            crate::aggregate_model_alias::aggregate_replacement_model_aliases(
+                &aggregate,
+                &member_profiles,
+            )
+        })
+        .unwrap_or_default();
+    let provider_models = aggregate_models
+        .iter()
+        .filter(|model| model.contains(':') && !model.contains('('))
+        .cloned()
+        .collect::<Vec<_>>();
+    let aggregate_primary_models = aggregate_models
+        .iter()
+        .filter(|model| !model.contains(':') && !model.contains('('))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut ordered_models = Vec::new();
+    let mut seen_models = std::collections::HashSet::new();
+    let model_candidates = if official_auth_first {
+        native_official_models
+            .into_iter()
+            .chain(dedicated_cli_models.iter().map(|alias| alias.alias.clone()))
+            .chain(replacement_models)
+            .chain(general_cli_models.iter().map(|alias| alias.alias.clone()))
+            .chain(provider_models)
+            .collect::<Vec<_>>()
+    } else {
+        aggregate_primary_models
+            .into_iter()
+            .chain(general_cli_models.iter().map(|alias| alias.alias.clone()))
+            .chain(provider_models)
+            .collect::<Vec<_>>()
+    };
+    for model in model_candidates {
+        if seen_models.insert(model.clone()) {
+            ordered_models.push(model);
+        }
+    }
 
     if active.config_contents.trim().is_empty() {
         active.config_contents = aggregate_startup_config_contents(&first_member.config_contents);
@@ -2367,30 +2487,25 @@ pub fn effective_active_relay_profile_for_codex(settings: &BackendSettings) -> R
     if active.auto_compact_limit.trim().is_empty() {
         active.auto_compact_limit = first_member.auto_compact_limit.trim().to_string();
     }
-    if active.model_list.trim().is_empty() {
-        active.model_list = aliases
-            .iter()
-            .map(|alias| alias.alias.trim())
-            .filter(|alias| !alias.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+    if !ordered_models.is_empty() {
+        active.model_list = ordered_models.join("\n");
     }
-    if active.model.trim().is_empty() {
+    let normalized_active_model =
+        crate::aggregate_model_alias::normalize_requested_model_name(&active.model);
+    let has_official_model = ordered_models
+        .iter()
+        .any(|model| crate::aggregate_model_alias::is_trusted_official_codex_model(model));
+    let active_is_official_model = ordered_models.iter().any(|model| {
+        crate::aggregate_model_alias::is_trusted_official_codex_model(model)
+            && model.eq_ignore_ascii_case(&normalized_active_model)
+    });
+    if active.model.trim().is_empty() || (has_official_model && !active_is_official_model) {
         let member_default = relay_profile_model(first_member);
-        active.model = aliases
+        active.model = ordered_models
             .iter()
-            .find(|alias| {
-                alias.provider_id == first_member.id
-                    && alias.target_model == member_default
-                    && alias.mapping_key.as_deref() == Some(alias.alias.as_str())
-            })
-            .or_else(|| {
-                aliases.iter().find(|alias| {
-                    alias.provider_id == first_member.id && alias.target_model == member_default
-                })
-            })
-            .or_else(|| aliases.first())
-            .map(|alias| alias.alias.clone())
+            .find(|model| crate::aggregate_model_alias::is_trusted_official_codex_model(model))
+            .cloned()
+            .or_else(|| ordered_models.first().cloned())
             .unwrap_or(member_default);
     }
     if active.model_windows.trim().is_empty() {
@@ -2581,8 +2696,9 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["wire_api"] = toml_edit::value("responses");
     }
-    provider["requires_openai_auth"] =
-        toml_edit::value(profile.relay_mode == crate::settings::RelayMode::Official);
+    provider["requires_openai_auth"] = toml_edit::value(
+        profile.relay_mode == crate::settings::RelayMode::Official || profile.official_mix_api_key,
+    );
     let provider_base_url = if profile.has_model_routes() {
         crate::protocol_proxy::local_responses_proxy_base_url(
             crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
@@ -2717,7 +2833,7 @@ fn config_has_model_provider(config_contents: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn auth_contents_looks_like_chatgpt_auth(contents: &str) -> bool {
+pub fn auth_contents_looks_like_chatgpt_auth(contents: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(contents) else {
         return false;
     };

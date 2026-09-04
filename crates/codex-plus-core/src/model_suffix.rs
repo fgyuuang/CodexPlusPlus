@@ -271,6 +271,7 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
             if let Some(use_responses_lite) = use_responses_lite_override {
                 model["use_responses_lite"] = json!(use_responses_lite);
             }
+            model["prefer_websockets"] = json!(false);
             if !has_model_metadata {
                 model["additional_speed_tiers"] = json!([]);
                 model["service_tiers"] = json!([]);

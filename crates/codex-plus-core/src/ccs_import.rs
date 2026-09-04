@@ -81,6 +81,7 @@ pub fn relay_profile_from_ccs(
             existing_ids,
         ),
         name: format!("{}（ccswitch）", strip_ccs_name_suffix(&provider.name)),
+        integration_type: String::new(),
         model: String::new(),
         base_url: provider.base_url.clone(),
         upstream_base_url: provider.base_url.clone(),

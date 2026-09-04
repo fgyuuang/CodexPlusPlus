@@ -1,11 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use codex_plus_core::install::SILENT_BINARY;
 use codex_plus_core::models::{DeleteResult, SessionRef};
 use codex_plus_core::relay_environment::RelayEnvironmentReport;
@@ -18,6 +19,8 @@ use codex_plus_core::user_scripts::UserScriptManager;
 use codex_plus_core::zed_remote::{ZedOpenStrategy, ZedRemoteProject};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tauri::Manager as _;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::install::{self, InstallActionResult, InstallOptions};
 
@@ -84,6 +87,76 @@ struct WeixinQrSession {
 
 struct WeixinRuntime {
     stop: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialAccountsPayload {
+    pub accounts: Vec<codex_plus_core::official_accounts::OfficialAccountSummary>,
+    pub active_account_id: String,
+    pub codex_running: bool,
+    pub restart_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialLoginSessionPayload {
+    pub login_id: String,
+    pub method: String,
+    pub status: String,
+    pub auth_url: String,
+    pub verification_url: String,
+    pub user_code: String,
+    pub expires_at: i64,
+    pub account: Option<codex_plus_core::official_accounts::OfficialAccountSummary>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialLoginStartRequest {
+    pub method: String,
+    #[serde(default)]
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialAccountUpdateRequest {
+    pub account_id: String,
+    pub patch: codex_plus_core::official_accounts::OfficialAccountPatch,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialAccountIdRequest {
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialAccountSwitchRequest {
+    pub account_id: String,
+    #[serde(default)]
+    pub confirm_restart: bool,
+    #[serde(default)]
+    pub discard_live_conflict: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialAccountImportRequest {
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub password: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialAccountExportRequest {
+    pub account_ids: Vec<String>,
+    pub path: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1372,6 +1445,355 @@ pub fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload
                 },
             )
         }
+    }
+}
+
+#[tauri::command]
+pub fn list_official_accounts() -> CommandResult<OfficialAccountsPayload> {
+    match official_accounts_payload(false) {
+        Ok(payload) => ok("官方账号已加载。", payload),
+        Err(error) => failed(
+            &format!("读取官方账号失败：{error}"),
+            empty_official_accounts_payload(),
+        ),
+    }
+}
+
+#[tauri::command]
+pub async fn start_official_account_login(
+    app: tauri::AppHandle,
+    request: OfficialLoginStartRequest,
+) -> CommandResult<OfficialLoginSessionPayload> {
+    let method = request.method.trim().to_ascii_lowercase();
+    if method == "browser" {
+        return start_official_browser_login(app, request.account_id).await;
+    }
+    if method == "device" {
+        return start_official_device_login(request.account_id).await;
+    }
+    failed(
+        "不支持的官方登录方式。",
+        empty_official_login_session(&method),
+    )
+}
+
+#[tauri::command]
+pub fn official_account_login_status(
+    login_id: String,
+) -> CommandResult<OfficialLoginSessionPayload> {
+    let sessions = official_login_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match sessions.get(login_id.trim()).cloned() {
+        Some(session) => ok("官方登录状态已更新。", session),
+        None => failed(
+            "官方登录会话不存在或已过期。",
+            empty_official_login_session("unknown"),
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn cancel_official_account_login(
+    app: tauri::AppHandle,
+    login_id: String,
+) -> CommandResult<OfficialLoginSessionPayload> {
+    let login_id = login_id.trim();
+    let mut sessions = official_login_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(session) = sessions.get_mut(login_id) else {
+        return failed(
+            "官方登录会话不存在或已过期。",
+            empty_official_login_session("unknown"),
+        );
+    };
+    if session.status == "pending" {
+        session.status = "cancelled".to_string();
+        session.error = Some("登录已取消".to_string());
+    }
+    if let Some(window) = app.get_webview_window(&official_login_window_label(login_id)) {
+        let _ = window.close();
+    }
+    ok("官方登录已取消。", session.clone())
+}
+
+#[tauri::command]
+pub fn update_official_account(
+    request: OfficialAccountUpdateRequest,
+) -> CommandResult<OfficialAccountsPayload> {
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    if request.patch.enabled == Some(false)
+        && settings.active_official_account_id == request.account_id.trim()
+    {
+        return failed(
+            "活动官方账号不能直接禁用，请先切换账号。",
+            empty_official_accounts_payload(),
+        );
+    }
+    let store = codex_plus_core::official_accounts::OfficialAccountStore::default();
+    match store.update(&request.account_id, request.patch) {
+        Ok(_) => match official_accounts_payload(false) {
+            Ok(payload) => ok("官方账号已更新。", payload),
+            Err(error) => failed(
+                &format!("账号已更新，但重新读取失败：{error}"),
+                empty_official_accounts_payload(),
+            ),
+        },
+        Err(error) => failed(
+            &format!("更新官方账号失败：{error}"),
+            empty_official_accounts_payload(),
+        ),
+    }
+}
+
+#[tauri::command]
+pub async fn refresh_official_account(
+    request: OfficialAccountIdRequest,
+) -> CommandResult<OfficialAccountsPayload> {
+    let store = codex_plus_core::official_accounts::OfficialAccountStore::default();
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let account_is_active = settings.active_official_account_id == request.account_id.trim();
+    let codex_running = codex_plus_core::watcher::codex_processes_running();
+    let home = codex_plus_core::codex_home::default_codex_home_dir();
+
+    if account_is_active
+        && let Err(error) =
+            persist_live_official_auth(&store, &home, &settings.active_official_account_id, false)
+    {
+        return CommandResult {
+            status: "conflict".to_string(),
+            message: format!("刷新前同步当前官方账号失败：{error}"),
+            payload: official_accounts_payload(false)
+                .unwrap_or_else(|_| empty_official_accounts_payload()),
+        };
+    }
+
+    let refresh_result = if account_is_active && codex_running {
+        store
+            .refresh_usage_with_current_token(&request.account_id, true)
+            .await
+    } else {
+        store.refresh_usage(&request.account_id, true).await
+    };
+
+    match refresh_result {
+        Ok(_) => {
+            if account_is_active
+                && !codex_running
+                && let Err(error) =
+                    sync_stored_official_auth_to_live(&store, &home, &request.account_id)
+            {
+                return failed(
+                    &format!("用量已刷新，但同步当前登录凭据失败：{error}"),
+                    official_accounts_payload(false)
+                        .unwrap_or_else(|_| empty_official_accounts_payload()),
+                );
+            }
+            match official_accounts_payload(false) {
+                Ok(payload) => ok("官方账号用量已刷新；令牌仅在需要时更新。", payload),
+                Err(error) => failed(
+                    &format!("刷新成功，但重新读取失败：{error}"),
+                    empty_official_accounts_payload(),
+                ),
+            }
+        }
+        Err(error) => failed(
+            &format!("刷新官方账号失败：{error}"),
+            official_accounts_payload(false).unwrap_or_else(|_| empty_official_accounts_payload()),
+        ),
+    }
+}
+
+#[tauri::command]
+pub async fn switch_official_account(
+    request: OfficialAccountSwitchRequest,
+) -> CommandResult<OfficialAccountsPayload> {
+    let store = codex_plus_core::official_accounts::OfficialAccountStore::default();
+    let target = match store.get(&request.account_id) {
+        Ok(account) if account.enabled => account,
+        Ok(_) => return failed("目标官方账号已禁用。", empty_official_accounts_payload()),
+        Err(error) => {
+            return failed(
+                &format!("读取目标官方账号失败：{error}"),
+                empty_official_accounts_payload(),
+            );
+        }
+    };
+    let was_running = codex_plus_core::watcher::codex_processes_running();
+    if was_running && !request.confirm_restart {
+        return CommandResult {
+            status: "needs_confirmation".to_string(),
+            message: "Codex 正在运行，切换账号需要停止并重启 Codex。".to_string(),
+            payload: official_accounts_payload(true)
+                .unwrap_or_else(|_| empty_official_accounts_payload_with_restart(true)),
+        };
+    }
+    let home = codex_plus_core::codex_home::default_codex_home_dir();
+    let settings_store = SettingsStore::default();
+    let mut settings = settings_store.load().unwrap_or_default();
+    if let Err(error) = persist_live_official_auth(
+        &store,
+        &home,
+        &settings.active_official_account_id,
+        request.discard_live_conflict,
+    ) {
+        return CommandResult {
+            status: "conflict".to_string(),
+            message: format!("切换前保存当前官方账号失败：{error}"),
+            payload: official_accounts_payload(false)
+                .unwrap_or_else(|_| empty_official_accounts_payload()),
+        };
+    }
+    if let Err(error) = store.refresh_tokens(&target.id, false).await {
+        return failed(
+            &format!("目标账号令牌无效，需要重新登录：{error}"),
+            official_accounts_payload(false).unwrap_or_else(|_| empty_official_accounts_payload()),
+        );
+    }
+    settings.active_official_account_id = target.id;
+    let target_auth = match store.get_auth_json(&settings.active_official_account_id) {
+        Ok(auth) => match serde_json::to_string_pretty(&auth) {
+            Ok(auth) => auth,
+            Err(error) => {
+                return failed(
+                    &format!("序列化目标官方账号失败：{error}"),
+                    official_accounts_payload(false)
+                        .unwrap_or_else(|_| empty_official_accounts_payload()),
+                );
+            }
+        },
+        Err(error) => {
+            return failed(
+                &format!("读取目标官方账号失败：{error}"),
+                official_accounts_payload(false)
+                    .unwrap_or_else(|_| empty_official_accounts_payload()),
+            );
+        }
+    };
+    if was_running {
+        codex_plus_core::watcher::stop_launcher_processes_and_wait();
+        codex_plus_core::watcher::stop_codex_processes_and_wait();
+    }
+    let _guard = relay_switch_mutex()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match codex_plus_core::relay_switch::switch_official_account_in_home(
+        &settings_store,
+        &home,
+        settings,
+        &target_auth,
+    ) {
+        Ok(_) => {
+            let _ = store.mark_used(&request.account_id);
+            match official_accounts_payload(was_running) {
+                Ok(payload) => ok("官方账号已切换。", payload),
+                Err(error) => failed(
+                    &format!("账号已切换，但重新读取失败：{error}"),
+                    empty_official_accounts_payload_with_restart(was_running),
+                ),
+            }
+        }
+        Err(error) => failed(
+            &format!("切换官方账号失败：{error}"),
+            official_accounts_payload(was_running)
+                .unwrap_or_else(|_| empty_official_accounts_payload_with_restart(was_running)),
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn delete_official_account(
+    request: OfficialAccountIdRequest,
+) -> CommandResult<OfficialAccountsPayload> {
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    if settings.active_official_account_id == request.account_id.trim() {
+        return failed(
+            "活动官方账号不能直接删除，请先切换账号。",
+            official_accounts_payload(false).unwrap_or_else(|_| empty_official_accounts_payload()),
+        );
+    }
+    let store = codex_plus_core::official_accounts::OfficialAccountStore::default();
+    match store.delete(&request.account_id) {
+        Ok(true) => ok(
+            "官方账号已删除。",
+            official_accounts_payload(false).unwrap_or_else(|_| empty_official_accounts_payload()),
+        ),
+        Ok(false) => failed(
+            "官方账号不存在。",
+            official_accounts_payload(false).unwrap_or_else(|_| empty_official_accounts_payload()),
+        ),
+        Err(error) => failed(
+            &format!("删除官方账号失败：{error}"),
+            official_accounts_payload(false).unwrap_or_else(|_| empty_official_accounts_payload()),
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn import_official_accounts(
+    request: OfficialAccountImportRequest,
+) -> CommandResult<OfficialAccountsPayload> {
+    let store = codex_plus_core::official_accounts::OfficialAccountStore::default();
+    let mut errors = Vec::new();
+    let mut success = 0usize;
+    for raw_path in request.paths {
+        let path = PathBuf::from(raw_path.trim());
+        let result = (|| -> anyhow::Result<()> {
+            let bytes = codex_plus_core::official_accounts::read_import_file(&path)?;
+            let value: Value = serde_json::from_slice(&bytes).context("导入文件不是有效 JSON")?;
+            if value.get("format").and_then(Value::as_str)
+                == Some("codex-plus-plus-official-accounts")
+            {
+                let result = store.import_encrypted(&bytes, &request.password)?;
+                success += result.imported.len() + result.updated.len();
+                errors.extend(result.errors);
+            } else {
+                store.upsert_auth_json(value)?;
+                success += 1;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            errors.push(format!("{}：{error}", path.display()));
+        }
+    }
+    let payload =
+        official_accounts_payload(false).unwrap_or_else(|_| empty_official_accounts_payload());
+    if success == 0 {
+        failed(&format!("没有导入账号：{}", errors.join("；")), payload)
+    } else if errors.is_empty() {
+        ok(&format!("已导入或更新 {success} 个官方账号。"), payload)
+    } else {
+        CommandResult {
+            status: "partial".to_string(),
+            message: format!(
+                "已导入或更新 {success} 个账号；部分文件失败：{}",
+                errors.join("；")
+            ),
+            payload,
+        }
+    }
+}
+
+#[tauri::command]
+pub fn export_official_accounts(
+    request: OfficialAccountExportRequest,
+) -> CommandResult<OfficialAccountsPayload> {
+    let store = codex_plus_core::official_accounts::OfficialAccountStore::default();
+    let path = PathBuf::from(request.path.trim());
+    let result = store
+        .export_encrypted(&request.account_ids, &request.password)
+        .and_then(|bytes| codex_plus_core::official_accounts::write_export_file(&path, &bytes));
+    match result {
+        Ok(()) => ok(
+            "官方账号加密备份已导出。",
+            official_accounts_payload(false).unwrap_or_else(|_| empty_official_accounts_payload()),
+        ),
+        Err(error) => failed(
+            &format!("导出官方账号失败：{error}"),
+            official_accounts_payload(false).unwrap_or_else(|_| empty_official_accounts_payload()),
+        ),
     }
 }
 
@@ -5489,17 +5911,354 @@ fn settings_payload(message: &str, failure_context: &str) -> CommandResult<Setti
     }
 }
 
+fn official_login_sessions() -> &'static Mutex<HashMap<String, OfficialLoginSessionPayload>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, OfficialLoginSessionPayload>>> =
+        OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn start_official_browser_login(
+    app: tauri::AppHandle,
+    expected_account_id: String,
+) -> CommandResult<OfficialLoginSessionPayload> {
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:1455").await {
+        Ok(listener) => listener,
+        Err(error) => {
+            return failed(
+                &format!("无法监听 OAuth 回调端口 1455，请改用设备码登录：{error}"),
+                empty_official_login_session("browser"),
+            );
+        }
+    };
+    let flow = match codex_plus_core::official_accounts::begin_browser_login() {
+        Ok(flow) => flow,
+        Err(error) => {
+            return failed(
+                &format!("创建 OAuth 登录会话失败：{error}"),
+                empty_official_login_session("browser"),
+            );
+        }
+    };
+    let session = OfficialLoginSessionPayload {
+        login_id: flow.login_id.clone(),
+        method: "browser".to_string(),
+        status: "pending".to_string(),
+        auth_url: flow.auth_url.clone(),
+        verification_url: String::new(),
+        user_code: String::new(),
+        expires_at: flow.expires_at,
+        account: None,
+        error: None,
+    };
+    official_login_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(flow.login_id.clone(), session.clone());
+    let label = official_login_window_label(&flow.login_id);
+    let external = match flow.auth_url.parse::<tauri::Url>() {
+        Ok(url) => url,
+        Err(error) => {
+            update_official_login_failure(&flow.login_id, format!("OAuth 地址无效：{error}"));
+            return failed("OAuth 地址无效。", session);
+        }
+    };
+    if let Err(error) =
+        tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(external))
+            .title("OpenAI 官方账号登录")
+            .inner_size(720.0, 820.0)
+            .min_inner_size(560.0, 640.0)
+            .incognito(true)
+            .build()
+    {
+        update_official_login_failure(&flow.login_id, format!("创建登录窗口失败：{error}"));
+        return failed(&format!("创建登录窗口失败：{error}"), session);
+    }
+    let login_id = flow.login_id.clone();
+    let expected_account_id = expected_account_id.trim().to_string();
+    tauri::async_runtime::spawn(async move {
+        let result = match await_browser_callback(listener, &flow).await {
+            Ok(code) => {
+                codex_plus_core::official_accounts::complete_browser_login(&flow, &code).await
+            }
+            Err(error) => Err(error),
+        };
+        finish_official_login(&login_id, &expected_account_id, result);
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.close();
+        }
+    });
+    ok("已打开隔离的 OpenAI 登录窗口。", session)
+}
+
+async fn start_official_device_login(
+    expected_account_id: String,
+) -> CommandResult<OfficialLoginSessionPayload> {
+    let flow = match codex_plus_core::official_accounts::begin_device_login().await {
+        Ok(flow) => flow,
+        Err(error) => {
+            return failed(
+                &format!("请求设备码失败：{error}"),
+                empty_official_login_session("device"),
+            );
+        }
+    };
+    let session = OfficialLoginSessionPayload {
+        login_id: flow.login_id.clone(),
+        method: "device".to_string(),
+        status: "pending".to_string(),
+        auth_url: String::new(),
+        verification_url: flow.verification_url.clone(),
+        user_code: flow.user_code.clone(),
+        expires_at: flow.expires_at,
+        account: None,
+        error: None,
+    };
+    official_login_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(flow.login_id.clone(), session.clone());
+    let login_id = flow.login_id.clone();
+    let expected_account_id = expected_account_id.trim().to_string();
+    tauri::async_runtime::spawn(async move {
+        let result = codex_plus_core::official_accounts::complete_device_login(&flow).await;
+        finish_official_login(&login_id, &expected_account_id, result);
+    });
+    ok("设备码已生成。", session)
+}
+
+async fn await_browser_callback(
+    listener: tokio::net::TcpListener,
+    flow: &codex_plus_core::official_accounts::BrowserLoginStart,
+) -> anyhow::Result<String> {
+    let (mut stream, _) = tokio::time::timeout(
+        codex_plus_core::official_accounts::LOGIN_SESSION_TTL,
+        listener.accept(),
+    )
+    .await
+    .context("OAuth 登录等待超时")??;
+    let mut buffer = vec![0u8; 16 * 1024];
+    let size = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer))
+        .await
+        .context("读取 OAuth 回调超时")??;
+    let request = String::from_utf8_lossy(&buffer[..size]);
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("OAuth 回调请求无效")?;
+    let callback_url = if target.starts_with("http://") || target.starts_with("https://") {
+        target.to_string()
+    } else {
+        format!("http://localhost:1455{target}")
+    };
+    let result = codex_plus_core::official_accounts::parse_callback_url(&callback_url, &flow.state);
+    let (status, body) = if result.is_ok() {
+        ("200 OK", "登录已完成，可以关闭此窗口。")
+    } else {
+        ("400 Bad Request", "登录回调无效，请返回管理器重试。")
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.as_bytes().len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    result
+}
+
+fn finish_official_login(login_id: &str, expected_account_id: &str, result: anyhow::Result<Value>) {
+    let mut sessions = official_login_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(session) = sessions.get_mut(login_id) else {
+        return;
+    };
+    if session.status != "pending" {
+        return;
+    }
+    match result.and_then(|auth| {
+        let parsed = codex_plus_core::official_accounts::parse_official_auth(&auth)?;
+        if !expected_account_id.is_empty() && parsed.id != expected_account_id {
+            anyhow::bail!("重新登录的身份与目标账号不一致");
+        }
+        codex_plus_core::official_accounts::OfficialAccountStore::default()
+            .upsert_auth_json(auth)
+            .map(|(account, _)| account)
+    }) {
+        Ok(account) => {
+            session.status = "success".to_string();
+            session.account = Some(account);
+            session.error = None;
+        }
+        Err(error) => {
+            session.status = "failed".to_string();
+            session.error = Some(error.to_string());
+        }
+    }
+}
+
+fn update_official_login_failure(login_id: &str, error: String) {
+    if let Some(session) = official_login_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(login_id)
+    {
+        session.status = "failed".to_string();
+        session.error = Some(error);
+    }
+}
+
+fn official_login_window_label(login_id: &str) -> String {
+    let suffix = login_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(24)
+        .collect::<String>();
+    format!("official-login-{suffix}")
+}
+
+fn empty_official_login_session(method: &str) -> OfficialLoginSessionPayload {
+    OfficialLoginSessionPayload {
+        login_id: String::new(),
+        method: method.to_string(),
+        status: "unknown".to_string(),
+        auth_url: String::new(),
+        verification_url: String::new(),
+        user_code: String::new(),
+        expires_at: 0,
+        account: None,
+        error: None,
+    }
+}
+
+fn official_accounts_payload(restart_required: bool) -> anyhow::Result<OfficialAccountsPayload> {
+    let settings_store = SettingsStore::default();
+    let mut settings = settings_store.load()?;
+    let migration = codex_plus_core::official_accounts::migrate_legacy_official_accounts(
+        &mut settings,
+        &codex_plus_core::codex_home::default_codex_home_dir(),
+    )?;
+    if migration.changed {
+        settings_store.save(&settings)?;
+    }
+    Ok(OfficialAccountsPayload {
+        accounts: codex_plus_core::official_accounts::OfficialAccountStore::default().list()?,
+        active_account_id: settings.active_official_account_id,
+        codex_running: codex_plus_core::watcher::codex_processes_running(),
+        restart_required,
+    })
+}
+
+fn empty_official_accounts_payload() -> OfficialAccountsPayload {
+    OfficialAccountsPayload {
+        accounts: Vec::new(),
+        active_account_id: String::new(),
+        codex_running: codex_plus_core::watcher::codex_processes_running(),
+        restart_required: false,
+    }
+}
+
+fn empty_official_accounts_payload_with_restart(restart_required: bool) -> OfficialAccountsPayload {
+    OfficialAccountsPayload {
+        restart_required,
+        ..empty_official_accounts_payload()
+    }
+}
+
+fn persist_live_official_auth(
+    store: &codex_plus_core::official_accounts::OfficialAccountStore,
+    home: &Path,
+    active_account_id: &str,
+    discard_conflict: bool,
+) -> anyhow::Result<()> {
+    let active_account_id = active_account_id.trim();
+    if active_account_id.is_empty() {
+        return Ok(());
+    }
+    let bytes = match fs::read(home.join("auth.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let Ok(auth) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(());
+    };
+    let Ok(parsed) = codex_plus_core::official_accounts::parse_official_auth(&auth) else {
+        return Ok(());
+    };
+    if parsed.id != active_account_id {
+        if discard_conflict {
+            return Ok(());
+        }
+        anyhow::bail!("live auth.json 属于另一个账号，请先导入当前登录或明确放弃后重试");
+    }
+    let stored = store.get_auth_json(active_account_id)?;
+    match codex_plus_core::official_accounts::official_auth_merge_decision(&stored, &auth)? {
+        codex_plus_core::official_accounts::OfficialAuthMergeDecision::KeepStored => {}
+        codex_plus_core::official_accounts::OfficialAuthMergeDecision::UseCandidate => {
+            store.replace_auth_json(active_account_id, auth)?;
+        }
+        codex_plus_core::official_accounts::OfficialAuthMergeDecision::Conflict => {
+            if !discard_conflict {
+                anyhow::bail!(
+                    "live auth.json 与账号库包含无法判定新旧的不同 refresh token，请重新登录或明确放弃 live 凭据"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sync_stored_official_auth_to_live(
+    store: &codex_plus_core::official_accounts::OfficialAccountStore,
+    home: &Path,
+    account_id: &str,
+) -> anyhow::Result<()> {
+    let auth = store.get_auth_json(account_id)?;
+    let mut bytes = serde_json::to_vec_pretty(&auth)?;
+    bytes.push(b'\n');
+    fs::create_dir_all(home)?;
+    codex_plus_core::settings::atomic_write(&home.join("auth.json"), &bytes)
+}
+
 fn settings_payload_value() -> Result<SettingsPayload, (anyhow::Error, SettingsPayload)> {
     let store = SettingsStore::default();
     let settings_path = codex_plus_core::paths::default_settings_path()
         .to_string_lossy()
         .to_string();
     match store.load() {
-        Ok(settings) => Ok(SettingsPayload {
-            settings,
-            settings_path,
-            user_scripts: user_script_inventory(),
-        }),
+        Ok(mut settings) => {
+            let migration = codex_plus_core::official_accounts::migrate_legacy_official_accounts(
+                &mut settings,
+                &codex_plus_core::codex_home::default_codex_home_dir(),
+            );
+            if let Err(error) = migration {
+                return Err((
+                    error,
+                    SettingsPayload {
+                        settings: settings_without_official_credentials(settings),
+                        settings_path,
+                        user_scripts: user_script_inventory(),
+                    },
+                ));
+            }
+            if migration.as_ref().is_ok_and(|result| result.changed)
+                && let Err(error) = store.save(&settings)
+            {
+                return Err((
+                    error,
+                    SettingsPayload {
+                        settings: settings_without_official_credentials(settings),
+                        settings_path,
+                        user_scripts: user_script_inventory(),
+                    },
+                ));
+            }
+            Ok(SettingsPayload {
+                settings: settings_without_official_credentials(settings),
+                settings_path,
+                user_scripts: user_script_inventory(),
+            })
+        }
         Err(error) => Err((
             error,
             SettingsPayload {
@@ -5513,12 +6272,25 @@ fn settings_payload_value() -> Result<SettingsPayload, (anyhow::Error, SettingsP
 
 fn fallback_settings_payload() -> SettingsPayload {
     SettingsPayload {
-        settings: SettingsStore::default().load().unwrap_or_default(),
+        settings: settings_without_official_credentials(
+            SettingsStore::default().load().unwrap_or_default(),
+        ),
         settings_path: codex_plus_core::paths::default_settings_path()
             .to_string_lossy()
             .to_string(),
         user_scripts: user_script_inventory(),
     }
+}
+
+fn settings_without_official_credentials(mut settings: BackendSettings) -> BackendSettings {
+    for profile in &mut settings.relay_profiles {
+        if profile.relay_mode == codex_plus_core::settings::RelayMode::Official
+            && !profile.official_mix_api_key
+        {
+            profile.auth_contents.clear();
+        }
+    }
+    settings
 }
 
 fn user_script_inventory() -> Value {
@@ -5916,6 +6688,18 @@ mod tests {
         let status = requested_launch_status(&request, "starting", "starting", 1);
 
         assert_eq!(status.codex_app, None);
+    }
+
+    #[test]
+    fn settings_payload_never_exposes_legacy_official_credentials() {
+        let mut settings = BackendSettings::default();
+        settings.relay_profiles[0].relay_mode = codex_plus_core::settings::RelayMode::Official;
+        settings.relay_profiles[0].auth_contents =
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#.to_string();
+
+        let sanitized = settings_without_official_credentials(settings);
+
+        assert!(sanitized.relay_profiles[0].auth_contents.is_empty());
     }
 
     #[test]
@@ -6449,6 +7233,7 @@ mod tests {
             aggregate_relay_profiles: vec![codex_plus_core::settings::AggregateRelayProfile {
                 id: "agg".to_string(),
                 name: "聚合供应商 1".to_string(),
+                session_provider: RelaySessionProvider::Custom,
                 strategy: codex_plus_core::settings::AggregateRelayStrategy::Failover,
                 model_mappings_enabled: true,
                 members: vec![codex_plus_core::settings::AggregateRelayMember {
@@ -6531,7 +7316,7 @@ mod tests {
     }
 
     #[test]
-    fn active_official_sync_clears_custom_provider_selection() {
+    fn active_official_sync_clears_custom_provider_selection_and_preserves_live_auth() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("config.toml"),
@@ -6564,7 +7349,7 @@ mod tests {
             parsed["model_providers"]["custom"]["base_url"].as_str(),
             Some("https://old.example/v1")
         );
-        assert!(!auth.contains("OPENAI_API_KEY"));
+        assert!(auth.contains("OPENAI_API_KEY"));
         assert!(auth.contains("auth_mode"));
     }
 
@@ -6584,7 +7369,9 @@ mod tests {
                 name: "Aggregate".to_string(),
                 session_provider: codex_plus_core::settings::RelaySessionProvider::Custom,
                 strategy: codex_plus_core::settings::AggregateRelayStrategy::Failover,
+                model_mappings_enabled: true,
                 members: Vec::new(),
+                model_mappings: Vec::new(),
             }],
             ..BackendSettings::default()
         };
@@ -7075,7 +7862,6 @@ enabled = true
         );
     }
 
-    #[test]
     /// #1972：用户误把 Codex++ 自己的 exe 选成了「Codex 应用路径」——文件选择器
     /// 只按 exe 扩展名过滤，拦不住。以前无效路径会原样存进 settings.json，而
     /// launcher 拿到显式无效 --app-path 又不回退自动探测，于是启动永久失败，

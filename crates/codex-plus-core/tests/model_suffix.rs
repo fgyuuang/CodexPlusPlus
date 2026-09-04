@@ -144,6 +144,7 @@ fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
         assert_eq!(model["service_tiers"][0]["id"], "priority");
         assert_eq!(model["supports_search_tool"], true);
         assert_eq!(model["use_responses_lite"], true);
+        assert_eq!(model["prefer_websockets"], false);
     }
 }
 

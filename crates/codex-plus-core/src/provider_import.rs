@@ -183,6 +183,7 @@ fn relay_profile_from_request(
             existing_ids,
         ),
         name: request.name.clone(),
+        integration_type: String::new(),
         model: String::new(),
         base_url: request.base_url.clone(),
         upstream_base_url: request.base_url.clone(),

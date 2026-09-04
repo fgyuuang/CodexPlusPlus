@@ -11,6 +11,8 @@ const PENDING_REMOTE_CONTROL_RECOVERY_FILE: &str = "pending-remote-control-recov
 const SKILLS_STATE_FILE: &str = "skills.json";
 const SKILLS_DIR: &str = "skills";
 const SKILL_BACKUPS_DIR: &str = "skill-backups";
+const OFFICIAL_ACCOUNTS_FILE: &str = "official-accounts.json";
+const OFFICIAL_ACCOUNT_SECRETS_FILE: &str = "official-account-secrets.json";
 
 pub fn default_app_state_dir() -> PathBuf {
     if let Some(home_dir) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
@@ -60,6 +62,14 @@ pub fn default_skills_state_path() -> PathBuf {
 /// 卸载 skill 时把源目录整体移到这里，方便反悔。不自动轮转删除。
 pub fn default_skill_backups_dir() -> PathBuf {
     default_app_state_dir().join(SKILL_BACKUPS_DIR)
+}
+
+pub fn default_official_accounts_path() -> PathBuf {
+    default_app_state_dir().join(OFFICIAL_ACCOUNTS_FILE)
+}
+
+pub fn default_official_account_secrets_path() -> PathBuf {
+    default_app_state_dir().join(OFFICIAL_ACCOUNT_SECRETS_FILE)
 }
 
 fn settings_path_for_tests() -> Option<PathBuf> {
@@ -136,5 +146,17 @@ mod tests {
         let path = default_pending_remote_control_recovery_path();
 
         assert!(path.ends_with(".codex-session-delete/pending-remote-control-recovery.json"));
+    }
+
+    #[test]
+    fn default_official_account_paths_use_app_state_directory() {
+        assert!(
+            default_official_accounts_path()
+                .ends_with(".codex-session-delete/official-accounts.json")
+        );
+        assert!(
+            default_official_account_secrets_path()
+                .ends_with(".codex-session-delete/official-account-secrets.json")
+        );
     }
 }

@@ -29,6 +29,13 @@ pub enum SelectionError {
         aggregate_id: String,
         relay_id: String,
     },
+    ExcludedMemberRelay {
+        aggregate_id: String,
+        relay_id: String,
+    },
+    UnknownDedicatedRelayModel {
+        model: String,
+    },
 }
 
 impl std::fmt::Display for SelectionError {
@@ -59,6 +66,16 @@ impl std::fmt::Display for SelectionError {
                 formatter,
                 "聚合供应商「{aggregate_id}」成员「{relay_id}」缺少 API Base URL 或 Key"
             ),
+            SelectionError::ExcludedMemberRelay {
+                aggregate_id,
+                relay_id,
+            } => write!(
+                formatter,
+                "聚合供应商「{aggregate_id}」不得调度专用直连供应商「{relay_id}」"
+            ),
+            SelectionError::UnknownDedicatedRelayModel { model } => {
+                write!(formatter, "未找到专用 API 模型「{model}」")
+            }
         }
     }
 }
@@ -82,6 +99,92 @@ impl RotationContext {
 pub enum RotationEvent {
     Success,
     Failure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixedModelRoute {
+    Official,
+    DedicatedRelay,
+    Aggregate,
+    Reject,
+}
+
+pub fn classify_mixed_model_route(
+    settings: &BackendSettings,
+    model: Option<&str>,
+) -> MixedModelRoute {
+    if settings.active_aggregate_relay_profile().is_none() {
+        return MixedModelRoute::Aggregate;
+    }
+    let official_auth_first = settings.active_relay_uses_official_login_auth();
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return if official_auth_first {
+            MixedModelRoute::Reject
+        } else {
+            MixedModelRoute::Aggregate
+        };
+    };
+    if official_auth_first && crate::aggregate_model_alias::is_trusted_official_codex_model(model) {
+        return MixedModelRoute::Official;
+    }
+    if crate::aggregate_model_alias::cliproxy_direct_api_aliases(&settings.relay_profiles)
+        .iter()
+        .any(|alias| alias.alias.eq_ignore_ascii_case(model))
+    {
+        return MixedModelRoute::DedicatedRelay;
+    }
+
+    let Some(aggregate) = settings.active_aggregate_relay_profile() else {
+        return MixedModelRoute::Reject;
+    };
+    let members = aggregate
+        .members
+        .iter()
+        .filter_map(|member| raw_relay_profile_by_id(settings, &member.relay_id).cloned())
+        .collect::<Vec<_>>();
+    let is_replacement =
+        crate::aggregate_model_alias::aggregate_replacement_model_aliases(&aggregate, &members)
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(model));
+    let aliases = crate::aggregate_model_alias::aggregate_catalog_aliases(&aggregate, &members);
+    let is_provider_alias = aliases.iter().any(|alias| {
+        alias.alias.contains(':')
+            && !alias.alias.contains('(')
+            && alias.alias.eq_ignore_ascii_case(model)
+    });
+    if is_replacement || is_provider_alias {
+        MixedModelRoute::Aggregate
+    } else if official_auth_first {
+        MixedModelRoute::Reject
+    } else {
+        MixedModelRoute::Aggregate
+    }
+}
+
+pub fn select_dedicated_relay_for_model(
+    settings: &BackendSettings,
+    model: Option<&str>,
+) -> Result<RelayProfile, SelectionError> {
+    let model = model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| SelectionError::UnknownDedicatedRelayModel {
+            model: String::new(),
+        })?;
+    let alias = crate::aggregate_model_alias::cliproxy_direct_api_aliases(&settings.relay_profiles)
+        .into_iter()
+        .find(|alias| alias.alias.eq_ignore_ascii_case(model))
+        .ok_or_else(|| SelectionError::UnknownDedicatedRelayModel {
+            model: model.to_string(),
+        })?;
+    let mut relay = raw_relay_profile_by_id(settings, &alias.relay_id)
+        .cloned()
+        .ok_or_else(|| SelectionError::UnknownDedicatedRelayModel {
+            model: model.to_string(),
+        })?;
+    relay.model_mappings.insert(alias.alias, alias.target_model);
+    relay.model_mappings_enabled = true;
+    Ok(relay)
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +449,14 @@ fn validate_aggregate_members(
                 relay_id: member.relay_id.clone(),
             });
         };
+        if crate::aggregate_model_alias::integration_is_excluded_from_aggregate(
+            &relay.integration_type,
+        ) {
+            return Err(SelectionError::ExcludedMemberRelay {
+                aggregate_id: aggregate.id.clone(),
+                relay_id: member.relay_id.clone(),
+            });
+        }
         if relay.base_url.trim().is_empty() || relay.api_key.trim().is_empty() {
             return Err(SelectionError::InvalidMemberRelay {
                 aggregate_id: aggregate.id.clone(),
@@ -382,6 +493,11 @@ fn member_pool_for_model(
         normalized_model.as_str()
     };
 
+    let explicit_dispatch_members = aggregate_dispatch_member_pool(settings, aggregate, model);
+    if !explicit_dispatch_members.is_empty() {
+        return Ok(explicit_dispatch_members);
+    }
+
     let direct_members = aggregate
         .members
         .iter()
@@ -393,11 +509,6 @@ fn member_pool_for_model(
         .collect::<Vec<_>>();
     if !direct_members.is_empty() {
         return Ok(direct_members);
-    }
-
-    let explicit_dispatch_members = aggregate_dispatch_member_pool(settings, aggregate, model);
-    if !explicit_dispatch_members.is_empty() {
-        return Ok(explicit_dispatch_members);
     }
 
     // 未声明模型目录或映射时，保持聚合的既有兜底语义：让成员自行决定
