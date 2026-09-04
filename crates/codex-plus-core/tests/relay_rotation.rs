@@ -5,6 +5,7 @@ use codex_plus_core::relay_rotation::{
 use codex_plus_core::settings::{
     AggregateRelayDispatchTarget, AggregateRelayMember, AggregateRelayModelMapping,
     AggregateRelayProfile, AggregateRelayStrategy, BackendSettings, RelayMode, RelayProfile,
+    RelaySessionProvider,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -29,6 +30,7 @@ fn aggregate(strategy: AggregateRelayStrategy) -> AggregateRelayProfile {
     AggregateRelayProfile {
         id: "agg".to_string(),
         name: "聚合".to_string(),
+        session_provider: RelaySessionProvider::Custom,
         strategy,
         model_mappings_enabled: true,
         members: vec![
@@ -53,6 +55,7 @@ fn aggregate_with_id(id: &str, strategy: AggregateRelayStrategy) -> AggregateRel
     AggregateRelayProfile {
         id: id.to_string(),
         name: "聚合".to_string(),
+        session_provider: RelaySessionProvider::Custom,
         strategy,
         model_mappings_enabled: true,
         members: vec![

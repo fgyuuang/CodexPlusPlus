@@ -42,6 +42,7 @@ export type DreamSkinThemeConfig = {
   image?: string;
   companion?: {
     dataUrl: string;
+    enabled?: boolean;
     width?: number;
     side?: "auto" | "left" | "right";
     offsetX?: number;
@@ -153,6 +154,42 @@ export type DreamSkinMarketResult = DreamSkinCommandResult<{
   cached: boolean;
   warning: string;
   themes: DreamSkinMarketTheme[];
+}>;
+
+export type DreamSkinCommunityTheme = {
+  applyCompatible: boolean;
+  authorDisplayName: string;
+  authorUserId: string;
+  displayMeta: {
+    appearance?: string;
+    colors?: Partial<DreamSkinColors>;
+    art?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  downloadCount: number;
+  id: string;
+  license: string;
+  name: string;
+  packageBytes: number;
+  packageSha256: string;
+  reviewedAt: string;
+  slug: string;
+  submittedAt: string;
+  themeId: string;
+  version: string;
+  previewUrl: string;
+  installed: boolean;
+  installedVersion: string;
+  updateAvailable: boolean;
+};
+
+export type DreamSkinCommunityResult = DreamSkinCommandResult<{
+  items: DreamSkinCommunityTheme[];
+  total: number;
+  fetchedAt: string;
+  cached: boolean;
+  warning: string;
+  installedThemeId: string;
 }>;
 
 export function defaultDreamSkinColors(): DreamSkinColors {

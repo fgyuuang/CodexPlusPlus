@@ -9,6 +9,41 @@ use serde_json::{Map, Value, json};
 
 use crate::script_market::MarketScript;
 
+/// Query the live renderer-side user-script registry through a one-shot CDP
+/// connection. This is intentionally read-only and does not touch the
+/// launcher-owned bridge websocket.
+pub async fn live_runtime_status(debug_port: u16) -> anyhow::Result<Value> {
+    let targets = crate::cdp::list_targets(debug_port).await?;
+    let target = live_runtime_target(&targets)?;
+    let websocket = target
+        .web_socket_debugger_url
+        .as_deref()
+        .context("Codex renderer has no WebSocket URL")?;
+    let response = crate::bridge::evaluate_script(
+        websocket,
+        "(() => JSON.stringify(window.__codexPlusUserScripts?.scripts || {}))()",
+    )
+    .await?;
+    parse_live_runtime_status_response(&response)
+}
+
+fn live_runtime_target(targets: &[crate::cdp::CdpTarget]) -> anyhow::Result<crate::cdp::CdpTarget> {
+    crate::cdp::pick_injectable_codex_page_target(targets)
+}
+
+fn parse_live_runtime_status_response(response: &Value) -> anyhow::Result<Value> {
+    let encoded = response
+        .pointer("/result/result/value")
+        .and_then(Value::as_str)
+        .context("user-script runtime probe returned no value")?;
+    let status: Value =
+        serde_json::from_str(encoded).context("invalid user-script runtime status JSON")?;
+    if !status.is_object() {
+        anyhow::bail!("user-script runtime status must be a JSON object");
+    }
+    Ok(status)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UserScriptConfig {
     pub enabled: bool,
@@ -176,8 +211,19 @@ impl UserScriptManager {
     }
 
     pub fn inventory(&self) -> anyhow::Result<Value> {
+        self.inventory_with_runtime_status(None)
+    }
+
+    /// Build the script inventory and, when available, merge the status recorded
+    /// by the renderer-side loader. The filesystem scan alone cannot tell
+    /// whether a script was actually evaluated, so callers that have access to
+    /// the live page should provide `window.__codexPlusUserScripts.scripts`.
+    pub fn inventory_with_runtime_status(
+        &self,
+        runtime_status: Option<&Value>,
+    ) -> anyhow::Result<Value> {
         let config = self.load_config();
-        let scripts = self.scan_scripts(&config)?;
+        let scripts = self.scan_scripts(&config, runtime_status)?;
         Ok(json!({
             "enabled": config.enabled,
             "builtin_dir": self.builtin_dir.to_string_lossy(),
@@ -203,16 +249,36 @@ impl UserScriptManager {
         Ok(blocks.join("\n"))
     }
 
-    fn scan_scripts(&self, config: &UserScriptConfig) -> anyhow::Result<Vec<Value>> {
+    fn scan_scripts(
+        &self,
+        config: &UserScriptConfig,
+        runtime_status: Option<&Value>,
+    ) -> anyhow::Result<Vec<Value>> {
+        let runtime_scripts = runtime_status
+            .and_then(|value| value.get("scripts").or(Some(value)))
+            .and_then(Value::as_object);
         Ok(self
             .scan_script_files(config)?
             .into_iter()
             .map(|script| {
                 let market = config.market.get(&script.key);
-                let status = if !config.enabled || !script.enabled {
+                let fallback_status = if !config.enabled || !script.enabled {
                     "disabled"
                 } else {
                     "not_loaded"
+                };
+                let live = runtime_scripts.and_then(|items| items.get(&script.key));
+                let status = if fallback_status == "disabled" {
+                    fallback_status
+                } else {
+                    live.and_then(|item| item.get("status").and_then(Value::as_str))
+                        .unwrap_or(fallback_status)
+                };
+                let error = if fallback_status == "disabled" {
+                    ""
+                } else {
+                    live.and_then(|item| item.get("error").and_then(Value::as_str))
+                        .unwrap_or("")
                 };
                 json!({
                     "key": script.key,
@@ -220,7 +286,7 @@ impl UserScriptManager {
                     "source": script.source,
                     "enabled": script.enabled,
                     "status": status,
-                    "error": "",
+                    "error": error,
                     "market_id": market.as_ref().map(|item| item.id.as_str()).unwrap_or(""),
                     "version": market.as_ref().map(|item| item.version.as_str()).unwrap_or(""),
                     "installed": market.is_some(),
@@ -296,6 +362,8 @@ fn wrap_script(script: &UserScriptFile, source: &str) -> String {
     format!(
         r#"
 (() => {{
+  const codexPlusIsNodeTestHarness = typeof process === "object" && !!process.versions?.node;
+  if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
   window.__codexPlusUserScripts = window.__codexPlusUserScripts || {{ scripts: {{}} }};
   const key = {key};
   window.__codexPlusUserScripts.scripts[key] = {{ key, name: {name}, source: {source_name}, status: "loading", error: "", loadedAt: new Date().toISOString() }};
@@ -396,4 +464,64 @@ fn current_unix_timestamp_string() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod runtime_status_tests {
+    use super::*;
+
+    fn target(id: &str, title: &str, url: &str, websocket: &str) -> crate::cdp::CdpTarget {
+        crate::cdp::CdpTarget {
+            id: id.to_string(),
+            target_type: "page".to_string(),
+            title: title.to_string(),
+            url: url.to_string(),
+            web_socket_debugger_url: Some(websocket.to_string()),
+        }
+    }
+
+    #[test]
+    fn parses_live_runtime_status_response() {
+        let response = json!({
+            "result": { "result": { "value": r#"{"user:test.js":{"status":"loaded","error":""}}"# } }
+        });
+
+        let status = parse_live_runtime_status_response(&response).unwrap();
+
+        assert_eq!(status["user:test.js"]["status"], "loaded");
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_live_runtime_status() {
+        assert!(parse_live_runtime_status_response(&json!({})).is_err());
+        assert!(
+            parse_live_runtime_status_response(&json!({
+                "result": { "result": { "value": "not json" } }
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_live_runtime_status_response(&json!({
+                "result": { "result": { "value": "[]" } }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn live_runtime_probe_selects_codex_page_over_manager() {
+        let targets = vec![
+            target(
+                "manager",
+                "Codex++ 管理工具",
+                "http://127.0.0.1:1420/",
+                "ws://manager",
+            ),
+            target("main", "Codex", "app://-/index.html", "ws://main"),
+        ];
+
+        let selected = live_runtime_target(&targets).unwrap();
+
+        assert_eq!(selected.id, "main");
+    }
 }

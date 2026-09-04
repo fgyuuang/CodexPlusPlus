@@ -88,12 +88,11 @@ pub fn relay_profile_from_ccs(
         protocol: provider.protocol,
         relay_mode: RelayMode::PureApi,
         official_mix_api_key: false,
+        hide_official_usage_alert: false,
         test_model: String::new(),
         config_contents: provider.config_contents.clone(),
         auth_contents: provider.auth_contents.clone(),
         use_common_config: true,
-        context_selection: crate::settings::RelayContextSelection::default(),
-        context_selection_initialized: false,
         context_window: String::new(),
         auto_compact_limit: String::new(),
         model_insert_mode: Default::default(),
@@ -106,6 +105,9 @@ pub fn relay_profile_from_ccs(
         user_agent: String::new(),
         model_mappings: Default::default(),
         model_mappings_enabled: true,
+        sub2api_enabled: false,
+        sub2api_multiplier: String::new(),
+        model_routes: Vec::new(),
     }
 }
 

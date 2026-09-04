@@ -6,14 +6,15 @@ pub mod storage;
 pub use backup::BackupStore;
 pub use markdown::{MarkdownExportService, export_markdown_from_paths};
 pub use provider_sync::{
-    ProviderSyncResult, ProviderSyncStatus, ProviderSyncTargetList, ProviderSyncTargetOption,
-    ProviderSyncTargetSource, SessionIndexCleanupApplyError, SessionIndexCleanupCandidate,
-    SessionIndexCleanupPreview, SessionIndexCleanupResult, apply_session_index_cleanup,
+    ProviderSyncAudit, ProviderSyncLockState, ProviderSyncResult, ProviderSyncStatus,
+    ProviderSyncTargetList, ProviderSyncTargetOption, ProviderSyncTargetSource,
+    SessionIndexCleanupApplyError, SessionIndexCleanupCandidate, SessionIndexCleanupPreview,
+    SessionIndexCleanupResult, apply_session_index_cleanup, inspect_provider_sync_lock,
     load_provider_sync_targets, normalize_all_session_providers_to_custom,
-    preview_session_index_cleanup, provider_sync_target_for_settings, run_provider_sync,
+    preview_session_index_cleanup, provider_sync_target_for_settings,
+    remote_control_session_recovery_candidate_exists, run_provider_sync,
     run_provider_sync_with_target,
+    run_remote_control_session_catalog_recovery_for_thread_with_target,
+    run_remote_control_session_finalization_for_thread_with_target,
 };
-pub use storage::{
-    LocalSession, SQLiteStorageAdapter, delete_local_from_paths,
-    move_codex_thread_workspace_from_paths,
-};
+pub use storage::{LocalSession, SQLiteStorageAdapter, delete_local_from_paths};
