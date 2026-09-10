@@ -339,6 +339,10 @@ export const EN_PLAIN: Record<string, string> = {
   "供应商测试": "Provider test",
   "供应商测试模型": "Provider test model",
   "供应商配置": "Provider configuration",
+  "工具切换": "Tool switcher",
+  "工具列表": "Tool list",
+  "该工具暂不可切换": "That tool cannot be switched yet",
+  "待接入": "Coming soon",
   "供应商配置可能不正确": "Provider configuration may be incorrect",
   "供应商配置已关闭": "Provider configuration disabled",
   "供应商配置总开关已关闭": "The provider configuration master switch is off",
@@ -1314,6 +1318,11 @@ export const EN_TEMPLATE: Record<string, string> = {
     "Route rule \"{0}\" priority must be an integer greater than or equal to 0.",
   "路由规则「{0}」的目标供应商必须是聚合成员，请先将其勾选为成员。":
     "Route rule \"{0}\" target provider must be an aggregate member; select it as a member first.",
+  "{0} 个模型": "{0} model(s)",
+  "{0}｜{1}｜{2} 个供应商": "{0} | {1} | {2} provider(s)",
+  "{0}｜{1}｜供应商配置尚未接入": "{0} | {1} | provider configuration not wired up yet",
+  "{0} 的供应商配置还没接入，切过去只会显示空列表。":
+    "Provider configuration for {0} is not wired up yet, so switching would only show an empty list.",
   "删除 Grok 模型「{0}」？": "Delete Grok model \"{0}\"?",
   "模型「{0}」的上下文窗口必须是大于 0 的整数。": "The context window for model \"{0}\" must be a positive integer.",
   "删除官方账号“{0}”？此操作会同时删除本机保存的加密登录信息。": "Delete official account “{0}”? This also deletes its locally encrypted login data.",
