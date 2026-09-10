@@ -421,6 +421,7 @@
   const codexThreadIdBadgeVersion = "1";
   const codexThreadServiceTierVersion = "1";
   const codexServiceTierBadgeClass = "codex-service-tier-badge";
+  const codexQuotaResumeButtonClass = "codex-plus-quota-resume-button";
   const codexServiceTierBadgeVersion = "3";
   const codexMenuLocalizationVersion = "1";
   const codexMenuLocalizationMap = new Map([
@@ -472,10 +473,11 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "9";
-  const codexAppServerModelRequestPatchVersion = "6";
+  const codexAppServerModelRequestPatchVersion = "8";
   const codexRemoteSessionRecoveryVersion = "5";
+  const codexQuotaResumeVersion = "1";
   const codexPluginMarketplaceUnlockVersion = "15";
-  const codexModelRequestBridgePatchVersion = "1";
+  const codexModelRequestBridgePatchVersion = "2";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -1213,7 +1215,7 @@
       .codex-plus-ad-link { display: inline-flex; align-items: center; justify-content: center; border-radius: 9px; background: #2563eb; color: #ffffff; font-size: 13px; font-weight: 650; text-decoration: none; padding: 8px 12px; }
       .codex-plus-ad-empty { border: 1px dashed rgba(255,255,255,.16); border-radius: 12px; color: #9ca3af; font-size: 13px; padding: 12px; text-align: center; }
       /* Keep injected surfaces on Codex's own semantic palette in both themes. */
-      :root, :where(.${moreMenuClass}, .${actionTooltipClass}, .${zedRemoteToastClass}, .codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}) {
+      :root {
         --codex-plus-bg-primary: var(--color-token-bg-primary, var(--token-bg-primary, #fff));
         --codex-plus-bg-secondary: var(--color-token-bg-secondary, var(--token-bg-secondary, #f7f7f7));
         --codex-plus-bg-elevated: var(--color-token-dropdown-background, var(--color-token-bg-elevated-secondary, var(--codex-plus-bg-primary)));
@@ -1229,6 +1231,8 @@
         --codex-plus-danger-bg: var(--color-background-danger-soft, rgba(220,38,38,.1));
         --codex-plus-success: var(--color-text-success, #15803d);
         --codex-plus-warning: var(--color-text-warning, #a16207);
+      }
+      :where(.${moreMenuClass}, .${actionTooltipClass}, .${zedRemoteToastClass}, .codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}) {
         color: var(--codex-plus-text);
         font-family: inherit;
       }
@@ -1258,6 +1262,18 @@
       .${sessionShareButtonClass}:focus-visible {
         background: var(--codex-plus-bg-hover);
         color: var(--codex-plus-text);
+      }
+      .${codexQuotaResumeButtonClass} {
+        position: relative;
+      }
+      .${codexQuotaResumeButtonClass}::after {
+        width: 0;
+        height: 0;
+        margin-left: 2px;
+        border-top: 6px solid transparent;
+        border-bottom: 6px solid transparent;
+        border-left: 10px solid currentColor;
+        content: "";
       }
       .${actionTooltipClass} {
         border-color: var(--codex-plus-border);
@@ -1395,7 +1411,7 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, capacityRetry: false, capacityRetryMaxAttempts: 5, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, capacityRetry: false, quotaResume: true, capacityRetryMaxAttempts: 5, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, answerOutline: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
@@ -1412,8 +1428,10 @@
     serviceTierControls: "codexAppServiceTierControls",
     petRealMouseLook: "codexAppPetRealMouseLook",
     stepwise: "codexAppStepwiseEnabled",
+    answerOutline: "codexAppAnswerOutlineEnabled",
     pasteFix: "codexAppPasteFix",
     capacityRetry: "codexAppCapacityRetry",
+    quotaResume: "codexAppQuotaResume",
     capacityRetryMaxAttempts: "codexAppCapacityRetryMaxAttempts",
     dreamSkinEnabled: "codexAppDreamSkinEnabled",
     dreamSkinPaused: "codexAppDreamSkinPaused",
@@ -1443,6 +1461,7 @@
         markdownExport: false,
         pasteFix: false,
         capacityRetry: false,
+        quotaResume: false,
         capacityRetryMaxAttempts: 5,
         projectMove: false,
         threadIdBadge: false,
@@ -1455,6 +1474,7 @@
         serviceTierControls: false,
         petRealMouseLook: false,
         stepwise: false,
+        answerOutline: false,
         dreamSkinEnabled: false,
         dreamSkinPaused: false,
         dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {},
@@ -1568,6 +1588,427 @@
     } else if (status?.phase === "recovered") {
       showToast(`模型容量已恢复，任务继续（Codex++ 已重试 ${attempt} 次）`, null);
     }
+  }
+
+  function codexQuotaResumeTextHasMarker(text) {
+    const normalized = String(text || "").toLowerCase();
+    return /usage[\s_-]*(?:limit|quota)|usage_limit_exceeded|insufficient[\s_-]*quota|quota[\s_-]*(?:exceeded|exhausted)|rate[\s_-]*limit(?:s|ed|ing)?|too[\s_-]*many[\s_-]*requests|http\s*429|billing[\s_-]*(?:limit|quota|hard[\s_-]*limit)|credit(?:s)?[\s_-]*(?:exhausted|insufficient|limit)|额度不足|额度已用完|配额不足|配额已用完|余额不足|限流|请求过于频繁|请求频率(?:过高|受限)/.test(normalized);
+  }
+
+  function codexQuotaResumeValueHasMarker(value, depth = 0, key = "") {
+    if (depth > 12 || value === null || value === undefined) return false;
+    if (typeof value === "string") return codexQuotaResumeTextHasMarker(value);
+    if (typeof value === "number") {
+      return value === 429 && /^(?:status|statuscode|httpstatus|code)$/i.test(String(key || ""));
+    }
+    if (Array.isArray(value)) {
+      return value.some((entry) => codexQuotaResumeValueHasMarker(entry, depth + 1, key));
+    }
+    if (typeof value !== "object") return false;
+    if (codexQuotaResumeTextHasMarker(value.message) || codexQuotaResumeTextHasMarker(value.name)) return true;
+    return Object.entries(value).some(([entryKey, entry]) =>
+      codexQuotaResumeValueHasMarker(entry, depth + 1, entryKey),
+    );
+  }
+
+  const codexQuotaResumeParamKeys = [
+    "cwd",
+    "approvalPolicy",
+    "approval_policy",
+    "sandboxPolicy",
+    "sandbox_policy",
+    "model",
+    "modelProvider",
+    "model_provider",
+    "serviceTier",
+    "service_tier",
+    "effort",
+    "reasoningEffort",
+    "reasoning_effort",
+    "personality",
+    "collaborationMode",
+    "collaboration_mode",
+    "summary",
+    "outputSchema",
+    "output_schema",
+  ];
+
+  function codexQuotaResumeTurnTemplate(params, threadIdHint = "") {
+    if (!params || typeof params !== "object" || Array.isArray(params)) return null;
+    const threadId = validThreadScrollSessionKey(
+      params.threadId || params.conversationId || threadIdHint || currentSessionRef().session_id,
+    );
+    if (!threadId) return null;
+    const template = { threadId };
+    for (const key of codexQuotaResumeParamKeys) {
+      if (Object.prototype.hasOwnProperty.call(params, key)) template[key] = params[key];
+    }
+    return template;
+  }
+
+  function codexQuotaResumeRuntime() {
+    const existing = window.__codexPlusQuotaResumeRuntime;
+    if (existing?.version === codexQuotaResumeVersion) return existing;
+    const runtime = {
+      version: codexQuotaResumeVersion,
+      pending: new Map(),
+      active: new Set(),
+      inFlight: new Set(),
+      templates: new Map(),
+      clients: new Map(),
+      lastClient: null,
+    };
+    window.__codexPlusQuotaResumeRuntime = runtime;
+    return runtime;
+  }
+
+  function trimCodexQuotaResumeMap(map, maxEntries = 80) {
+    while (map.size > maxEntries) map.delete(map.keys().next().value);
+  }
+
+  function rememberCodexQuotaResumeTurnRequest(client, params, threadIdHint = "") {
+    if (!codexPlusSettings().quotaResume) return null;
+    const template = codexQuotaResumeTurnTemplate(params, threadIdHint);
+    if (!template) return null;
+    const runtime = codexQuotaResumeRuntime();
+    runtime.templates.delete(template.threadId);
+    runtime.templates.set(template.threadId, template);
+    if (client && typeof client.sendRequest === "function") {
+      runtime.clients.delete(template.threadId);
+      runtime.clients.set(template.threadId, client);
+      runtime.lastClient = client;
+    }
+    trimCodexQuotaResumeMap(runtime.templates);
+    trimCodexQuotaResumeMap(runtime.clients);
+    return template;
+  }
+
+  function mergeCodexQuotaResumeThreadSettings(client, params, threadIdHint = "") {
+    if (!codexPlusSettings().quotaResume) return null;
+    const update = codexQuotaResumeTurnTemplate(params, threadIdHint);
+    if (!update) return null;
+    const runtime = codexQuotaResumeRuntime();
+    const template = { ...(runtime.templates.get(update.threadId) || { threadId: update.threadId }), ...update };
+    runtime.templates.delete(update.threadId);
+    runtime.templates.set(update.threadId, template);
+    if (client && typeof client.sendRequest === "function") {
+      runtime.clients.delete(update.threadId);
+      runtime.clients.set(update.threadId, client);
+      runtime.lastClient = client;
+    }
+    trimCodexQuotaResumeMap(runtime.templates);
+    trimCodexQuotaResumeMap(runtime.clients);
+    return template;
+  }
+
+  function codexQuotaResumeAppServerRequestTarget(method, params) {
+    const requestMethod = appServerModelRequestMethod(String(method || ""), params);
+    if (!["turn/start", "thread/settings/update", "thread/resume"].includes(requestMethod)) return null;
+    if (String(method || "") === "send-cli-request-for-host"
+        && params?.params
+        && typeof params.params === "object"
+        && !Array.isArray(params.params)) {
+      return {
+        requestMethod,
+        params: params.params,
+        threadIdHint: params.conversationId || params.threadId || "",
+      };
+    }
+    return {
+      requestMethod,
+      params,
+      threadIdHint: params?.conversationId || params?.threadId || "",
+    };
+  }
+
+  function codexQuotaResumeTurnParamsFromMessage(message) {
+    if (!message || typeof message !== "object") return null;
+    if (message.type === "start-turn-for-host") {
+      return { params: message.params, threadIdHint: message.conversationId || message.threadId || "" };
+    }
+    if (message.type === "send-cli-request-for-host"
+        && ["turn/start", "thread/settings/update", "thread/resume"].includes(String(message.method || ""))) {
+      return {
+        method: String(message.method || ""),
+        params: message.params,
+        threadIdHint: message.conversationId || message.threadId || "",
+      };
+    }
+    if ((message.type === "mcp-request" || message.type === "worker-request")
+        && ["turn/start", "thread/settings/update", "thread/resume"].includes(String(message.request?.method || ""))) {
+      return {
+        method: String(message.request.method || ""),
+        params: message.request.params,
+        threadIdHint: message.conversationId || message.threadId || "",
+      };
+    }
+    if (message.type === "fetch" && /^vscode:\/\/codex\/(?:turn\/start|thread\/settings\/update|thread\/resume)/.test(String(message.url || ""))) {
+      let params = message.body;
+      if (typeof params === "string") {
+        try { params = JSON.parse(params); } catch { return null; }
+      }
+      return {
+        method: String(message.url).slice("vscode://codex/".length).split(/[?#]/, 1)[0],
+        params: params?.params || params,
+        threadIdHint: message.conversationId || message.threadId || "",
+      };
+    }
+    return null;
+  }
+
+  function rememberCodexQuotaResumeBridgeMessage(message) {
+    if (!codexPlusSettings().quotaResume) return null;
+    const target = codexQuotaResumeTurnParamsFromMessage(message);
+    if (!target) return null;
+    return target.method && target.method !== "turn/start"
+      ? mergeCodexQuotaResumeThreadSettings(null, target.params, target.threadIdHint)
+      : rememberCodexQuotaResumeTurnRequest(null, target.params, target.threadIdHint);
+  }
+
+  function registerCodexQuotaResumeClient(client) {
+    if (!client || typeof client.sendRequest !== "function") return;
+    codexQuotaResumeRuntime().lastClient = client;
+  }
+
+  function refreshCodexQuotaResumeSoon() {
+    requestAnimationFrame(() => {
+      try {
+        installCodexQuotaResumeButton();
+      } catch (error) {
+        sendCodexPlusDiagnostic("quota_resume_button_refresh_failed", {
+          errorName: error?.name || "",
+          errorMessage: error?.message || String(error),
+        });
+      }
+    });
+  }
+
+  function observeCodexQuotaResumeEvent(method, params) {
+    if (!codexPlusSettings().quotaResume) return false;
+    const eventMethod = String(method || "");
+    if (eventMethod !== "turn/started" && eventMethod !== "turn/completed") return false;
+    const threadId = validThreadScrollSessionKey(params?.threadId || params?.conversationId || "");
+    if (!threadId) return false;
+    const runtime = codexQuotaResumeRuntime();
+    if (eventMethod === "turn/started") {
+      runtime.active.add(threadId);
+      runtime.pending.delete(threadId);
+      runtime.inFlight.delete(threadId);
+      refreshCodexQuotaResumeSoon();
+      return true;
+    }
+    runtime.active.delete(threadId);
+    runtime.inFlight.delete(threadId);
+    const turn = params?.turn && typeof params.turn === "object" ? params.turn : {};
+    const status = String(turn.status || params?.status || "").toLowerCase();
+    const error = turn.error ?? turn.errorInfo ?? params?.error ?? params?.errorInfo ?? null;
+    if (status === "failed" && codexQuotaResumeValueHasMarker(error)) {
+      runtime.pending.delete(threadId);
+      runtime.pending.set(threadId, { at: Date.now() });
+      trimCodexQuotaResumeMap(runtime.pending);
+      sendCodexPlusDiagnostic("quota_resume_available", { threadId });
+    } else {
+      runtime.pending.delete(threadId);
+    }
+    refreshCodexQuotaResumeSoon();
+    return true;
+  }
+
+  function observeCodexQuotaResumeNotification(value) {
+    const queue = [{ value, depth: 0 }];
+    const seen = new WeakSet();
+    while (queue.length > 0) {
+      const current = queue.shift();
+      const candidate = current?.value;
+      if (!candidate || typeof candidate !== "object") continue;
+      if (seen.has(candidate)) continue;
+      seen.add(candidate);
+      const method = String(candidate.method || candidate.type || "");
+      if (observeCodexQuotaResumeEvent(method, candidate.params || candidate.payload || candidate.data || {})) return true;
+      if (current.depth >= 4) continue;
+      for (const key of ["message", "response", "detail", "data", "payload", "params", "notification"]) {
+        const nested = candidate[key];
+        if (nested && typeof nested === "object") queue.push({ value: nested, depth: current.depth + 1 });
+      }
+    }
+    return false;
+  }
+
+  function installCodexQuotaResumeListener() {
+    if (window.__codexPlusQuotaResumeListenerVersion === codexQuotaResumeVersion) return;
+    if (window.__codexPlusQuotaResumeMessageHandler) {
+      window.removeEventListener("message", window.__codexPlusQuotaResumeMessageHandler, true);
+    }
+    const handler = (event) => {
+      if (event?.source !== window) return;
+      const origin = String(event?.origin || "");
+      if (origin && origin !== "null" && origin !== window.location.origin) return;
+      observeCodexQuotaResumeNotification(event?.data);
+    };
+    window.__codexPlusQuotaResumeMessageHandler = handler;
+    window.addEventListener("message", handler, true);
+    window.__codexPlusQuotaResumeListenerVersion = codexQuotaResumeVersion;
+  }
+
+  function installCodexQuotaResumeDispatcherSubscription(dispatcher, assetPrefix = "") {
+    if (!dispatcher || typeof dispatcher.subscribe !== "function") return false;
+    if (window.__codexPlusQuotaResumeDispatcher === dispatcher
+        && window.__codexPlusQuotaResumeDispatcherVersion === codexQuotaResumeVersion) return true;
+    if (typeof window.__codexPlusQuotaResumeDispatcherUnsubscribe === "function") {
+      try { window.__codexPlusQuotaResumeDispatcherUnsubscribe(); } catch {}
+    }
+    const unsubscribers = [
+      dispatcher.subscribe("turn/started", (params) => observeCodexQuotaResumeEvent("turn/started", params)),
+      dispatcher.subscribe("turn/completed", (params) => observeCodexQuotaResumeEvent("turn/completed", params)),
+    ];
+    window.__codexPlusQuotaResumeDispatcher = dispatcher;
+    window.__codexPlusQuotaResumeDispatcherVersion = codexQuotaResumeVersion;
+    window.__codexPlusQuotaResumeDispatcherUnsubscribe = () => {
+      for (const unsubscribe of unsubscribers) {
+        if (typeof unsubscribe !== "function") continue;
+        try { unsubscribe(); } catch {}
+      }
+    };
+    sendCodexPlusDiagnostic("quota_resume_dispatcher_subscription_installed", { assetPrefix });
+    return true;
+  }
+
+  function codexQuotaResumeEditorIsEmpty(composer) {
+    const editors = Array.from(composer?.querySelectorAll?.("textarea, [contenteditable='true'], [contenteditable='']") || []);
+    const editor = editors.find(visibleElement) || editors[0];
+    if (!editor) return false;
+    const value = typeof editor.value === "string" ? editor.value : (editor.innerText || editor.textContent || "");
+    return String(value).replace(/[\u200B-\u200D\uFEFF]/g, "").trim().length === 0;
+  }
+
+  function codexQuotaResumeNativeSendButton(composer) {
+    return Array.from(composer?.querySelectorAll?.("button[aria-label]") || []).find((button) => {
+      if (!visibleElement(button) || button.classList.contains(codexQuotaResumeButtonClass)) return false;
+      const label = String(button.getAttribute("aria-label") || "").trim();
+      return /^(?:send message|send|add to queue|发送消息|发送|提交|加入队列|添加到队列)$/i.test(label);
+    }) || null;
+  }
+
+  function removeCodexQuotaResumeButtons(exceptThreadId = "") {
+    document.querySelectorAll(`.${codexQuotaResumeButtonClass}`).forEach((button) => {
+      if (exceptThreadId && button.dataset.codexPlusQuotaResumeThreadId === exceptThreadId) return;
+      const nativeButton = button.__codexPlusQuotaResumeNativeButton;
+      if (nativeButton?.isConnected) nativeButton.style.display = button.__codexPlusQuotaResumeNativeDisplay || "";
+      button.remove();
+    });
+  }
+
+  async function resumeCodexQuotaInterruptedTask(threadId) {
+    const normalizedThreadId = validThreadScrollSessionKey(threadId);
+    const runtime = codexQuotaResumeRuntime();
+    if (!normalizedThreadId || !codexPlusSettings().quotaResume
+        || !runtime.pending.has(normalizedThreadId)
+        || runtime.active.has(normalizedThreadId)
+        || runtime.inFlight.has(normalizedThreadId)) return false;
+    runtime.inFlight.add(normalizedThreadId);
+    window.setTimeout(() => {
+      if (!runtime.inFlight.has(normalizedThreadId) || runtime.active.has(normalizedThreadId)) return;
+      runtime.inFlight.delete(normalizedThreadId);
+      refreshCodexQuotaResumeSoon();
+    }, 15000);
+    refreshCodexQuotaResumeSoon();
+    try {
+      let client = runtime.clients.get(normalizedThreadId) || runtime.lastClient;
+      if (!client || typeof client.sendRequest !== "function") {
+        installAppServerModelRequestPatch();
+        if (appServerModelRequestPatchPromise) await appServerModelRequestPatchPromise;
+        client = runtime.clients.get(normalizedThreadId) || runtime.lastClient;
+      }
+      const template = runtime.templates.get(normalizedThreadId) || { threadId: normalizedThreadId };
+      const params = {
+        ...template,
+        threadId: normalizedThreadId,
+        input: [],
+        turnTrigger: "resume_interrupted_task",
+      };
+      sendCodexPlusDiagnostic("quota_resume_requested", {
+        threadId: normalizedThreadId,
+        model: String(params.model || ""),
+        modelProvider: String(params.modelProvider || params.model_provider || ""),
+        hasTemplate: runtime.templates.has(normalizedThreadId),
+      });
+      let result;
+      if (client && typeof client.sendRequest === "function") {
+        result = await client.sendRequest("turn/start", params);
+      } else {
+        const bridge = window.electronBridge;
+        if (!bridge || typeof bridge.sendMessageFromView !== "function") throw new Error("Codex app-server transport unavailable");
+        result = await bridge.sendMessageFromView({
+          type: "start-turn-for-host",
+          conversationId: normalizedThreadId,
+          params,
+        });
+      }
+      if (result?.turn?.id || result?.turnId) {
+        runtime.active.add(normalizedThreadId);
+        runtime.pending.delete(normalizedThreadId);
+        runtime.inFlight.delete(normalizedThreadId);
+      }
+      refreshCodexQuotaResumeSoon();
+      return true;
+    } catch (error) {
+      runtime.inFlight.delete(normalizedThreadId);
+      sendCodexPlusDiagnostic("quota_resume_failed", {
+        threadId: normalizedThreadId,
+        errorName: error?.name || "",
+        errorMessage: error?.message || String(error),
+      });
+      showToast("继续任务失败，请稍后重试", null);
+      refreshCodexQuotaResumeSoon();
+      return false;
+    }
+  }
+
+  function installCodexQuotaResumeButton() {
+    const runtime = codexQuotaResumeRuntime();
+    const threadId = validThreadScrollSessionKey(currentSessionRef().session_id);
+    const eligible = codexPlusSettings().quotaResume
+      && !!threadId
+      && runtime.pending.has(threadId)
+      && !runtime.active.has(threadId);
+    if (!eligible) {
+      removeCodexQuotaResumeButtons();
+      return;
+    }
+    const composer = codexServiceTierFindComposerEl();
+    if (!composer || !codexQuotaResumeEditorIsEmpty(composer)) {
+      removeCodexQuotaResumeButtons();
+      return;
+    }
+    removeCodexQuotaResumeButtons(threadId);
+    const existing = document.querySelector(`.${codexQuotaResumeButtonClass}[data-codex-plus-quota-resume-thread-id="${CSS.escape(threadId)}"]`);
+    const existingNativeButton = existing?.__codexPlusQuotaResumeNativeButton;
+    const existingNativeLabel = String(existingNativeButton?.getAttribute?.("aria-label") || "").trim();
+    if (existingNativeButton?.isConnected && existingNativeButton.disabled
+        && /^(?:send message|send|add to queue|发送消息|发送|提交|加入队列|添加到队列)$/i.test(existingNativeLabel)) {
+      existing.disabled = runtime.inFlight.has(threadId);
+      existing.toggleAttribute("aria-busy", runtime.inFlight.has(threadId));
+      return;
+    }
+    removeCodexQuotaResumeButtons();
+    const nativeButton = codexQuotaResumeNativeSendButton(composer);
+    if (!nativeButton || !nativeButton.disabled || !nativeButton.parentElement) return;
+    const resumeButton = nativeButton.cloneNode(false);
+    resumeButton.classList.add(codexQuotaResumeButtonClass);
+    resumeButton.dataset.codexPlusQuotaResumeThreadId = threadId;
+    resumeButton.type = "button";
+    resumeButton.disabled = runtime.inFlight.has(threadId);
+    resumeButton.setAttribute("aria-label", "继续任务");
+    resumeButton.title = "继续任务";
+    resumeButton.__codexPlusQuotaResumeNativeButton = nativeButton;
+    resumeButton.__codexPlusQuotaResumeNativeDisplay = nativeButton.style.display;
+    resumeButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void resumeCodexQuotaInterruptedTask(threadId);
+    });
+    nativeButton.insertAdjacentElement("afterend", resumeButton);
+    nativeButton.style.display = "none";
   }
 
   function isCodexResponsesFetchRequest(input, init) {
@@ -2471,9 +2912,10 @@
     const backendKey = codexPlusBackendSettingMap[key];
     if (backendKey) {
       if (key === "stepwise") syncStepwisePanel(value);
+      if (key === "answerOutline") syncStepwisePanel(undefined, value);
       void setBackendSetting(backendKey, value).then(() => {
-        if (key === "stepwise") {
-          Promise.resolve(window.__codexStepwisePanel?.loadSettings?.()).then(() => syncStepwisePanel(value));
+        if (key === "stepwise" || key === "answerOutline") {
+          Promise.resolve(window.__codexStepwisePanel?.loadSettings?.()).then(() => syncStepwisePanel());
         }
       }).catch(() => {
         void loadBackendSettings();
@@ -2512,9 +2954,15 @@
     scan();
   }
 
-  function syncStepwisePanel(enabled = codexPlusSettings().stepwise) {
+  function syncStepwisePanel(
+    enabled = codexPlusSettings().stepwise,
+    answerOutlineEnabled = codexPlusSettings().answerOutline
+  ) {
     try {
-      window.__codexStepwisePanel?.syncSettings?.({ enabled: !!enabled });
+      window.__codexStepwisePanel?.syncSettings?.({
+        enabled: !!enabled,
+        answerOutlineEnabled: !!answerOutlineEnabled,
+      });
     } catch (error) {
       sendCodexPlusDiagnostic("stepwise_sync_failed", {
         errorName: error?.name || "",
@@ -3593,14 +4041,16 @@
       || codexModelCatalog?.codexModelProvider
       || codexModelCatalog?.model_provider
       || codexModelCatalog?.modelProvider
+      || (String(profile?.relayMode || "") === "pureApi" ? "custom" : "")
       || ""
     ).trim();
   }
 
   function codexRemoteSessionProviderRequestMethod(method) {
+    // app-server restores persisted model/provider/reasoning for thread/resume only
+    // when the caller supplies none of those overrides.
     return [
       "thread/start",
-      "thread/resume",
       "start-conversation",
       "start-thread-for-host",
       "thread-prewarm-start",
@@ -3616,8 +4066,7 @@
     if (!params || typeof params !== "object" || Array.isArray(params)) return params;
     const profile = codexRemoteSessionActiveProfile();
     const pureApi = String(profile?.relayMode || "") === "pureApi";
-    const isExtendedPureApiRequest = requestMethod === "thread/resume" || requestMethod === "turn/start";
-    if (isExtendedPureApiRequest && !pureApi) return params;
+    if (requestMethod === "turn/start" && !pureApi) return params;
     const hasModelProvider = Object.prototype.hasOwnProperty.call(params, "modelProvider")
       || Object.prototype.hasOwnProperty.call(params, "model_provider");
     if (requestMethod === "turn/start" && !hasModelProvider) return params;
@@ -3976,6 +4425,7 @@
           return dispatchCodexPlusMessage(dispatcher, type, payload);
         };
         installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix);
+        installCodexQuotaResumeDispatcherSubscription(dispatcher, assetPrefix);
         window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
         serviceTierDispatcherPatchMissCount = 0;
         sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", { assetPrefix });
@@ -4490,8 +4940,12 @@
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="petRealMouseLook"><span></span></button>
             </div>` : ""}
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Stepwise</div><div class="codex-plus-row-description">在当前 Codex 页面显示可拖动的下一步建议浮层，可在设置页配置模型和直接发送。启停后需重启 Codex++ 生效。</div></div>
+              <div><div class="codex-plus-row-title">悬浮球 · Stepwise</div><div class="codex-plus-row-description">生成下一步建议。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
+            </div>
+            <div class="codex-plus-row">
+              <div><div class="codex-plus-row-title">悬浮球 · 回答大纲</div><div class="codex-plus-row-description">整理回答结构。</div></div>
+              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="answerOutline"><span></span></button>
             </div>
             <div class="codex-plus-row" data-codex-service-tier-controls="true">
               <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承优先读取 Codex 应用内设置，其次读取 config.toml 的 service_tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
@@ -4606,6 +5060,7 @@
       event.preventDefault();
       event.stopPropagation();
       overlay.remove();
+      if (pageMode) setCodexPlusSidebarNavActive(false);
     }, true);
     overlay.addEventListener("input", (event) => {
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
@@ -4746,6 +5201,26 @@
     setCodexPlusSidebarNavActive(false);
   }
 
+  function closeCodexPlusPageAfterNativeNavigation() {
+    clearTimeout(window.__codexPlusPageNavigationCloseTimer);
+    window.__codexPlusPageNavigationCloseTimer = setTimeout(() => {
+      window.__codexPlusPageNavigationCloseTimer = null;
+      closeCodexPlusPage();
+    }, 0);
+  }
+
+  function installCodexPlusPageNavigationCloseHandler() {
+    document.removeEventListener("click", window.__codexPlusPageNavigationCloseHandler, true);
+    window.__codexPlusPageNavigationCloseHandler = (event) => {
+      if (!document.querySelector(`.${codexPlusPageClass}`)) return;
+      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      if (!target?.closest(selectors.sidebarThread)) return;
+      // Let Codex's own click handler update its route before removing our page.
+      closeCodexPlusPageAfterNativeNavigation();
+    };
+    document.addEventListener("click", window.__codexPlusPageNavigationCloseHandler, true);
+  }
+
   function installCodexPlusSidebarNavigation() {
     document.querySelectorAll(`#${codexPlusMenuId}, [data-codex-plus-menu="true"]`).forEach((node) => node.remove());
     const navigation = document.querySelector('aside.app-shell-left-panel nav[role="navigation"], nav[role="navigation"]');
@@ -4765,7 +5240,7 @@
       navigation.addEventListener("click", (event) => {
         const target = event.target instanceof Element ? event.target : event.target?.parentElement;
         if (target?.closest(`#${codexPlusSidebarNavId}`)) return;
-        if (target?.closest("button, a")) closeCodexPlusPage();
+        if (target?.closest("button, a")) closeCodexPlusPageAfterNativeNavigation();
       }, true);
     }
     let wrapper = document.getElementById(codexPlusSidebarNavId);
@@ -6915,7 +7390,7 @@
   }
 
   function installCodexModelRequestBridgePatch() {
-    if (!codexPlusModelUnlockEnabled()) return;
+    if (!codexPlusModelUnlockEnabled() && !codexPlusSettings().quotaResume) return;
     const bridge = window.electronBridge;
     if (!bridge || typeof bridge.sendMessageFromView !== "function") return;
     if (bridge.__codexPlusModelRequestBridgePatch === codexModelRequestBridgePatchVersion) return;
@@ -6923,7 +7398,10 @@
     bridge.sendMessageFromView = function codexPlusModelPatchedSendMessageFromView(message) {
       let nextMessage = message;
       try {
-        nextMessage = patchCodexModelReasoningRequestMessage(message);
+        if (codexPlusModelUnlockEnabled()) {
+          nextMessage = patchCodexModelReasoningRequestMessage(message);
+        }
+        rememberCodexQuotaResumeBridgeMessage(nextMessage);
       } catch (error) {
         sendCodexPlusDiagnostic("model_reasoning_bridge_patch_failed", {
           errorName: error?.name || "",
@@ -6987,7 +7465,7 @@
       displayName: displaySuffix && !displayName.endsWith(displaySuffix) ? `${displayName}${displaySuffix}` : displayName,
       description: metadata?.description || codexModelCatalog.provider_name || codexModelCatalog.model_provider || "Custom model",
       hidden: false,
-      isDefault: (codexModelCatalog.default_model || codexModelCatalog.model) === modelName,
+      isDefault: false,
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "medium",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
       ...(Array.isArray(metadata?.additionalSpeedTiers)
@@ -7102,13 +7580,6 @@
       value.hidden_models = value.hidden_models.filter((name) => !names.includes(name));
       if (value.hidden_models.length !== before) changed = true;
     }
-    if (value.defaultModel == null && names.length > 0) {
-      value.defaultModel = codexPlusModelDescriptor(names[0]);
-      changed = true;
-    } else if (typeof value.defaultModel === "string" && names.includes(value.defaultModel) && value.model == null) {
-      value.model = value.defaultModel;
-      changed = true;
-    }
     return changed;
   }
 
@@ -7175,12 +7646,8 @@
         changed = true;
       }
     });
-    const nextValue = {
-      ...value,
-      available_models: availableModels,
-      default_model: names[0] || value.default_model,
-    };
-    if (!changed && nextValue.default_model === value.default_model) return config;
+    if (!changed) return config;
+    const nextValue = { ...value, available_models: availableModels };
     try {
       config.value = nextValue;
     } catch {
@@ -7293,11 +7760,62 @@
     return result;
   }
 
+  function codexPerModelContextEnabled() {
+    const profile = codexRemoteSessionActiveProfile();
+    if (!profile) return false;
+    return [profile.modelWindows, profile.modelAutoCompact, profile.modelMetadata]
+      .some((value) => typeof value === "string" && value.trim() && value.trim() !== "{}");
+  }
+
+  function codexThreadModelRequestState(method, params, result) {
+    const requestMethod = String(method || "");
+    const threadId = String(
+      params?.threadId
+      || params?.conversationId
+      || result?.thread?.id
+      || result?.threadId
+      || ""
+    ).trim();
+    const model = String(params?.model || result?.thread?.model || "").trim();
+    return { requestMethod, threadId, model };
+  }
+
+  async function refreshCodexThreadModelBeforeTurn(client, originalSendRequest, method, params, options) {
+    if (String(method || "") !== "turn/start" || !codexPerModelContextEnabled()) return null;
+    const { threadId, model } = codexThreadModelRequestState(method, params);
+    if (!threadId || !model) return null;
+    const previousModel = client.__codexPlusThreadModels?.get(threadId) || "";
+    if (!previousModel || previousModel === model) return null;
+    let resumeParams = { threadId, model };
+    resumeParams = applyCodexRemoteSessionProviderOverride("thread/resume", resumeParams);
+    try {
+      await originalSendRequest("thread/resume", resumeParams, options);
+      client.__codexPlusThreadModels.set(threadId, model);
+      sendCodexPlusDiagnostic("thread_model_context_refreshed", {
+        threadId,
+        from: previousModel,
+        to: model,
+      });
+      return true;
+    } catch (error) {
+      sendCodexPlusDiagnostic("thread_model_context_refresh_failed", {
+        threadId,
+        from: previousModel,
+        to: model,
+        errorName: error?.name || "",
+        errorMessage: error?.message || String(error),
+      });
+      return false;
+    }
+  }
+
   function patchAppServerModelRequestClient(client) {
     if (!client || typeof client.sendRequest !== "function") return false;
     if (client.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
     const originalSendRequest = client.__codexPlusModelOriginalSendRequest || client.sendRequest.bind(client);
     client.__codexPlusModelOriginalSendRequest = originalSendRequest;
+    client.__codexPlusThreadModels = client.__codexPlusThreadModels || new Map();
+    registerCodexQuotaResumeClient(client);
     client.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
       let providerRefreshFailed = false;
@@ -7317,7 +7835,50 @@
       const nextParams = providerRefreshFailed
         ? params
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
-      const result = await originalSendRequest(method, nextParams, options);
+      const quotaResumeTarget = codexQuotaResumeAppServerRequestTarget(method, nextParams);
+      if (quotaResumeTarget?.requestMethod === "turn/start") {
+        rememberCodexQuotaResumeTurnRequest(
+          client,
+          quotaResumeTarget.params,
+          quotaResumeTarget.threadIdHint,
+        );
+      } else if (quotaResumeTarget) {
+        mergeCodexQuotaResumeThreadSettings(
+          client,
+          quotaResumeTarget.params,
+          quotaResumeTarget.threadIdHint,
+        );
+      }
+      const modelContextRefresh = await refreshCodexThreadModelBeforeTurn(
+        client,
+        originalSendRequest,
+        method,
+        nextParams,
+        options
+      );
+      let result;
+      try {
+        result = await originalSendRequest(method, nextParams, options);
+      } catch (error) {
+        if (requestMethod === "turn/start" && codexQuotaResumeValueHasMarker(error)) {
+          const failedTurnParams = quotaResumeTarget?.params;
+          const threadId = validThreadScrollSessionKey(failedTurnParams?.threadId || failedTurnParams?.conversationId || "");
+          if (threadId) {
+            const runtime = codexQuotaResumeRuntime();
+            runtime.active.delete(threadId);
+            runtime.inFlight.delete(threadId);
+            runtime.pending.set(threadId, { at: Date.now() });
+            trimCodexQuotaResumeMap(runtime.pending);
+            refreshCodexQuotaResumeSoon();
+          }
+        }
+        throw error;
+      }
+      const threadState = codexThreadModelRequestState(requestMethod, nextParams, result);
+      if (modelContextRefresh !== false && threadState.threadId && threadState.model
+          && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
+        client.__codexPlusThreadModels.set(threadState.threadId, threadState.model);
+      }
       if (!codexPlusModelUnlockEnabled()) return result;
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
       return patchAppServerModelResult(requestMethod, result);
@@ -7333,7 +7894,7 @@
   let appServerModelRequestPatchRetryTimer = 0;
 
   function scheduleAppServerModelRequestPatchRetry() {
-    if (!codexRemoteSessionProviderPatchEnabled()) return;
+    if (!codexRemoteSessionProviderPatchEnabled() && !codexPlusSettings().quotaResume) return;
     if (appServerModelRequestPatchRetryTimer) return;
     appServerModelRequestPatchRetryTimer = window.setTimeout(() => {
       appServerModelRequestPatchRetryTimer = 0;
@@ -7356,6 +7917,10 @@
       sendCodexPlusDiagnostic(event, detail);
     }
     if (codexRemoteSessionProviderPatchEnabled()) {
+      scheduleAppServerModelRequestPatchRetry();
+      return;
+    }
+    if (codexPlusSettings().quotaResume && appServerModelRequestPatchMissCount < appServerModelRequestPatchMaxMisses) {
       scheduleAppServerModelRequestPatchRetry();
       return;
     }
@@ -7420,7 +7985,8 @@
 
   function ensureCodexModelWhitelistInstalls() {
     if (codexPlusModelUnlockEnabled()
-        || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())) {
+        || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
+        || codexPlusSettings().quotaResume) {
       installAppServerModelRequestPatch();
     }
     void installDictationSupportPatch();
@@ -9773,13 +10339,19 @@
     refreshOfficialUsageAlertVisibility();
     installCodexServiceTierDispatcherPatch();
     installCodexRemoteSessionRecoveryListener();
+    installCodexQuotaResumeListener();
     if (window.__codexPlusRemoteSessionRecoveryDispatcher) {
       installCodexRemoteSessionDispatcherSubscription(
         window.__codexPlusRemoteSessionRecoveryDispatcher,
         "existing-renderer"
       );
+      installCodexQuotaResumeDispatcherSubscription(
+        window.__codexPlusRemoteSessionRecoveryDispatcher,
+        "existing-renderer"
+      );
     }
     installCodexPlusSidebarNavigation();
+    installCodexPlusPageNavigationCloseHandler();
     installSessionShareImportListener();
     localizeCodexMenus();
     scheduleBackendHeartbeat();
@@ -10734,6 +11306,7 @@
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
     installCodexServiceTierBadge();
+    installCodexQuotaResumeButton();
     installSessionShareButton();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
@@ -10755,7 +11328,7 @@
   }
 
   function isExtensionUiNode(node) {
-    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, .${codexServiceTierBadgeClass}, .${sessionShareButtonClass}, .codex-zed-remote-button, .codex-zed-remote-toast, .${sessionCopyMenuItemClass}, #codex-plus-menu`);
+    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, .${codexServiceTierBadgeClass}, .${codexQuotaResumeButtonClass}, .${sessionShareButtonClass}, .codex-zed-remote-button, .codex-zed-remote-toast, .${sessionCopyMenuItemClass}, #codex-plus-menu`);
   }
 
   function scanRelevantSelector() {

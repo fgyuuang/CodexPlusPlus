@@ -5,7 +5,7 @@
 ## 项目概述
 
 本仓库是 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 fork。
-当前版本 v1.2.42，本地分支 `codex/fix-plugin-marketplace-persistence`。
+当前版本 v1.2.56，本地分支 `codex/Manage-multiple-official-accounts`。
 
 本地扩展了聚合供应商路由与模型别名、认证与会话隔离、插件市场保留等功能，
 详见 `docs/local-features.md` —— 每次上游合并后必须逐条确认回归。
@@ -73,6 +73,8 @@
 - 官方登录混合模式的 `model_provider = "custom"` 是本地协议代理的传输标识，不代表官方裸模型被发往第三方；不得仅为界面显示把混合会话强制改写成 `openai`，否则恢复会话可能绕过聚合代理
 - 官方内置 `image_gen` 的 `/v1/images/generations` 与 `/v1/images/edits` 必须使用所选 ChatGPT 登录直通 `https://chatgpt.com/backend-api/codex/images/*`；不得使用 `experimental_bearer_token`、供应商轮转或 failover，也不得把请求正文、提示词、图像数据或认证头写入日志
 - 由 CodexPlusPlus 生成并指向本地 HTTP 协议代理的 model catalog 必须设置 `prefer_websockets = false`，防止 Codex 对不支持 WebSocket 的本地代理重复握手后误入供应商路径
+- 外接模型不论名称默认先设置 `tool_mode = "code_mode_only"`，包括 `Chat ECNU:ecnu-reasoner` 及 DeepSeek V4；只保留显式非空的其他模式，不得因能力探测尚未完成而预先退化到普通 MCP/传统工具体验
+- 额度、配额或限流导致任务停止后的继续必须使用 app-server 原生空回合：`turn/start`、`input = []`、`turnTrigger = "resume_interrupted_task"`；不得填入“继续”或模拟键盘发送。继续回合必须保留外接模型的 model/provider/reasoning/cwd/permissions，上述功能默认开启
 - Codex 模型列表内切换模型时，必须在新版 `electronBridge.sendMessageFromView` 请求层校验目标模型的 reasoning effort；官方 `gpt-5.6-sol/terra/luna` 在目录尚未加载时仍须保留各自内置能力，供应商模型不得继承不支持的 `max/ultra`
 - 流式供应商或聚合请求失败、非 2xx、断流或缺少终止事件时，协议代理必须返回合法 `response.failed` SSE 并记录 `helper.protocol_proxy_stream_failed`；不得把异常流记录为成功，也不得因此导致 thread agent loop 死亡
 

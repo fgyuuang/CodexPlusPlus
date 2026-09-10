@@ -13,6 +13,7 @@ const SKILLS_DIR: &str = "skills";
 const SKILL_BACKUPS_DIR: &str = "skill-backups";
 const OFFICIAL_ACCOUNTS_FILE: &str = "official-accounts.json";
 const OFFICIAL_ACCOUNT_SECRETS_FILE: &str = "official-account-secrets.json";
+const PENDING_MANAGER_NAVIGATION_FILE: &str = "pending-manager-navigation.json";
 
 pub fn default_app_state_dir() -> PathBuf {
     if let Some(home_dir) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
@@ -70,6 +71,10 @@ pub fn default_official_accounts_path() -> PathBuf {
 
 pub fn default_official_account_secrets_path() -> PathBuf {
     default_app_state_dir().join(OFFICIAL_ACCOUNT_SECRETS_FILE)
+}
+
+pub fn default_pending_manager_navigation_path() -> PathBuf {
+    default_app_state_dir().join(PENDING_MANAGER_NAVIGATION_FILE)
 }
 
 fn settings_path_for_tests() -> Option<PathBuf> {
@@ -158,5 +163,12 @@ mod tests {
             default_official_account_secrets_path()
                 .ends_with(".codex-session-delete/official-account-secrets.json")
         );
+    }
+
+    #[test]
+    fn default_pending_manager_navigation_path_uses_app_state_directory() {
+        let path = default_pending_manager_navigation_path();
+
+        assert!(path.ends_with(".codex-session-delete/pending-manager-navigation.json"));
     }
 }

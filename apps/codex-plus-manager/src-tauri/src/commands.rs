@@ -253,6 +253,8 @@ pub struct RemotePluginMarketplacePayload {
 #[serde(rename_all = "camelCase")]
 pub struct CcsProvidersPayload {
     pub db_path: String,
+    pub configured_db_path: String,
+    pub fallback_reason: Option<String>,
     pub providers: Vec<codex_plus_core::ccs_import::CcsProviderImport>,
 }
 
@@ -619,6 +621,13 @@ pub fn startup_options() -> CommandResult<StartupPayload> {
             show_update: startup_should_show_update(),
         },
     )
+}
+
+#[tauri::command]
+pub fn consume_pending_manager_navigation()
+-> Result<Option<codex_plus_core::manager_navigation::ManagerNavigationIntent>, String> {
+    codex_plus_core::manager_navigation::consume_pending_manager_navigation()
+        .map_err(|error| error.to_string())
 }
 
 pub fn startup_should_show_update() -> bool {
@@ -2584,22 +2593,28 @@ fn dream_skin_content_type(path: &Path) -> &'static str {
 
 #[tauri::command]
 pub fn load_ccs_providers() -> CommandResult<CcsProvidersPayload> {
-    let db_path = codex_plus_core::ccs_import::default_ccs_db_path();
-    match codex_plus_core::ccs_import::list_codex_providers_from_db(&db_path) {
-        Ok(providers) => ok(
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    match codex_plus_core::ccs_import::resolve_codex_provider_source(&settings.ccs_db_path) {
+        Ok(source) => ok(
             &format!(
                 "已读取 cc-switch Codex 供应商配置：{} 个。",
-                providers.len()
+                source.providers.len()
             ),
             CcsProvidersPayload {
-                db_path: db_path.to_string_lossy().to_string(),
-                providers,
+                db_path: source.db_path.to_string_lossy().to_string(),
+                configured_db_path: source.configured_db_path,
+                fallback_reason: source.fallback_reason,
+                providers: source.providers,
             },
         ),
         Err(error) => failed(
             &format!("读取 cc-switch 供应商配置失败：{error}"),
             CcsProvidersPayload {
-                db_path: db_path.to_string_lossy().to_string(),
+                db_path: codex_plus_core::ccs_import::default_ccs_db_path()
+                    .to_string_lossy()
+                    .to_string(),
+                configured_db_path: settings.ccs_db_path,
+                fallback_reason: None,
                 providers: Vec::new(),
             },
         ),
@@ -2608,16 +2623,17 @@ pub fn load_ccs_providers() -> CommandResult<CcsProvidersPayload> {
 
 #[tauri::command]
 pub fn import_ccs_providers() -> CommandResult<SettingsPayload> {
-    let providers = match codex_plus_core::ccs_import::list_codex_providers_from_default_db() {
-        Ok(providers) => providers,
-        Err(error) => {
-            let payload = settings_payload_value().unwrap_or_else(|(_, payload)| payload);
-            return failed(&format!("读取 cc-switch 供应商配置失败：{error}"), payload);
-        }
-    };
-
     let store = SettingsStore::default();
     let mut settings = store.load().unwrap_or_default();
+    let providers =
+        match codex_plus_core::ccs_import::resolve_codex_provider_source(&settings.ccs_db_path) {
+            Ok(source) => source.providers,
+            Err(error) => {
+                let payload = settings_payload_value().unwrap_or_else(|(_, payload)| payload);
+                return failed(&format!("读取 cc-switch 供应商配置失败：{error}"), payload);
+            }
+        };
+
     let mut existing_keys: Vec<String> = settings
         .relay_profiles
         .iter()
@@ -5200,22 +5216,24 @@ pub async fn diagnose_relay_profile(profile: RelayProfile) -> CommandResult<Prov
     if codex_plus_core::relay_config::relay_profile_base_url(&profile)
         .trim()
         .is_empty()
-        || codex_plus_core::relay_config::relay_profile_api_key(&profile)
-            .trim()
-            .is_empty()
+        || (!profile.uses_no_auth()
+            && codex_plus_core::relay_config::relay_profile_api_key(&profile)
+                .trim()
+                .is_empty())
     {
         checks.push(ProviderDoctorCheck {
             id: "config".to_string(),
             title: "配置完整性".to_string(),
             status: "failed".to_string(),
-            detail: "Base URL 或 API Key 为空。".to_string(),
+            detail: "Base URL 为空，或需要认证但 API Key 为空。".to_string(),
         });
         let payload = ProviderDoctorPayload {
             profile_name,
             model: test_model,
             summary: "配置不完整，无法发起上游诊断。".to_string(),
-            recommendation: "先填写 Base URL 和 API Key；如果是官方账号，请切换到官方登录模式。"
-                .to_string(),
+            recommendation:
+                "先填写 Base URL，并填写 API Key 或为可信上游开启无需认证；如果是官方账号，请切换到官方登录模式。"
+                    .to_string(),
             checks,
         };
         return failed("Provider Doctor：配置不完整。", payload);
@@ -5623,7 +5641,7 @@ pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
                 );
             }
             ok(
-                "纯 API 模式已写入：config.toml 已写入 custom provider，auth.json 已切换为当前供应商。",
+                "纯 API 模式已写入：config.toml 已写入 custom provider，官方 auth.json 保持不变。",
                 relay_payload(status, result.backup_path),
             )
         }
@@ -5825,6 +5843,7 @@ fn relay_switch_mutex() -> &'static Mutex<()> {
 fn empty_context_entries() -> codex_plus_core::relay_config::CodexContextEntries {
     codex_plus_core::relay_config::CodexContextEntries {
         mcp_servers: Vec::new(),
+        skills: Vec::new(),
         plugins: Vec::new(),
     }
 }
@@ -6556,6 +6575,95 @@ fn shortcut_state(shortcut: install::ShortcutState) -> PathState {
             "missing".to_string()
         },
         path: shortcut.path,
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestVlmRequest {
+    pub api_key: String,
+    pub model: String,
+    pub base_url: String,
+    pub image_data_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestVlmResult {
+    pub vlm_status: String,
+    pub http_code: Option<u16>,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+    pub description: Option<String>,
+    pub model: String,
+    pub raw_request: Option<String>,
+    pub raw_response: Option<String>,
+}
+
+/// 用表单当前 VLM 配置 + 用户上传图片（data URL）测试 VLM 可用性。
+/// 用表单当前值（未保存亦可）；失败也返回结构化 payload 供前端渲染诊断。
+#[tauri::command]
+pub async fn test_vlm(request: TestVlmRequest) -> CommandResult<TestVlmResult> {
+    // 加固 spec §4.1 第二道门：前端校验可被绕过（IPC 直调），类型与大小在
+    // 信任边界重新校验；非法输入不发起网络请求。
+    if let Err(reason) = codex_plus_core::vision::validate_image_data_url(&request.image_data_url) {
+        return failed(
+            "VLM 测试失败：invalid_image",
+            TestVlmResult {
+                vlm_status: "invalid_image".to_string(),
+                http_code: None,
+                duration_ms: 0,
+                error: Some(reason),
+                description: None,
+                model: request.model,
+                raw_request: None,
+                raw_response: None,
+            },
+        );
+    }
+    let config = codex_plus_core::vision::VlmConfig {
+        api_key: request.api_key,
+        model: request.model.clone(),
+        base_url: request.base_url,
+    };
+    let client = match codex_plus_core::http_client::vlm_http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return failed(
+                &format!("VLM HTTP 客户端构建失败：{e}"),
+                TestVlmResult {
+                    vlm_status: "client_error".to_string(),
+                    http_code: None,
+                    duration_ms: 0,
+                    // 加固 spec §4.2：client_error 路径同样过脱敏，全仓库一条规则
+                    error: Some(codex_plus_core::vision::redact_secrets(
+                        &e.to_string(),
+                        &config.api_key,
+                    )),
+                    description: None,
+                    model: request.model,
+                    raw_request: None,
+                    raw_response: None,
+                },
+            );
+        }
+    };
+    let outcome =
+        codex_plus_core::vision::test_vlm_once(&config, &request.image_data_url, &client).await;
+    let result = TestVlmResult {
+        vlm_status: outcome.status.clone(),
+        http_code: outcome.http_code,
+        duration_ms: outcome.duration_ms,
+        error: outcome.error,
+        description: outcome.text,
+        model: request.model,
+        raw_request: outcome.raw_request,
+        raw_response: outcome.raw_response,
+    };
+    if outcome.status == "ok" {
+        ok("VLM 测试成功。", result)
+    } else {
+        failed(&format!("VLM 测试失败：{}", outcome.status), result)
     }
 }
 
@@ -7808,7 +7916,7 @@ mod tests {
     }
 
     #[test]
-    fn config_save_applies_official_deepseek_responses_compatibility() {
+    fn config_save_preserves_deepseek_responses_native_code_mode() {
         let profile = RelayProfile {
             id: "custom-deepseek".to_string(),
             base_url: "https://api.deepseek.com/".to_string(),
@@ -7826,9 +7934,7 @@ enabled = true
 
         let prepared = prepare_relay_file_contents("config", config, &profile).unwrap();
 
-        assert!(prepared.contains("unified_exec = true"));
-        assert!(prepared.contains("code_mode_only = false"));
-        assert!(prepared.contains("enabled = false"));
+        assert_eq!(prepared, config);
     }
 
     #[test]

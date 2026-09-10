@@ -22,6 +22,7 @@ pub const OFFICIAL_CHATGPT_CODEX_IMAGE_GENERATIONS_URL: &str =
     "https://chatgpt.com/backend-api/codex/images/generations";
 pub const OFFICIAL_CHATGPT_CODEX_IMAGE_EDITS_URL: &str =
     "https://chatgpt.com/backend-api/codex/images/edits";
+pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1400,7 +1401,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
                     original_user_agent,
                 ))?,
                 &endpoint,
-                relay.api_key.trim(),
+                &relay,
                 is_stream,
                 &upstream_body,
             ),
@@ -1718,6 +1719,7 @@ async fn open_official_chatgpt_responses_request(
     official_endpoint: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     normalize_responses_input_items(&mut request_json);
+    normalize_responses_tool_call_item_ids(&mut request_json);
     let capacity_retry_key = settings
         .codex_app_capacity_retry
         .then(|| capacity_retry_request_key(&request_json));
@@ -1905,15 +1907,12 @@ pub async fn open_models_proxy_request(
             "wireApi": UpstreamWireApi::Responses
         }),
     );
-    let upstream = send_upstream_request(
-        crate::http_client::proxied_client(&effective_user_agent(
-            &relay.user_agent,
-            original_user_agent,
-        ))?
-        .get(endpoint)
-        .bearer_auth(relay.api_key.trim()),
-    )
-    .await?;
+    let request = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?
+    .get(endpoint);
+    let upstream = send_upstream_request(with_relay_auth(request, &relay)).await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -1960,17 +1959,14 @@ pub async fn open_audio_transcriptions_proxy_request(
             "bodyBytes": body.len()
         }),
     );
-    let upstream = send_upstream_request(
-        crate::http_client::proxied_client(&effective_user_agent(
-            &relay.user_agent,
-            original_user_agent,
-        ))?
-        .post(endpoint)
-        .bearer_auth(relay.api_key.trim())
-        .header(reqwest::header::CONTENT_TYPE, content_type)
-        .body(body.to_vec()),
-    )
-    .await?;
+    let request = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?
+    .post(endpoint)
+    .header(reqwest::header::CONTENT_TYPE, content_type)
+    .body(body.to_vec());
+    let upstream = send_upstream_request(with_relay_auth(request, &relay)).await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -2253,7 +2249,7 @@ pub async fn open_chat_completions_proxy_request(
     if relay.base_url.trim().is_empty() {
         anyhow::bail!("Chat Completions 上游 Base URL 不能为空");
     }
-    if relay.api_key.trim().is_empty() {
+    if relay.api_key.trim().is_empty() && !relay.uses_no_auth() {
         anyhow::bail!("Chat Completions 上游 Key 不能为空");
     }
 
@@ -2268,15 +2264,17 @@ pub async fn open_chat_completions_proxy_request(
     ))?;
     let mut builder = client
         .post(chat_completions_url(&relay.base_url))
-        .bearer_auth(relay.api_key.trim())
         .header(reqwest::header::CONTENT_TYPE, "application/json");
     if is_stream {
         builder = builder
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache");
     }
-    let upstream =
-        send_upstream_request_for_responses(builder.json(&request_json), is_stream).await?;
+    let upstream = send_upstream_request_for_responses(
+        with_relay_auth(builder.json(&request_json), &relay),
+        is_stream,
+    )
+    .await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -2317,7 +2315,7 @@ async fn upstream_request_parts(
     rewrite_model_for_relay(&mut body, relay);
     if relay.protocol == RelayProtocol::Responses {
         normalize_responses_input_items(&mut body);
-        normalize_responses_custom_tool_call_ids(&mut body);
+        normalize_responses_tool_call_item_ids(&mut body);
     }
 
     // Image handling (per-model): send-as-is / strip / VLM analysis
@@ -2415,14 +2413,14 @@ fn rewrite_model_for_relay(body: &mut Value, relay: &crate::settings::RelayProfi
 fn upstream_request_builder(
     client: reqwest::Client,
     endpoint: &str,
-    api_key: &str,
+    relay: &crate::settings::RelayProfile,
     is_stream: bool,
     upstream_body: &Value,
 ) -> reqwest::RequestBuilder {
     let mut builder = client
         .post(endpoint)
-        .bearer_auth(api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
+    builder = with_relay_auth(builder, relay);
     if is_stream {
         builder = builder
             .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -2435,10 +2433,21 @@ fn validate_upstream(relay: &crate::settings::RelayProfile) -> anyhow::Result<()
     if relay.base_url.trim().is_empty() {
         anyhow::bail!("上游 Base URL 不能为空");
     }
-    if relay.api_key.trim().is_empty() {
+    if relay.api_key.trim().is_empty() && !relay.uses_no_auth() {
         anyhow::bail!("上游 Key 不能为空");
     }
     Ok(())
+}
+
+fn with_relay_auth(
+    request: reqwest::RequestBuilder,
+    relay: &crate::settings::RelayProfile,
+) -> reqwest::RequestBuilder {
+    if relay.uses_no_auth() {
+        request
+    } else {
+        request.bearer_auth(relay.api_key.trim())
+    }
 }
 
 fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
@@ -3535,36 +3544,39 @@ fn truncate_error_preview(input: &str) -> String {
     input.chars().take(ERROR_BODY_PREVIEW_LIMIT).collect()
 }
 
-fn normalize_responses_custom_tool_call_ids(body: &mut Value) {
+fn normalize_responses_tool_call_item_ids(body: &mut Value) {
     let Some(input) = body.get_mut("input") else {
         return;
     };
     match input {
         Value::Array(items) => {
             for item in items {
-                normalize_custom_tool_call_item_id(item);
+                normalize_tool_call_item_id(item);
             }
         }
-        Value::Object(_) => normalize_custom_tool_call_item_id(input),
+        Value::Object(_) => normalize_tool_call_item_id(input),
         _ => {}
     }
 }
 
-fn normalize_custom_tool_call_item_id(item: &mut Value) {
-    if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
-        return;
-    }
+fn normalize_tool_call_item_id(item: &mut Value) {
+    let expected_prefix = match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => "fc_",
+        Some("custom_tool_call") => "ctc_",
+        _ => return,
+    };
     let Some(id) = item.get("id").and_then(Value::as_str) else {
         return;
     };
-    if id.starts_with("ctc_") {
+    if id.starts_with(expected_prefix) {
         return;
     }
     let suffix = id
         .strip_prefix("fc_")
+        .or_else(|| id.strip_prefix("ctc_"))
         .or_else(|| id.strip_prefix("item_"))
         .unwrap_or(id);
-    item["id"] = json!(format!("ctc_{suffix}"));
+    item["id"] = json!(format!("{expected_prefix}{suffix}"));
 }
 
 fn append_responses_input(input: &Value, messages: &mut Vec<Value>) {

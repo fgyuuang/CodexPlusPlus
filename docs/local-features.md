@@ -15,13 +15,13 @@
 | 聚合路由 | `crates/codex-plus-core/src/relay_rotation.rs` | `classify_mixed_model_route`、`aggregate_member_pool_for_provider_alias`、`dispatch_entries`、aggregate failover 选择逻辑。混合模式必须先区分官方裸模型与供应商别名。上游行为完全不同，合并后需逐函数确认。 |
 | 官方直连代理 | `crates/codex-plus-core/src/protocol_proxy.rs` | 裸官方模型从实时 `auth.json` 读取 ChatGPT access token/account id，直连官方 Codex Responses；官方错误只有一个候选，禁止进入 aggregate failover。 |
 | 官方图像工具代理 | `crates/codex-plus-core/src/protocol_proxy.rs`、`launcher.rs` | 混合模式下把 Codex 内置 `gpt-image-2` 的 generation/edit 请求直通 ChatGPT Codex Images；不使用第三方 key，不进入聚合轮转。 |
-| 模型目录 | `crates/codex-plus-core/src/model_catalog.rs`、`aggregate_model_alias.rs` | `displaySuffix` 注入、官方模型优先排序、提供者独立模型条目（`供应商一:gpt-5.4`）生成；默认模型不得被 `composer-2.5` 等供应商专属首项抢占。 |
+| 模型目录 | `crates/codex-plus-core/src/model_catalog.rs`、`aggregate_model_alias.rs`、`model_suffix.rs` | `displaySuffix` 注入、官方模型优先排序、提供者独立模型条目（`供应商一:gpt-5.4`）生成；所有外接模型默认先使用原生 `code_mode_only`，可信官方 GPT 的 CLI/供应商别名额外继承 reasoning、Fast、工具与基础指令，未知模型不得冒充官方能力；默认模型不得被 `composer-2.5` 等供应商专属首项抢占。 |
 | 聚合数据结构 | `crates/codex-plus-core/src/settings.rs` | `AggregateRelayProfile`、`AggregateRelayMember`、`AggregateRelayModelMapping`、`AggregateRelayDispatchTarget`。 |
 | 前端聚合面板 | `apps/codex-plus-manager/src/aggregateMappings.ts` | 新文件。展示顺序、有效映射计算、提供者标签生成；列表固定为官方 `gpt-5.6-sol/terra/luna` 等模型在前，供应商模型按成员顺序在后。 |
 | 前端聚合编辑器 | `apps/codex-plus-manager/src/App.tsx` | `AggregateRelayProfileEditor`、`normalizeAggregateConfig`、`inferAggregateModelList`、`aggregateDisplayModelEntries`。 |
 | 前端测试 | `apps/codex-plus-manager/src/aggregateMappings.test.ts` | 顺序回归测试。 |
 
-**合并确认点**：检查聚合供应商保存→应用后，模型下拉是否出现带括号的正确名称、官方模型是否按 `5.6-sol → 5.6-terra → 5.6-luna → 其余模型` 排列、供应商模型是否按成员顺序排列、默认模型是否不再落到 `供应商:composer-2.5`、mappings 编辑是否可保存恢复。必须额外模拟官方请求失败，确认供应商端口没有收到请求；供应商的 `gpt-5.2` 等模型只能显示为括号别名或 `供应商:模型`。
+**合并确认点**：检查聚合供应商保存→应用后，模型下拉是否出现带括号的正确名称、官方模型是否按 `5.6-sol → 5.6-terra → 5.6-luna → 其余模型` 排列、供应商模型是否按成员顺序排列、默认模型是否不再落到 `供应商:composer-2.5`、mappings 编辑是否可保存恢复。必须额外模拟官方请求失败，确认供应商端口没有收到请求；供应商的 `gpt-5.2` 等模型只能显示为括号别名或 `供应商:模型`。使用可信 GPT 别名或 `Chat ECNU:ecnu-reasoner` 等非 GPT 外接模型打开 `codex://threads/...` 时，都应先走原生 `exec`/`codex_app.read_thread` 路径，不得预先退化为反复探测普通 MCP 服务器 `codex`；端点不支持 custom tool 时再返回明确失败。
 
 ---
 
@@ -57,7 +57,7 @@ CLIProxyAPI 固定部署到 `D:\pro\CLIProxyAPI`，独立负责账号登录、OA
 | Manager 页面 | `apps/codex-plus-manager/src/App.tsx` | 展示状态、API Base URL、连接密钥、模型与测试结果；普通供应商编辑器不得改写或删除受管字段。 |
 | 独立配置 | `D:\pro\CLIProxyAPI\config\config.yaml` | 仅首次缺失时生成；已有文件不覆盖。账号维护通过 CLIProxyAPI 的 `/management.html` 完成。 |
 
-**合并确认点**：未安装或未启动 CLIProxyAPI 时原功能不受影响；受管供应商 ID 固定为 `managed-cliproxy`，API Base URL 必须包含 `/v1`。按钮1开启后，CLIProxyAPI 的官方、Gemini 等全部模型都必须进入独立直连组；按钮2关闭时顺序为“官方原生 → 聚合替换项 → CLI 全部模型 → 聚合成员模型”，按钮2开启时顺序为“官方原生 → CLI 官方模型 → 聚合替换项 → CLI 非官方模型 → 聚合成员模型”。CLI 模型必须通过受管配置直连，禁止加入聚合成员、轮转或 failover。`CLIProxyAPI:gpt-5.6-sol/terra/luna` 按各自元数据继承 Fast、默认 reasoning 和 `max/ultra` 等受支持档位；Gemini、普通供应商同名模型及不在可信清单内的模型不得继承。CLIProxyAPI 账号文件变化不得触发 Codex++ 凭据写回、额度刷新或 provider sync。
+**合并确认点**：未安装或未启动 CLIProxyAPI 时原功能不受影响；受管供应商 ID 固定为 `managed-cliproxy`，API Base URL 必须包含 `/v1`。按钮1开启后，CLIProxyAPI 的官方、Gemini 等全部模型都必须进入独立直连组；按钮2关闭时顺序为“官方原生 → 聚合替换项 → CLI 全部模型 → 聚合成员模型”，按钮2开启时顺序为“官方原生 → CLI 官方模型 → 聚合替换项 → CLI 非官方模型 → 聚合成员模型”。CLI 模型必须通过受管配置直连，禁止加入聚合成员、轮转或 failover。`CLIProxyAPI:gpt-5.6-sol/terra/luna` 按各自元数据继承 Fast、默认 reasoning 和 `max/ultra` 等受支持档位；Gemini、普通供应商同名模型及不在可信清单内的模型不得继承这些官方能力，但仍默认先尝试 `code_mode_only`。CLIProxyAPI 账号文件变化不得触发 Codex++ 凭据写回、额度刷新或 provider sync。
 
 ### 2.2 NewAPI 独立接入
 
@@ -84,6 +84,19 @@ NewAPI 保持独立部署并自行维护渠道、用户、令牌、数据库、�
 | Manager 设置 | `apps/codex-plus-manager/src/App.tsx` | “错误与重试”提供开关和 1–20 次自定义次数；次数只统计 Codex++ 内部重发。 |
 
 **合并确认点**：使用含 `response.created` / `response.in_progress` 前导事件、延迟容量失败、`model_at_capacity` 代码和 JSON 转义消息的流式用例验证。命中后日志必须出现 `protocol_proxy.capacity_retry_loop`，Codex 页面可以显示重试提示，但任务不得收到中间失败事件；成功重试后同一任务继续执行。
+
+### 2.4 额度停止后的原生空回合继续
+
+“额度停止后继续”默认开启。任务因 usage limit、quota、rate limit、billing limit、credits exhausted、HTTP 429 或对应中文额度错误停止后，如果当前输入为空且没有运行中的回合，Codex++ 在原发送按钮位置显示三角继续按钮。点击后直接调用 app-server `turn/start`，传入 `input: []` 和 `turnTrigger: "resume_interrupted_task"`，不得向输入框写入“继续”、模拟 Enter 或创建普通文本回合。
+
+| 模块 | 文件 | 维护要点 |
+|---|---|---|
+| 设置与页面 | `crates/codex-plus-core/src/settings.rs`、`apps/codex-plus-manager/src/App.tsx` | `codexAppQuotaResume` 默认开启，受“启用 Codex增强”总开关控制。 |
+| app-server 状态机 | `assets/inject/renderer-inject.js` | 记录最近一次 `turn/start` 的 cwd、权限、模型、provider、service tier、reasoning、personality 和 collaboration mode；只保存恢复参数，不保存原输入正文。 |
+| 继续按钮 | `assets/inject/renderer-inject.js` | 监听 `turn/started` / `turn/completed`；额度类 `failed` 才显示自定义按钮，运行中、输入非空、普通错误或正常完成不得显示。 |
+| 回归测试 | `apps/codex-plus-manager/src/renderer-inject.test.ts`、`crates/codex-plus-core/tests/capacity_retry_settings.rs` | 覆盖额度识别、ECNU/DeepSeek provider 参数保留、空 `input`、默认设置和禁止文本“继续”。 |
+
+**合并确认点**：使用外接 ECNU DeepSeek V4 制造额度不足停止，确认输入为空时发送按钮替换为三角继续按钮；点击后 app-server 收到同 thread 的空 `turn/start`，`turnTrigger` 为 `resume_interrupted_task`，模型、provider、reasoning、cwd 与权限不变，rollout 中不得新增用户文本“继续”。恢复回合开始后按钮必须立即退出继续态；若再次额度失败则重新出现。
 
 ---
 

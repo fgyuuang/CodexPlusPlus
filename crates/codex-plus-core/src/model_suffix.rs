@@ -12,6 +12,9 @@ pub struct ModelCatalogEntry {
     pub display_name: String,
     /// 来自后缀的窗口值；None 表示该条目无后缀（回落顶层默认）。
     pub suffix_window: Option<u64>,
+    /// 显式自动压缩百分比，以百万分之一百分比为单位（90% = 90_000_000）。
+    /// None 表示不覆盖 Codex 默认的自动压缩行为。
+    pub auto_compact_percent: Option<u32>,
 }
 
 /// 解析单个模型条目的后缀，返回 (slug, 可选窗口)。
@@ -69,8 +72,36 @@ pub(crate) fn parse_window_token(token: &str) -> Option<u64> {
         .trim()
         .parse::<u64>()
         .ok()
-        .map(|value| value * multiplier)
+        .and_then(|value| value.checked_mul(multiplier))
         .filter(|value| *value > 0)
+}
+
+/// 解析自动压缩百分比 token，如 "90"、"84.329412%"。
+/// 返回百万分之一百分比，供 Rust 与前端使用同一套精度和舍入规则。
+pub(crate) fn parse_compact_percent(token: &str) -> Option<u32> {
+    let token = token.trim();
+    let token = token.strip_suffix('%').unwrap_or(token).trim();
+    if token.ends_with('%') {
+        return None;
+    }
+    let (whole, fraction) = token.split_once('.').unwrap_or((token, ""));
+    if fraction.len() > 6 || whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if !fraction.is_empty() && !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let whole = whole.parse::<u32>().ok()?;
+    let mut fraction_value = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u32>().ok()?
+    };
+    for _ in fraction.len()..6 {
+        fraction_value = fraction_value.checked_mul(10)?;
+    }
+    let scaled = whole.checked_mul(1_000_000)?.checked_add(fraction_value)?;
+    (scaled > 0 && scaled <= 100_000_000).then_some(scaled)
 }
 
 /// 收集 profile 的全部模型条目（当前 model + model_list），去重并从 `model_windows` map 读取窗口。
@@ -82,6 +113,7 @@ pub(crate) fn parse_window_token(token: &str) -> Option<u64> {
 pub fn collect_catalog_entries(
     model_list: &str,
     model_windows: &HashMap<String, String>,
+    model_auto_compact: &HashMap<String, String>,
     current_model: &str,
 ) -> Vec<ModelCatalogEntry> {
     // 先解析 model_list，保留顺序并去重；后缀已从 model_list 剥离，窗口来自 model_windows map。
@@ -102,10 +134,14 @@ pub fn collect_catalog_entries(
         let suffix_window = model_windows
             .get(&slug)
             .and_then(|token| parse_window_token(token));
+        let auto_compact_percent = model_auto_compact
+            .get(&slug)
+            .and_then(|token| parse_compact_percent(token));
         list_entries.push(ModelCatalogEntry {
             display_name: slug.clone(),
             slug,
             suffix_window,
+            auto_compact_percent,
         });
     }
 
@@ -118,10 +154,14 @@ pub fn collect_catalog_entries(
             let suffix_window = model_windows
                 .get(&slug)
                 .and_then(|token| parse_window_token(token));
+            let auto_compact_percent = model_auto_compact
+                .get(&slug)
+                .and_then(|token| parse_compact_percent(token));
             entries.push(ModelCatalogEntry {
                 display_name: slug.clone(),
                 slug: slug.clone(),
                 suffix_window,
+                auto_compact_percent,
             });
             // 从 list_entries 中移除同 slug 条目，避免重复。
             list_entries.retain(|entry| entry.slug != slug);
@@ -150,11 +190,14 @@ const DEEPSEEK_METADATA_JSON: &str = include_str!(concat!(
 ));
 
 pub fn requires_bundled_metadata_catalog(slug: &str) -> bool {
-    gpt56_metadata_entry(slug).is_some()
+    trusted_official_metadata_slug(slug)
+        .and_then(gpt56_metadata_entry)
+        .is_some()
 }
 
 pub fn model_ui_metadata(slug: &str) -> Option<Value> {
-    let metadata = gpt56_metadata_entry(slug)?;
+    let metadata_slug = trusted_official_metadata_slug(slug)?;
+    let metadata = gpt56_metadata_entry(metadata_slug)?;
     let levels = metadata
         .get("supported_reasoning_levels")?
         .as_array()?
@@ -174,10 +217,14 @@ pub fn model_ui_metadata(slug: &str) -> Option<Value> {
         })
         .collect::<Vec<_>>();
     Some(json!({
-        "displayName": metadata
-            .get("display_name")
-            .and_then(Value::as_str)
-            .unwrap_or(slug),
+        "displayName": if metadata_slug.eq_ignore_ascii_case(slug.trim()) {
+            metadata
+                .get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or(slug)
+        } else {
+            slug
+        },
         "description": metadata
             .get("description")
             .and_then(Value::as_str)
@@ -198,13 +245,25 @@ pub fn model_ui_metadata(slug: &str) -> Option<Value> {
     }))
 }
 
+/// 外接模型默认先尝试 Codex 原生 Code Mode。显式非空模式仍由模型元数据决定。
+pub(crate) fn apply_default_native_tool_mode(model: &mut Value) -> bool {
+    let needs_default = match model.get("tool_mode") {
+        Some(Value::String(value)) if !value.trim().is_empty() => false,
+        _ => true,
+    };
+    if needs_default {
+        model["tool_mode"] = json!("code_mode_only");
+    }
+    needs_default
+}
+
 /// 构建 codex model_catalog_json 内容。
 ///
 /// 采用 cc-switch 的 template-clone 思路：取 codex 自带 bundled entry 做模板，
 /// 再覆盖 slug / display_name / description / context_window / max_context_window /
 /// effective_context_window_percent / priority / auto_compact_token_limit 等字段。
 /// 无后缀条目用 fallback_window；fallback 也无时回落 272000（codex 默认）。
-/// auto_compact_token_limit 留 null：codex 内置模型即 null（按比例算，调研第六节）。
+/// auto_compact_token_limit 仅在条目带显式百分比时写入；否则留 null，保持 Codex 默认行为。
 pub fn build_model_catalog_json(
     entries: &[ModelCatalogEntry],
     fallback_window: Option<u64>,
@@ -245,6 +304,12 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
                     .map(|template| (template, false))
                     .unwrap_or_else(|| model_template_entry(&entry.slug))
             };
+            let template_slug = model
+                .get("slug")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let uses_alias_template =
+                has_model_metadata && !template_slug.eq_ignore_ascii_case(entry.slug.trim());
             let metadata_window = model.get("context_window").and_then(Value::as_u64);
             let context_window = entry
                 .suffix_window
@@ -252,8 +317,10 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
                 .or(metadata_window)
                 .unwrap_or(272_000);
             model["slug"] = json!(entry.slug);
-            if !has_model_metadata {
+            if !has_model_metadata || uses_alias_template {
                 model["display_name"] = json!(entry.display_name);
+            }
+            if !has_model_metadata {
                 model["description"] = json!(entry.display_name);
             }
             model["context_window"] = json!(context_window);
@@ -262,7 +329,14 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
             if !deepseek_metadata {
                 model["effective_context_window_percent"] = json!(100);
             }
-            model["auto_compact_token_limit"] = Value::Null;
+            if let Some(compact_percent) = entry.auto_compact_percent {
+                let compact_limit = ((context_window as u128 * compact_percent as u128
+                    + 50_000_000)
+                    / 100_000_000) as u64;
+                model["auto_compact_token_limit"] = json!(compact_limit.max(1));
+            } else {
+                model["auto_compact_token_limit"] = Value::Null;
+            }
             model["priority"] = json!(1000 + index);
             model["visibility"] = json!("list");
             if !deepseek_metadata {
@@ -272,6 +346,7 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
                 model["use_responses_lite"] = json!(use_responses_lite);
             }
             model["prefer_websockets"] = json!(false);
+            apply_default_native_tool_mode(&mut model);
             if !has_model_metadata {
                 model["additional_speed_tiers"] = json!([]);
                 model["service_tiers"] = json!([]);
@@ -296,10 +371,14 @@ fn deepseek_model_template_entry(slug: &str) -> Option<(Value, bool)> {
 }
 
 fn model_template_entry(slug: &str) -> (Value, bool) {
-    if let Some(entry) = bundled_template_entry(slug) {
+    let metadata_slug = match trusted_official_metadata_slug(slug) {
+        Some(metadata_slug) => metadata_slug,
+        None => slug,
+    };
+    if let Some(entry) = bundled_template_entry(metadata_slug) {
         return (entry, true);
     }
-    if let Some(compatibility) = gpt56_metadata_entry(slug) {
+    if let Some(compatibility) = gpt56_metadata_entry(metadata_slug) {
         let mut template = first_bundled_template_entry().unwrap_or_else(|| json!({}));
         if let (Some(target), Some(source)) = (template.as_object_mut(), compatibility.as_object())
         {
@@ -313,6 +392,26 @@ fn model_template_entry(slug: &str) -> (Value, bool) {
         first_bundled_template_entry().unwrap_or_else(|| json!({})),
         false,
     )
+}
+
+fn trusted_official_metadata_slug(slug: &str) -> Option<&'static str> {
+    let normalized = crate::aggregate_model_alias::normalize_requested_model_name(slug);
+    let candidate = if crate::aggregate_model_alias::is_trusted_official_codex_model(&normalized) {
+        normalized.as_str()
+    } else {
+        slug.trim()
+            .rsplit_once(':')
+            .map(|(_, model)| model)
+            .unwrap_or(slug)
+            .trim()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+    };
+    crate::aggregate_model_alias::TRUSTED_OFFICIAL_CODEX_MODELS
+        .iter()
+        .copied()
+        .find(|official| official.eq_ignore_ascii_case(candidate))
 }
 
 fn bundled_template_entry(slug: &str) -> Option<Value> {

@@ -8,9 +8,11 @@ use codex_plus_core::settings::{BackendSettings, SettingsStore};
 fn capacity_retry_defaults_to_false_and_round_trips_through_json() {
     let mut settings = BackendSettings::default();
     assert!(!settings.codex_app_capacity_retry);
+    assert!(settings.codex_app_quota_resume);
     assert_eq!(settings.codex_app_capacity_retry_max_attempts, 5);
 
     settings.codex_app_capacity_retry = true;
+    settings.codex_app_quota_resume = false;
     settings.codex_app_capacity_retry_max_attempts = 7;
     let json = serde_json::to_value(&settings).expect("serialize settings");
     assert_eq!(
@@ -23,9 +25,15 @@ fn capacity_retry_defaults_to_false_and_round_trips_through_json() {
             .and_then(|value| value.as_u64()),
         Some(7)
     );
+    assert_eq!(
+        json.get("codexAppQuotaResume")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
 
     let parsed: BackendSettings = serde_json::from_value(json).expect("deserialize settings");
     assert!(parsed.codex_app_capacity_retry);
+    assert!(!parsed.codex_app_quota_resume);
     assert_eq!(parsed.codex_app_capacity_retry_max_attempts, 7);
 }
 
@@ -41,10 +49,16 @@ fn capacity_retry_is_preserved_by_partial_settings_updates() {
     assert_eq!(updated.codex_app_capacity_retry_max_attempts, 9);
 
     let updated = store
+        .update(serde_json::json!({ "codexAppQuotaResume": false }))
+        .expect("disable quota resume");
+    assert!(!updated.codex_app_quota_resume);
+
+    let updated = store
         .update(serde_json::json!({ "codexAppThreadIdBadge": true }))
         .expect("update unrelated setting");
     assert!(updated.codex_app_capacity_retry);
     assert_eq!(updated.codex_app_capacity_retry_max_attempts, 9);
+    assert!(!updated.codex_app_quota_resume);
 }
 
 #[test]
@@ -53,6 +67,7 @@ fn injection_script_installs_the_capacity_retry_guard() {
 
     assert!(script.contains("capacityRetry: \"codexAppCapacityRetry\""));
     assert!(script.contains("capacityRetryMaxAttempts: \"codexAppCapacityRetryMaxAttempts\""));
+    assert!(script.contains("quotaResume: \"codexAppQuotaResume\""));
     assert!(script.contains("installCodexCapacityRetry();"));
     assert!(script.contains("selected model is at capacity"));
     assert!(script.contains("capacity_error_retried"));
@@ -63,6 +78,9 @@ fn injection_script_installs_the_capacity_retry_guard() {
     assert!(script.contains("capacity_error_passthrough"));
     assert!(!script.contains("codexCapacityRetrySyntheticResponse"));
     assert!(!script.contains("The upstream service is temporarily unavailable"));
+    assert!(script.contains("resume_interrupted_task"));
+    assert!(script.contains("input: []"));
+    assert!(script.contains("quota_resume_requested"));
 }
 
 #[test]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use codex_plus_core::model_suffix::{
     build_model_catalog_json, build_model_catalog_json_with_template, collect_catalog_entries,
-    model_ui_metadata, parse_model_suffix,
+    model_ui_metadata, parse_model_suffix, requires_bundled_metadata_catalog,
 };
 
 #[test]
@@ -56,8 +56,12 @@ fn parse_suffix_rejects_zero_and_negative() {
 fn collect_entries_includes_current_model_and_strips_suffix() {
     let mut windows = HashMap::new();
     windows.insert("deepseek-v4-pro".to_string(), "1M".to_string());
-    let entries =
-        collect_catalog_entries("deepseek-v4-pro\nqwen3-coder", &windows, "deepseek-v4-pro");
+    let entries = collect_catalog_entries(
+        "deepseek-v4-pro\nqwen3-coder",
+        &windows,
+        &HashMap::new(),
+        "deepseek-v4-pro",
+    );
     // 当前 model 与列表去重后共 2 条
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].slug, "deepseek-v4-pro");
@@ -68,8 +72,12 @@ fn collect_entries_includes_current_model_and_strips_suffix() {
 
 #[test]
 fn collect_entries_deduplicates() {
-    let entries =
-        collect_catalog_entries("qwen3-coder\nqwen3-coder", &HashMap::new(), "qwen3-coder");
+    let entries = collect_catalog_entries(
+        "qwen3-coder\nqwen3-coder",
+        &HashMap::new(),
+        &HashMap::new(),
+        "qwen3-coder",
+    );
     assert_eq!(entries.len(), 1);
 }
 
@@ -78,7 +86,12 @@ fn build_catalog_json_writes_context_window_and_strips_suffix() {
     let mut windows = HashMap::new();
     windows.insert("deepseek-v4-pro".to_string(), "1M".to_string());
     windows.insert("claude-sonnet-4".to_string(), "200K".to_string());
-    let entries = collect_catalog_entries("deepseek-v4-pro\nclaude-sonnet-4", &windows, "");
+    let entries = collect_catalog_entries(
+        "deepseek-v4-pro\nclaude-sonnet-4",
+        &windows,
+        &HashMap::new(),
+        "",
+    );
     let catalog = build_model_catalog_json(&entries, None);
     assert!(catalog.contains(r#""slug": "deepseek-v4-pro""#));
     assert!(catalog.contains(r#""context_window": 1000000"#));
@@ -94,16 +107,33 @@ fn build_catalog_json_writes_context_window_and_strips_suffix() {
 
 #[test]
 fn build_catalog_json_uses_fallback_for_no_suffix_entries() {
-    let entries = collect_catalog_entries("qwen3-coder", &HashMap::new(), "");
+    let entries = collect_catalog_entries("qwen3-coder", &HashMap::new(), &HashMap::new(), "");
     let catalog = build_model_catalog_json(&entries, Some(272_000));
     assert!(catalog.contains(r#""slug": "qwen3-coder""#));
     assert!(catalog.contains(r#""context_window": 272000"#));
 }
 
 #[test]
+fn non_gpt_models_default_to_native_codex_tool_mode() {
+    let entries = collect_catalog_entries(
+        "Chat ECNU:ecnu-reasoner\ndeepseek-v4-pro\nqwen3-coder\nclaude-sonnet-4",
+        &HashMap::new(),
+        &HashMap::new(),
+        "Chat ECNU:ecnu-reasoner",
+    );
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+
+    for model in catalog["models"].as_array().unwrap() {
+        assert_eq!(model["tool_mode"], "code_mode_only");
+    }
+}
+
+#[test]
 fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
     let entries = collect_catalog_entries(
         "gpt-5.6-sol\ngpt-5.6-terra\ngpt-5.6-luna",
+        &HashMap::new(),
         &HashMap::new(),
         "gpt-5.6-sol",
     );
@@ -149,12 +179,70 @@ fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
 }
 
 #[test]
+fn trusted_provider_gpt_aliases_inherit_native_codex_tool_experience() {
+    let entries = collect_catalog_entries(
+        "CLIProxyAPI:gpt-5.6-luna\n供应商一:gpt-5.6-sol\ngpt-5.6-terra(供应商一)",
+        &HashMap::new(),
+        &HashMap::new(),
+        "CLIProxyAPI:gpt-5.6-luna",
+    );
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    let models = catalog["models"].as_array().unwrap();
+
+    for slug in [
+        "CLIProxyAPI:gpt-5.6-luna",
+        "供应商一:gpt-5.6-sol",
+        "gpt-5.6-terra(供应商一)",
+    ] {
+        let model = models.iter().find(|model| model["slug"] == slug).unwrap();
+        assert_eq!(model["display_name"], slug);
+        assert_eq!(model["tool_mode"], "code_mode_only");
+        assert_eq!(model["shell_type"], "shell_command");
+        assert_eq!(model["apply_patch_tool_type"], "freeform");
+        assert_eq!(model["supports_search_tool"], true);
+        assert!(
+            model["supported_reasoning_levels"]
+                .as_array()
+                .is_some_and(|levels| levels.iter().any(|level| level["effort"] == "max"))
+        );
+        assert!(
+            model["additional_speed_tiers"]
+                .as_array()
+                .is_some_and(|tiers| tiers.iter().any(|tier| tier == "fast"))
+        );
+        assert!(
+            model["base_instructions"]
+                .as_str()
+                .is_some_and(|instructions| !instructions.trim().is_empty())
+        );
+    }
+
+    assert_eq!(
+        model_ui_metadata("CLIProxyAPI:gpt-5.6-luna").unwrap()["displayName"],
+        "CLIProxyAPI:gpt-5.6-luna"
+    );
+    assert!(requires_bundled_metadata_catalog(
+        "CLIProxyAPI:gpt-5.6-luna"
+    ));
+    assert!(!requires_bundled_metadata_catalog(
+        "Chat ECNU:ecnu-reasoner"
+    ));
+}
+
+#[test]
 fn build_catalog_json_preserves_template_responses_lite_behavior() {
-    let entries = collect_catalog_entries("official-model", &HashMap::new(), "official-model");
+    let entries = collect_catalog_entries(
+        "official-model",
+        &HashMap::new(),
+        &HashMap::new(),
+        "official-model",
+    );
     let template = serde_json::json!({
         "slug": "official-template",
         "supports_search_tool": true,
-        "use_responses_lite": true
+        "use_responses_lite": true,
+        "tool_mode": "unified_exec"
     });
     let catalog: serde_json::Value = serde_json::from_str(&build_model_catalog_json_with_template(
         &entries,
@@ -165,6 +253,7 @@ fn build_catalog_json_preserves_template_responses_lite_behavior() {
 
     assert_eq!(catalog["models"][0]["use_responses_lite"], true);
     assert_eq!(catalog["models"][0]["supports_search_tool"], true);
+    assert_eq!(catalog["models"][0]["tool_mode"], "unified_exec");
 }
 
 #[test]
@@ -183,8 +272,12 @@ fn collect_entries_adopts_suffix_for_current_model_from_list() {
     // 当前 model 本身无后缀，但 model_list 中靠后位置有同名带后缀条目。
     let mut windows = HashMap::new();
     windows.insert("deepseek-v4-pro".to_string(), "1M".to_string());
-    let entries =
-        collect_catalog_entries("qwen3-coder\ndeepseek-v4-pro", &windows, "deepseek-v4-pro");
+    let entries = collect_catalog_entries(
+        "qwen3-coder\ndeepseek-v4-pro",
+        &windows,
+        &HashMap::new(),
+        "deepseek-v4-pro",
+    );
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].slug, "deepseek-v4-pro");
     assert_eq!(entries[0].suffix_window, Some(1_000_000));
@@ -198,6 +291,7 @@ fn collect_entries_prefers_later_suffix_for_duplicate_slug() {
     let entries = collect_catalog_entries(
         "deepseek/deepseek-v4-flash\ndeepseek/deepseek-v4-flash",
         &windows,
+        &HashMap::new(),
         "",
     );
     assert_eq!(entries.len(), 1);
@@ -213,6 +307,7 @@ fn collect_entries_prefers_later_suffix_when_reversed() {
     let entries = collect_catalog_entries(
         "deepseek/deepseek-v4-flash\ndeepseek/deepseek-v4-flash",
         &windows,
+        &HashMap::new(),
         "",
     );
     assert_eq!(entries.len(), 1);

@@ -176,6 +176,12 @@ pub trait LaunchHooks: Send + Sync {
     async fn apply_active_relay_profile(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
         Ok(())
     }
+    async fn ensure_active_protocol_proxy_config(
+        &self,
+        _settings: &BackendSettings,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn ensure_plugin_marketplace_config(
         &self,
         _settings: &BackendSettings,
@@ -346,6 +352,14 @@ where
     }
 }
 
+fn helper_bind_retry_timeout_ms(protocol_proxy_enabled: bool, is_macos: bool) -> u64 {
+    if protocol_proxy_enabled || is_macos {
+        HELPER_BIND_RETRY_TIMEOUT_MS
+    } else {
+        0
+    }
+}
+
 pub async fn launch_and_inject_with_hooks<H>(
     options: LaunchOptions,
     hooks: H,
@@ -420,15 +434,13 @@ where
         }
         let protocol_proxy_enabled = helper_port_requires_fixed_binding(&settings);
         if protocol_proxy_enabled {
+            hooks.ensure_active_protocol_proxy_config(&settings).await?;
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            // 只有被固定成协议代理端口时才需要等：普通 helper 端口上面已经挑过空闲的了。
-            let bind_retry_timeout_ms = if protocol_proxy_enabled {
-                HELPER_BIND_RETRY_TIMEOUT_MS
-            } else {
-                0
-            };
+            // macOS 重启时旧 launcher 的 socket 释放可能稍晚于进程退出。
+            let bind_retry_timeout_ms =
+                helper_bind_retry_timeout_ms(protocol_proxy_enabled, cfg!(target_os = "macos"));
             start_helper_waiting_for_busy_port(
                 || hooks.start_helper(helper_port),
                 bind_retry_timeout_ms,
@@ -716,6 +728,15 @@ impl LaunchHooks for DefaultLaunchHooks {
             &profile,
             &common_config,
         )?;
+        Ok(())
+    }
+
+    async fn ensure_active_protocol_proxy_config(
+        &self,
+        settings: &BackendSettings,
+    ) -> anyhow::Result<()> {
+        let home = crate::relay_config::default_codex_home_dir();
+        crate::relay_config::ensure_active_protocol_proxy_config_in_home(&home, settings)?;
         Ok(())
     }
 
@@ -3491,6 +3512,19 @@ mod tests {
         assert!(should_probe_launcher_cdp(true, false));
         assert!(!should_probe_launcher_cdp(true, true));
         assert!(!should_probe_launcher_cdp(false, false));
+    }
+
+    #[test]
+    fn helper_bind_retry_covers_fixed_proxy_ports_and_macos_restarts() {
+        assert_eq!(
+            helper_bind_retry_timeout_ms(true, false),
+            HELPER_BIND_RETRY_TIMEOUT_MS
+        );
+        assert_eq!(
+            helper_bind_retry_timeout_ms(false, true),
+            HELPER_BIND_RETRY_TIMEOUT_MS
+        );
+        assert_eq!(helper_bind_retry_timeout_ms(false, false), 0);
     }
 
     #[tokio::test]
