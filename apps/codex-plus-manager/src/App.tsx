@@ -4076,6 +4076,11 @@ export function App() {
             <div className="brand-subtitle">{t("管理控制台")}</div>
           </div>
         </div>
+        <ToolSwitcher
+          tools={toolEntries}
+          activeTool={activeTool}
+          onSelect={(toolId) => void switchTool(toolId)}
+        />
         <nav className="nav" aria-label={t("主导航")}>
           {navigationSections.map((section) => {
             // 按当前工具过滤：只留下属于这个工具、或与工具无关的页面。
@@ -4120,11 +4125,6 @@ export function App() {
             <h1>{routeTitle(route)}</h1>
             <p>{routeSubtitle(route)}</p>
           </div>
-          <ToolSwitcher
-            tools={toolEntries}
-            activeTool={activeTool}
-            onSelect={(toolId) => void switchTool(toolId)}
-          />
           <div className="topbar-actions">
             <Button
               onClick={() => toggleLanguage()}
@@ -8257,10 +8257,11 @@ function SessionsScreen({
 /// 所以两处不会重复展示同一条。
 function RecommendationsScreen({ ads, actions }: { ads: AdsResult | null; actions: Actions }) {
   const items = (ads?.ads ?? []).filter((ad) => !isExpiredAd(ad));
-  // 置顶位排在最前，并从列表里去掉重复的一条 —— 它本来就不在 ads 池里，
-  // 这里再按 id 去一次重，防止广告源两边都写了同一条时重复渲染。
+  // 置顶位排在最前，并把推荐池里指向同一家的那条去掉 —— 广告源里同一条赞助商
+  // 常常同时出现在 top_ad 和 ads 里（两个 id、同一个落地页），只比 id 去不掉。
   const topAd = ads?.topAd && !isExpiredAd(ads.topAd) ? ads.topAd : null;
-  const pool = topAd ? items.filter((ad) => ad.id !== topAd.id) : items;
+  const topIdentity = topAd ? adIdentity(topAd) : "";
+  const pool = topAd ? items.filter((ad) => adIdentity(ad) !== topIdentity) : items;
   const ordered = topAd ? [topAd, ...pool] : pool;
   const sponsors = ordered.filter((ad) => ad.type === "sponsor");
   const normal = ordered.filter((ad) => ad.type === "normal");
@@ -12246,7 +12247,22 @@ function AdGrid({ ads, empty, actions }: { ads: AdItem[]; empty: string; actions
 }
 
 function formatAdTitle(title: string) {
-  return title.split(/[｜|]/, 1)[0].trim() || title;
+  return title.trim() || title;
+}
+
+/// 广告的「同一家」判据：优先按去掉 query、尾斜杠并转小写后的落地 URL，
+/// 无法解析 URL 时退回标题，避免置顶位和推荐池因不同 id 重复展示。
+function adIdentity(ad: AdItem): string {
+  const url = (ad.url || "").trim();
+  if (url) {
+    try {
+      const parsed = new URL(url);
+      return `${parsed.host}${parsed.pathname}`.replace(/\/+$/, "").toLowerCase();
+    } catch {
+      return url.replace(/[?#].*$/, "").replace(/\/+$/, "").toLowerCase();
+    }
+  }
+  return (ad.title || "").trim().toLowerCase();
 }
 
 function isExpiredAd(ad: AdItem) {
