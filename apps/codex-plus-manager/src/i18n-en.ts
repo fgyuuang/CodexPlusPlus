@@ -369,6 +369,15 @@ export const EN_PLAIN: Record<string, string> = {
   "已保存": "Saved",
   "打开赞助商": "Open sponsor",
   "打开推荐内容": "Open recommendation",
+  "Codex 供应商设置": "Codex provider settings",
+  "只作用于 Codex 供应商的配置": "Applies only to Codex providers",
+  "「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。":
+    "The Test provider button sends one real request with this model to check that the key and endpoint work.",
+  "Codex 图片覆盖层": "Codex image overlay",
+  "在当前 Codex 会话上叠加一张背景图": "Overlay a background image on the current Codex session",
+  "这个工具目前没有独立设置项": "This tool has no settings of its own yet",
+  "该工具的配置在它自己的页签里管理；上面的基础设置对所有工具通用。":
+    "This tool is configured on its own tab; the basic settings above apply to every tool.",
   "赞助本项目的中转服务商": "Relay services sponsoring this project",
   "内容来自 BigPizzaV3/Ad-List，赞助商推荐见「项目赞助商」页。":
     "Content comes from BigPizzaV3/Ad-List; sponsors are listed on the Project sponsors page.",
@@ -1371,6 +1380,7 @@ export const EN_TEMPLATE: Record<string, string> = {
   "共 {0} 家赞助商": "{0} sponsor(s) in total",
   "{0} 家": "{0} sponsor(s)",
   "{0} 状态": "{0} status",
+  "{0} 设置": "{0} settings",
   "{0} 个已保存": "{0} saved",
   "已新增供应商「{0}」，填好模型列表后点「应用到 Grok」。":
     "Added provider \"{0}\"; fill in its model list and click Apply to Grok.",
