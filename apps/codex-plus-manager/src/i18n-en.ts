@@ -368,6 +368,7 @@ export const EN_PLAIN: Record<string, string> = {
   "请先保存当前供应商，再应用到 Grok。": "Save the current provider before applying it to Grok.",
   "已保存": "Saved",
   "打开赞助商": "Open sponsor",
+  "打开推荐内容": "Open recommendation",
   "赞助本项目的中转服务商": "Relay services sponsoring this project",
   "内容来自 BigPizzaV3/Ad-List，赞助商推荐见「项目赞助商」页。":
     "Content comes from BigPizzaV3/Ad-List; sponsors are listed on the Project sponsors page.",
@@ -375,6 +376,9 @@ export const EN_PLAIN: Record<string, string> = {
     "Content comes from BigPizzaV3/Ad-List — the same data shown on the overview page.",
   "刷新赞助商": "Refresh sponsors",
   "全部赞助商": "All sponsors",
+  "赞助商推荐": "Sponsor recommendations",
+  "内容来自 BigPizzaV3/Ad-List，含置顶推荐与普通推荐。":
+    "Content comes from BigPizzaV3/Ad-List, including the pinned and regular recommendations.",
   "普通推荐内容": "General recommendations",
   "有未保存修改。": "Unsaved changes.",
   "Grok 当前配置": "Grok's current config",
@@ -533,7 +537,6 @@ export const EN_PLAIN: Record<string, string> = {
   "安装维护": "Install & maintenance",
   "完整增强": "Full enhancement",
   "官方": "Official",
-  "项目赞助商": "Project sponsor",
   "官方混入 API Key": "Official mixed-in API Key",
   "官方混合 API 不应在 auth.json 中保存 OPENAI_API_KEY。请清理此供应商的 auth.json 后再切换。":
     "Official mixed API should not store OPENAI_API_KEY in auth.json. Clear this provider's auth.json before switching.",
