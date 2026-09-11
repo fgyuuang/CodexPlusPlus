@@ -195,19 +195,30 @@ const ASTRA_METADATA_JSON: &str = include_str!(concat!(
 ));
 
 pub fn requires_bundled_metadata_catalog(slug: &str) -> bool {
-    let metadata_slug = trusted_official_metadata_slug(slug).unwrap_or_else(|| slug.trim());
-    compatibility_metadata_entry(metadata_slug).is_some()
+    let metadata_slug =
+        trusted_official_metadata_slug(slug).unwrap_or_else(|| slug.trim().to_string());
+    crate::official_model_catalog::official_model_metadata(&metadata_slug).is_some()
+        || compatibility_metadata_entry(&metadata_slug).is_some()
 }
 
 pub fn model_ui_metadata(slug: &str) -> Option<Value> {
-    let metadata_slug = trusted_official_metadata_slug(slug).unwrap_or_else(|| slug.trim());
-    let metadata = compatibility_metadata_entry(metadata_slug)?;
+    let metadata_slug =
+        trusted_official_metadata_slug(slug).unwrap_or_else(|| slug.trim().to_string());
+    let metadata = crate::official_model_catalog::official_model_metadata(&metadata_slug)
+        .or_else(|| compatibility_metadata_entry(&metadata_slug))?;
     let levels = metadata
-        .get("supported_reasoning_levels")?
-        .as_array()?
+        .get("supported_reasoning_levels")
+        .or_else(|| metadata.get("supportedReasoningLevels"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
         .iter()
         .filter_map(|level| {
-            let effort = level.get("effort")?.as_str()?.trim();
+            let effort = level
+                .get("effort")
+                .or_else(|| level.get("reasoningEffort"))
+                .and_then(Value::as_str)?
+                .trim();
             if effort.is_empty() {
                 return None;
             }
@@ -215,17 +226,20 @@ pub fn model_ui_metadata(slug: &str) -> Option<Value> {
                 "reasoningEffort": effort,
                 "description": level
                     .get("description")
+                    .or_else(|| level.get("descriptionText"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
             }))
         })
         .collect::<Vec<_>>();
+    let display_name = metadata
+        .get("display_name")
+        .or_else(|| metadata.get("displayName"))
+        .and_then(Value::as_str)
+        .unwrap_or(slug);
     Some(json!({
         "displayName": if metadata_slug.eq_ignore_ascii_case(slug.trim()) {
-            metadata
-                .get("display_name")
-                .and_then(Value::as_str)
-                .unwrap_or(slug)
+            display_name
         } else {
             slug
         },
@@ -235,15 +249,18 @@ pub fn model_ui_metadata(slug: &str) -> Option<Value> {
             .unwrap_or("Custom model"),
         "defaultReasoningEffort": metadata
             .get("default_reasoning_level")
+            .or_else(|| metadata.get("defaultReasoningEffort"))
             .and_then(Value::as_str)
             .unwrap_or("medium"),
         "supportedReasoningEfforts": levels,
         "additionalSpeedTiers": metadata
             .get("additional_speed_tiers")
+            .or_else(|| metadata.get("additionalSpeedTiers"))
             .cloned()
             .unwrap_or_else(|| json!([])),
         "serviceTiers": metadata
             .get("service_tiers")
+            .or_else(|| metadata.get("serviceTiers"))
             .cloned()
             .unwrap_or_else(|| json!([]))
     }))
@@ -375,14 +392,20 @@ fn deepseek_model_template_entry(slug: &str) -> Option<(Value, bool)> {
 }
 
 fn model_template_entry(slug: &str) -> (Value, bool) {
-    let metadata_slug = match trusted_official_metadata_slug(slug) {
-        Some(metadata_slug) => metadata_slug,
-        None => slug,
-    };
-    if let Some(entry) = bundled_template_entry(metadata_slug) {
+    let metadata_slug = trusted_official_metadata_slug(slug).unwrap_or_else(|| slug.to_string());
+    if let Some(entry) = bundled_template_entry(&metadata_slug) {
         return (entry, true);
     }
-    if let Some(compatibility) = compatibility_metadata_entry(metadata_slug) {
+    if let Some(official) = crate::official_model_catalog::official_model_metadata(&metadata_slug) {
+        let mut template = first_bundled_template_entry().unwrap_or_else(|| json!({}));
+        if let (Some(target), Some(source)) = (template.as_object_mut(), official.as_object()) {
+            for (key, value) in source {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        return (template, true);
+    }
+    if let Some(compatibility) = compatibility_metadata_entry(&metadata_slug) {
         let mut template = first_bundled_template_entry().unwrap_or_else(|| json!({}));
         if let (Some(target), Some(source)) = (template.as_object_mut(), compatibility.as_object())
         {
@@ -398,7 +421,7 @@ fn model_template_entry(slug: &str) -> (Value, bool) {
     )
 }
 
-fn trusted_official_metadata_slug(slug: &str) -> Option<&'static str> {
+fn trusted_official_metadata_slug(slug: &str) -> Option<String> {
     let normalized = crate::aggregate_model_alias::normalize_requested_model_name(slug);
     let candidate = if crate::aggregate_model_alias::is_trusted_official_codex_model(&normalized) {
         normalized.as_str()
@@ -412,10 +435,102 @@ fn trusted_official_metadata_slug(slug: &str) -> Option<&'static str> {
             .next()
             .unwrap_or_default()
     };
-    crate::aggregate_model_alias::TRUSTED_OFFICIAL_CODEX_MODELS
+    crate::official_model_catalog::is_trusted_official_model(candidate)
+        .then(|| candidate.to_string())
+}
+
+/// 在官方登录混合模式下，把当前官方账号目录作为本地 catalog 基线。
+/// 官方条目保留原始元数据，Codex++ 只覆盖本地代理所需的传输能力；其它
+/// 聚合/供应商别名继续保留在官方条目之后。
+pub fn merge_official_model_entries(catalog_json: &str) -> String {
+    let Ok(mut catalog) = serde_json::from_str::<Value>(catalog_json) else {
+        return catalog_json.to_string();
+    };
+    let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) else {
+        return catalog_json.to_string();
+    };
+    let existing_models = std::mem::take(models);
+    let mut existing_by_slug = existing_models
+        .into_iter()
+        .filter_map(|entry| {
+            let slug = entry.get("slug").and_then(Value::as_str)?.trim();
+            Some((slug.to_ascii_lowercase(), entry))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut merged = Vec::new();
+    let official_entries =
+        crate::official_model_catalog::official_model_entries_for_current_settings();
+    for mut entry in official_entries {
+        let Some(slug) = entry.get("slug").and_then(Value::as_str) else {
+            continue;
+        };
+        let key = slug.to_ascii_lowercase();
+        if let Some(existing) = existing_by_slug.remove(&key) {
+            if let (Some(target), Some(source)) = (entry.as_object_mut(), existing.as_object()) {
+                for (field, value) in source {
+                    target.insert(field.clone(), value.clone());
+                }
+            }
+        }
+        entry["prefer_websockets"] = json!(false);
+        apply_default_native_tool_mode(&mut entry);
+        merged.push(entry);
+    }
+    let mut remaining = existing_by_slug.into_values().collect::<Vec<_>>();
+    remaining.sort_by(|left, right| {
+        left.get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+    merged.extend(remaining);
+    *models = merged;
+    serde_json::to_string_pretty(&catalog).unwrap_or_else(|_| catalog_json.to_string())
+}
+
+/// 兼容旧调用方：只追加当前账号的隐藏官方条目，不改变已有可见模型顺序。
+pub fn merge_cached_official_hidden_entries(catalog_json: &str) -> String {
+    let Ok(mut catalog) = serde_json::from_str::<Value>(catalog_json) else {
+        return catalog_json.to_string();
+    };
+    let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) else {
+        return catalog_json.to_string();
+    };
+    let existing = models
         .iter()
-        .copied()
-        .find(|official| official.eq_ignore_ascii_case(candidate))
+        .filter_map(|model| model.get("slug").and_then(Value::as_str))
+        .map(|slug| slug.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut appended = existing;
+    for mut entry in crate::official_model_catalog::cached_official_model_entries() {
+        let Some(slug) = entry.get("slug").and_then(Value::as_str) else {
+            continue;
+        };
+        let visible = entry
+            .get("visibility")
+            .and_then(Value::as_str)
+            .map(|value| value.eq_ignore_ascii_case("list"))
+            .unwrap_or(true);
+        let supported = entry
+            .get("supported_in_api")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if visible && supported {
+            continue;
+        }
+        if !appended.insert(slug.to_ascii_lowercase()) {
+            continue;
+        }
+        entry["prefer_websockets"] = json!(false);
+        apply_default_native_tool_mode(&mut entry);
+        models.push(entry);
+    }
+    serde_json::to_string_pretty(&catalog).unwrap_or_else(|_| catalog_json.to_string())
 }
 
 fn bundled_template_entry(slug: &str) -> Option<Value> {

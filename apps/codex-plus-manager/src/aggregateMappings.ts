@@ -1,3 +1,5 @@
+import { visibleOfficialModelSlugs } from "./official-model-catalog";
+
 export type RelayAggregateStrategy = "failover" | "conversationRoundRobin" | "requestRoundRobin" | "weightedRoundRobin";
 
 export type RelayProfileLike = {
@@ -28,16 +30,6 @@ export type RelayAggregateConfig = {
   members: Array<{ profileId: string; weight: number }>;
   modelMappings: RelayAggregateModelMapping[];
 };
-
-export const DEFAULT_CODEX_MODEL_MAPPING_KEYS = [
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5.3-codex",
-] as const;
 
 export function relayProfileModels(profile: RelayProfileLike): string[] {
   const seen = new Set<string>();
@@ -312,7 +304,7 @@ export function aggregateMappingKeyOptions(
 ): string[] {
   return Array.from(
     new Set([
-      ...DEFAULT_CODEX_MODEL_MAPPING_KEYS,
+      ...visibleOfficialModelSlugs(),
       ...effectiveMappings.map((entry) => entry.codexModel),
       ...aggregateRepeatedModelKeys(memberProfiles),
       currentCodexModel.trim(),

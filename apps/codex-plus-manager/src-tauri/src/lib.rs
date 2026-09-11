@@ -65,6 +65,11 @@ pub fn run() {
             commands::start_weixin_connect_from_saved_settings();
             register_main_window_events(main_window, transient);
             cliproxy::start_cliproxy_from_saved_settings(transient);
+            // 目录刷新是后台增强能力；失败时仍由核心回退目录保证 Codex 可启动。
+            tauri::async_runtime::spawn(async {
+                let _ =
+                    codex_plus_core::official_model_catalog::refresh_active_account(false).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -89,6 +94,8 @@ pub fn run() {
             commands::weixin_connect_stop,
             commands::find_desktop_codex_cli,
             commands::list_official_accounts,
+            commands::get_official_model_catalog_status,
+            commands::refresh_official_model_catalog,
             commands::start_official_account_login,
             commands::official_account_login_status,
             commands::cancel_official_account_login,

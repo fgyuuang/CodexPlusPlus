@@ -94,10 +94,15 @@ import {
   aggregateOrderedModelList,
   aggregatePersistedMappingsFromEffective,
   aggregateProviderLabel,
-  DEFAULT_CODEX_MODEL_MAPPING_KEYS,
   relayProfileModels,
   type AggregateEffectiveModelMapping,
 } from "@/aggregateMappings";
+import {
+  isTrustedOfficialModel,
+  setOfficialModelCatalog as setOfficialModelCatalogModels,
+  trustedOfficialModelSlugs,
+  visibleOfficialModelSlugs,
+} from "./official-model-catalog";
 import { tokenizeCode, type CodeLanguage } from "./code-highlight";
 import { filterModelGroups } from "./model-groups";
 import { codexGoalsFeatureState, setCodexGoalsFeatureInConfig } from "./goals-config";
@@ -284,6 +289,16 @@ type OfficialAccountsResult = CommandResult<{
   activeAccountId: string;
   codexRunning: boolean;
   restartRequired: boolean;
+}>;
+
+type OfficialModelCatalogResult = CommandResult<{
+  status: string;
+  source: string;
+  visibleModels: string[];
+  fetchedAt: number | null;
+  clientVersion: string;
+  stale: boolean;
+  error?: string | null;
 }>;
 
 type OfficialLoginSessionResult = CommandResult<{
@@ -527,7 +542,6 @@ type RelayProtocol = "responses" | "chatCompletions";
 type StepwiseProtocol = "auto" | "chat_completions" | "responses" | "anthropic_messages";
 type StepwiseGenerationMode = "auto" | "manual";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
-const CODEX_MODEL_MAPPING_KEYS = DEFAULT_CODEX_MODEL_MAPPING_KEYS;
 type RelaySessionProvider = "custom" | "openai";
 const CHAT_UPSTREAM_BASE_URL_KEY = "codex_plus_chat_base_url";
 const SCRIPT_MARKET_REPOSITORY_URL = "https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket";
@@ -1302,6 +1316,7 @@ export function App() {
   const [weixinQr, setWeixinQr] = useState<WeixinQrResult | null>(null);
   const [relay, setRelay] = useState<RelayResult | null>(null);
   const [officialAccounts, setOfficialAccounts] = useState<OfficialAccountsResult | null>(null);
+  const [officialModelCatalog, setOfficialModelCatalogStatus] = useState<OfficialModelCatalogResult | null>(null);
   const [cliproxy, setCliproxy] = useState<CliproxyStatusResult | null>(null);
   const [cliproxyModels, setCliproxyModels] = useState<CliproxyModelsResult | null>(null);
   const [cliproxyTest, setCliproxyTest] = useState<CliproxyTestResult | null>(null);
@@ -1565,6 +1580,19 @@ export function App() {
     return result;
   };
 
+  const refreshOfficialModelCatalog = async (silent = false, force = false) => {
+    const command = force ? "refresh_official_model_catalog" : "get_official_model_catalog_status";
+    const result = await run(() => call<OfficialModelCatalogResult>(command, force ? { force: true } : undefined));
+    if (result) {
+      setOfficialModelCatalogStatus(result);
+      setOfficialModelCatalogModels(result.visibleModels);
+      if (!silent || !isSuccessStatus(result.status)) {
+        showResultNotice(t("官方模型目录"), result, { silentSuccess: true });
+      }
+    }
+    return result;
+  };
+
   const startOfficialAccountLogin = async (method: "browser" | "device", accountId = "") => {
     const result = await run(() =>
       call<OfficialLoginSessionResult>("start_official_account_login", { request: { method, accountId } }),
@@ -1640,6 +1668,7 @@ export function App() {
     if (isSuccessStatus(result.status)) {
       await refreshSettings(true);
       await refreshRelayFiles(true);
+      await refreshOfficialModelCatalog(true);
     }
     showResultNotice(t("切换官方账号"), result);
     if (confirmRestart && result.restartRequired) await restart();
@@ -2716,6 +2745,7 @@ export function App() {
       await refreshWeixinStatus(true);
       await refreshRelay(true);
       await refreshOfficialAccounts(true);
+      await refreshOfficialModelCatalog(true);
       await refreshCliproxy(true);
       await refreshNewapi(true);
       await refreshRelayFiles(true);
@@ -3624,6 +3654,8 @@ export function App() {
       await refreshAds(true);
       await refreshTools(true);
       if (!handledNavigation) await refreshSettings(true);
+      await refreshOfficialAccounts(true);
+      await refreshOfficialModelCatalog(true);
       await refreshRelay(true);
       await refreshEnvConflicts(true);
       await refreshProviderSyncTargets(true);
@@ -3950,6 +3982,7 @@ export function App() {
       },
       refreshRelay,
       refreshOfficialAccounts,
+      refreshOfficialModelCatalog,
       startOfficialAccountLogin,
       officialAccountLoginStatus,
       cancelOfficialAccountLogin,
@@ -4048,7 +4081,7 @@ export function App() {
       disableWatcher: () => watcherAction("disable_watcher"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, officialAccounts, cliproxy, cliproxyModels, newapi, newapiModels, localSessions, sessionShareUrl, importSessionUrl, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, officialAccounts, officialModelCatalog, cliproxy, cliproxyModels, newapi, newapiModels, localSessions, sessionShareUrl, importSessionUrl, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
   );
   const hasUpdate = update?.updateAvailable === true;
 
@@ -4166,6 +4199,7 @@ export function App() {
             <RelayScreen
               settings={settings}
               officialAccounts={officialAccounts}
+              officialModelCatalog={officialModelCatalog}
               cliproxy={cliproxy}
               cliproxyModels={cliproxyModels}
               cliproxyTest={cliproxyTest}
@@ -4416,6 +4450,7 @@ type Actions = {
   setLaunchMode: (launchMode: LaunchMode) => Promise<void>;
   refreshRelay: () => Promise<void>;
   refreshOfficialAccounts: (silent?: boolean) => Promise<OfficialAccountsResult | null>;
+  refreshOfficialModelCatalog: (silent?: boolean, force?: boolean) => Promise<OfficialModelCatalogResult | null>;
   startOfficialAccountLogin: (method: "browser" | "device", accountId?: string) => Promise<OfficialLoginSessionResult | null>;
   officialAccountLoginStatus: (loginId: string) => Promise<OfficialLoginSessionResult | null>;
   cancelOfficialAccountLogin: (loginId: string) => Promise<void>;
@@ -5232,6 +5267,7 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
 function RelayScreen({
   settings: _settings,
   officialAccounts,
+  officialModelCatalog,
   cliproxy,
   cliproxyModels,
   cliproxyTest,
@@ -5247,6 +5283,7 @@ function RelayScreen({
 }: {
   settings: SettingsResult | null;
   officialAccounts: OfficialAccountsResult | null;
+  officialModelCatalog: OfficialModelCatalogResult | null;
   cliproxy: CliproxyStatusResult | null;
   cliproxyModels: CliproxyModelsResult | null;
   cliproxyTest: CliproxyTestResult | null;
@@ -5423,29 +5460,32 @@ function RelayScreen({
               <ToggleVisual />
             </label>
             {normalized.officialLoginMixedMode ? (
-              <div className="relay-fields official-login-mixed-fields">
-                <Field className="relay-field-official-login" label={t("认证账号")}>
-                  <select
-                    className="field-select"
-                    value={officialAccounts?.activeAccountId || ""}
-                    onChange={(event) => {
-                      void actions.switchOfficialAccount(event.currentTarget.value);
-                    }}
-                  >
-                    {(officialAccounts?.accounts ?? []).filter((account) => account.enabled).map((account) => (
-                      <option key={account.id} value={account.id}>{account.name || account.email || account.id}</option>
-                    ))}
-                  </select>
-                </Field>
-                <Field className="relay-field-request-target" label={t("请求目标")}>
-                  <Input readOnly value={selectedRequestTarget.name || selectedRequestTarget.id} />
-                  <p className="field-hint">
-                    {isOfficialLoginProfile(selectedRequestTarget)
-                      ? t("当前使用官方 API；点击其他供应商的“使用”即可覆写请求目标。")
-                      : tf("认证顺序：{0} → {1}。", [activeOfficialAccount?.name || activeOfficialAccount?.email || "openai", selectedRequestTarget.name || selectedRequestTarget.id])}
-                  </p>
-                </Field>
-              </div>
+              <>
+                <div className="relay-fields official-login-mixed-fields">
+                  <Field className="relay-field-official-login" label={t("认证账号")}>
+                    <select
+                      className="field-select"
+                      value={officialAccounts?.activeAccountId || ""}
+                      onChange={(event) => {
+                        void actions.switchOfficialAccount(event.currentTarget.value);
+                      }}
+                    >
+                      {(officialAccounts?.accounts ?? []).filter((account) => account.enabled).map((account) => (
+                        <option key={account.id} value={account.id}>{account.name || account.email || account.id}</option>
+                      ))}
+                    </select>
+                  </Field>
+                  <Field className="relay-field-request-target" label={t("请求目标")}>
+                    <Input readOnly value={selectedRequestTarget.name || selectedRequestTarget.id} />
+                    <p className="field-hint">
+                      {isOfficialLoginProfile(selectedRequestTarget)
+                        ? t("当前使用官方 API；点击其他供应商的“使用”即可覆写请求目标。")
+                        : tf("认证顺序：{0} → {1}。", [activeOfficialAccount?.name || activeOfficialAccount?.email || "openai", selectedRequestTarget.name || selectedRequestTarget.id])}
+                    </p>
+                  </Field>
+                </div>
+                <OfficialModelCatalogStatusPanel status={officialModelCatalog} actions={actions} />
+              </>
             ) : null}
           </div>
           <div className="relay-add-row">
@@ -5521,6 +5561,57 @@ function RelayScreen({
       </Panel>
       )}
     </>
+  );
+}
+
+function OfficialModelCatalogStatusPanel({
+  status,
+  actions,
+}: {
+  status: OfficialModelCatalogResult | null;
+  actions: Actions;
+}) {
+  const [busy, setBusy] = useState(false);
+  const source = status?.source === "account_snapshot"
+    ? t("当前账号快照")
+    : status?.source === "bundled_cli"
+      ? t("Codex CLI bundled 目录")
+      : status?.source === "bundled"
+        ? t("Codex 内置目录")
+        : status?.source === "compatibility"
+          ? t("兼容目录")
+          : status?.source || t("无");
+  const fetchedAt = status?.fetchedAt ? formatUnixTime(status.fetchedAt) : t("未记录");
+  const refresh = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await actions.refreshOfficialModelCatalog(false, true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="official-model-catalog-status">
+      <div className="official-model-catalog-head">
+        <div>
+          <strong>{t("动态官方模型目录")}</strong>
+          <span>{t("模型名称与能力来自当前官方账号或 Codex bundled catalog，不再固定写死。")}</span>
+        </div>
+        <Button disabled={busy} onClick={() => void refresh()} size="icon" title={t("刷新官方模型目录")} variant="outline">
+          <RefreshCw className={`h-4 w-4 ${busy ? "spin" : ""}`} />
+        </Button>
+      </div>
+      <div className="official-model-catalog-meta">
+        <span><strong>{t("来源")}</strong>{source}</span>
+        <span><strong>{t("更新时间")}</strong>{fetchedAt}</span>
+        <span><strong>{t("模型数量")}</strong>{status ? tf("{0} 个模型", [status.visibleModels.length]) : t("未读取")}</span>
+        <span><strong>{t("客户端版本")}</strong>{status?.clientVersion || t("未知")}</span>
+      </div>
+      {status?.stale ? <div className="official-model-catalog-warning">{t("当前目录已过期，Codex 仍会使用最近一次可用快照。")}</div> : null}
+      {status?.error ? <div className="official-model-catalog-error">{status.error}</div> : null}
+    </div>
   );
 }
 
@@ -6212,6 +6303,7 @@ function OfficialAccountsPanel({ result, actions }: { result: OfficialAccountsRe
         setLoginSession(next);
         if (next.status === "success") {
           void actions.refreshOfficialAccounts(true);
+          void actions.refreshOfficialModelCatalog(true, true);
           void actions.showMessage(
             t("官方账号登录"),
             tf("账号“{0}”已保存。", [next.account?.name || next.account?.email || "OpenAI"]),
@@ -10092,7 +10184,7 @@ function RelayProfileEditor({
               </label>
             </span>
             <div className="relay-model-mappings-grid">
-              {CODEX_MODEL_MAPPING_KEYS.map((codexModel) => {
+              {visibleOfficialModelSlugs().map((codexModel: string) => {
                 const currentValue = (profile.modelMappings || {})[codexModel] || "";
                 const options = Array.from(new Set([...availableModels, currentValue].filter(Boolean)));
                 return (
@@ -14164,7 +14256,7 @@ function aggregateMemberWeightMap(aggregate: RelayAggregateConfig): Map<string, 
 
 function nextAggregateMappingKey(mappings: AggregateEffectiveModelMapping[]): string {
   const used = new Set(mappings.map((mapping) => mapping.codexModel.trim()).filter(Boolean));
-  const defaultKey = CODEX_MODEL_MAPPING_KEYS.find((model) => !used.has(model));
+  const defaultKey = visibleOfficialModelSlugs().find((model) => !used.has(model));
   if (defaultKey) return defaultKey;
   let suffix = 1;
   while (used.has(suffix === 1 ? "custom-model" : `custom-model-${suffix}`)) suffix += 1;
@@ -14214,7 +14306,7 @@ function isCliproxyGeneralProfile(profile: Pick<RelayProfile, "id" | "integratio
 
 function isCliproxyOfficialModel(model: string): boolean {
   const baseModel = model.trim().split("/").at(-1)?.trim().toLowerCase() ?? "";
-  return DEFAULT_CODEX_MODEL_MAPPING_KEYS.some((candidate) => candidate === baseModel);
+  return isTrustedOfficialModel(baseModel);
 }
 
 function isOfficialLoginProfile(profile: RelayProfile): boolean {
@@ -14273,17 +14365,17 @@ function inferAggregateModelList(profile: RelayProfile, settings: BackendSetting
 }
 
 function officialLoginModelList(settings: BackendSettings): string[] {
-  if (settings.activeOfficialAccountId) return [...DEFAULT_CODEX_MODEL_MAPPING_KEYS];
+  if (settings.activeOfficialAccountId) return visibleOfficialModelSlugs();
   const official = settings.relayProfiles.find((profile) => profile.id === settings.officialLoginRelayId)
     ?? settings.relayProfiles.find((profile) => isOfficialLoginProfile(profile));
-  return official && isOfficialLoginProfile(official) ? [...DEFAULT_CODEX_MODEL_MAPPING_KEYS] : [];
+  return official && isOfficialLoginProfile(official) ? visibleOfficialModelSlugs() : [];
 }
 
 function cliproxyOfficialModelAliases(settings: BackendSettings): string[] {
   const profile = settings.relayProfiles.find(isCliproxyOfficialProfile);
   if (!profile) return [];
   const models = relayProfileModels(profile);
-  return DEFAULT_CODEX_MODEL_MAPPING_KEYS.flatMap((officialModel) => {
+  return trustedOfficialModelSlugs().flatMap((officialModel: string) => {
     const candidates = models
       .filter((model) => model.trim().split("/").at(-1)?.trim().toLowerCase() === officialModel)
       .sort((left, right) => Number(left.includes("/")) - Number(right.includes("/")) || left.localeCompare(right));

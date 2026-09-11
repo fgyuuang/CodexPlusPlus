@@ -3100,23 +3100,97 @@
   const codexAppModuleFailures = new Map();
   const codexAppModuleRetryCooldownMs = 30000;
   const codexAppModuleMaxAttempts = 8;
-  const codexTrustedOfficialCapabilityModels = new Set([
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-  ]);
-  const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
-  // 这里只放确认支持 priority service tier 的官方模型——这个集合同时用于生成
-  // 「Fast 仅支持 …」的提示文案，塞进没验证过的模型等于对用户做出错误承诺。
-  // 第三方模型（deepseek 等）走下面 codexServiceTierFastSupportedForModel 里的
-  // 模型元数据判定：上游自己声明了 priority 才认。
-  ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
+  // 目录请求尚未完成时，保留旧版 Codex 已知能力。该兼容表只用于
+  // reasoning/Fast 能力校验，不参与官方模型信任、列表或路由判定。
+  const codexLegacyCapabilityFallback = {
+    "gpt-5.6-sol": { defaultReasoningEffort: "low", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"], additionalSpeedTiers: ["fast"], serviceTiers: [{ id: "priority" }] },
+    "gpt-5.6-terra": { defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"], additionalSpeedTiers: ["fast"], serviceTiers: [{ id: "priority" }] },
+    "gpt-5.6-luna": { defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"], additionalSpeedTiers: ["fast"], serviceTiers: [{ id: "priority" }] },
+  };
+
+  function codexCurrentModelCatalog() {
+    try {
+      return codexModelCatalog && typeof codexModelCatalog === "object" ? codexModelCatalog : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function codexCatalogSlug(value) {
+    if (typeof value === "string") return value.trim();
+    if (!value || typeof value !== "object") return "";
+    return String(value.slug || value.model || value.id || "").trim();
+  }
+
+  function codexCatalogOfficialModels(includeHidden = true) {
+    const catalog = codexCurrentModelCatalog();
+    const values = Array.isArray(catalog.trustedOfficialModels) && catalog.trustedOfficialModels.length
+      ? catalog.trustedOfficialModels
+      : (Array.isArray(catalog.officialModels) ? catalog.officialModels : []);
+    return uniqueValues(values.map(codexCatalogSlug)).filter((model) => {
+      if (model.includes(":") || model.includes("(")) return false;
+      if (includeHidden) return true;
+      const visible = Array.isArray(catalog.models) ? catalog.models.map(codexCatalogSlug) : [];
+      return visible.some((candidate) => candidate.toLowerCase() === model.toLowerCase());
+    });
+  }
+
+  function codexCatalogMetadata(modelName) {
+    const catalog = codexCurrentModelCatalog();
+    const metadata = catalog.modelMetadata || catalog.model_metadata;
+    if (!metadata || typeof metadata !== "object") return null;
+    const normalized = String(modelName || "").trim();
+    if (!normalized) return null;
+    const exactKey = Object.keys(metadata).find((key) => key.toLowerCase() === normalized.toLowerCase());
+    if (exactKey && metadata[exactKey] && typeof metadata[exactKey] === "object") return metadata[exactKey];
+    const prefix = "cliproxyapi:";
+    if (normalized.toLowerCase().startsWith(prefix)) {
+      const base = normalized.slice(prefix.length).trim();
+      const trustedBase = codexCatalogOfficialModels().some((model) => model.toLowerCase() === base.toLowerCase());
+      const legacyBaseKey = Object.keys(codexLegacyCapabilityFallback).find((key) => key.toLowerCase() === base.toLowerCase());
+      if (trustedBase || legacyBaseKey) {
+        const baseKey = Object.keys(metadata).find((key) => key.toLowerCase() === base.toLowerCase());
+        if (baseKey && metadata[baseKey] && typeof metadata[baseKey] === "object") return metadata[baseKey];
+        if (legacyBaseKey) return codexLegacyCapabilityFallback[legacyBaseKey];
+      }
+    }
+    const legacyKey = Object.keys(codexLegacyCapabilityFallback).find((key) => key.toLowerCase() === normalized.toLowerCase());
+    return legacyKey ? codexLegacyCapabilityFallback[legacyKey] : null;
+  }
+
+  function codexCatalogModelSupportsFast(metadata) {
+    if (!metadata || typeof metadata !== "object") return false;
+    const speedTiers = Array.isArray(metadata.additionalSpeedTiers)
+      ? metadata.additionalSpeedTiers
+      : (Array.isArray(metadata.additional_speed_tiers) ? metadata.additional_speed_tiers : []);
+    if (speedTiers.some((entry) => {
+      const value = entry && typeof entry === "object" ? (entry.id || entry.name || entry.value) : entry;
+      return String(value || "").trim().toLowerCase() === "fast";
+    })) return true;
+    const serviceTiers = Array.isArray(metadata.serviceTiers)
+      ? metadata.serviceTiers
+      : (Array.isArray(metadata.service_tiers) ? metadata.service_tiers : []);
+    return serviceTiers.some((entry) => {
+      const value = entry && typeof entry === "object" ? (entry.id || entry.name || entry.value) : entry;
+      const normalized = String(value || "").trim().toLowerCase();
+      return normalized === "fast" || normalized === "priority";
+    });
+  }
+
+  function codexServiceTierSupportedFastModelNames() {
+    const catalog = codexCurrentModelCatalog();
+    const names = [];
+    const candidates = uniqueValues([
+      ...codexCatalogOfficialModels(false),
+      ...(Array.isArray(catalog.models) ? catalog.models : []),
+    ]);
+    for (const model of candidates) {
+      if (codexCatalogModelSupportsFast(codexCatalogMetadata(model))) names.push(model);
+    }
+    return uniqueValues(names);
+  }
 
   function uniqueCodexAppAssetUrls(urls) {
     return Array.from(new Set((urls || []).filter((url) => typeof url === "string" && url.includes("/assets/") && url.split("?")[0].endsWith(".js"))));
@@ -3368,16 +3442,17 @@
   }
 
   function codexServiceTierFastModelListLabel() {
-    return Array.from(codexServiceTierSupportedFastModels).join(" / ");
+    const models = codexServiceTierSupportedFastModelNames();
+    return models.length ? models.join(" / ") : "暂无已知支持 Fast 的模型";
   }
 
   function normalizeCodexServiceTierModelName(model) {
     const normalized = String(model || "").trim().toLowerCase();
-    if (codexTrustedOfficialCapabilityModels.has(normalized)) return normalized;
+    if (codexCatalogOfficialModels().some((candidate) => candidate.toLowerCase() === normalized)) return normalized;
     const cliPrefix = "cliproxyapi:";
     if (!normalized.startsWith(cliPrefix)) return normalized;
     const cliModel = normalized.slice(cliPrefix.length);
-    return codexTrustedOfficialCapabilityModels.has(cliModel) ? cliModel : normalized;
+    return codexCatalogOfficialModels().some((candidate) => candidate.toLowerCase() === cliModel) ? cliModel : normalized;
   }
 
   function codexServiceTierModelFromValue(value, visited = new WeakSet(), depth = 0) {
@@ -3404,17 +3479,14 @@
   }
 
   function codexServiceTierFastSupportedForModel(modelName) {
-    const normalized = normalizeCodexServiceTierModelName(modelName);
+    const normalized = String(modelName || "").trim();
     if (!normalized) return false;
-    if (codexServiceTierSupportedFastModels.has(normalized)) return true;
-    // 不按名字猜：模型叫 deepseek 不代表它的中转站支持 priority tier。
-    // 只认上游模型元数据里明确声明的 priority。
     try {
-      const metadata = typeof codexPlusModelMetadata === "function" ? codexPlusModelMetadata(modelName) : null;
-      if (metadata && Array.isArray(metadata.serviceTiers) && metadata.serviceTiers.some((t) => String(t.id || t).toLowerCase() === "priority")) return true;
-    } catch {}
-    // removed blanket apikey fallback to keep test contract (FAST only for known models)
-    return false;
+      const metadata = typeof codexPlusModelMetadata === "function" ? codexPlusModelMetadata(normalized) : null;
+      return codexCatalogModelSupportsFast(metadata);
+    } catch {
+      return false;
+    }
   }
 
   function codexServiceTierFastUnsupportedMessage(modelName = codexServiceTierCurrentModelName()) {
@@ -3434,10 +3506,9 @@
   }
 
   function codexServiceTierFastAvailability(modelName = codexServiceTierCurrentModelName()) {
-    const normalizedModel = normalizeCodexServiceTierModelName(modelName);
     return {
       modelName: modelName || "",
-      supported: !!normalizedModel && codexServiceTierSupportedFastModels.has(normalizedModel),
+      supported: codexServiceTierFastSupportedForModel(modelName),
     };
   }
 
@@ -7156,7 +7227,7 @@
     return Array.from(new Set(values.filter((value) => typeof value === "string" && value.trim().length > 0)));
   }
 
-  let codexModelCatalog = { status: "loading", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+  let codexModelCatalog = { status: "loading", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], officialModels: [], trustedOfficialModels: [], modelMetadata: {}, sources: [], responses_api: { status: "unknown", message: "" } };
   let codexModelCatalogLoadedAt = 0;
   let codexModelCatalogPromise = null;
   let codexModelWhitelistRefreshTimer = 0;
@@ -7201,6 +7272,9 @@
           codex_model_provider: "",
           provider_name: "",
           models: [],
+          officialModels: [],
+          trustedOfficialModels: [],
+          modelMetadata: {},
           sources: [],
           responses_api: { status: "unknown", message: "" },
           ...catalog,
@@ -7251,7 +7325,7 @@
     if (!force && codexModelCatalogLoadedAt && Date.now() - codexModelCatalogLoadedAt < 10000) return codexModelCatalog;
     codexModelCatalogPromise = postJson("/codex-model-catalog", {})
       .then(async (result) => {
-        codexModelCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+        codexModelCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], officialModels: [], trustedOfficialModels: [], modelMetadata: {}, sources: [], responses_api: { status: "unknown", message: "" } };
         if ((!codexModelCatalog.models || codexModelCatalog.models.length === 0) && codexModelCatalog.status === "not_configured") {
           try {
             const settingsPromise = postJson("/settings/get", {});
@@ -7279,7 +7353,7 @@
         return codexModelCatalog;
       })
       .catch((error) => {
-        codexModelCatalog = { status: "failed", message: String(error?.message || error), model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+        codexModelCatalog = { status: "failed", message: String(error?.message || error), model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], officialModels: [], trustedOfficialModels: [], modelMetadata: {}, sources: [], responses_api: { status: "unknown", message: "" } };
         codexModelCatalogLoadedAt = Date.now();
         return codexModelCatalog;
       })
@@ -7290,14 +7364,11 @@
   }
 
   function codexPlusModelMetadata(modelName) {
-    const metadata = codexModelCatalog.modelMetadata || codexModelCatalog.model_metadata;
     const normalizedName = codexServiceTierModelFromValue(modelName);
-    const exact = metadata && typeof metadata === "object" ? metadata[normalizedName] : null;
-    const matchedKey = !exact && metadata && typeof metadata === "object"
-      ? Object.keys(metadata).find((key) => key.toLowerCase() === normalizedName.toLowerCase())
-      : null;
-    const value = exact || (matchedKey ? metadata[matchedKey] : null);
-    return value && typeof value === "object" ? value : null;
+    return codexCatalogMetadata(normalizedName)
+      || (normalizedName !== String(modelName || "").trim()
+        ? codexCatalogMetadata(String(modelName || "").trim())
+        : null);
   }
 
   function modelReasoningEfforts(modelName) {
@@ -7313,16 +7384,20 @@
   }
 
   function codexBuiltInReasoningMetadata(modelName) {
-    switch (normalizeCodexServiceTierModelName(modelName)) {
-      case "gpt-5.6-sol":
-        return { defaultEffort: "low", supported: ["low", "medium", "high", "xhigh", "max", "ultra"] };
-      case "gpt-5.6-terra":
-        return { defaultEffort: "medium", supported: ["low", "medium", "high", "xhigh", "max", "ultra"] };
-      case "gpt-5.6-luna":
-        return { defaultEffort: "medium", supported: ["low", "medium", "high", "xhigh", "max"] };
-      default:
-        return null;
-    }
+    const metadata = codexPlusModelMetadata(modelName);
+    if (!metadata || typeof metadata !== "object") return null;
+    const supportedValues = Array.isArray(metadata.supportedReasoningEfforts)
+      ? metadata.supportedReasoningEfforts
+      : (Array.isArray(metadata.supported_reasoning_levels) ? metadata.supported_reasoning_levels : []);
+    const supported = supportedValues
+      .map((entry) => typeof entry === "string" ? entry : entry?.reasoningEffort || entry?.effort)
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean);
+    if (!supported.length) return null;
+    return {
+      defaultEffort: String(metadata.defaultReasoningEffort || metadata.default_reasoning_level || "").trim(),
+      supported,
+    };
   }
 
   function codexModelReasoningEffortValues(modelName) {

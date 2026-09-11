@@ -63,6 +63,8 @@ pub async fn read_codex_model_catalog() -> Value {
                 "provider_name": "",
                 "default_model": "",
                 "models": [],
+                "officialModels": [],
+                "trustedOfficialModels": [],
                 "modelMetadata": {},
                 "sources": [],
                 "responses_api": responses_api_status("unknown", "", "")
@@ -88,6 +90,16 @@ fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) ->
     };
     let model_count = models.len();
     let model_metadata = model_ui_metadata_map(&models);
+    let official_models = if settings.active_relay_uses_official_login_auth() {
+        crate::official_model_catalog::visible_official_model_slugs_for_settings(settings)
+    } else {
+        Vec::new()
+    };
+    let trusted_official_models = if settings.active_relay_uses_official_login_auth() {
+        crate::official_model_catalog::trusted_official_model_slugs_for_settings(settings)
+    } else {
+        Vec::new()
+    };
     json!({
         "status": if models.is_empty() { "not_configured" } else { "ok" },
         "path": home.join("config.toml").to_string_lossy(),
@@ -98,6 +110,8 @@ fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) ->
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,
+        "officialModels": official_models,
+        "trustedOfficialModels": trusted_official_models,
         "modelMetadata": model_metadata,
         "sources": [
             {
@@ -260,10 +274,12 @@ fn aggregate_relay_model_catalog_value(
         .cloned()
         .collect::<Vec<_>>();
     let official_models = if official_auth_first {
-        crate::aggregate_model_alias::TRUSTED_OFFICIAL_CODEX_MODELS
-            .iter()
-            .map(|model| (*model).to_string())
-            .collect::<Vec<_>>()
+        crate::official_model_catalog::visible_official_model_slugs_for_settings(settings)
+    } else {
+        aggregate_official_models.clone()
+    };
+    let trusted_official_models = if official_auth_first {
+        crate::official_model_catalog::trusted_official_model_slugs_for_settings(settings)
     } else {
         aggregate_official_models.clone()
     };
@@ -278,9 +294,9 @@ fn aggregate_relay_model_catalog_value(
     );
     let mut models = Vec::new();
     let mut seen_models = HashSet::new();
-    for model in official_models {
+    for model in &official_models {
         if seen_models.insert(model.clone()) {
-            models.push(model);
+            models.push(model.clone());
         }
     }
     for alias in &dedicated_cli_models {
@@ -384,10 +400,8 @@ fn aggregate_relay_model_catalog_value(
         }
     }
     if official_auth_first {
-        let trusted_official_models = crate::aggregate_model_alias::TRUSTED_OFFICIAL_CODEX_MODELS
-            .iter()
-            .map(|model| (*model).to_string())
-            .collect::<Vec<_>>();
+        let trusted_official_models =
+            crate::official_model_catalog::visible_official_model_slugs_for_settings(settings);
         if let Some(metadata) = model_ui_metadata_map(&trusted_official_models).as_object() {
             if let Some(target) = model_metadata.as_object_mut() {
                 for (model, value) in metadata {
@@ -421,6 +435,8 @@ fn aggregate_relay_model_catalog_value(
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,
+        "officialModels": official_models,
+        "trustedOfficialModels": trusted_official_models,
         "modelMetadata": model_metadata,
         "model_details": model_details,
         "sources": member_profiles.iter().map(|member| json!({
@@ -524,6 +540,8 @@ pub async fn read_codex_model_catalog_from_home(
     };
     let responses_api = preferred_responses_api_status(&source_statuses);
     let model_metadata = model_ui_metadata_map(&models);
+    let official_models = crate::official_model_catalog::visible_official_model_slugs();
+    let trusted_official_models = crate::official_model_catalog::trusted_official_model_slugs();
 
     json!({
         "status": status,
@@ -534,6 +552,8 @@ pub async fn read_codex_model_catalog_from_home(
         "provider_name": provider_name,
         "default_model": default_model,
         "models": models,
+        "officialModels": official_models,
+        "trustedOfficialModels": trusted_official_models,
         "modelMetadata": model_metadata,
         "sources": source_statuses,
         "responses_api": responses_api

@@ -23,16 +23,6 @@ pub struct AggregateDispatchEntry {
     pub via_mapping: bool,
 }
 
-pub const TRUSTED_OFFICIAL_CODEX_MODELS: &[&str] = &[
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-];
-
 pub const CLIPROXY_OFFICIAL_INTEGRATION_TYPE: &str = "cliproxy-official";
 pub const CLIPROXY_OFFICIAL_PROVIDER_LABEL: &str = "CLIProxyAPI";
 pub const CLIPROXY_GENERAL_INTEGRATION_TYPE: &str = "cliproxy";
@@ -73,15 +63,17 @@ pub fn cliproxy_official_api_aliases(profiles: &[RelayProfile]) -> Vec<DirectRel
         .collect::<Vec<_>>();
     let mut aliases = Vec::new();
 
-    for official_model in TRUSTED_OFFICIAL_CODEX_MODELS {
+    for official_model in crate::official_model_catalog::visible_official_model_slugs() {
         let mut candidates = official_profiles
             .iter()
             .flat_map(|profile| {
+                let official_model_for_profile = official_model.clone();
                 relay_profile_model_ids(profile)
                     .into_iter()
                     .filter_map(move |target_model| {
-                        (cliproxy_official_model_name(&target_model)
-                            .is_some_and(|model| model.eq_ignore_ascii_case(official_model)))
+                        (cliproxy_official_model_name(&target_model).is_some_and(|model| {
+                            model.eq_ignore_ascii_case(&official_model_for_profile)
+                        }))
                         .then(|| (profile.id.trim().to_string(), target_model))
                     })
             })
@@ -98,7 +90,7 @@ pub fn cliproxy_official_api_aliases(profiles: &[RelayProfile]) -> Vec<DirectRel
             continue;
         };
         aliases.push(DirectRelayAlias {
-            alias: provider_label(CLIPROXY_OFFICIAL_PROVIDER_LABEL, official_model),
+            alias: provider_label(CLIPROXY_OFFICIAL_PROVIDER_LABEL, &official_model),
             relay_id,
             target_model,
         });
@@ -156,10 +148,7 @@ pub fn cliproxy_official_model_name(model: &str) -> Option<&str> {
 }
 
 pub fn is_trusted_official_codex_model(model: &str) -> bool {
-    let model = model.trim();
-    TRUSTED_OFFICIAL_CODEX_MODELS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(model))
+    crate::official_model_catalog::is_trusted_official_model(model)
 }
 
 pub fn provider_display_name(profile: &RelayProfile) -> String {

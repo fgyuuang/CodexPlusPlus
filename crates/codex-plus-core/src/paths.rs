@@ -13,6 +13,7 @@ const SKILLS_DIR: &str = "skills";
 const SKILL_BACKUPS_DIR: &str = "skill-backups";
 const OFFICIAL_ACCOUNTS_FILE: &str = "official-accounts.json";
 const OFFICIAL_ACCOUNT_SECRETS_FILE: &str = "official-account-secrets.json";
+const OFFICIAL_MODEL_CATALOG_FILE: &str = "official-model-catalog.json";
 const PENDING_MANAGER_NAVIGATION_FILE: &str = "pending-manager-navigation.json";
 
 pub fn default_app_state_dir() -> PathBuf {
@@ -73,6 +74,13 @@ pub fn default_official_account_secrets_path() -> PathBuf {
     default_app_state_dir().join(OFFICIAL_ACCOUNT_SECRETS_FILE)
 }
 
+pub fn default_official_model_catalog_path() -> PathBuf {
+    if let Some(path) = official_model_catalog_path_for_tests() {
+        return path;
+    }
+    default_app_state_dir().join(OFFICIAL_MODEL_CATALOG_FILE)
+}
+
 pub fn default_pending_manager_navigation_path() -> PathBuf {
     default_app_state_dir().join(PENDING_MANAGER_NAVIGATION_FILE)
 }
@@ -86,6 +94,7 @@ fn settings_path_for_tests() -> Option<PathBuf> {
 }
 
 static SETTINGS_PATH_FOR_TESTS: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static OFFICIAL_MODEL_CATALOG_PATH_FOR_TESTS: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 #[cfg(test)]
 static SETTINGS_PATH_TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -104,6 +113,27 @@ pub fn set_settings_path_for_tests(path: Option<PathBuf>) -> Option<PathBuf> {
         .lock()
         .ok()
         .and_then(|mut current| std::mem::replace(&mut *current, path))
+}
+
+fn official_model_catalog_path_for_tests() -> Option<PathBuf> {
+    OFFICIAL_MODEL_CATALOG_PATH_FOR_TESTS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|path| path.clone())
+}
+
+pub fn set_official_model_catalog_path_for_tests(path: Option<PathBuf>) -> Option<PathBuf> {
+    OFFICIAL_MODEL_CATALOG_PATH_FOR_TESTS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .map(|mut current| {
+            let previous = current.clone();
+            *current = path;
+            previous
+        })
+        .flatten()
 }
 
 #[cfg(test)]
@@ -163,6 +193,13 @@ mod tests {
             default_official_account_secrets_path()
                 .ends_with(".codex-session-delete/official-account-secrets.json")
         );
+    }
+
+    #[test]
+    fn default_official_model_catalog_path_uses_app_state_directory() {
+        let path = default_official_model_catalog_path();
+
+        assert!(path.ends_with(".codex-session-delete/official-model-catalog.json"));
     }
 
     #[test]

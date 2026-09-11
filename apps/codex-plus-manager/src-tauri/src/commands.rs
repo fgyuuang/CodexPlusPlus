@@ -98,6 +98,9 @@ pub struct OfficialAccountsPayload {
     pub restart_required: bool,
 }
 
+pub type OfficialModelCatalogPayload =
+    codex_plus_core::official_model_catalog::OfficialModelCatalogStatus;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialLoginSessionPayload {
@@ -1643,6 +1646,36 @@ pub fn list_official_accounts() -> CommandResult<OfficialAccountsPayload> {
 }
 
 #[tauri::command]
+pub fn get_official_model_catalog_status() -> CommandResult<OfficialModelCatalogPayload> {
+    ok(
+        "官方模型目录状态已加载。",
+        codex_plus_core::official_model_catalog::status_for_current_settings(),
+    )
+}
+
+#[tauri::command]
+pub async fn refresh_official_model_catalog(
+    force: Option<bool>,
+) -> CommandResult<OfficialModelCatalogPayload> {
+    match codex_plus_core::official_model_catalog::refresh_active_account(force.unwrap_or(false))
+        .await
+    {
+        Ok(status) => ok("官方模型目录已刷新。", status),
+        Err(error) => {
+            let settings = SettingsStore::default().load().unwrap_or_default();
+            let safe_error = error.to_string().chars().take(240).collect::<String>();
+            failed(
+                &format!("官方模型目录刷新失败，已使用回退目录：{safe_error}"),
+                codex_plus_core::official_model_catalog::status_for_settings(
+                    &settings,
+                    Some(safe_error),
+                ),
+            )
+        }
+    }
+}
+
+#[tauri::command]
 pub async fn start_official_account_login(
     app: tauri::AppHandle,
     request: OfficialLoginStartRequest,
@@ -1854,6 +1887,12 @@ pub async fn switch_official_account(
             );
         }
     };
+    let _ = codex_plus_core::official_model_catalog::refresh_account(
+        &settings.active_official_account_id,
+        &settings,
+        false,
+    )
+    .await;
     if was_running {
         codex_plus_core::watcher::stop_launcher_processes_and_wait();
         codex_plus_core::watcher::stop_codex_processes_and_wait();

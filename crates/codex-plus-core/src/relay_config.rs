@@ -1940,9 +1940,10 @@ fn apply_model_catalog_to_config(
     // Catalog capabilities must follow the effective config, not stale profile URLs.
     let official_deepseek_responses =
         uses_official_deepseek_responses_for_config(profile, &config_text);
-    let default_native_catalog = !entries.is_empty()
-        && (profile.relay_mode != crate::settings::RelayMode::Official
-            || official_deepseek_responses);
+    let default_native_catalog = profile.official_mix_api_key
+        || (!entries.is_empty()
+            && (profile.relay_mode != crate::settings::RelayMode::Official
+                || official_deepseek_responses));
     let fallback = parse_optional_positive_u64(&profile.context_window, "上下文大小")?;
     // 用户已手写 model_catalog_json 指针时保留，不覆盖（保 preserves_user_model_catalog_json 测试）。
     // Codex++ 管理的 catalog 必须随当前 profile 切换；否则前一个供应商的模型列表会残留。
@@ -2040,6 +2041,11 @@ fn apply_model_catalog_to_config(
         custom_responses.then_some(false),
         official_deepseek_responses,
     );
+    let catalog_json = if profile.official_mix_api_key {
+        crate::model_suffix::merge_official_model_entries(&catalog_json)
+    } else {
+        catalog_json
+    };
     let catalog_json = apply_model_metadata_overrides(&catalog_json, &model_metadata)?;
     crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
     let mut doc = parse_toml_document(&config_text)?;
@@ -2787,12 +2793,7 @@ pub fn effective_active_relay_profile_for_codex(settings: &BackendSettings) -> R
     );
     let official_auth_first = settings.active_relay_uses_official_login_auth();
     let native_official_models = official_auth_first
-        .then(|| {
-            crate::aggregate_model_alias::TRUSTED_OFFICIAL_CODEX_MODELS
-                .iter()
-                .map(|model| (*model).to_string())
-                .collect::<Vec<_>>()
-        })
+        .then(|| crate::official_model_catalog::visible_official_model_slugs_for_settings(settings))
         .unwrap_or_default();
     let dedicated_cli_models = official_auth_first
         .then(|| {
