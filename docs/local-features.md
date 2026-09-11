@@ -52,6 +52,7 @@ CLIProxyAPI 固定部署到 `D:\pro\CLIProxyAPI`，独立负责账号登录、OA
 | 模块 | 文件 | 维护要点 |
 |---|---|---|
 | Manager 服务控制 | `apps/codex-plus-manager/src-tauri/src/cliproxy.rs` | 固定版本下载与 SHA-256 校验、DPAPI 连接密钥、PID/可执行路径核验、独立进程启停。不得并入 `official_accounts.rs`。 |
+| CLIProxy 自启动 | `apps/codex-plus-manager/src-tauri/src/cliproxy.rs`、`src/lib.rs`、`src/App.tsx` | `cliproxy-integration.json` 的 `autoStart` 仅控制正常 Manager 启动时的后台服务启动；`--transient` 不触发，启动失败只写诊断日志，不读取或同步 CLIProxyAPI 账号目录。 |
 | 受管供应商标识 | `crates/codex-plus-core/src/settings.rs` | `RelayProfile.integrationType = "cliproxy"` 用于识别受管通用直连配置；它不成为聚合成员，也不参与账号同步。`cliproxy-official` 只表示第二开关启用的官方模型专用通道。 |
 | 独立模型路由 | `crates/codex-plus-core/src/aggregate_model_alias.rs`、`model_catalog.rs`、`relay_rotation.rs`、`relay_config.rs`、`assets/inject/renderer-inject.js` | CLIProxyAPI 模型使用 `CLIProxyAPI:模型名` 直连受管配置，不进入聚合轮转。按钮2开启时官方模型由 `cliproxy-official` 接管，通用通道只展示非官方模型；可信 CLI 官方模型按基础模型继承 Fast 与 reasoning 档位。 |
 | Manager 页面 | `apps/codex-plus-manager/src/App.tsx` | 展示状态、API Base URL、连接密钥、模型与测试结果；普通供应商编辑器不得改写或删除受管字段。 |

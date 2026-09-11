@@ -101,6 +101,8 @@ struct CliproxyIntegrationSettings {
     config_path: String,
     #[serde(default)]
     base_url: String,
+    #[serde(default)]
+    auto_start: bool,
 }
 
 impl Default for CliproxyIntegrationSettings {
@@ -110,6 +112,7 @@ impl Default for CliproxyIntegrationSettings {
             binary_path: String::new(),
             config_path: String::new(),
             base_url: String::new(),
+            auto_start: false,
         }
     }
 }
@@ -139,14 +142,16 @@ fn save_connection_settings(request: CliproxySaveConnectionRequest) -> anyhow::R
     let binary_path = optional_absolute_path_text(&request.binary_path, "可执行文件")?;
     let config_path = optional_absolute_path_text(&request.config_path, "配置文件")?;
     let service_url = normalize_service_url(&request.base_url)?;
+    let current_settings = load_integration_settings()?;
     let next = CliproxyIntegrationSettings {
         install_root,
         binary_path,
         config_path,
         base_url: openai_api_base_url(&service_url),
+        auto_start: current_settings.auto_start,
     };
 
-    let current_layout = Layout::configured()?;
+    let current_layout = Layout::from_integration_settings(&current_settings);
     if let Some(state) = load_runtime_state(&current_layout)?
         && process_matches(&state)
     {
@@ -262,6 +267,7 @@ pub struct CliproxyStatusPayload {
     pub config_path: String,
     pub base_url: String,
     pub management_url: String,
+    pub auto_start: bool,
     pub api_key: String,
     pub management_key: String,
     pub profile_installed: bool,
@@ -316,6 +322,12 @@ pub struct CliproxySaveConnectionRequest {
     #[serde(default)]
     pub config_path: String,
     pub base_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliproxySetAutoStartRequest {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -512,6 +524,32 @@ pub async fn cliproxy_save_connection(
 }
 
 #[tauri::command]
+pub async fn cliproxy_set_auto_start(
+    request: CliproxySetAutoStartRequest,
+) -> CommandResult<CliproxyStatusPayload> {
+    match set_auto_start(request.enabled) {
+        Ok(()) => match status_payload().await {
+            Ok(payload) => success(
+                if request.enabled {
+                    "CLIProxyAPI 已设置为随 Codex++ 启动。"
+                } else {
+                    "CLIProxyAPI 自启动已关闭。"
+                },
+                payload,
+            ),
+            Err(error) => failure(
+                &format!("CLIProxyAPI 自启动设置已保存，但刷新状态失败：{error}"),
+                fallback_status(),
+            ),
+        },
+        Err(error) => failure(
+            &format!("保存 CLIProxyAPI 自启动设置失败：{error}"),
+            status_payload().await.unwrap_or_else(|_| fallback_status()),
+        ),
+    }
+}
+
+#[tauri::command]
 pub async fn cliproxy_apply_profile(
     request: CliproxyApplyRequest,
 ) -> CommandResult<CliproxyApplyPayload> {
@@ -679,6 +717,43 @@ async fn start_service() -> anyhow::Result<()> {
     anyhow::bail!("服务未在 12 秒内通过 /healthz 检查")
 }
 
+fn should_auto_start(settings: &CliproxyIntegrationSettings, transient: bool) -> bool {
+    !transient && settings.auto_start
+}
+
+pub fn start_cliproxy_from_saved_settings(transient: bool) {
+    let settings = match load_integration_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.cliproxy_auto_start_settings_load_failed",
+                json!({ "message": error.to_string() }),
+            );
+            return;
+        }
+    };
+    if !should_auto_start(&settings, transient) {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        match start_service().await {
+            Ok(()) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.cliproxy_auto_start_started",
+                    json!({ "status": "ok" }),
+                );
+            }
+            Err(error) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.cliproxy_auto_start_failed",
+                    json!({ "message": error.to_string() }),
+                );
+            }
+        }
+    });
+}
+
 async fn stop_service() -> anyhow::Result<()> {
     let layout = Layout::configured()?;
     let Some(state) = load_runtime_state(&layout)? else {
@@ -722,6 +797,7 @@ async fn status_payload() -> anyhow::Result<CliproxyStatusPayload> {
     }
     let secrets = load_secrets(&layout).ok().flatten();
     let settings = SettingsStore::default().load().unwrap_or_default();
+    let integration_settings = load_integration_settings().unwrap_or_default();
     let installed_version = if binary.is_some() {
         RELEASE_VERSION.to_string()
     } else {
@@ -748,6 +824,7 @@ async fn status_payload() -> anyhow::Result<CliproxyStatusPayload> {
             "{}/management.html",
             connection.base_url.trim_end_matches('/')
         ),
+        auto_start: integration_settings.auto_start,
         api_key: secrets
             .as_ref()
             .map(|value| value.api_key.clone())
@@ -765,6 +842,12 @@ async fn status_payload() -> anyhow::Result<CliproxyStatusPayload> {
             .iter()
             .any(is_general_managed_profile),
     })
+}
+
+fn set_auto_start(enabled: bool) -> anyhow::Result<()> {
+    let mut settings = load_integration_settings()?;
+    settings.auto_start = enabled;
+    atomic_write_json(&integration_settings_path(), &settings)
 }
 
 async fn list_models_payload() -> anyhow::Result<CliproxyModelsPayload> {
@@ -1435,6 +1518,7 @@ fn now_ts() -> i64 {
 fn fallback_status() -> CliproxyStatusPayload {
     let layout = Layout::configured().unwrap_or_else(|_| Layout::default());
     let connection = connection_info(&layout).unwrap_or_default();
+    let auto_start = load_integration_settings().unwrap_or_default().auto_start;
     CliproxyStatusPayload {
         installed: false,
         running: false,
@@ -1448,6 +1532,7 @@ fn fallback_status() -> CliproxyStatusPayload {
         config_path: layout.config_path.to_string_lossy().to_string(),
         base_url: openai_api_base_url(&connection.base_url),
         management_url: format!("{}/management.html", connection.base_url),
+        auto_start,
         api_key: String::new(),
         management_key: String::new(),
         profile_installed: false,
@@ -1564,6 +1649,7 @@ mod tests {
             binary_path: binary.to_string_lossy().to_string(),
             config_path: config.to_string_lossy().to_string(),
             base_url: "http://127.0.0.1:9123/v1".to_string(),
+            auto_start: false,
         };
 
         let layout = Layout::from_integration_settings(&settings);
@@ -1581,6 +1667,33 @@ mod tests {
         let serialized = serde_json::to_string(&settings).unwrap();
         assert!(!serialized.contains("apiKey"));
         assert!(!serialized.contains("managementKey"));
+    }
+
+    #[test]
+    fn cliproxy_auto_start_defaults_off_and_round_trips() {
+        let defaults = CliproxyIntegrationSettings::default();
+        assert!(!defaults.auto_start);
+
+        let enabled: CliproxyIntegrationSettings = serde_json::from_value(json!({
+            "installRoot": "D:/CLIProxyAPI",
+            "autoStart": true
+        }))
+        .unwrap();
+        assert!(enabled.auto_start);
+        assert_eq!(
+            serde_json::to_value(&enabled).unwrap()["autoStart"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn cliproxy_auto_start_skips_transient_manager() {
+        let settings = CliproxyIntegrationSettings {
+            auto_start: true,
+            ..CliproxyIntegrationSettings::default()
+        };
+        assert!(should_auto_start(&settings, false));
+        assert!(!should_auto_start(&settings, true));
     }
 
     #[test]

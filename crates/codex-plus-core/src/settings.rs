@@ -426,8 +426,6 @@ impl Default for DreamSkinThemeConfig {
 pub struct BackendSettings {
     #[serde(rename = "codexAppPath", default)]
     pub codex_app_path: String,
-    #[serde(rename = "codexAppAutoStart", default)]
-    pub codex_app_auto_start: bool,
     #[serde(rename = "codexExtraArgs", default)]
     pub codex_extra_args: Vec<String>,
     #[serde(rename = "providerSyncEnabled", default)]
@@ -638,7 +636,6 @@ impl Default for BackendSettings {
     fn default() -> Self {
         Self {
             codex_app_path: String::new(),
-            codex_app_auto_start: false,
             codex_extra_args: Vec::new(),
             provider_sync_enabled: false,
             provider_sync_saved_providers: Vec::new(),
@@ -1336,7 +1333,6 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("codexAppPath").and_then(Value::as_str) {
         target.insert("codexAppPath".to_string(), Value::String(value.to_string()));
     }
-    merge_bool_setting(target, source, "codexAppAutoStart");
     if let Some(value) = source.get("codexExtraArgs").and_then(Value::as_array) {
         let args = value
             .iter()
@@ -2112,7 +2108,6 @@ mod tests {
         assert!(settings.relay_common_config_contents.is_empty());
         assert_eq!(settings.relay_test_model, default_relay_test_model());
         assert!(!settings.codex_app_stepwise_enabled);
-        assert!(!settings.codex_app_auto_start);
         assert_eq!(settings.codex_app_stepwise_generation_mode, "auto");
         assert!(!settings.codex_app_answer_outline_enabled);
         assert!(!settings.codex_app_stepwise_direct_send);
@@ -2135,22 +2130,6 @@ mod tests {
         );
         assert!(settings.weixin_connect_token.is_empty());
         assert_eq!(settings.weixin_connect_sandbox, "read-only");
-    }
-
-    #[test]
-    fn settings_deserialize_and_serialize_codex_auto_start() {
-        let defaults: BackendSettings = serde_json::from_str("{}").unwrap();
-        assert!(!defaults.codex_app_auto_start);
-
-        let enabled: BackendSettings = serde_json::from_value(json!({
-            "codexAppAutoStart": true
-        }))
-        .unwrap();
-        assert!(enabled.codex_app_auto_start);
-        assert_eq!(
-            serde_json::to_value(&enabled).unwrap()["codexAppAutoStart"],
-            json!(true)
-        );
     }
 
     #[test]
@@ -2724,17 +2703,6 @@ experimental_bearer_token = "sk-existing""#
         store.save(&settings).unwrap();
 
         assert_eq!(store.load().unwrap(), settings);
-    }
-
-    #[test]
-    fn settings_store_update_persists_codex_auto_start() {
-        let dir = temp_dir();
-        let store = SettingsStore::new(dir.join("settings.json"));
-
-        let updated = store.update(json!({ "codexAppAutoStart": true })).unwrap();
-
-        assert!(updated.codex_app_auto_start);
-        assert!(store.load().unwrap().codex_app_auto_start);
     }
 
     #[test]

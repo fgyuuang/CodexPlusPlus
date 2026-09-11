@@ -369,7 +369,6 @@ export const EN_PLAIN: Record<string, string> = {
   "入口安装": "Entrypoint install",
   "入口安装、修复、Watcher 与手动启动": "Entrypoint install, repair, watcher and manual launch",
   "入口管理": "Entrypoint management",
-  "随 Codex++ 启动自动启动 Codex": "Start Codex automatically with Codex++",
   "全选当前列表": "Select all in current list",
   "关于": "About",
   "关于 Codex++": "About Codex++",
@@ -1100,6 +1099,10 @@ export const EN_PLAIN: Record<string, string> = {
   "CLIProxyAPI 测试": "CLIProxyAPI test",
   "CLIProxyAPI API Key": "CLIProxyAPI API Key",
   "CLIProxyAPI 启动与连接位置": "CLIProxyAPI launch and connection settings",
+  "CLIProxyAPI 自启动": "CLIProxyAPI auto-start",
+  "随 Codex++ 启动自动启动 CLIProxyAPI": "Start CLIProxyAPI automatically with Codex++",
+  "开启后，正常启动 Codex++ Manager 时会在后台启动 CLIProxyAPI；临时 Manager 不会触发。":
+    "When enabled, CLIProxyAPI starts in the background with a normal Codex++ Manager launch; transient Manager launches do not trigger it.",
   "CLIProxyAPI 供应商": "CLIProxyAPI provider",
   "安装 CLIProxyAPI": "Install CLIProxyAPI",
   "启动 CLIProxyAPI": "Start CLIProxyAPI",

@@ -996,55 +996,6 @@ fn spawn_codex_plus_launch(
     }
 }
 
-fn auto_start_launch_request(settings: &BackendSettings, transient: bool) -> Option<LaunchRequest> {
-    if transient || !settings.codex_app_auto_start {
-        return None;
-    }
-
-    Some(LaunchRequest {
-        app_path: settings.codex_app_path.clone(),
-        debug_port: default_debug_port(),
-        helper_port: default_helper_port(),
-        sync_active_relay: false,
-    })
-}
-
-pub fn start_codex_from_saved_settings(transient: bool) {
-    let settings = match SettingsStore::default().load() {
-        Ok(settings) => settings,
-        Err(error) => {
-            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                "manager.auto_start_settings_load_failed",
-                json!({ "message": error.to_string() }),
-            );
-            return;
-        }
-    };
-    let Some(request) = auto_start_launch_request(&settings, transient) else {
-        return;
-    };
-
-    let result = spawn_codex_plus_launch(
-        request,
-        "Codex 自动启动任务已在后台开始，可稍后查看概览状态。",
-    );
-    let status = result.status;
-    let event = if status == "accepted" {
-        "manager.auto_start_requested"
-    } else {
-        "manager.auto_start_failed"
-    };
-    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-        event,
-        json!({
-            "status": status,
-            "message": result.message,
-            "debug_port": default_debug_port(),
-            "helper_port": default_helper_port()
-        }),
-    );
-}
-
 fn save_requested_launch_status(
     request: &LaunchRequest,
     status: &str,
@@ -7551,21 +7502,6 @@ base_url = "https://example.invalid/v1"
 
         assert!(!request.sync_active_relay);
         assert!(requested.sync_active_relay);
-    }
-
-    #[test]
-    fn auto_start_launch_request_requires_enabled_non_transient_manager() {
-        let mut settings = BackendSettings::default();
-        assert!(auto_start_launch_request(&settings, false).is_none());
-
-        settings.codex_app_auto_start = true;
-        settings.codex_app_path = "C:/Portable/Codex".to_string();
-        let request = auto_start_launch_request(&settings, false).unwrap();
-        assert_eq!(request.app_path, "C:/Portable/Codex");
-        assert_eq!(request.debug_port, default_debug_port());
-        assert_eq!(request.helper_port, default_helper_port());
-        assert!(!request.sync_active_relay);
-        assert!(auto_start_launch_request(&settings, true).is_none());
     }
 
     #[test]

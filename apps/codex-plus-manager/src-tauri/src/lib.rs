@@ -64,7 +64,7 @@ pub fn run() {
             install_tray(app)?;
             commands::start_weixin_connect_from_saved_settings();
             register_main_window_events(main_window, transient);
-            commands::start_codex_from_saved_settings(transient);
+            cliproxy::start_cliproxy_from_saved_settings(transient);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -202,6 +202,7 @@ pub fn run() {
             cliproxy::cliproxy_test_api,
             cliproxy::cliproxy_save_api_key,
             cliproxy::cliproxy_save_connection,
+            cliproxy::cliproxy_set_auto_start,
             cliproxy::cliproxy_apply_profile,
             cliproxy::cliproxy_disable_official_profile,
             cliproxy::cliproxy_disable_integration,

@@ -298,7 +298,6 @@ type OfficialLoginSessionResult = CommandResult<{
 
 type BackendSettings = {
   codexAppPath: string;
-  codexAppAutoStart: boolean;
   codexExtraArgs: string[];
   providerSyncEnabled: boolean;
   providerSyncSavedProviders: string[];
@@ -689,6 +688,7 @@ type CliproxyStatusResult = CommandResult<{
   configPath: string;
   baseUrl: string;
   managementUrl: string;
+  autoStart: boolean;
   apiKey: string;
   managementKey: string;
   profileInstalled: boolean;
@@ -1110,7 +1110,6 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
 
 const defaultSettings: BackendSettings = {
   codexAppPath: "",
-  codexAppAutoStart: false,
   codexExtraArgs: [],
   providerSyncEnabled: false,
   providerSyncSavedProviders: [],
@@ -1621,6 +1620,17 @@ export function App() {
     if (result) {
       setCliproxy(result);
       showResultNotice(title, result);
+    }
+    return result;
+  };
+
+  const setCliproxyAutoStart = async (enabled: boolean) => {
+    const result = await run(() =>
+      call<CliproxyStatusResult>("cliproxy_set_auto_start", { request: { enabled } }),
+    );
+    if (result) {
+      setCliproxy(result);
+      showResultNotice(t("CLIProxyAPI 自启动"), result);
     }
     return result;
   };
@@ -3848,6 +3858,7 @@ export function App() {
       startCliproxy: () => runCliproxyStatusAction("cliproxy_start", t("启动 CLIProxyAPI")),
       stopCliproxy: () => runCliproxyStatusAction("cliproxy_stop", t("停止 CLIProxyAPI")),
       restartCliproxy: () => runCliproxyStatusAction("cliproxy_restart", t("重启 CLIProxyAPI")),
+      setCliproxyAutoStart,
       openCliproxyManagement,
       refreshCliproxyModels,
       testCliproxyApi,
@@ -4293,6 +4304,7 @@ type Actions = {
   startCliproxy: () => Promise<CliproxyStatusResult | null>;
   stopCliproxy: () => Promise<CliproxyStatusResult | null>;
   restartCliproxy: () => Promise<CliproxyStatusResult | null>;
+  setCliproxyAutoStart: (enabled: boolean) => Promise<CliproxyStatusResult | null>;
   openCliproxyManagement: () => Promise<void>;
   refreshCliproxyModels: (silent?: boolean) => Promise<CliproxyModelsResult | null>;
   testCliproxyApi: (model: string) => Promise<CliproxyTestResult | null>;
@@ -5472,6 +5484,25 @@ function CliproxyPanel({
             <ExternalLink className="h-4 w-4" />
             {t("管理页面")}
           </Button>
+        </div>
+
+        <div className="cliproxy-section">
+          <label className="switch-row relay-master-switch">
+            <input
+              checked={result?.autoStart === true}
+              disabled={!!busy || !installed}
+              onChange={(event) => {
+                const enabled = event.currentTarget.checked;
+                void runAction("autoStart", () => actions.setCliproxyAutoStart(enabled));
+              }}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("随 Codex++ 启动自动启动 CLIProxyAPI")}</strong>
+              <small>{t("开启后，正常启动 Codex++ Manager 时会在后台启动 CLIProxyAPI；临时 Manager 不会触发。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
         </div>
 
         <div className="cliproxy-section">
@@ -8152,19 +8183,6 @@ function MaintenanceScreen({
       <Panel>
         <CardHead title={t("手动启动")} detail={t("应用路径留空时使用已保存路径；没有保存路径时使用自动探测")} />
         <CardContent>
-          <label className="check-row">
-            <input
-              checked={form.codexAppAutoStart}
-              onChange={(event) => {
-                const next = { ...form, codexAppAutoStart: event.currentTarget.checked };
-                onFormChange(next);
-                void actions.saveSettingsValue(next, true);
-              }}
-              type="checkbox"
-            />
-            <span>{t("随 Codex++ 启动自动启动 Codex")}</span>
-          </label>
-          <p className="field-hint">{t("开启后，正常启动 Codex++ Manager 时会复用静默启动入口；临时 Manager 不会触发。")}</p>
           <Field label={t("应用路径覆盖")}>
             <Input
               value={launchForm.appPath}
