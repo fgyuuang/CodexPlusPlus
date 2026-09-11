@@ -1493,6 +1493,7 @@ mod tests {
                     target_model: "upstream-test".to_string(),
                 }],
             }],
+            routes: Vec::new(),
         }];
         store.save(&settings).unwrap();
 

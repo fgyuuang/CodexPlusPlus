@@ -390,6 +390,7 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
                 weight: 1,
             }],
             model_mappings: Vec::new(),
+            routes: Vec::new(),
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()
@@ -446,6 +447,7 @@ fn official_login_mixed_mode_restores_official_auth_before_aggregate_api_overrid
                 weight: 1,
             }],
             model_mappings: Vec::new(),
+            routes: Vec::new(),
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()

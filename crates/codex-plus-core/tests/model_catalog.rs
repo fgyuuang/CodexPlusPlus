@@ -384,6 +384,7 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
                             },
                         ],
                     }],
+                    routes: Vec::new(),
                 }],
                 ..BackendSettings::default()
             })

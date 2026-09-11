@@ -996,6 +996,55 @@ fn spawn_codex_plus_launch(
     }
 }
 
+fn auto_start_launch_request(settings: &BackendSettings, transient: bool) -> Option<LaunchRequest> {
+    if transient || !settings.codex_app_auto_start {
+        return None;
+    }
+
+    Some(LaunchRequest {
+        app_path: settings.codex_app_path.clone(),
+        debug_port: default_debug_port(),
+        helper_port: default_helper_port(),
+        sync_active_relay: false,
+    })
+}
+
+pub fn start_codex_from_saved_settings(transient: bool) {
+    let settings = match SettingsStore::default().load() {
+        Ok(settings) => settings,
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.auto_start_settings_load_failed",
+                json!({ "message": error.to_string() }),
+            );
+            return;
+        }
+    };
+    let Some(request) = auto_start_launch_request(&settings, transient) else {
+        return;
+    };
+
+    let result = spawn_codex_plus_launch(
+        request,
+        "Codex 自动启动任务已在后台开始，可稍后查看概览状态。",
+    );
+    let status = result.status;
+    let event = if status == "accepted" {
+        "manager.auto_start_requested"
+    } else {
+        "manager.auto_start_failed"
+    };
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        event,
+        json!({
+            "status": status,
+            "message": result.message,
+            "debug_port": default_debug_port(),
+            "helper_port": default_helper_port()
+        }),
+    );
+}
+
 fn save_requested_launch_status(
     request: &LaunchRequest,
     status: &str,
@@ -3345,7 +3394,7 @@ pub async fn load_provider_sync_targets() -> CommandResult<Value> {
                     }
                 })
                 .collect::<Vec<_>>();
-            merge_manual_provider_sync_targets(&mut targets, &manual, &settings);
+            merge_manual_provider_sync_targets(&mut targets, &manual, &settings, None);
             ok(
                 "Provider 同步目标已加载。",
                 serde_json::to_value(targets).unwrap_or_else(|_| json!({})),
@@ -3359,6 +3408,7 @@ fn merge_manual_provider_sync_targets(
     targets: &mut codex_plus_data::ProviderSyncTargetList,
     manual: &[String],
     settings: &BackendSettings,
+    codex_home: Option<&Path>,
 ) {
     for id in manual {
         if let Some(existing) = targets.targets.iter_mut().find(|target| target.id == *id) {
@@ -3374,6 +3424,11 @@ fn merge_manual_provider_sync_targets(
             existing.is_manual = settings.provider_sync_manual_providers.contains(id);
             existing.is_saved = settings.provider_sync_saved_providers.contains(id);
         } else {
+            let (is_resolvable, unavailable_reason) =
+                match codex_plus_data::validate_provider_sync_target(codex_home, Some(id)) {
+                    Ok(_) => (true, None),
+                    Err(reason) => (false, Some(reason)),
+                };
             targets
                 .targets
                 .push(codex_plus_data::ProviderSyncTargetOption {
@@ -3385,6 +3440,8 @@ fn merge_manual_provider_sync_targets(
                     session_count: 0,
                     rollout_session_count: 0,
                     sqlite_session_count: 0,
+                    is_resolvable,
+                    unavailable_reason,
                 });
         }
     }
@@ -3457,6 +3514,25 @@ pub async fn apply_session_index_cleanup(
 
 #[tauri::command]
 pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResult<Value> {
+    let target_provider = target_provider
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let target_for_validation = target_provider.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_data::validate_provider_sync_target(None, target_for_validation.as_deref())
+    })
+    .await
+    {
+        // Keep None as "use current" so the sync reads the live selection again.
+        Ok(Ok(_)) => {}
+        Ok(Err(message)) => return provider_sync_preflight_failure(&message),
+        Err(error) => {
+            return provider_sync_preflight_failure(&format!(
+                "provider target validation task failed: {error}"
+            ));
+        }
+    };
+    let target_for_settings = target_provider.clone();
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     prepare_codex_app_state_before_provider_switch(&home, "manager.sync_providers_now.before");
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -3467,7 +3543,11 @@ pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResul
     match result {
         Ok(sync) => {
             if is_success_sync_status(&sync.status) {
-                persist_provider_sync_selection(&sync.target_provider);
+                persist_provider_sync_selection(
+                    target_for_settings
+                        .as_deref()
+                        .unwrap_or(&sync.target_provider),
+                );
                 finish_codex_app_state_after_provider_switch(
                     &home,
                     "manager.sync_providers_now.after",
@@ -3494,6 +3574,17 @@ pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResul
             failed(&format!("供应商同步失败：{error}"), json!({}))
         }
     }
+}
+
+fn provider_sync_preflight_failure(message: &str) -> CommandResult<Value> {
+    failed(
+        &format!("供应商同步未执行：{message}"),
+        json!({
+            "syncStatus": "skipped",
+            "targetProvider": "",
+            "syncMessage": message,
+        }),
+    )
 }
 
 fn is_success_sync_status(status: &codex_plus_data::ProviderSyncStatus) -> bool {
@@ -6916,6 +7007,55 @@ mod tests {
     }
 
     #[test]
+    fn provider_sync_preflight_failure_is_structured_as_skipped() {
+        let result = provider_sync_preflight_failure("target is not resolvable");
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.payload["syncStatus"], "skipped");
+        assert_eq!(result.payload["targetProvider"], "");
+        assert_eq!(result.payload["syncMessage"], "target is not resolvable");
+    }
+
+    #[test]
+    fn manual_provider_sync_targets_keep_unresolvable_history_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            r#"model_provider = "relay-live"
+
+[model_providers.relay-live]
+base_url = "https://example.invalid/v1"
+"#,
+        )
+        .unwrap();
+        let mut settings = BackendSettings::default();
+        settings.provider_sync_manual_providers =
+            vec!["relay-live".to_string(), "relay-history".to_string()];
+        let manual = settings.provider_sync_manual_providers.clone();
+        let mut targets = codex_plus_data::ProviderSyncTargetList {
+            current_provider: "relay-live".to_string(),
+            targets: Vec::new(),
+        };
+
+        merge_manual_provider_sync_targets(&mut targets, &manual, &settings, Some(temp.path()));
+
+        let live = targets
+            .targets
+            .iter()
+            .find(|target| target.id == "relay-live")
+            .unwrap();
+        assert!(live.is_resolvable);
+        assert!(live.unavailable_reason.is_none());
+        let history = targets
+            .targets
+            .iter()
+            .find(|target| target.id == "relay-history")
+            .unwrap();
+        assert!(!history.is_resolvable);
+        assert!(history.unavailable_reason.is_some());
+    }
+
+    #[test]
     fn provider_sync_synced_is_reported_as_command_success() {
         let result = provider_sync_command_result(provider_sync_result_for_test(
             codex_plus_data::ProviderSyncStatus::Synced,
@@ -7349,6 +7489,7 @@ mod tests {
                     weight: 1,
                 }],
                 model_mappings: Vec::new(),
+                routes: Vec::new(),
             }],
             active_aggregate_relay_id: "agg".to_string(),
             ..BackendSettings::default()
@@ -7410,6 +7551,21 @@ mod tests {
 
         assert!(!request.sync_active_relay);
         assert!(requested.sync_active_relay);
+    }
+
+    #[test]
+    fn auto_start_launch_request_requires_enabled_non_transient_manager() {
+        let mut settings = BackendSettings::default();
+        assert!(auto_start_launch_request(&settings, false).is_none());
+
+        settings.codex_app_auto_start = true;
+        settings.codex_app_path = "C:/Portable/Codex".to_string();
+        let request = auto_start_launch_request(&settings, false).unwrap();
+        assert_eq!(request.app_path, "C:/Portable/Codex");
+        assert_eq!(request.debug_port, default_debug_port());
+        assert_eq!(request.helper_port, default_helper_port());
+        assert!(!request.sync_active_relay);
+        assert!(auto_start_launch_request(&settings, true).is_none());
     }
 
     #[test]
@@ -7480,6 +7636,7 @@ mod tests {
                 model_mappings_enabled: true,
                 members: Vec::new(),
                 model_mappings: Vec::new(),
+                routes: Vec::new(),
             }],
             ..BackendSettings::default()
         };

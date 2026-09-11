@@ -43,6 +43,7 @@ pub fn run() {
         );
     }
     let show_update = commands::startup_should_show_update();
+    let transient = startup_is_transient();
     let app_result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
@@ -62,7 +63,8 @@ pub fn run() {
             let main_window = main_window_builder.build()?;
             install_tray(app)?;
             commands::start_weixin_connect_from_saved_settings();
-            register_main_window_events(main_window, startup_is_transient());
+            register_main_window_events(main_window, transient);
+            commands::start_codex_from_saved_settings(transient);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
