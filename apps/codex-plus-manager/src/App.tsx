@@ -102,7 +102,7 @@ import {
   setOfficialModelCatalog as setOfficialModelCatalogModels,
   trustedOfficialModelSlugs,
   visibleOfficialModelSlugs,
-} from "./official-model-catalog";
+} from "./official-model-catalog.ts";
 import { tokenizeCode, type CodeLanguage } from "./code-highlight";
 import { filterModelGroups } from "./model-groups";
 import { codexGoalsFeatureState, setCodexGoalsFeatureInConfig } from "./goals-config";
@@ -736,7 +736,6 @@ type CliproxyStatusResult = CommandResult<{
   configPath: string;
   baseUrl: string;
   managementUrl: string;
-  autoStart: boolean;
   apiKey: string;
   managementKey: string;
   profileInstalled: boolean;
@@ -1586,6 +1585,7 @@ export function App() {
     if (result) {
       setOfficialModelCatalogStatus(result);
       setOfficialModelCatalogModels(result.visibleModels);
+      if (force && isSuccessStatus(result.status)) await refreshSettings(true);
       if (!silent || !isSuccessStatus(result.status)) {
         showResultNotice(t("官方模型目录"), result, { silentSuccess: true });
       }
@@ -1755,17 +1755,6 @@ export function App() {
     return result;
   };
 
-  const setCliproxyAutoStart = async (enabled: boolean) => {
-    const result = await run(() =>
-      call<CliproxyStatusResult>("cliproxy_set_auto_start", { request: { enabled } }),
-    );
-    if (result) {
-      setCliproxy(result);
-      showResultNotice(t("CLIProxyAPI 自启动"), result);
-    }
-    return result;
-  };
-
   const openCliproxyManagement = async () => {
     const result = await run(() => call<CommandResult<Record<string, unknown>>>("cliproxy_open_management"));
     if (result && !isSuccessStatus(result.status)) showResultNotice(t("CLIProxyAPI 管理页面"), result);
@@ -1775,6 +1764,7 @@ export function App() {
     const result = await run(() => call<CliproxyModelsResult>("cliproxy_list_models"));
     if (result) {
       setCliproxyModels(result);
+      if (isSuccessStatus(result.status)) await refreshSettings(true);
       if (!silent || !isSuccessStatus(result.status)) {
         showResultNotice(t("CLIProxyAPI 模型"), result, { silentSuccess: true });
       }
@@ -2845,6 +2835,10 @@ export function App() {
   };
 
   const launchCommand = async (command: "launch_codex_plus" | "restart_codex_plus", syncActiveRelay = false) => {
+    if (settingsForm.officialLoginMixedMode && settingsForm.activeOfficialAccountId.trim()) {
+      // 目录刷新是增强能力；失败时继续启动，使用当前账号快照或 bundled 回退。
+      await refreshOfficialModelCatalog(true, true);
+    }
     const result = await run(() =>
       call<LaunchCommandResult>(command, {
         request: {
@@ -3555,6 +3549,10 @@ export function App() {
     });
     setRelaySwitching(true);
     try {
+      if (switchSettings.officialLoginMixedMode && switchSettings.activeOfficialAccountId.trim()) {
+        // 切换前先更新可信官方目录，避免新账号模型在下一次启动前丢失。
+        await refreshOfficialModelCatalog(true, true);
+      }
       const result = await run(() =>
         call<RelaySwitchResult>("switch_relay_profile", {
           request: { settings: switchSettings, previousActiveRelayId },
@@ -3997,7 +3995,6 @@ export function App() {
       startCliproxy: () => runCliproxyStatusAction("cliproxy_start", t("启动 CLIProxyAPI")),
       stopCliproxy: () => runCliproxyStatusAction("cliproxy_stop", t("停止 CLIProxyAPI")),
       restartCliproxy: () => runCliproxyStatusAction("cliproxy_restart", t("重启 CLIProxyAPI")),
-      setCliproxyAutoStart,
       openCliproxyManagement,
       refreshCliproxyModels,
       testCliproxyApi,
@@ -4468,7 +4465,6 @@ type Actions = {
   startCliproxy: () => Promise<CliproxyStatusResult | null>;
   stopCliproxy: () => Promise<CliproxyStatusResult | null>;
   restartCliproxy: () => Promise<CliproxyStatusResult | null>;
-  setCliproxyAutoStart: (enabled: boolean) => Promise<CliproxyStatusResult | null>;
   openCliproxyManagement: () => Promise<void>;
   refreshCliproxyModels: (silent?: boolean) => Promise<CliproxyModelsResult | null>;
   testCliproxyApi: (model: string) => Promise<CliproxyTestResult | null>;
@@ -5775,25 +5771,6 @@ function CliproxyPanel({
         </div>
 
         <div className="cliproxy-section">
-          <label className="switch-row relay-master-switch">
-            <input
-              checked={result?.autoStart === true}
-              disabled={!!busy || !installed}
-              onChange={(event) => {
-                const enabled = event.currentTarget.checked;
-                void runAction("autoStart", () => actions.setCliproxyAutoStart(enabled));
-              }}
-              type="checkbox"
-            />
-            <span>
-              <strong>{t("随 Codex++ 启动自动启动 CLIProxyAPI")}</strong>
-              <small>{t("开启后，正常启动 Codex++ Manager 时会在后台启动 CLIProxyAPI；临时 Manager 不会触发。")}</small>
-            </span>
-            <ToggleVisual />
-          </label>
-        </div>
-
-        <div className="cliproxy-section">
           <div className="cliproxy-section-head">
             <strong>{t("启动与连接位置")}</strong>
             {running && managed ? <span>{t("修改启动位置前请先停止 Manager 启动的服务")}</span> : null}
@@ -6698,7 +6675,7 @@ function EnhanceScreen({
             <FeatureGroup title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
               <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled || !patchMode} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
               <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
-              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5 / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
+              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；可用性依据当前官方模型目录元数据动态判定，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
               <div className="feature-action-row">
                 <div>
                   <strong>{t("官方远端插件缓存")}</strong>

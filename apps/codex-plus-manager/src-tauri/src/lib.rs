@@ -64,11 +64,9 @@ pub fn run() {
             install_tray(app)?;
             commands::start_weixin_connect_from_saved_settings();
             register_main_window_events(main_window, transient);
-            cliproxy::start_cliproxy_from_saved_settings(transient);
             // 目录刷新是后台增强能力；失败时仍由核心回退目录保证 Codex 可启动。
             tauri::async_runtime::spawn(async {
-                let _ =
-                    codex_plus_core::official_model_catalog::refresh_active_account(false).await;
+                commands::refresh_official_model_catalog_in_background().await;
             });
             Ok(())
         })
@@ -212,7 +210,6 @@ pub fn run() {
             cliproxy::cliproxy_test_api,
             cliproxy::cliproxy_save_api_key,
             cliproxy::cliproxy_save_connection,
-            cliproxy::cliproxy_set_auto_start,
             cliproxy::cliproxy_apply_profile,
             cliproxy::cliproxy_disable_official_profile,
             cliproxy::cliproxy_disable_integration,

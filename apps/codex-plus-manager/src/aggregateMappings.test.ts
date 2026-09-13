@@ -7,6 +7,18 @@ import {
   type RelayAggregateConfig,
   type RelayProfileLike,
 } from "./aggregateMappings.ts";
+import { setOfficialModelCatalog } from "./official-model-catalog.ts";
+
+test.before(() => {
+  // 模拟官方在线目录：排序应直接跟随目录顺序，不依赖源码中的模型清单。
+  setOfficialModelCatalog([
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.4",
+    "gpt-7-orion",
+  ]);
+});
 
 test("aggregate display lists provider-specific GPT models in member order", () => {
   const members: RelayProfileLike[] = [
@@ -37,7 +49,7 @@ test("aggregate display lists provider-specific GPT models in member order", () 
 
 test("aggregate model list keeps official models first and provider models by member order", () => {
   const members: RelayProfileLike[] = [
-    { id: "provider-a", name: "供应商一", model: "gpt-5.4", modelList: "gpt-5.4\ngpt-5.6-sol" },
+    { id: "provider-a", name: "供应商一", model: "gpt-5.4", modelList: "gpt-5.4\ngpt-5.6-sol\ngpt-6-astra\ngpt-7-orion" },
     { id: "provider-b", name: "供应商二", model: "vendor-gpt-5.4", modelList: "vendor-gpt-5.4" },
   ];
   const aggregate: RelayAggregateConfig = {
@@ -51,10 +63,14 @@ test("aggregate model list keeps official models first and provider models by me
   };
 
   assert.deepEqual(aggregateOrderedModelList(aggregate, members), [
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.4",
+    "gpt-7-orion",
     "供应商一:gpt-5.4",
     "供应商一:gpt-5.6-sol",
+    "供应商一:gpt-6-astra",
+    "供应商一:gpt-7-orion",
     "供应商二:vendor-gpt-5.4",
   ]);
 });

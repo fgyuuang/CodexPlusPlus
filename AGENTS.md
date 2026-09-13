@@ -68,14 +68,14 @@
 - 会话管理必须显示各 provider 的唯一会话数、rollout 数和 SQLite 数；不得再次退化为固定同步到 `custom`
 - 官方登录混合模式必须保持认证源与请求目标分离：`officialLoginRelayId` 只恢复官方 ChatGPT 登录，第三方或聚合 profile 负责 API 覆写；官方 API 不得加入聚合成员、轮转或权重计算
 - 官方登录混合模式下，官方原生模型保持原名并优先显示；聚合替换项使用半角格式 `gpt-5.4(供应商1|供应商2:真实模型)`；目标模型与 Codex 模型相同时只显示供应商名称
-- 官方登录混合模式的裸模型名只允许来自可信官方清单：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex`；供应商提供的其他 `gpt-*` 不得伪装成官方裸模型
+- 官方登录混合模式的裸模型名只允许来自当前官方账号目录、Codex bundled catalog 或内置兼容目录中的精确条目匹配；供应商提供的其他 `gpt-*` 不得伪装成官方裸模型。目录条目可随官方发布变化，不得维护固定模型数组
 - 官方裸模型必须直连 ChatGPT Codex Responses，官方请求失败或 WebSocket 握手失败不得进入供应商轮转；聚合只接受括号别名或 `供应商:模型`，未知裸模型必须关闭式拒绝
 - 官方登录混合模式的 `model_provider = "custom"` 是本地协议代理的传输标识，不代表官方裸模型被发往第三方；不得仅为界面显示把混合会话强制改写成 `openai`，否则恢复会话可能绕过聚合代理
 - 官方内置 `image_gen` 的 `/v1/images/generations` 与 `/v1/images/edits` 必须使用所选 ChatGPT 登录直通 `https://chatgpt.com/backend-api/codex/images/*`；不得使用 `experimental_bearer_token`、供应商轮转或 failover，也不得把请求正文、提示词、图像数据或认证头写入日志
 - 由 CodexPlusPlus 生成并指向本地 HTTP 协议代理的 model catalog 必须设置 `prefer_websockets = false`，防止 Codex 对不支持 WebSocket 的本地代理重复握手后误入供应商路径
 - 外接模型不论名称默认先设置 `tool_mode = "code_mode_only"`，包括 `Chat ECNU:ecnu-reasoner` 及 DeepSeek V4；只保留显式非空的其他模式，不得因能力探测尚未完成而预先退化到普通 MCP/传统工具体验
 - 额度、配额或限流导致任务停止后的继续必须使用 app-server 原生空回合：`turn/start`、`input = []`、`turnTrigger = "resume_interrupted_task"`；不得填入“继续”或模拟键盘发送。继续回合必须保留外接模型的 model/provider/reasoning/cwd/permissions，上述功能默认开启
-- Codex 模型列表内切换模型时，必须在新版 `electronBridge.sendMessageFromView` 请求层校验目标模型的 reasoning effort；官方 `gpt-5.6-sol/terra/luna` 在目录尚未加载时仍须保留各自内置能力，供应商模型不得继承不支持的 `max/ultra`
+- Codex 模型列表内切换模型时，必须在新版 `electronBridge.sendMessageFromView` 请求层按官方目录元数据校验目标模型的 reasoning effort；目录尚未加载时不得用名称猜测未知能力，供应商模型不得继承不支持的 `max/ultra`
 - 流式供应商或聚合请求失败、非 2xx、断流或缺少终止事件时，协议代理必须返回合法 `response.failed` SSE 并记录 `helper.protocol_proxy_stream_failed`；不得把异常流记录为成功，也不得因此导致 thread agent loop 死亡
 
 ## 发布编译

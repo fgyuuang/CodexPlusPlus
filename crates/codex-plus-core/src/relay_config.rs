@@ -2797,13 +2797,18 @@ pub fn effective_active_relay_profile_for_codex(settings: &BackendSettings) -> R
         .unwrap_or_default();
     let dedicated_cli_models = official_auth_first
         .then(|| {
-            crate::aggregate_model_alias::cliproxy_official_api_aliases(&settings.relay_profiles)
+            crate::aggregate_model_alias::cliproxy_official_api_aliases_for_settings(
+                &settings.relay_profiles,
+                settings,
+            )
         })
         .unwrap_or_default();
-    let general_cli_models = crate::aggregate_model_alias::cliproxy_general_api_aliases(
-        &settings.relay_profiles,
-        !dedicated_cli_models.is_empty(),
-    );
+    let general_cli_models =
+        crate::aggregate_model_alias::cliproxy_general_api_aliases_for_settings(
+            &settings.relay_profiles,
+            !dedicated_cli_models.is_empty(),
+            settings,
+        );
     let replacement_models = official_auth_first
         .then(|| {
             crate::aggregate_model_alias::aggregate_replacement_model_aliases(
@@ -2859,18 +2864,22 @@ pub fn effective_active_relay_profile_for_codex(settings: &BackendSettings) -> R
     }
     let normalized_active_model =
         crate::aggregate_model_alias::normalize_requested_model_name(&active.model);
-    let has_official_model = ordered_models
-        .iter()
-        .any(|model| crate::aggregate_model_alias::is_trusted_official_codex_model(model));
+    let has_official_model = ordered_models.iter().any(|model| {
+        crate::aggregate_model_alias::is_trusted_official_codex_model_for_settings(model, settings)
+    });
     let active_is_official_model = ordered_models.iter().any(|model| {
-        crate::aggregate_model_alias::is_trusted_official_codex_model(model)
+        crate::aggregate_model_alias::is_trusted_official_codex_model_for_settings(model, settings)
             && model.eq_ignore_ascii_case(&normalized_active_model)
     });
     if active.model.trim().is_empty() || (has_official_model && !active_is_official_model) {
         let member_default = relay_profile_model(first_member);
         active.model = ordered_models
             .iter()
-            .find(|model| crate::aggregate_model_alias::is_trusted_official_codex_model(model))
+            .find(|model| {
+                crate::aggregate_model_alias::is_trusted_official_codex_model_for_settings(
+                    model, settings,
+                )
+            })
             .cloned()
             .or_else(|| ordered_models.first().cloned())
             .unwrap_or(member_default);

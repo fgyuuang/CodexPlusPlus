@@ -1,4 +1,4 @@
-import { visibleOfficialModelSlugs } from "./official-model-catalog";
+import { visibleOfficialModelSlugs } from "./official-model-catalog.ts";
 
 export type RelayAggregateStrategy = "failover" | "conversationRoundRobin" | "requestRoundRobin" | "weightedRoundRobin";
 
@@ -246,15 +246,7 @@ export function aggregateOrderedModelList(
 }
 
 function compareAggregateModelNames(left: string, right: string): number {
-  const preferred = [
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-  ];
+  const preferred = visibleOfficialModelSlugs().map((model) => model.trim().toLowerCase()).filter(Boolean);
   const normalizedLeft = left.trim().toLowerCase();
   const normalizedRight = right.trim().toLowerCase();
   const leftRank = preferred.indexOf(normalizedLeft);

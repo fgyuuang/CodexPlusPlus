@@ -393,9 +393,6 @@ fn deepseek_model_template_entry(slug: &str) -> Option<(Value, bool)> {
 
 fn model_template_entry(slug: &str) -> (Value, bool) {
     let metadata_slug = trusted_official_metadata_slug(slug).unwrap_or_else(|| slug.to_string());
-    if let Some(entry) = bundled_template_entry(&metadata_slug) {
-        return (entry, true);
-    }
     if let Some(official) = crate::official_model_catalog::official_model_metadata(&metadata_slug) {
         let mut template = first_bundled_template_entry().unwrap_or_else(|| json!({}));
         if let (Some(target), Some(source)) = (template.as_object_mut(), official.as_object()) {
@@ -404,6 +401,9 @@ fn model_template_entry(slug: &str) -> (Value, bool) {
             }
         }
         return (template, true);
+    }
+    if let Some(entry) = bundled_template_entry(&metadata_slug) {
+        return (entry, true);
     }
     if let Some(compatibility) = compatibility_metadata_entry(&metadata_slug) {
         let mut template = first_bundled_template_entry().unwrap_or_else(|| json!({}));

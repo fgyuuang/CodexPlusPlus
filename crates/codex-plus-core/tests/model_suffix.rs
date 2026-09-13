@@ -181,19 +181,19 @@ fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
 #[test]
 fn trusted_provider_gpt_aliases_inherit_native_codex_tool_experience() {
     let entries = collect_catalog_entries(
-        "CLIProxyAPI:gpt-5.6-luna\n供应商一:gpt-5.6-sol\ngpt-5.6-terra(供应商一)",
+        "CLIProxyAPI:gpt-5.5\n供应商一:gpt-5.5\ngpt-5.5(供应商一)",
         &HashMap::new(),
         &HashMap::new(),
-        "CLIProxyAPI:gpt-5.6-luna",
+        "CLIProxyAPI:gpt-5.5",
     );
     let catalog: serde_json::Value =
         serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
     let models = catalog["models"].as_array().unwrap();
 
     for slug in [
-        "CLIProxyAPI:gpt-5.6-luna",
-        "供应商一:gpt-5.6-sol",
-        "gpt-5.6-terra(供应商一)",
+        "CLIProxyAPI:gpt-5.5",
+        "供应商一:gpt-5.5",
+        "gpt-5.5(供应商一)",
     ] {
         let model = models.iter().find(|model| model["slug"] == slug).unwrap();
         assert_eq!(model["display_name"], slug);
@@ -204,7 +204,7 @@ fn trusted_provider_gpt_aliases_inherit_native_codex_tool_experience() {
         assert!(
             model["supported_reasoning_levels"]
                 .as_array()
-                .is_some_and(|levels| levels.iter().any(|level| level["effort"] == "max"))
+                .is_some_and(|levels| levels.iter().any(|level| level["effort"] == "xhigh"))
         );
         assert!(
             model["additional_speed_tiers"]
@@ -219,12 +219,10 @@ fn trusted_provider_gpt_aliases_inherit_native_codex_tool_experience() {
     }
 
     assert_eq!(
-        model_ui_metadata("CLIProxyAPI:gpt-5.6-luna").unwrap()["displayName"],
-        "CLIProxyAPI:gpt-5.6-luna"
+        model_ui_metadata("CLIProxyAPI:gpt-5.5").unwrap()["displayName"],
+        "CLIProxyAPI:gpt-5.5"
     );
-    assert!(requires_bundled_metadata_catalog(
-        "CLIProxyAPI:gpt-5.6-luna"
-    ));
+    assert!(requires_bundled_metadata_catalog("CLIProxyAPI:gpt-5.5"));
     assert!(!requires_bundled_metadata_catalog(
         "Chat ECNU:ecnu-reasoner"
     ));
@@ -268,6 +266,8 @@ fn astra_metadata_exposes_max_ultra_in_catalog_and_ui() {
         serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
     let model = &catalog["models"][0];
     let metadata = model_ui_metadata("gpt-6-astra").unwrap();
+    let official =
+        codex_plus_core::official_model_catalog::official_model_metadata("gpt-6-astra").unwrap();
     let expected = vec!["low", "medium", "high", "xhigh", "max", "ultra"];
     for (levels, key) in [
         (&model["supported_reasoning_levels"], "effort"),
@@ -283,13 +283,19 @@ fn astra_metadata_exposes_max_ultra_in_catalog_and_ui() {
     }
     assert_eq!(model["display_name"], "GPT-6-Astra");
     assert_eq!(metadata["displayName"], model["display_name"]);
-    assert_eq!(model["default_reasoning_level"], "medium");
-    assert_eq!(metadata["defaultReasoningEffort"], "medium");
+    assert_eq!(
+        model["default_reasoning_level"],
+        official["default_reasoning_level"]
+    );
+    assert_eq!(
+        metadata["defaultReasoningEffort"],
+        official["default_reasoning_level"]
+    );
     assert_eq!(model["context_window"], 272_000);
     assert_eq!(model["max_context_window"], 272_000);
     assert_eq!(model["supports_search_tool"], true);
     assert_eq!(model["supports_image_detail_original"], true);
-    assert_eq!(model["use_responses_lite"], false);
+    assert_eq!(model["use_responses_lite"], official["use_responses_lite"]);
     assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
     assert_eq!(
         metadata["additionalSpeedTiers"],

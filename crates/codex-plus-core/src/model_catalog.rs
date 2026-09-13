@@ -285,13 +285,18 @@ fn aggregate_relay_model_catalog_value(
     };
     let dedicated_cli_models = official_auth_first
         .then(|| {
-            crate::aggregate_model_alias::cliproxy_official_api_aliases(&settings.relay_profiles)
+            crate::aggregate_model_alias::cliproxy_official_api_aliases_for_settings(
+                &settings.relay_profiles,
+                settings,
+            )
         })
         .unwrap_or_default();
-    let general_cli_models = crate::aggregate_model_alias::cliproxy_general_api_aliases(
-        &settings.relay_profiles,
-        !dedicated_cli_models.is_empty(),
-    );
+    let general_cli_models =
+        crate::aggregate_model_alias::cliproxy_general_api_aliases_for_settings(
+            &settings.relay_profiles,
+            !dedicated_cli_models.is_empty(),
+            settings,
+        );
     let mut models = Vec::new();
     let mut seen_models = HashSet::new();
     for model in &official_models {
@@ -362,9 +367,9 @@ fn aggregate_relay_model_catalog_value(
     let profile_model = profile.model.trim();
     let normalized_profile_model =
         crate::aggregate_model_alias::normalize_requested_model_name(profile_model);
-    let has_official_models = models
-        .iter()
-        .any(|item| crate::aggregate_model_alias::is_trusted_official_codex_model(item));
+    let has_official_models = models.iter().any(|item| {
+        crate::aggregate_model_alias::is_trusted_official_codex_model_for_settings(item, settings)
+    });
     let default_model = if has_official_models
         && crate::aggregate_model_alias::looks_like_codex_model_key(&normalized_profile_model)
         && models.iter().any(|item| item == &normalized_profile_model)
@@ -384,8 +389,11 @@ fn aggregate_relay_model_catalog_value(
     if let Some(metadata) = model_metadata.as_object_mut() {
         for alias in dedicated_cli_models.iter().chain(general_cli_models.iter()) {
             let base_model =
-                crate::aggregate_model_alias::cliproxy_official_model_name(&alias.target_model)
-                    .unwrap_or(alias.target_model.trim());
+                crate::aggregate_model_alias::cliproxy_official_model_name_for_settings(
+                    &alias.target_model,
+                    settings,
+                )
+                .unwrap_or(alias.target_model.trim());
             let Some(mut value) = crate::model_suffix::model_ui_metadata(base_model)
                 .and_then(|value| value.as_object().cloned())
             else {

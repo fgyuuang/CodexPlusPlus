@@ -181,12 +181,19 @@ pub fn classify_mixed_model_route(
             MixedModelRoute::Aggregate
         };
     };
-    if official_auth_first && crate::aggregate_model_alias::is_trusted_official_codex_model(model) {
+    if official_auth_first
+        && crate::aggregate_model_alias::is_trusted_official_codex_model_for_settings(
+            model, settings,
+        )
+    {
         return MixedModelRoute::Official;
     }
-    if crate::aggregate_model_alias::cliproxy_direct_api_aliases(&settings.relay_profiles)
-        .iter()
-        .any(|alias| alias.alias.eq_ignore_ascii_case(model))
+    if crate::aggregate_model_alias::cliproxy_direct_api_aliases_for_settings(
+        &settings.relay_profiles,
+        settings,
+    )
+    .iter()
+    .any(|alias| alias.alias.eq_ignore_ascii_case(model))
     {
         return MixedModelRoute::DedicatedRelay;
     }
@@ -228,12 +235,15 @@ pub fn select_dedicated_relay_for_model(
         .ok_or_else(|| SelectionError::UnknownDedicatedRelayModel {
             model: String::new(),
         })?;
-    let alias = crate::aggregate_model_alias::cliproxy_direct_api_aliases(&settings.relay_profiles)
-        .into_iter()
-        .find(|alias| alias.alias.eq_ignore_ascii_case(model))
-        .ok_or_else(|| SelectionError::UnknownDedicatedRelayModel {
-            model: model.to_string(),
-        })?;
+    let alias = crate::aggregate_model_alias::cliproxy_direct_api_aliases_for_settings(
+        &settings.relay_profiles,
+        settings,
+    )
+    .into_iter()
+    .find(|alias| alias.alias.eq_ignore_ascii_case(model))
+    .ok_or_else(|| SelectionError::UnknownDedicatedRelayModel {
+        model: model.to_string(),
+    })?;
     let mut relay = raw_relay_profile_by_id(settings, &alias.relay_id)
         .cloned()
         .ok_or_else(|| SelectionError::UnknownDedicatedRelayModel {

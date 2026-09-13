@@ -3102,14 +3102,6 @@
   const codexAppModuleMaxAttempts = 8;
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
-  // 目录请求尚未完成时，保留旧版 Codex 已知能力。该兼容表只用于
-  // reasoning/Fast 能力校验，不参与官方模型信任、列表或路由判定。
-  const codexLegacyCapabilityFallback = {
-    "gpt-5.6-sol": { defaultReasoningEffort: "low", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"], additionalSpeedTiers: ["fast"], serviceTiers: [{ id: "priority" }] },
-    "gpt-5.6-terra": { defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"], additionalSpeedTiers: ["fast"], serviceTiers: [{ id: "priority" }] },
-    "gpt-5.6-luna": { defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"], additionalSpeedTiers: ["fast"], serviceTiers: [{ id: "priority" }] },
-  };
-
   function codexCurrentModelCatalog() {
     try {
       return codexModelCatalog && typeof codexModelCatalog === "object" ? codexModelCatalog : {};
@@ -3149,15 +3141,12 @@
     if (normalized.toLowerCase().startsWith(prefix)) {
       const base = normalized.slice(prefix.length).trim();
       const trustedBase = codexCatalogOfficialModels().some((model) => model.toLowerCase() === base.toLowerCase());
-      const legacyBaseKey = Object.keys(codexLegacyCapabilityFallback).find((key) => key.toLowerCase() === base.toLowerCase());
-      if (trustedBase || legacyBaseKey) {
+      if (trustedBase) {
         const baseKey = Object.keys(metadata).find((key) => key.toLowerCase() === base.toLowerCase());
         if (baseKey && metadata[baseKey] && typeof metadata[baseKey] === "object") return metadata[baseKey];
-        if (legacyBaseKey) return codexLegacyCapabilityFallback[legacyBaseKey];
       }
     }
-    const legacyKey = Object.keys(codexLegacyCapabilityFallback).find((key) => key.toLowerCase() === normalized.toLowerCase());
-    return legacyKey ? codexLegacyCapabilityFallback[legacyKey] : null;
+    return null;
   }
 
   function codexCatalogModelSupportsFast(metadata) {
@@ -7376,11 +7365,7 @@
     if (Array.isArray(supported) && supported.length > 0) {
       return supported.map((entry) => typeof entry === "string" ? entry : { ...entry });
     }
-    const builtIn = codexBuiltInReasoningMetadata(modelName);
-    if (builtIn) {
-      return builtIn.supported.map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
-    }
-    return ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+    return [];
   }
 
   function codexBuiltInReasoningMetadata(modelName) {
@@ -7575,7 +7560,7 @@
       description: metadata?.description || codexModelCatalog.provider_name || codexModelCatalog.model_provider || "Custom model",
       hidden: false,
       isDefault: false,
-      defaultReasoningEffort: metadata?.defaultReasoningEffort || "medium",
+      defaultReasoningEffort: metadata?.defaultReasoningEffort || "",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
       ...(Array.isArray(metadata?.additionalSpeedTiers)
         ? { additionalSpeedTiers: metadata.additionalSpeedTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry) }

@@ -2704,7 +2704,10 @@ experimental_bearer_token = "sk-existing""#
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
 
-        assert_eq!(store.load().unwrap(), BackendSettings::default());
+        assert_eq!(
+            store.load().unwrap(),
+            normalize_settings_config_sections(BackendSettings::default())
+        );
     }
 
     #[test]
@@ -2714,7 +2717,10 @@ experimental_bearer_token = "sk-existing""#
         std::fs::write(&path, "{bad json").unwrap();
         let store = SettingsStore::new(path);
 
-        assert_eq!(store.load().unwrap(), BackendSettings::default());
+        assert_eq!(
+            store.load().unwrap(),
+            normalize_settings_config_sections(BackendSettings::default())
+        );
     }
 
     #[test]
@@ -2730,7 +2736,10 @@ experimental_bearer_token = "sk-existing""#
 
         store.save(&settings).unwrap();
 
-        assert_eq!(store.load().unwrap(), settings);
+        assert_eq!(
+            store.load().unwrap(),
+            normalize_settings_config_sections(settings)
+        );
     }
 
     #[test]

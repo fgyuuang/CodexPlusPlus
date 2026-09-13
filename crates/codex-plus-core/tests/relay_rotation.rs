@@ -209,22 +209,22 @@ fn official_mixed_mode_classifies_models_without_supplier_leakage() {
         ..RelayProfile::default()
     });
     settings.relay_profiles[0].name = "ProviderA".to_string();
-    settings.relay_profiles[0].model_list = "gpt-5.6-sol\ngpt-5.2".to_string();
+    settings.relay_profiles[0].model_list = "gpt-5.5\ngpt-5.2".to_string();
 
     assert_eq!(
-        classify_mixed_model_route(&settings, Some("gpt-5.6-sol")),
+        classify_mixed_model_route(&settings, Some("gpt-5.5")),
         MixedModelRoute::Official
     );
     assert_eq!(
-        classify_mixed_model_route(&settings, Some("gpt-5.6-sol(ProviderA)")),
+        classify_mixed_model_route(&settings, Some("gpt-5.5(ProviderA)")),
         MixedModelRoute::Aggregate
     );
     assert_eq!(
-        classify_mixed_model_route(&settings, Some("ProviderA:gpt-5.6-sol")),
+        classify_mixed_model_route(&settings, Some("ProviderA:gpt-5.5")),
         MixedModelRoute::Aggregate
     );
     assert_eq!(
-        classify_mixed_model_route(&settings, Some("gpt-5.2")),
+        classify_mixed_model_route(&settings, Some("gpt-99-fake")),
         MixedModelRoute::Reject
     );
     assert_eq!(
@@ -253,8 +253,8 @@ fn cliproxy_official_alias_uses_dedicated_relay_and_keeps_raw_target_model() {
         integration_type: "cliproxy-official".to_string(),
         base_url: "http://127.0.0.1:8317/v1".to_string(),
         api_key: "cli-key".to_string(),
-        model: "account-2/gpt-5.6-sol".to_string(),
-        model_list: "account-2/gpt-5.6-sol".to_string(),
+        model: "account-2/gpt-5.5".to_string(),
+        model_list: "account-2/gpt-5.5".to_string(),
         ..RelayProfile::default()
     });
     settings.relay_profiles.push(RelayProfile {
@@ -264,23 +264,22 @@ fn cliproxy_official_alias_uses_dedicated_relay_and_keeps_raw_target_model() {
         base_url: "http://127.0.0.1:8317/v1".to_string(),
         api_key: "cli-key".to_string(),
         model: "gemini-2.5-pro".to_string(),
-        model_list: "account-2/gpt-5.6-sol\ngemini-2.5-pro".to_string(),
+        model_list: "account-2/gpt-5.5\ngemini-2.5-pro".to_string(),
         ..RelayProfile::default()
     });
 
     assert_eq!(
-        classify_mixed_model_route(&settings, Some("CLIProxyAPI:gpt-5.6-sol")),
+        classify_mixed_model_route(&settings, Some("CLIProxyAPI:gpt-5.5")),
         MixedModelRoute::DedicatedRelay
     );
-    let relay =
-        select_dedicated_relay_for_model(&settings, Some("CLIProxyAPI:gpt-5.6-sol")).unwrap();
+    let relay = select_dedicated_relay_for_model(&settings, Some("CLIProxyAPI:gpt-5.5")).unwrap();
     assert_eq!(relay.id, "managed-cliproxy-official");
     assert_eq!(
         relay
             .model_mappings
-            .get("CLIProxyAPI:gpt-5.6-sol")
+            .get("CLIProxyAPI:gpt-5.5")
             .map(String::as_str),
-        Some("account-2/gpt-5.6-sol")
+        Some("account-2/gpt-5.5")
     );
     assert_eq!(
         classify_mixed_model_route(&settings, Some("CLIProxyAPI:gemini-2.5-pro")),

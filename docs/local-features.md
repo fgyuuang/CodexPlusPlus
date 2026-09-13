@@ -15,13 +15,15 @@
 | 聚合路由 | `crates/codex-plus-core/src/relay_rotation.rs` | `classify_mixed_model_route`、`aggregate_member_pool_for_provider_alias`、`dispatch_entries`、aggregate failover 选择逻辑。混合模式必须先区分官方裸模型与供应商别名。上游行为完全不同，合并后需逐函数确认。 |
 | 官方直连代理 | `crates/codex-plus-core/src/protocol_proxy.rs` | 裸官方模型从实时 `auth.json` 读取 ChatGPT access token/account id，直连官方 Codex Responses；官方错误只有一个候选，禁止进入 aggregate failover。 |
 | 官方图像工具代理 | `crates/codex-plus-core/src/protocol_proxy.rs`、`launcher.rs` | 混合模式下把 Codex 内置 `gpt-image-2` 的 generation/edit 请求直通 ChatGPT Codex Images；不使用第三方 key，不进入聚合轮转。 |
-| 模型目录 | `crates/codex-plus-core/src/model_catalog.rs`、`aggregate_model_alias.rs`、`model_suffix.rs` | `displaySuffix` 注入、官方模型优先排序、提供者独立模型条目（`供应商一:gpt-5.4`）生成；所有外接模型默认先使用原生 `code_mode_only`，可信官方 GPT 的 CLI/供应商别名额外继承 reasoning、Fast、工具与基础指令，未知模型不得冒充官方能力；默认模型不得被 `composer-2.5` 等供应商专属首项抢占。 |
+| 模型目录 | `crates/codex-plus-core/src/model_catalog.rs`、`aggregate_model_alias.rs`、`model_suffix.rs`、`official_model_catalog.rs` | `displaySuffix` 注入、当前官方目录优先排序、提供者独立模型条目（`供应商:模型`）生成；所有外接模型默认先使用原生 `code_mode_only`，只有当前账号目录、bundled catalog 或兼容目录中精确存在的官方条目才继承 reasoning、Fast、工具与基础指令，未知模型不得冒充官方能力；默认模型不得被供应商专属首项抢占。 |
 | 聚合数据结构 | `crates/codex-plus-core/src/settings.rs` | `AggregateRelayProfile`、`AggregateRelayMember`、`AggregateRelayModelMapping`、`AggregateRelayDispatchTarget`。 |
-| 前端聚合面板 | `apps/codex-plus-manager/src/aggregateMappings.ts` | 新文件。展示顺序、有效映射计算、提供者标签生成；列表固定为官方 `gpt-5.6-sol/terra/luna` 等模型在前，供应商模型按成员顺序在后。 |
+| 前端聚合面板 | `apps/codex-plus-manager/src/aggregateMappings.ts` | 新文件。展示顺序、有效映射计算、提供者标签生成；列表按当前官方目录顺序把官方模型放在前面，供应商模型按成员顺序在后。 |
 | 前端聚合编辑器 | `apps/codex-plus-manager/src/App.tsx` | `AggregateRelayProfileEditor`、`normalizeAggregateConfig`、`inferAggregateModelList`、`aggregateDisplayModelEntries`。 |
 | 前端测试 | `apps/codex-plus-manager/src/aggregateMappings.test.ts` | 顺序回归测试。 |
 
-**合并确认点**：检查聚合供应商保存→应用后，模型下拉是否出现带括号的正确名称、官方模型是否按 `5.6-sol → 5.6-terra → 5.6-luna → 其余模型` 排列、供应商模型是否按成员顺序排列、默认模型是否不再落到 `供应商:composer-2.5`、mappings 编辑是否可保存恢复。必须额外模拟官方请求失败，确认供应商端口没有收到请求；供应商的 `gpt-5.2` 等模型只能显示为括号别名或 `供应商:模型`。使用可信 GPT 别名或 `Chat ECNU:ecnu-reasoner` 等非 GPT 外接模型打开 `codex://threads/...` 时，都应先走原生 `exec`/`codex_app.read_thread` 路径，不得预先退化为反复探测普通 MCP 服务器 `codex`；端点不支持 custom tool 时再返回明确失败。
+**合并确认点**：检查聚合供应商保存→应用后，模型下拉是否出现带括号的正确名称、官方模型是否按当前官方目录顺序排列、供应商模型是否按成员顺序排列、默认模型是否不再落到供应商专属首项、mappings 编辑是否可保存恢复。必须额外模拟官方请求失败，确认供应商端口没有收到请求；供应商模型只能显示为括号别名或 `供应商:模型`。使用可信官方别名或 `Chat ECNU:ecnu-reasoner` 等非 GPT 外接模型打开 `codex://threads/...` 时，都应先走原生 `exec`/`codex_app.read_thread` 路径，不得预先退化为反复探测普通 MCP 服务器 `codex`；端点不支持 custom tool 时再返回明确失败。
+
+官方模型目录由 `official_model_catalog.rs` 维护：Manager 启动、Codex 启动/重启、供应商切换和官方账号切换前尝试刷新当前账号的 `/backend-api/codex/models`。缓存按账号保存于 `.codex-session-delete/official-model-catalog.json`，只记录模型条目、ETag、客户端版本和时间戳，不保存令牌或认证头。请求失败时依次回退到当前账号快照、bundled CLI、仓库兼容目录，不能阻止 Codex 启动；`get_official_model_catalog_status` 与 `refresh_official_model_catalog` 只返回安全状态和可见模型列表。官方目录或 CLIProxyAPI `/v1/models` 刷新成功后，若 `managed-cliproxy-official` 已启用，Manager 必须按当前可信目录顺序重新筛选该 profile；模型集合变化时同步重建当前活动混合聚合 catalog，但不得启动 CLIProxyAPI、关闭 Codex 或触发 Codex 重启。
 
 ---
 
@@ -52,13 +54,12 @@ CLIProxyAPI 固定部署到 `D:\pro\CLIProxyAPI`，独立负责账号登录、OA
 | 模块 | 文件 | 维护要点 |
 |---|---|---|
 | Manager 服务控制 | `apps/codex-plus-manager/src-tauri/src/cliproxy.rs` | 固定版本下载与 SHA-256 校验、DPAPI 连接密钥、PID/可执行路径核验、独立进程启停。不得并入 `official_accounts.rs`。 |
-| CLIProxy 自启动 | `apps/codex-plus-manager/src-tauri/src/cliproxy.rs`、`src/lib.rs`、`src/App.tsx` | `cliproxy-integration.json` 的 `autoStart` 仅控制正常 Manager 启动时的后台服务启动；`--transient` 不触发，启动失败只写诊断日志，不读取或同步 CLIProxyAPI 账号目录。 |
 | 受管供应商标识 | `crates/codex-plus-core/src/settings.rs` | `RelayProfile.integrationType = "cliproxy"` 用于识别受管通用直连配置；它不成为聚合成员，也不参与账号同步。`cliproxy-official` 只表示第二开关启用的官方模型专用通道。 |
-| 独立模型路由 | `crates/codex-plus-core/src/aggregate_model_alias.rs`、`model_catalog.rs`、`relay_rotation.rs`、`relay_config.rs`、`assets/inject/renderer-inject.js` | CLIProxyAPI 模型使用 `CLIProxyAPI:模型名` 直连受管配置，不进入聚合轮转。按钮2开启时官方模型由 `cliproxy-official` 接管，通用通道只展示非官方模型；可信 CLI 官方模型按基础模型继承 Fast 与 reasoning 档位。 |
+| 独立模型路由 | `crates/codex-plus-core/src/aggregate_model_alias.rs`、`model_catalog.rs`、`relay_rotation.rs`、`relay_config.rs`、`assets/inject/renderer-inject.js` | CLIProxyAPI 模型使用 `CLIProxyAPI:模型名` 直连受管配置，不进入聚合轮转。按钮2开启时官方模型由 `cliproxy-official` 接管，通用通道只展示非官方模型；只有官方目录精确匹配的 CLI 模型按基础条目继承 Fast 与 reasoning 档位。 |
 | Manager 页面 | `apps/codex-plus-manager/src/App.tsx` | 展示状态、API Base URL、连接密钥、模型与测试结果；普通供应商编辑器不得改写或删除受管字段。 |
 | 独立配置 | `D:\pro\CLIProxyAPI\config\config.yaml` | 仅首次缺失时生成；已有文件不覆盖。账号维护通过 CLIProxyAPI 的 `/management.html` 完成。 |
 
-**合并确认点**：未安装或未启动 CLIProxyAPI 时原功能不受影响；受管供应商 ID 固定为 `managed-cliproxy`，API Base URL 必须包含 `/v1`。按钮1开启后，CLIProxyAPI 的官方、Gemini 等全部模型都必须进入独立直连组；按钮2关闭时顺序为“官方原生 → 聚合替换项 → CLI 全部模型 → 聚合成员模型”，按钮2开启时顺序为“官方原生 → CLI 官方模型 → 聚合替换项 → CLI 非官方模型 → 聚合成员模型”。CLI 模型必须通过受管配置直连，禁止加入聚合成员、轮转或 failover。`CLIProxyAPI:gpt-5.6-sol/terra/luna` 按各自元数据继承 Fast、默认 reasoning 和 `max/ultra` 等受支持档位；Gemini、普通供应商同名模型及不在可信清单内的模型不得继承这些官方能力，但仍默认先尝试 `code_mode_only`。CLIProxyAPI 账号文件变化不得触发 Codex++ 凭据写回、额度刷新或 provider sync。
+**合并确认点**：CLIProxyAPI 只允许用户从 Manager 手动启动、停止或重启，不得随 Manager 或 Codex++ 自动启动。未安装或未启动 CLIProxyAPI 时原功能不受影响；受管供应商 ID 固定为 `managed-cliproxy`，API Base URL 必须包含 `/v1`。按钮1开启后，CLIProxyAPI 的官方、Gemini 等全部模型都必须进入独立直连组；按钮2关闭时顺序为“官方原生 → 聚合替换项 → CLI 全部模型 → 聚合成员模型”，按钮2开启时顺序为“官方原生 → CLI 官方模型 → 聚合替换项 → CLI 非官方模型 → 聚合成员模型”。CLI 模型必须通过受管配置直连，禁止加入聚合成员、轮转或 failover。CLIProxy 官方模型只在基础 slug 与当前官方目录精确匹配时继承 Fast、默认 reasoning 和受支持档位；Gemini、普通供应商同名模型及未知模型不得继承这些官方能力，但仍默认先尝试 `code_mode_only`。CLIProxyAPI 账号文件变化不得触发 Codex++ 凭据写回、额度刷新或 provider sync。
 
 ### 2.2 NewAPI 独立接入
 

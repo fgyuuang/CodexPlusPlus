@@ -1034,7 +1034,7 @@ fn restore_optional_file_bytes(path: &Path, contents: Option<&[u8]>) -> anyhow::
     Ok(())
 }
 
-fn sync_active_relay_to_home(
+pub(crate) fn sync_active_relay_to_home(
     settings: &BackendSettings,
     home: &Path,
 ) -> anyhow::Result<codex_plus_core::relay_config::RelayApplyResult> {
@@ -1660,7 +1660,13 @@ pub async fn refresh_official_model_catalog(
     match codex_plus_core::official_model_catalog::refresh_active_account(force.unwrap_or(false))
         .await
     {
-        Ok(status) => ok("官方模型目录已刷新。", status),
+        Ok(status) => {
+            let mut message = "官方模型目录已刷新。".to_string();
+            if let Some(sync_message) = sync_cliproxy_official_profile().await {
+                message.push_str(&sync_message);
+            }
+            ok(&message, status)
+        }
         Err(error) => {
             let settings = SettingsStore::default().load().unwrap_or_default();
             let safe_error = error.to_string().chars().take(240).collect::<String>();
@@ -1673,6 +1679,95 @@ pub async fn refresh_official_model_catalog(
             )
         }
     }
+}
+
+pub(crate) async fn refresh_official_model_catalog_in_background() {
+    match codex_plus_core::official_model_catalog::refresh_active_account(false).await {
+        Ok(_) => {
+            let _ = sync_cliproxy_official_profile().await;
+        }
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.official_model_catalog_background_refresh_failed",
+                json!({ "message": safe_catalog_sync_error(&error.to_string()) }),
+            );
+        }
+    }
+}
+
+pub(crate) async fn sync_cliproxy_official_profile() -> Option<String> {
+    finalize_cliproxy_official_profile_sync(crate::cliproxy::sync_existing_official_profile().await)
+}
+
+pub(crate) fn sync_cliproxy_official_profile_from_models(models: &[String]) -> Option<String> {
+    finalize_cliproxy_official_profile_sync(
+        crate::cliproxy::sync_existing_official_profile_from_models(models),
+    )
+}
+
+fn finalize_cliproxy_official_profile_sync(
+    result: anyhow::Result<Option<crate::cliproxy::CliproxyOfficialProfileSync>>,
+) -> Option<String> {
+    let sync = match result {
+        Ok(Some(sync)) => sync,
+        Ok(None) => return None,
+        Err(error) => {
+            let safe_error = safe_catalog_sync_error(&error.to_string());
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.cliproxy_official_catalog_sync_failed",
+                json!({ "message": safe_error }),
+            );
+            return Some("CLIProxyAPI 官方模型同步失败，已保留现有配置。".to_string());
+        }
+    };
+
+    if !sync.changed {
+        return Some(format!(
+            "CLIProxyAPI 官方模型已核对，共 {} 个。",
+            sync.model_count
+        ));
+    }
+
+    let should_sync_live = sync.settings.relay_profiles_enabled
+        && sync.settings.active_relay_uses_official_login_auth()
+        && sync.settings.active_aggregate_relay_profile().is_some();
+    if !should_sync_live {
+        return Some(format!(
+            "CLIProxyAPI 官方模型已同步，共 {} 个。",
+            sync.model_count
+        ));
+    }
+
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _guard = relay_switch_mutex()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match sync_active_relay_to_home(&sync.settings, &home) {
+        Ok(_) => Some(format!(
+            "CLIProxyAPI 官方模型和当前聚合目录已同步，共 {} 个。",
+            sync.model_count
+        )),
+        Err(error) => {
+            let safe_error = safe_catalog_sync_error(&error.to_string());
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.cliproxy_official_live_catalog_sync_failed",
+                json!({ "message": safe_error }),
+            );
+            Some(
+                "CLIProxyAPI 官方模型已同步，但当前聚合目录写入失败，将在下次应用配置时重试。"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+fn safe_catalog_sync_error(error: &str) -> String {
+    error
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .chars()
+        .take(240)
+        .collect()
 }
 
 #[tauri::command]

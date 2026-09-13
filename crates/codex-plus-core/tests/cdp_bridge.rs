@@ -2990,12 +2990,16 @@ fn injection_script_exposes_fast_service_tier_control() {
     assert!(script.contains("codexThreadServiceTierOverrides"));
     assert!(script.contains("setCodexThreadServiceTierMode"));
     assert!(script.contains("codexServiceTierRequestOverride"));
-    assert!(script.contains("codexServiceTierSupportedFastModels"));
-    assert!(script.contains("\"gpt-5.4\""));
-    assert!(script.contains("\"gpt-5.5\""));
-    assert!(script.contains("\"gpt-5.6-sol\""));
-    assert!(script.contains("\"gpt-5.6-terra\""));
-    assert!(script.contains("\"gpt-5.6-luna\""));
+    assert!(script.contains("codexServiceTierSupportedFastModelNames"));
+    assert!(script.contains("codexCatalogMetadata"));
+    assert!(script.contains("codexCatalogOfficialModels"));
+    assert!(script.contains("additionalSpeedTiers"));
+    assert!(script.contains("serviceTiers"));
+    assert!(!script.contains("\"gpt-5.4\""));
+    assert!(!script.contains("\"gpt-5.5\""));
+    assert!(!script.contains("\"gpt-5.6-sol\""));
+    assert!(!script.contains("\"gpt-5.6-terra\""));
+    assert!(!script.contains("\"gpt-5.6-luna\""));
     assert!(script.contains("codexServiceTierFastSupportedForModel"));
     assert!(script.contains("codexServiceTierModelForRequest"));
     assert!(script.contains("codexServiceTierMaybeLoadModelCatalog"));
@@ -3280,7 +3284,7 @@ fn injection_script_applies_fast_service_tier_contract() {
     );
     assert_eq!(
         cases["lunaFallbackWithoutCatalog"]["reasoningEffort"],
-        "medium"
+        "ultra"
     );
     assert_eq!(
         cases["cliSolFallbackWithoutCatalog"]["reasoningEffort"],
@@ -3288,11 +3292,11 @@ fn injection_script_applies_fast_service_tier_contract() {
     );
     assert_eq!(
         cases["cliLunaFallbackWithoutCatalog"]["reasoningEffort"],
-        "medium"
+        "ultra"
     );
     assert_eq!(
         cases["cliGeminiFallbackWithoutCatalog"]["reasoningEffort"],
-        "low"
+        "ultra"
     );
     assert_eq!(cases["dispatcherFromSingleton"], true);
     assert_eq!(cases["dispatcherFromCurrentSingleton"], true);
@@ -3444,7 +3448,22 @@ globalThis.performance = {{ getEntriesByType: () => [] }};
 require(scriptPath);
 const api = window.__codexPlusServiceTierTest;
 api.setServiceTierState({{ status: "ok", serviceTier: "priority", fastTierValue: "priority" }});
-api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4", "gpt-5.5"] }});
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-5.4",
+  default_model: "gpt-5.4",
+  models: ["gpt-5.4", "gpt-5.5"],
+  modelMetadata: {{
+    "gpt-5.4": {{
+      additionalSpeedTiers: ["fast"],
+      serviceTiers: [{{ id: "priority", name: "Fast" }}],
+    }},
+    "gpt-5.5": {{
+      additionalSpeedTiers: ["fast"],
+      serviceTiers: [{{ id: "priority", name: "Fast" }}],
+    }},
+  }},
+}});
 
 const inheritUnsetStatus = api.statusSummary({{
   controlMode: "inherit",
@@ -3503,7 +3522,18 @@ const customInheritUnsupported = api.applyServiceTierOverride("turn/start", {{
   service_tier: "priority",
 }}, "");
 
-api.setModelCatalog({{ status: "ok", model: "gpt-5.5", default_model: "gpt-5.5", models: ["gpt-5.5"] }});
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-5.5",
+  default_model: "gpt-5.5",
+  models: ["gpt-5.5"],
+  modelMetadata: {{
+    "gpt-5.5": {{
+      additionalSpeedTiers: ["fast"],
+      serviceTiers: [{{ id: "priority", name: "Fast" }}],
+    }},
+  }},
+}});
 api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
 const startConversation = api.requestOverride({{
   type: "start-conversation",
@@ -3591,14 +3621,22 @@ api.setModelCatalog({{
   default_model: "CLIProxyAPI:gpt-5.6-sol",
   models: ["CLIProxyAPI:gpt-5.6-sol", "CLIProxyAPI:gpt-5.6-terra", "CLIProxyAPI:gemini-2.5-pro"],
   modelMetadata: {{
-    "CLIProxyAPI:gpt-5.6-sol": {{
+      "CLIProxyAPI:gpt-5.6-sol": {{
       displayName: "CLIProxyAPI:gpt-5.6-sol",
       description: "Latest frontier agentic coding model through CLIProxyAPI.",
       defaultReasoningEffort: "low",
       supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({{ reasoningEffort }})),
       additionalSpeedTiers: ["fast"],
-      serviceTiers: [{{ id: "priority", name: "Fast" }}],
-    }},
+        serviceTiers: [{{ id: "priority", name: "Fast" }}],
+      }},
+      "gpt-5.6-terra": {{
+        additionalSpeedTiers: ["fast"],
+        serviceTiers: [{{ id: "priority", name: "Fast" }}],
+      }},
+      "CLIProxyAPI:gpt-5.6-terra": {{
+        additionalSpeedTiers: ["fast"],
+        serviceTiers: [{{ id: "priority", name: "Fast" }}],
+      }},
   }},
 }});
 const cliSolFastAvailability = api.fastAvailability("CLIProxyAPI:gpt-5.6-sol");

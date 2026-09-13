@@ -24,10 +24,11 @@ fn codex_home_env_dir_is_valid(path: &PathBuf) -> bool {
 /// 判定在**规范化之后**做，`..`、符号链接、大小写差异都拦得住；同时容忍路径尚不存在
 /// （清理临时目录的常见情形，此时用词法规范化比较）。
 pub fn ensure_safe_recursive_removal(target: &Path, codex_home: &Path) -> anyhow::Result<()> {
+    let target_is_root = is_filesystem_root(target);
     let target = normalize_for_comparison(target);
     let home = normalize_for_comparison(codex_home);
 
-    if target.as_os_str().is_empty() || target == Path::new("/") {
+    if target_is_root || target.as_os_str().is_empty() || is_filesystem_root(&target) {
         anyhow::bail!("拒绝删除文件系统根目录：{}", target.display());
     }
     if target == home {
@@ -44,6 +45,21 @@ pub fn ensure_safe_recursive_removal(target: &Path, codex_home: &Path) -> anyhow
         );
     }
     Ok(())
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut components = path.components();
+    match components.next() {
+        Some(std::path::Component::RootDir) => components.next().is_none(),
+        Some(std::path::Component::Prefix(_)) => {
+            matches!(components.next(), Some(std::path::Component::RootDir))
+                && components.next().is_none()
+        }
+        _ => false,
+    }
 }
 
 /// 规范化到可比较的形态。

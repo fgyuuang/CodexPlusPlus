@@ -695,8 +695,8 @@ export const EN_PLAIN: Record<string, string> = {
   "时间": "Time",
   "桌宠跟随真实鼠标": "Real-mouse pet look",
   "释放并注册内置缓存": "Extract and register embedded cache",
-  "显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5 / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna，其他模型按 Standard 发送。":
-    "Show the service-tier toggle button; Fast only supports gpt-5.4 / gpt-5.5, other models are sent as Standard.",
+  "显示服务模式切换按钮；可用性依据当前官方模型目录元数据动态判定，其他模型按 Standard 发送。":
+    "Show the service-tier toggle button; availability is determined from the current official model catalog metadata, and other models are sent as Standard.",
   "普通推荐": "Regular recommendations",
   "多模态模型（支持图片输入的模型）请保持 send-as-is。": "Keep send-as-is for multimodal models that support image input.",
   "暂无": "None",
@@ -1157,10 +1157,6 @@ export const EN_PLAIN: Record<string, string> = {
   "CLIProxyAPI 测试": "CLIProxyAPI test",
   "CLIProxyAPI API Key": "CLIProxyAPI API Key",
   "CLIProxyAPI 启动与连接位置": "CLIProxyAPI launch and connection settings",
-  "CLIProxyAPI 自启动": "CLIProxyAPI auto-start",
-  "随 Codex++ 启动自动启动 CLIProxyAPI": "Start CLIProxyAPI automatically with Codex++",
-  "开启后，正常启动 Codex++ Manager 时会在后台启动 CLIProxyAPI；临时 Manager 不会触发。":
-    "When enabled, CLIProxyAPI starts in the background with a normal Codex++ Manager launch; transient Manager launches do not trigger it.",
   "CLIProxyAPI 供应商": "CLIProxyAPI provider",
   "安装 CLIProxyAPI": "Install CLIProxyAPI",
   "启动 CLIProxyAPI": "Start CLIProxyAPI",

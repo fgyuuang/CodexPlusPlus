@@ -1067,10 +1067,44 @@ experimental_bearer_token = "sk-first-member"
 
 #[test]
 fn aggregate_startup_profile_orders_cliproxy_direct_models_by_special_official_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let previous_catalog_path = codex_plus_core::paths::set_official_model_catalog_path_for_tests(
+        Some(temp.path().join("official-model-catalog.json")),
+    );
+    std::fs::write(
+        codex_plus_core::official_model_catalog::official_model_catalog_path(),
+        serde_json::json!({
+            "version": 1,
+            "accounts": {
+                "fixture-account": {
+                    "accountId": "fixture-account",
+                    "fetchedAt": 1_800_000_000i64,
+                    "clientVersion": "0.153.4",
+                    "etag": "fixture-etag",
+                    "source": "account_snapshot",
+                    "models": [
+                        {"slug": "gpt-6-astra", "visibility": "list", "supported_in_api": true},
+                        {"slug": "gpt-5.6-sol", "visibility": "list", "supported_in_api": true},
+                        {"slug": "gpt-5.6-terra", "visibility": "list", "supported_in_api": true},
+                        {"slug": "gpt-5.6-luna", "visibility": "list", "supported_in_api": true},
+                        {"slug": "gpt-5.5", "visibility": "list", "supported_in_api": true},
+                        {"slug": "gpt-5.4", "visibility": "list", "supported_in_api": true},
+                        {"slug": "gpt-5.4-mini", "visibility": "list", "supported_in_api": true},
+                        {"slug": "gpt-5.3-codex", "visibility": "list", "supported_in_api": true},
+                        {"slug": "gpt-7-internal", "visibility": "hidden", "supported_in_api": true}
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
     let mut settings = BackendSettings {
         active_relay_id: "aggregate".to_string(),
         active_aggregate_relay_id: "aggregate".to_string(),
         official_login_mixed_mode: true,
+        active_official_account_id: "fixture-account".to_string(),
         relay_profiles: vec![
             RelayProfile {
                 id: "provider-a".to_string(),
@@ -1131,6 +1165,7 @@ fn aggregate_startup_profile_orders_cliproxy_direct_models_by_special_official_s
     assert_eq!(
         with_special.model_list.lines().collect::<Vec<_>>(),
         [
+            "gpt-6-astra",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -1152,6 +1187,7 @@ fn aggregate_startup_profile_orders_cliproxy_direct_models_by_special_official_s
     assert_eq!(
         without_special.model_list.lines().collect::<Vec<_>>(),
         [
+            "gpt-6-astra",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -1165,6 +1201,8 @@ fn aggregate_startup_profile_orders_cliproxy_direct_models_by_special_official_s
             "供应商一:gpt-5.4",
         ]
     );
+
+    codex_plus_core::paths::set_official_model_catalog_path_for_tests(previous_catalog_path);
 }
 
 #[test]
@@ -4706,7 +4744,12 @@ experimental_bearer_token = "sk-deepseek"
         .unwrap(),
     )
     .unwrap();
-    let model = &catalog["models"][0];
+    let model = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "deepseek-v4-flash")
+        .unwrap();
     assert_eq!(model["slug"], "deepseek-v4-flash");
     assert_eq!(model["shell_type"], "shell_command");
     assert_eq!(model["apply_patch_tool_type"], "freeform");
@@ -5829,7 +5872,7 @@ experimental_bearer_token = "sk-new"
 /// `os error 3` 拒绝**整份** config.toml —— 用户看到的是"无法加载 config.toml，
 /// 因此此对话串无法继续"，和真正的故障点毫无关系，极难自诊。
 #[test]
-fn apply_relay_profile_drops_catalog_pointer_with_unexpanded_variable() {
+fn apply_relay_profile_drops_catalog_pointer_with_unexpanded_variable_primary() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
         id: "relay-a".to_string(),
@@ -5867,7 +5910,7 @@ experimental_bearer_token = "sk-new"
 /// 收窄的边界：**只**认未展开变量这一种。普通的相对/绝对路径即使当前读不到，
 /// 也仍然按既有语义保留（用户在挂载盘、或自己删了 catalog 但想留着手改）。
 #[test]
-fn apply_relay_profile_keeps_plain_catalog_pointer_even_if_missing() {
+fn apply_relay_profile_keeps_plain_catalog_pointer_even_if_missing_primary() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
         id: "relay-a".to_string(),

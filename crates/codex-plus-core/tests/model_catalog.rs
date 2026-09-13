@@ -283,6 +283,56 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
     let previous_codex_home = std::env::var_os("CODEX_HOME");
     let previous_settings_path =
         codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+    let official_catalog_path = temp.path().join("official-model-catalog.json");
+    let previous_official_catalog_path =
+        codex_plus_core::paths::set_official_model_catalog_path_for_tests(Some(
+            official_catalog_path.clone(),
+        ));
+    std::fs::write(
+        &official_catalog_path,
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "accounts": {
+                "account-fixture": {
+                    "accountId": "account-fixture",
+                    "fetchedAt": 1_800_000_000i64,
+                    "clientVersion": "0.153.4",
+                    "etag": "fixture-etag",
+                    "source": "account_snapshot",
+                    "models": [
+                        {
+                            "slug": "gpt-6-astra",
+                            "display_name": "GPT-6-Astra",
+                            "description": "Fixture future official model",
+                            "default_reasoning_level": "medium",
+                            "supported_reasoning_levels": [
+                                { "effort": "low", "description": "Fast" },
+                                { "effort": "medium", "description": "Balanced" },
+                                { "effort": "high", "description": "Deep" },
+                                { "effort": "xhigh", "description": "Extra deep" },
+                                { "effort": "max", "description": "Maximum" },
+                                { "effort": "ultra", "description": "Ultra" }
+                            ],
+                            "additional_speed_tiers": ["fast"],
+                            "service_tiers": [{ "id": "priority", "name": "Fast" }],
+                            "visibility": "list",
+                            "supported_in_api": true,
+                            "context_window": 272000,
+                            "max_context_window": 272000
+                        },
+                        {
+                            "slug": "gpt-7-internal",
+                            "display_name": "GPT-7 Internal",
+                            "visibility": "hidden",
+                            "supported_in_api": true
+                        }
+                    ]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     unsafe {
         std::env::set_var("CODEX_HOME", &codex_home);
     }
@@ -294,12 +344,13 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
                 active_aggregate_relay_id: "aggregate".to_string(),
                 official_login_mixed_mode: true,
                 official_login_relay_id: "official".to_string(),
+                active_official_account_id: "account-fixture".to_string(),
                 relay_profiles: vec![
                     RelayProfile {
                         id: "official".to_string(),
                         name: "OpenAI".to_string(),
                         relay_mode: RelayMode::Official,
-                        model_list: "gpt-5.6-sol\ngpt-5.6-terra\ngpt-5.6-luna".to_string(),
+                        model_list: "gpt-6-astra".to_string(),
                         auth_contents:
                             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#
                                 .to_string(),
@@ -309,8 +360,8 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
                         id: "managed-cliproxy-official".to_string(),
                         name: "CLIProxyAPI 官方模型".to_string(),
                         integration_type: "cliproxy-official".to_string(),
-                        model: "account-2/gpt-5.6-sol".to_string(),
-                        model_list: "account-2/gpt-5.6-sol".to_string(),
+                        model: "account-2/gpt-6-astra".to_string(),
+                        model_list: "account-2/gpt-6-astra".to_string(),
                         base_url: "http://127.0.0.1:8317/v1".to_string(),
                         api_key: "cli-key".to_string(),
                         relay_mode: RelayMode::PureApi,
@@ -321,7 +372,7 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
                         name: "CLIProxyAPI".to_string(),
                         integration_type: "cliproxy".to_string(),
                         model: "gemini-2.5-pro".to_string(),
-                        model_list: "account-2/gpt-5.6-sol\ngemini-2.5-pro".to_string(),
+                        model_list: "account-2/gpt-6-astra\ngemini-2.5-pro".to_string(),
                         base_url: "http://127.0.0.1:8317/v1".to_string(),
                         api_key: "cli-key".to_string(),
                         relay_mode: RelayMode::PureApi,
@@ -330,8 +381,8 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
                     RelayProfile {
                         id: "provider-a".to_string(),
                         name: "供应商一".to_string(),
-                        model: "gpt-5.4".to_string(),
-                        model_list: "gpt-5.4\ngpt-5.6-sol\ngpt-5.2".to_string(),
+                        model: "gpt-6-astra".to_string(),
+                        model_list: "gpt-6-astra\ngpt-5.2".to_string(),
                         base_url: "https://a.example.test/v1".to_string(),
                         api_key: "key-a".to_string(),
                         relay_mode: RelayMode::PureApi,
@@ -340,8 +391,8 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
                     RelayProfile {
                         id: "provider-b".to_string(),
                         name: "供应商二".to_string(),
-                        model: "vendor-gpt-5.4".to_string(),
-                        model_list: "vendor-gpt-5.4".to_string(),
+                        model: "vendor-gpt-6-astra".to_string(),
+                        model_list: "vendor-gpt-6-astra".to_string(),
                         base_url: "https://b.example.test/v1".to_string(),
                         api_key: "key-b".to_string(),
                         relay_mode: RelayMode::PureApi,
@@ -350,7 +401,7 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
                     RelayProfile {
                         id: "aggregate".to_string(),
                         name: "聚合".to_string(),
-                        model: "gpt-5.4".to_string(),
+                        model: "gpt-6-astra".to_string(),
                         relay_mode: RelayMode::Aggregate,
                         ..RelayProfile::default()
                     },
@@ -372,15 +423,15 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
                         },
                     ],
                     model_mappings: vec![codex_plus_core::settings::AggregateRelayModelMapping {
-                        codex_model: "gpt-5.4".to_string(),
+                        codex_model: "gpt-6-astra".to_string(),
                         targets: vec![
                             codex_plus_core::settings::AggregateRelayDispatchTarget {
                                 relay_id: "provider-b".to_string(),
-                                target_model: "vendor-gpt-5.4".to_string(),
+                                target_model: "vendor-gpt-6-astra".to_string(),
                             },
                             codex_plus_core::settings::AggregateRelayDispatchTarget {
                                 relay_id: "provider-a".to_string(),
-                                target_model: "gpt-5.4".to_string(),
+                                target_model: "gpt-6-astra".to_string(),
                             },
                         ],
                     }],
@@ -403,105 +454,64 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
         },
     }
     codex_plus_core::paths::set_settings_path_for_tests(previous_settings_path);
-
-    assert_eq!(result["default_model"], "gpt-5.6-sol");
-    assert_eq!(result["model_provider"], "custom");
-    assert_eq!(
-        result["models"],
-        json!([
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
-            "gpt-5.3-codex",
-            "CLIProxyAPI:gpt-5.6-sol",
-            "gpt-5.6-sol(供应商一)",
-            "gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)",
-            "gpt-5.2(供应商一)",
-            "CLIProxyAPI:gemini-2.5-pro",
-            "供应商一:gpt-5.4",
-            "供应商一:gpt-5.6-sol",
-            "供应商一:gpt-5.2",
-            "供应商二:vendor-gpt-5.4"
-        ])
+    codex_plus_core::paths::set_official_model_catalog_path_for_tests(
+        previous_official_catalog_path,
     );
-    assert_eq!(
-        result["models"]
+
+    assert_eq!(result["default_model"], "gpt-6-astra");
+    assert_eq!(result["model_provider"], "custom");
+    assert_eq!(result["officialModels"], json!(["gpt-6-astra"]));
+    assert!(
+        result["trustedOfficialModels"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|model| *model == "gpt-5.6-sol")
+            .any(|model| model == "gpt-7-internal")
+    );
+    let models = result["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "gpt-6-astra"));
+    assert!(
+        models
+            .iter()
+            .any(|model| model == "CLIProxyAPI:gpt-6-astra")
+    );
+    assert!(
+        models
+            .iter()
+            .any(|model| model == "gpt-6-astra(供应商一|供应商二:vendor-gpt-6-astra)")
+    );
+    assert!(!models.iter().any(|model| model == "gpt-7-internal"));
+    assert_eq!(
+        models
+            .iter()
+            .filter(|model| *model == "gpt-6-astra")
             .count(),
         1
     );
-    assert!(
-        result["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|model| model == "供应商一:gpt-5.4")
-    );
-    assert!(
-        result["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|model| model == "供应商二:vendor-gpt-5.4")
-    );
-    assert!(
-        result["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|model| model == "供应商一:gpt-5.6-sol")
-    );
-    assert!(result["modelMetadata"]["gpt-5.4"]["displaySuffix"].is_null());
     assert_eq!(
-        result["modelMetadata"]["gpt-5.6-sol"]["defaultReasoningEffort"],
-        "low"
+        result["modelMetadata"]["gpt-6-astra"]["defaultReasoningEffort"],
+        "medium"
     );
-    assert!(result["modelMetadata"]["gpt-5.6-sol"]["displaySuffix"].is_null());
+    assert!(result["modelMetadata"]["gpt-6-astra"]["displaySuffix"].is_null());
     assert_eq!(
-        result["modelMetadata"]["gpt-5.6-sol(供应商一)"]["displayName"],
-        "gpt-5.6-sol(供应商一)"
+        result["modelMetadata"]["gpt-6-astra(供应商一|供应商二:vendor-gpt-6-astra)"]["displayName"],
+        "gpt-6-astra(供应商一|供应商二:vendor-gpt-6-astra)"
     );
     assert_eq!(
-        result["modelMetadata"]["CLIProxyAPI:gpt-5.6-sol"]["displayName"],
-        "CLIProxyAPI:gpt-5.6-sol"
+        result["modelMetadata"]["CLIProxyAPI:gpt-6-astra"]["displayName"],
+        "CLIProxyAPI:gpt-6-astra"
     );
     assert_eq!(
-        result["modelMetadata"]["CLIProxyAPI:gpt-5.6-sol"]["supportedReasoningEfforts"][5]["reasoningEffort"],
+        result["modelMetadata"]["CLIProxyAPI:gpt-6-astra"]["supportedReasoningEfforts"][5]["reasoningEffort"],
         "ultra"
     );
     assert_eq!(
-        result["modelMetadata"]["CLIProxyAPI:gpt-5.6-sol"]["additionalSpeedTiers"][0],
+        result["modelMetadata"]["CLIProxyAPI:gpt-6-astra"]["additionalSpeedTiers"][0],
         "fast"
     );
     assert_eq!(
-        result["modelMetadata"]["CLIProxyAPI:gpt-5.6-sol"]["serviceTiers"][0]["id"],
+        result["modelMetadata"]["CLIProxyAPI:gpt-6-astra"]["serviceTiers"][0]["id"],
         "priority"
-    );
-    assert_eq!(
-        result["modelMetadata"]["gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)"]["displayName"],
-        "gpt-5.4(供应商一|供应商二:vendor-gpt-5.4)"
-    );
-    assert_eq!(
-        result["modelMetadata"]["供应商一:gpt-5.6-sol"]["defaultReasoningEffort"],
-        "low"
-    );
-    assert_eq!(
-        result["modelMetadata"]["供应商一:gpt-5.6-sol"]["displayName"],
-        "供应商一:gpt-5.6-sol"
-    );
-    assert!(result["modelMetadata"]["供应商一:gpt-5.6-sol"]["displaySuffix"].is_null());
-    assert!(
-        !result["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|model| model == "gpt-5.2")
     );
 }
 

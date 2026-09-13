@@ -459,7 +459,18 @@ fn official_login_mixed_mode_restores_official_auth_before_aggregate_api_overrid
 
     assert!(result.configured);
     assert!(live_config.contains(r#"model_provider = "custom""#));
-    assert!(live_config.contains(r#"model = "gpt-5.6-sol""#));
+    let configured_model = live_config
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("model = \"")?.strip_suffix('"'))
+        .unwrap_or_default();
+    assert!(!configured_model.is_empty());
+    assert!(
+        codex_plus_core::official_model_catalog::visible_official_model_slugs_for_settings(
+            &result.settings,
+        )
+        .iter()
+        .any(|model| model.eq_ignore_ascii_case(configured_model))
+    );
     assert!(live_config.contains("requires_openai_auth = true"));
     assert!(live_config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
     assert_eq!(

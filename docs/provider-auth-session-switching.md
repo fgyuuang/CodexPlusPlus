@@ -50,18 +50,18 @@
 
 | 请求模型名 | 路由 | 失败行为 |
 |---|---|---|
-| `gpt-5.6-sol` 等可信官方裸模型 | `https://chatgpt.com/backend-api/codex/responses` | 返回官方错误，绝不进入第三方轮转 |
-| `CLIProxyAPI:gpt-5.6-sol` | 按钮2开启时使用 CLIProxyAPI 官方专用配置；关闭时使用通用 CLIProxyAPI 配置 | 只请求 CLIProxyAPI，不进入聚合轮转 |
-| `gpt-5.6-sol(供应商1|供应商2:真实模型)` | 对应 aggregate dispatch 成员 | 按聚合策略在该映射成员内轮转 |
+| 当前官方目录中的可信裸模型 | `https://chatgpt.com/backend-api/codex/responses` | 返回官方错误，绝不进入第三方轮转 |
+| `CLIProxyAPI:<官方目录中的 slug>` | 按钮2开启时使用 CLIProxyAPI 官方专用配置；关闭时使用通用 CLIProxyAPI 配置 | 只请求 CLIProxyAPI，不进入聚合轮转 |
+| `<官方 slug>(供应商1|供应商2:真实模型)` | 对应 aggregate dispatch 成员 | 按聚合策略在该映射成员内轮转 |
 | `CLIProxyAPI:gemini-2.5-pro` 等非官方模型 | CLIProxyAPI 通用受管配置 | 只请求 CLIProxyAPI，不进入聚合轮转 |
 | `供应商1:gpt-5.6-sol` | 指定供应商 | 仅选择该供应商 |
 | `gpt-5.2` 等未知裸模型 | 拒绝 | 不连接任何第三方供应商 |
 
-可信官方裸模型清单固定为：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex`。供应商即使提供同名或其他 `gpt-*` 模型，也只能通过聚合括号别名或 `供应商:模型` 调用，避免与官方同名模型冲突。
+可信官方裸模型不再使用固定清单：只有当前活动账号目录、Codex bundled catalog 或仓库兼容目录中精确存在的 slug 才能作为官方裸模型。供应商即使提供同名或其他 `gpt-*` 模型，也只能通过聚合括号别名或 `供应商:模型` 调用，避免与官方同名模型冲突。
 
-CLIProxyAPI 的两个开关职责独立：按钮1控制所有 CLI 模型是否作为受管直连供应商接入；按钮2只控制可信官方 Codex 模型是否使用专用通道并提升到聚合项之前。按钮2关闭时，CLI 官方模型仍由按钮1的通用通道提供，并与 Gemini 等模型一起排在聚合替换项之后。
+CLIProxyAPI 的两个开关职责独立：按钮1控制所有 CLI 模型是否作为受管直连供应商接入；按钮2只控制可信官方 Codex 模型是否使用专用通道并提升到聚合项之前。按钮2关闭时，CLI 官方模型仍由按钮1的通用通道提供，并与 Gemini 等模型一起排在聚合替换项之后。按钮2开启后，官方目录刷新与 CLIProxyAPI 模型刷新都会重新计算专用 profile，并在模型集合变化时原地更新当前混合聚合 catalog；该同步只写设置和 catalog，不负责启动 CLIProxyAPI，也不关闭或重启 Codex。
 
-Codex 模型下拉列表切换时，由 renderer bridge 对 `thread/settings/update` 与 `turn/start` 的 reasoning effort 做目标模型校验。官方裸模型及可信的 `CLIProxyAPI:gpt-5.6-sol/terra/luna` 即使模型目录尚未完成加载，也使用对应基础模型的内置官方能力作为 fallback；其模型描述符同时继承 Fast service tier 与 `max/ultra` 等实际支持档位。能力按具体基础模型判断，Gemini、普通供应商同名模型或未知 CLI 模型不会仅因来自 CLIProxyAPI 而获得官方能力。
+Codex 模型下拉列表切换时，由 renderer bridge 对 `thread/settings/update` 与 `turn/start` 的 reasoning effort 做目标模型校验。官方裸模型及 `CLIProxyAPI:<官方 slug>` 的能力只从官方目录条目读取；目录尚未完成加载或条目不存在时不猜测 reasoning/Fast 能力。能力按具体基础模型判断，Gemini、普通供应商同名模型或未知 CLI 模型不会仅因来自 CLIProxyAPI 而获得官方能力。
 
 供应商或聚合 Responses 流出现超时、非 2xx、传输中断或未发送终止事件时，本地协议代理统一以 HTTP 200 SSE 返回 `response.failed`，并记为 `helper.protocol_proxy_stream_failed`。该失败只结束当前 turn，不得破坏官方认证、会话 provider 或后续切回官方模型的 `thread/settings/update`。
 
@@ -96,9 +96,9 @@ Content-Type: application/json
 
 请求体中的确切模型名分别为：
 
-- 官方直连：`gpt-5.6-sol`
-- 聚合替换：`gpt-5.6-sol(供应商1|供应商2:真实模型)`，必须使用 Manager 实际显示的完整半角名称
-- 指定供应商：`供应商1:gpt-5.6-sol`
+- 官方直连：`<官方目录中的 slug>`
+- 聚合替换：`<官方 slug>(供应商1|供应商2:真实模型)`，必须使用 Manager 实际显示的完整半角名称
+- 指定供应商：`供应商1:<官方或供应商模型>`
 
 `POST /v1/chat/completions` 仍只用于活动供应商声明为 Chat Completions 的协议转换，不提供官方 ChatGPT 裸模型直连。需要官方混合路由的 Claudian 配置必须使用 `/v1/responses`。
 

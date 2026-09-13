@@ -1,5 +1,6 @@
 use crate::settings::{
-    AggregateRelayDispatchTarget, AggregateRelayModelMapping, AggregateRelayProfile, RelayProfile,
+    AggregateRelayDispatchTarget, AggregateRelayModelMapping, AggregateRelayProfile,
+    BackendSettings, RelayProfile,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -57,13 +58,30 @@ pub fn integration_is_cliproxy_general(integration_type: &str) -> bool {
 }
 
 pub fn cliproxy_official_api_aliases(profiles: &[RelayProfile]) -> Vec<DirectRelayAlias> {
+    let official_models = crate::official_model_catalog::visible_official_model_slugs();
+    cliproxy_official_api_aliases_for_slugs(profiles, &official_models)
+}
+
+pub fn cliproxy_official_api_aliases_for_settings(
+    profiles: &[RelayProfile],
+    settings: &BackendSettings,
+) -> Vec<DirectRelayAlias> {
+    let official_models =
+        crate::official_model_catalog::visible_official_model_slugs_for_settings(settings);
+    cliproxy_official_api_aliases_for_slugs(profiles, &official_models)
+}
+
+fn cliproxy_official_api_aliases_for_slugs(
+    profiles: &[RelayProfile],
+    official_models: &[String],
+) -> Vec<DirectRelayAlias> {
     let official_profiles = profiles
         .iter()
         .filter(|profile| integration_is_cliproxy_official(&profile.integration_type))
         .collect::<Vec<_>>();
     let mut aliases = Vec::new();
 
-    for official_model in crate::official_model_catalog::visible_official_model_slugs() {
+    for official_model in official_models {
         let mut candidates = official_profiles
             .iter()
             .flat_map(|profile| {
@@ -71,9 +89,10 @@ pub fn cliproxy_official_api_aliases(profiles: &[RelayProfile]) -> Vec<DirectRel
                 relay_profile_model_ids(profile)
                     .into_iter()
                     .filter_map(move |target_model| {
-                        (cliproxy_official_model_name(&target_model).is_some_and(|model| {
-                            model.eq_ignore_ascii_case(&official_model_for_profile)
-                        }))
+                        (cliproxy_official_model_name_for_slugs(&target_model, official_models)
+                            .is_some_and(|model| {
+                                model.eq_ignore_ascii_case(&official_model_for_profile)
+                            }))
                         .then(|| (profile.id.trim().to_string(), target_model))
                     })
             })
@@ -102,6 +121,25 @@ pub fn cliproxy_general_api_aliases(
     profiles: &[RelayProfile],
     exclude_official_models: bool,
 ) -> Vec<DirectRelayAlias> {
+    let trusted_models = crate::official_model_catalog::trusted_official_model_slugs();
+    cliproxy_general_api_aliases_for_slugs(profiles, exclude_official_models, &trusted_models)
+}
+
+pub fn cliproxy_general_api_aliases_for_settings(
+    profiles: &[RelayProfile],
+    exclude_official_models: bool,
+    settings: &BackendSettings,
+) -> Vec<DirectRelayAlias> {
+    let trusted_models =
+        crate::official_model_catalog::trusted_official_model_slugs_for_settings(settings);
+    cliproxy_general_api_aliases_for_slugs(profiles, exclude_official_models, &trusted_models)
+}
+
+fn cliproxy_general_api_aliases_for_slugs(
+    profiles: &[RelayProfile],
+    exclude_official_models: bool,
+    trusted_models: &[String],
+) -> Vec<DirectRelayAlias> {
     let mut aliases = Vec::new();
     let mut seen = HashSet::new();
     for profile in profiles.iter().filter(|profile| {
@@ -109,7 +147,9 @@ pub fn cliproxy_general_api_aliases(
             || profile.id.trim() == CLIPROXY_GENERAL_PROFILE_ID
     }) {
         for target_model in relay_profile_model_ids(profile) {
-            if exclude_official_models && cliproxy_official_model_name(&target_model).is_some() {
+            if exclude_official_models
+                && cliproxy_official_model_name_for_slugs(&target_model, trusted_models).is_some()
+            {
                 continue;
             }
             let alias = provider_label(CLIPROXY_OFFICIAL_PROVIDER_LABEL, &target_model);
@@ -128,12 +168,36 @@ pub fn cliproxy_general_api_aliases(
 
 pub fn cliproxy_direct_api_aliases(profiles: &[RelayProfile]) -> Vec<DirectRelayAlias> {
     let official_aliases = cliproxy_official_api_aliases(profiles);
+    let trusted_models = crate::official_model_catalog::trusted_official_model_slugs();
+    cliproxy_direct_api_aliases_from_parts(profiles, official_aliases, &trusted_models)
+}
+
+pub fn cliproxy_direct_api_aliases_for_settings(
+    profiles: &[RelayProfile],
+    settings: &BackendSettings,
+) -> Vec<DirectRelayAlias> {
+    let official_aliases = cliproxy_official_api_aliases_for_settings(profiles, settings);
+    let trusted_models =
+        crate::official_model_catalog::trusted_official_model_slugs_for_settings(settings);
+    cliproxy_direct_api_aliases_from_parts(profiles, official_aliases, &trusted_models)
+}
+
+fn cliproxy_direct_api_aliases_from_parts(
+    profiles: &[RelayProfile],
+    official_aliases: Vec<DirectRelayAlias>,
+    trusted_models: &[String],
+) -> Vec<DirectRelayAlias> {
     let mut aliases = official_aliases.clone();
     let mut seen = aliases
         .iter()
         .map(|alias| alias.alias.to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    for alias in cliproxy_general_api_aliases(profiles, !official_aliases.is_empty()) {
+    let general_aliases = cliproxy_general_api_aliases_for_slugs(
+        profiles,
+        !official_aliases.is_empty(),
+        trusted_models,
+    );
+    for alias in general_aliases {
         if seen.insert(alias.alias.to_ascii_lowercase()) {
             aliases.push(alias);
         }
@@ -142,13 +206,42 @@ pub fn cliproxy_direct_api_aliases(profiles: &[RelayProfile]) -> Vec<DirectRelay
 }
 
 pub fn cliproxy_official_model_name(model: &str) -> Option<&str> {
+    let trusted_models = crate::official_model_catalog::trusted_official_model_slugs();
+    cliproxy_official_model_name_for_slugs(model, &trusted_models)
+}
+
+pub fn cliproxy_official_model_name_for_settings<'a>(
+    model: &'a str,
+    settings: &BackendSettings,
+) -> Option<&'a str> {
+    let trusted_models =
+        crate::official_model_catalog::trusted_official_model_slugs_for_settings(settings);
+    cliproxy_official_model_name_for_slugs(model, &trusted_models)
+}
+
+fn cliproxy_official_model_name_for_slugs<'a>(
+    model: &'a str,
+    trusted_models: &[String],
+) -> Option<&'a str> {
     let model = model.trim();
     let base_model = model.rsplit('/').next().unwrap_or(model).trim();
-    is_trusted_official_codex_model(base_model).then_some(base_model)
+    trusted_models
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(base_model))
+        .then_some(base_model)
 }
 
 pub fn is_trusted_official_codex_model(model: &str) -> bool {
     crate::official_model_catalog::is_trusted_official_model(model)
+}
+
+pub fn is_trusted_official_codex_model_for_settings(
+    model: &str,
+    settings: &BackendSettings,
+) -> bool {
+    crate::official_model_catalog::trusted_official_model_slugs_for_settings(settings)
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(model.trim()))
 }
 
 pub fn provider_display_name(profile: &RelayProfile) -> String {
@@ -784,14 +877,14 @@ mod tests {
                 id: "managed-cliproxy".to_string(),
                 integration_type: "cliproxy".to_string(),
                 model: "gemini-2.5-pro".to_string(),
-                model_list: "gpt-5.6-sol\ngemini-2.5-pro".to_string(),
+                model_list: "gpt-5.5\ngemini-2.5-pro".to_string(),
                 ..RelayProfile::default()
             },
             RelayProfile {
                 id: "managed-cliproxy-official".to_string(),
                 integration_type: "cliproxy-official".to_string(),
-                model: "account-2/gpt-5.6-sol".to_string(),
-                model_list: "account-2/gpt-5.6-sol".to_string(),
+                model: "account-2/gpt-5.5".to_string(),
+                model_list: "account-2/gpt-5.5".to_string(),
                 ..RelayProfile::default()
             },
         ];
@@ -808,7 +901,7 @@ mod tests {
                 .into_iter()
                 .map(|alias| alias.alias)
                 .collect::<Vec<_>>(),
-            ["CLIProxyAPI:gpt-5.6-sol", "CLIProxyAPI:gemini-2.5-pro"]
+            ["CLIProxyAPI:gpt-5.5", "CLIProxyAPI:gemini-2.5-pro"]
         );
         let aliases = cliproxy_direct_api_aliases(&profiles);
         assert_eq!(
@@ -816,7 +909,7 @@ mod tests {
                 .iter()
                 .map(|alias| alias.alias.as_str())
                 .collect::<Vec<_>>(),
-            ["CLIProxyAPI:gpt-5.6-sol", "CLIProxyAPI:gemini-2.5-pro"]
+            ["CLIProxyAPI:gpt-5.5", "CLIProxyAPI:gemini-2.5-pro"]
         );
         assert_eq!(aliases[0].relay_id, "managed-cliproxy-official");
         assert_eq!(aliases[1].relay_id, "managed-cliproxy");

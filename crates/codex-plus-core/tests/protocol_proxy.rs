@@ -2826,7 +2826,7 @@ async fn official_model_capacity_error_is_rewritten_without_supplier_failover() 
             RelayProfile {
                 id: supplier_id.to_string(),
                 name: "Supplier".to_string(),
-                model_list: "gpt-5.6-sol".to_string(),
+                model_list: "gpt-5.5".to_string(),
                 base_url: format!("http://{supplier_addr}/v1"),
                 api_key: "supplier-key".to_string(),
                 relay_mode: RelayMode::PureApi,
@@ -2859,7 +2859,7 @@ async fn official_model_capacity_error_is_rewritten_without_supplier_failover() 
     };
 
     let result = open_responses_proxy_request_with_settings_and_official_endpoint(
-        r#"{"model":"gpt-5.6-sol","input":"hi","stream":true}"#,
+        r#"{"model":"gpt-5.5","input":"hi","stream":true}"#,
         settings,
         &format!("http://{official_addr}/backend-api/codex/responses"),
     )
@@ -2929,7 +2929,7 @@ async fn official_model_request_normalizes_supplier_generated_history() {
         ..BackendSettings::default()
     };
     let body = json!({
-        "model": "gpt-5.6-sol",
+        "model": "gpt-5.5",
         "input": [
             {"type":"reasoning","id":"rs_resp_supplier","reasoning_content":"private chain","summary":[]},
             {"type":"message","id":"resp_supplier_msg","role":"assistant","content":[]},

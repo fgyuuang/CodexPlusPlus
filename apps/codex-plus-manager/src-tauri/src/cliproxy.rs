@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -101,8 +102,6 @@ struct CliproxyIntegrationSettings {
     config_path: String,
     #[serde(default)]
     base_url: String,
-    #[serde(default)]
-    auto_start: bool,
 }
 
 impl Default for CliproxyIntegrationSettings {
@@ -112,7 +111,6 @@ impl Default for CliproxyIntegrationSettings {
             binary_path: String::new(),
             config_path: String::new(),
             base_url: String::new(),
-            auto_start: false,
         }
     }
 }
@@ -148,7 +146,6 @@ fn save_connection_settings(request: CliproxySaveConnectionRequest) -> anyhow::R
         binary_path,
         config_path,
         base_url: openai_api_base_url(&service_url),
-        auto_start: current_settings.auto_start,
     };
 
     let current_layout = Layout::from_integration_settings(&current_settings);
@@ -267,7 +264,6 @@ pub struct CliproxyStatusPayload {
     pub config_path: String,
     pub base_url: String,
     pub management_url: String,
-    pub auto_start: bool,
     pub api_key: String,
     pub management_key: String,
     pub profile_installed: bool,
@@ -298,6 +294,13 @@ pub struct CliproxyApplyPayload {
     pub created: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CliproxyOfficialProfileSync {
+    pub(crate) settings: BackendSettings,
+    pub(crate) changed: bool,
+    pub(crate) model_count: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliproxyTestRequest {
@@ -322,12 +325,6 @@ pub struct CliproxySaveConnectionRequest {
     #[serde(default)]
     pub config_path: String,
     pub base_url: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CliproxySetAutoStartRequest {
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -374,10 +371,16 @@ pub async fn cliproxy_install() -> CommandResult<CliproxyStatusPayload> {
 #[tauri::command]
 pub async fn cliproxy_start() -> CommandResult<CliproxyStatusPayload> {
     match start_service().await {
-        Ok(()) => success(
-            "CLIProxyAPI 已启动。",
-            status_payload().await.unwrap_or_else(|_| fallback_status()),
-        ),
+        Ok(()) => {
+            let mut message = "CLIProxyAPI 已启动。".to_string();
+            if let Some(sync_message) = crate::commands::sync_cliproxy_official_profile().await {
+                message.push_str(&sync_message);
+            }
+            success(
+                &message,
+                status_payload().await.unwrap_or_else(|_| fallback_status()),
+            )
+        }
         Err(error) => failure(
             &format!("启动 CLIProxyAPI 失败：{error}"),
             status_payload().await.unwrap_or_else(|_| fallback_status()),
@@ -408,10 +411,16 @@ pub async fn cliproxy_restart() -> CommandResult<CliproxyStatusPayload> {
         );
     }
     match start_service().await {
-        Ok(()) => success(
-            "CLIProxyAPI 已重启。",
-            status_payload().await.unwrap_or_else(|_| fallback_status()),
-        ),
+        Ok(()) => {
+            let mut message = "CLIProxyAPI 已重启。".to_string();
+            if let Some(sync_message) = crate::commands::sync_cliproxy_official_profile().await {
+                message.push_str(&sync_message);
+            }
+            success(
+                &message,
+                status_payload().await.unwrap_or_else(|_| fallback_status()),
+            )
+        }
         Err(error) => failure(
             &format!("重启 CLIProxyAPI 失败：{error}"),
             status_payload().await.unwrap_or_else(|_| fallback_status()),
@@ -431,10 +440,15 @@ pub async fn cliproxy_open_management() -> CommandResult<Value> {
 #[tauri::command]
 pub async fn cliproxy_list_models() -> CommandResult<CliproxyModelsPayload> {
     match list_models_payload().await {
-        Ok(payload) => success(
-            &format!("CLIProxyAPI 返回了 {} 个模型。", payload.models.len()),
-            payload,
-        ),
+        Ok(payload) => {
+            let mut message = format!("CLIProxyAPI 返回了 {} 个模型。", payload.models.len());
+            if let Some(sync_message) =
+                crate::commands::sync_cliproxy_official_profile_from_models(&payload.models)
+            {
+                message.push_str(&sync_message);
+            }
+            success(&message, payload)
+        }
         Err(error) => failure(
             &format!("读取 CLIProxyAPI 模型失败：{error}"),
             CliproxyModelsPayload {
@@ -518,32 +532,6 @@ pub async fn cliproxy_save_connection(
         },
         Err(error) => failure(
             &format!("保存 CLIProxyAPI 启动与连接位置失败：{error}"),
-            status_payload().await.unwrap_or_else(|_| fallback_status()),
-        ),
-    }
-}
-
-#[tauri::command]
-pub async fn cliproxy_set_auto_start(
-    request: CliproxySetAutoStartRequest,
-) -> CommandResult<CliproxyStatusPayload> {
-    match set_auto_start(request.enabled) {
-        Ok(()) => match status_payload().await {
-            Ok(payload) => success(
-                if request.enabled {
-                    "CLIProxyAPI 已设置为随 Codex++ 启动。"
-                } else {
-                    "CLIProxyAPI 自启动已关闭。"
-                },
-                payload,
-            ),
-            Err(error) => failure(
-                &format!("CLIProxyAPI 自启动设置已保存，但刷新状态失败：{error}"),
-                fallback_status(),
-            ),
-        },
-        Err(error) => failure(
-            &format!("保存 CLIProxyAPI 自启动设置失败：{error}"),
             status_payload().await.unwrap_or_else(|_| fallback_status()),
         ),
     }
@@ -717,43 +705,6 @@ async fn start_service() -> anyhow::Result<()> {
     anyhow::bail!("服务未在 12 秒内通过 /healthz 检查")
 }
 
-fn should_auto_start(settings: &CliproxyIntegrationSettings, transient: bool) -> bool {
-    !transient && settings.auto_start
-}
-
-pub fn start_cliproxy_from_saved_settings(transient: bool) {
-    let settings = match load_integration_settings() {
-        Ok(settings) => settings,
-        Err(error) => {
-            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                "manager.cliproxy_auto_start_settings_load_failed",
-                json!({ "message": error.to_string() }),
-            );
-            return;
-        }
-    };
-    if !should_auto_start(&settings, transient) {
-        return;
-    }
-
-    tauri::async_runtime::spawn(async move {
-        match start_service().await {
-            Ok(()) => {
-                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                    "manager.cliproxy_auto_start_started",
-                    json!({ "status": "ok" }),
-                );
-            }
-            Err(error) => {
-                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                    "manager.cliproxy_auto_start_failed",
-                    json!({ "message": error.to_string() }),
-                );
-            }
-        }
-    });
-}
-
 async fn stop_service() -> anyhow::Result<()> {
     let layout = Layout::configured()?;
     let Some(state) = load_runtime_state(&layout)? else {
@@ -797,7 +748,6 @@ async fn status_payload() -> anyhow::Result<CliproxyStatusPayload> {
     }
     let secrets = load_secrets(&layout).ok().flatten();
     let settings = SettingsStore::default().load().unwrap_or_default();
-    let integration_settings = load_integration_settings().unwrap_or_default();
     let installed_version = if binary.is_some() {
         RELEASE_VERSION.to_string()
     } else {
@@ -824,7 +774,6 @@ async fn status_payload() -> anyhow::Result<CliproxyStatusPayload> {
             "{}/management.html",
             connection.base_url.trim_end_matches('/')
         ),
-        auto_start: integration_settings.auto_start,
         api_key: secrets
             .as_ref()
             .map(|value| value.api_key.clone())
@@ -842,12 +791,6 @@ async fn status_payload() -> anyhow::Result<CliproxyStatusPayload> {
             .iter()
             .any(is_general_managed_profile),
     })
-}
-
-fn set_auto_start(enabled: bool) -> anyhow::Result<()> {
-    let mut settings = load_integration_settings()?;
-    settings.auto_start = enabled;
-    atomic_write_json(&integration_settings_path(), &settings)
 }
 
 async fn list_models_payload() -> anyhow::Result<CliproxyModelsPayload> {
@@ -1020,15 +963,7 @@ fn apply_profile_with(
         profile.id == profile_id || profile.integration_type == integration_type
     });
     let created = existing_index.is_none();
-    let mut models = request
-        .models
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .filter(|value| model_belongs_to_channel(value, channel))
-        .collect::<Vec<_>>();
-    models.sort();
-    models.dedup();
+    let models = normalized_models_for_channel(&request.models, channel, &settings);
     ensure!(
         !models.is_empty(),
         if channel == CHANNEL_OFFICIAL {
@@ -1092,17 +1027,139 @@ fn requested_channel(request: &CliproxyApplyRequest) -> anyhow::Result<&'static 
     }
 }
 
-fn model_belongs_to_channel(model: &str, channel: &str) -> bool {
-    if channel == CHANNEL_OFFICIAL {
-        cliproxy_model_is_official(model)
-    } else {
-        true
-    }
+pub(crate) async fn sync_existing_official_profile()
+-> anyhow::Result<Option<CliproxyOfficialProfileSync>> {
+    let payload = list_models_payload().await?;
+    sync_existing_official_profile_from_models(&payload.models)
 }
 
-fn cliproxy_model_is_official(model: &str) -> bool {
+pub(crate) fn sync_existing_official_profile_from_models(
+    models: &[String],
+) -> anyhow::Result<Option<CliproxyOfficialProfileSync>> {
+    sync_existing_official_profile_with(&SettingsStore::default(), models)
+}
+
+fn sync_existing_official_profile_with(
+    store: &SettingsStore,
+    models: &[String],
+) -> anyhow::Result<Option<CliproxyOfficialProfileSync>> {
+    let mut settings = store.load().unwrap_or_default();
+    let Some(profile_index) = settings
+        .relay_profiles
+        .iter()
+        .position(is_official_managed_profile)
+    else {
+        return Ok(None);
+    };
+    let synchronized_models = normalized_models_for_channel(models, CHANNEL_OFFICIAL, &settings);
+    ensure!(
+        !synchronized_models.is_empty(),
+        "CLIProxyAPI 未返回与当前官方目录精确匹配的 Codex 模型"
+    );
+
+    let mut profile = settings.relay_profiles[profile_index].clone();
+    let selected_model =
+        select_synchronized_official_model(&profile.model, &synchronized_models, &settings);
+    profile.model = selected_model.clone();
+    profile.test_model = selected_model;
+    profile.model_list = synchronized_models.join("\n");
+    let changed = profile != settings.relay_profiles[profile_index];
+    if changed {
+        settings.relay_profiles[profile_index] = profile;
+        store.save(&settings)?;
+    }
+
+    Ok(Some(CliproxyOfficialProfileSync {
+        settings,
+        changed,
+        model_count: synchronized_models.len(),
+    }))
+}
+
+fn normalized_models_for_channel(
+    models: &[String],
+    channel: &str,
+    settings: &BackendSettings,
+) -> Vec<String> {
+    let sanitized = models
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if channel != CHANNEL_OFFICIAL {
+        let mut models = sanitized
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        models.sort();
+        models.dedup();
+        return models;
+    }
+
+    let trusted =
+        codex_plus_core::official_model_catalog::trusted_official_model_slugs_for_settings(
+            settings,
+        );
+    normalized_official_models(&sanitized, &trusted)
+}
+
+fn normalized_official_models(models: &[&str], trusted: &[String]) -> Vec<String> {
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    for slug in trusted {
+        for model in models {
+            if !cliproxy_model_base(model).eq_ignore_ascii_case(&slug) {
+                continue;
+            }
+            if seen.insert(model.to_ascii_lowercase()) {
+                ordered.push((*model).to_string());
+            }
+        }
+    }
+    ordered
+}
+
+fn select_synchronized_official_model(
+    current: &str,
+    models: &[String],
+    settings: &BackendSettings,
+) -> String {
+    let current = current.trim();
+    if let Some(model) = models
+        .iter()
+        .find(|model| model.eq_ignore_ascii_case(current))
+    {
+        return model.clone();
+    }
+    let current_base = cliproxy_model_base(current);
+    if !current_base.is_empty()
+        && let Some(model) = models
+            .iter()
+            .find(|model| cliproxy_model_base(model).eq_ignore_ascii_case(current_base))
+    {
+        return model.clone();
+    }
+    for slug in
+        codex_plus_core::official_model_catalog::visible_official_model_slugs_for_settings(settings)
+    {
+        if let Some(model) = models
+            .iter()
+            .find(|model| cliproxy_model_base(model).eq_ignore_ascii_case(&slug))
+        {
+            return model.clone();
+        }
+    }
+    models[0].clone()
+}
+
+fn cliproxy_model_base(model: &str) -> &str {
     let model = model.trim();
-    let base_model = model.rsplit('/').next().unwrap_or(model).trim();
+    model.rsplit('/').next().unwrap_or(model).trim()
+}
+
+#[cfg(test)]
+fn cliproxy_model_is_official(model: &str) -> bool {
+    let base_model = cliproxy_model_base(model);
     codex_plus_core::aggregate_model_alias::is_trusted_official_codex_model(base_model)
 }
 
@@ -1518,7 +1575,6 @@ fn now_ts() -> i64 {
 fn fallback_status() -> CliproxyStatusPayload {
     let layout = Layout::configured().unwrap_or_else(|_| Layout::default());
     let connection = connection_info(&layout).unwrap_or_default();
-    let auto_start = load_integration_settings().unwrap_or_default().auto_start;
     CliproxyStatusPayload {
         installed: false,
         running: false,
@@ -1532,7 +1588,6 @@ fn fallback_status() -> CliproxyStatusPayload {
         config_path: layout.config_path.to_string_lossy().to_string(),
         base_url: openai_api_base_url(&connection.base_url),
         management_url: format!("{}/management.html", connection.base_url),
-        auto_start,
         api_key: String::new(),
         management_key: String::new(),
         profile_installed: false,
@@ -1649,7 +1704,6 @@ mod tests {
             binary_path: binary.to_string_lossy().to_string(),
             config_path: config.to_string_lossy().to_string(),
             base_url: "http://127.0.0.1:9123/v1".to_string(),
-            auto_start: false,
         };
 
         let layout = Layout::from_integration_settings(&settings);
@@ -1667,33 +1721,6 @@ mod tests {
         let serialized = serde_json::to_string(&settings).unwrap();
         assert!(!serialized.contains("apiKey"));
         assert!(!serialized.contains("managementKey"));
-    }
-
-    #[test]
-    fn cliproxy_auto_start_defaults_off_and_round_trips() {
-        let defaults = CliproxyIntegrationSettings::default();
-        assert!(!defaults.auto_start);
-
-        let enabled: CliproxyIntegrationSettings = serde_json::from_value(json!({
-            "installRoot": "D:/CLIProxyAPI",
-            "autoStart": true
-        }))
-        .unwrap();
-        assert!(enabled.auto_start);
-        assert_eq!(
-            serde_json::to_value(&enabled).unwrap()["autoStart"],
-            json!(true)
-        );
-    }
-
-    #[test]
-    fn cliproxy_auto_start_skips_transient_manager() {
-        let settings = CliproxyIntegrationSettings {
-            auto_start: true,
-            ..CliproxyIntegrationSettings::default()
-        };
-        assert!(should_auto_start(&settings, false));
-        assert!(!should_auto_start(&settings, true));
     }
 
     #[test]
@@ -1848,6 +1875,108 @@ mod tests {
     }
 
     #[test]
+    fn official_model_normalization_uses_dynamic_catalog_order() {
+        let trusted = vec!["gpt-future-fixture".to_string(), "gpt-6-astra".to_string()];
+        let models = vec![
+            "gpt-6-astra",
+            "account-2/gpt-future-fixture",
+            "gpt-never-official-fixture",
+        ];
+
+        assert_eq!(
+            normalized_official_models(&models, &trusted),
+            vec![
+                "account-2/gpt-future-fixture".to_string(),
+                "gpt-6-astra".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn official_profile_sync_adds_and_removes_catalog_models_without_creating_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let available =
+            codex_plus_core::official_model_catalog::trusted_official_model_slugs_for_settings(
+                &BackendSettings::default(),
+            );
+        let astra = available
+            .iter()
+            .find(|model| model.eq_ignore_ascii_case("gpt-6-astra"))
+            .cloned()
+            .expect("兼容目录应包含 gpt-6-astra");
+        let previous = available
+            .iter()
+            .find(|model| !model.eq_ignore_ascii_case(&astra))
+            .cloned()
+            .expect("兼容目录应包含至少两个官方模型");
+
+        store.save(&BackendSettings::default()).unwrap();
+        assert!(
+            sync_existing_official_profile_with(&store, std::slice::from_ref(&astra))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .relay_profiles
+                .iter()
+                .all(|profile| !is_official_managed_profile(profile))
+        );
+
+        let mut settings = BackendSettings::default();
+        settings.relay_profiles = vec![codex_plus_core::settings::RelayProfile {
+            id: OFFICIAL_PROFILE_ID.to_string(),
+            name: "CLIProxyAPI 官方 Codex API".to_string(),
+            integration_type: OFFICIAL_INTEGRATION_TYPE.to_string(),
+            model: previous.clone(),
+            test_model: previous.clone(),
+            model_list: previous.clone(),
+            ..codex_plus_core::settings::RelayProfile::default()
+        }];
+        store.save(&settings).unwrap();
+
+        let added = sync_existing_official_profile_with(
+            &store,
+            &[
+                astra.clone(),
+                previous.clone(),
+                "gpt-never-official-fixture".to_string(),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(added.changed);
+        assert_eq!(added.model_count, 2);
+        let managed = added
+            .settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == OFFICIAL_PROFILE_ID)
+            .unwrap();
+        assert!(managed.model_list.lines().any(|model| model == astra));
+        assert!(managed.model_list.lines().any(|model| model == previous));
+        assert!(!managed.model_list.contains("gpt-never-official-fixture"));
+
+        let removed = sync_existing_official_profile_with(&store, std::slice::from_ref(&astra))
+            .unwrap()
+            .unwrap();
+        assert!(removed.changed);
+        assert_eq!(removed.model_count, 1);
+        let managed = removed
+            .settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == OFFICIAL_PROFILE_ID)
+            .unwrap();
+        assert_eq!(managed.model, astra);
+        assert_eq!(managed.test_model, astra);
+        assert_eq!(managed.model_list, astra);
+    }
+
+    #[test]
     fn integration_channel_keeps_all_models_and_coexists_with_official_channel() {
         let temp = tempfile::tempdir().unwrap();
         let layout = Layout::new(temp.path().join("CLIProxyAPI"));
@@ -1983,8 +2112,15 @@ mod tests {
 
     #[test]
     fn cliproxy_model_classification_accepts_account_prefixed_official_models() {
-        assert!(cliproxy_model_is_official("gpt-5.6-sol"));
-        assert!(cliproxy_model_is_official("account-2/gpt-5.4"));
+        let official_model =
+            codex_plus_core::official_model_catalog::visible_official_model_slugs()
+                .into_iter()
+                .next()
+                .expect("兼容目录至少应提供一个官方模型");
+        assert!(cliproxy_model_is_official(&official_model));
+        assert!(cliproxy_model_is_official(&format!(
+            "account-2/{official_model}"
+        )));
         assert!(!cliproxy_model_is_official("anthropic/claude-sonnet-4"));
         assert!(!cliproxy_model_is_official("openai/gpt-4.1"));
     }

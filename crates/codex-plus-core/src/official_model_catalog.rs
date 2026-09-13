@@ -153,19 +153,19 @@ pub async fn refresh_account(
     let previous = load_cache()
         .ok()
         .and_then(|cache| cache.accounts.get(account_id).cloned());
-    let previous_etag = previous.as_ref().and_then(|item| item.etag.clone());
+    let previous_etag = cached_etag_for_request(previous.as_ref(), &client_version, force);
 
     let mut response = request_catalog(
         &auth,
         &parsed.chatgpt_account_id,
         &client_version,
-        previous_etag.as_deref(),
+        previous_etag,
     )
     .await;
     if matches!(response, Err(CatalogRequestError::Unauthorized)) {
         // 令牌过期时只刷新一次，避免网络错误导致无限刷新循环。
         auth = store
-            .refresh_tokens(account_id, force)
+            .refresh_tokens(account_id, true)
             .await
             .with_context(|| "官方模型目录请求返回 401，刷新令牌失败")
             .and_then(|_| store.get_auth_json(account_id))?;
@@ -174,7 +174,7 @@ pub async fn refresh_account(
             &auth,
             &parsed.chatgpt_account_id,
             &client_version,
-            previous_etag.as_deref(),
+            previous_etag,
         )
         .await;
     }
@@ -380,19 +380,10 @@ fn fallback_entries_for_settings(
     }
 
     if let Some(entries) = bundled_cli_catalog(settings) {
+        let entries = merge_catalog_entries(entries, compatibility_entries(true));
         return (
             entries,
-            "bundled_cli".to_string(),
-            None,
-            discover_client_version_sync(settings),
-        );
-    }
-
-    let bundled = bundled_catalog_entries();
-    if !bundled.is_empty() {
-        return (
-            bundled,
-            "bundled".to_string(),
+            "bundled_cli+compatibility".to_string(),
             None,
             discover_client_version_sync(settings),
         );
@@ -507,12 +498,59 @@ fn codex_cli_candidates(settings: &BackendSettings) -> Vec<PathBuf> {
     if let Some(cli_dir) = crate::app_paths::find_standalone_codex_app_dir() {
         candidates.push(crate::app_paths::build_codex_executable(&cli_dir));
     }
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        candidates.extend(windows_local_codex_cli_candidates(Path::new(
+            &local_app_data,
+        )));
+    }
     candidates.push(PathBuf::from("codex"));
     let mut seen = HashSet::new();
     candidates
         .into_iter()
         .filter(|candidate| seen.insert(candidate.to_string_lossy().to_ascii_lowercase()))
         .collect()
+}
+
+fn cached_etag_for_request<'a>(
+    previous: Option<&'a CachedOfficialCatalog>,
+    client_version: &str,
+    force: bool,
+) -> Option<&'a str> {
+    if force {
+        return None;
+    }
+    previous
+        .filter(|snapshot| snapshot.client_version == client_version)
+        .and_then(|snapshot| snapshot.etag.as_deref())
+        .filter(|etag| !etag.trim().is_empty())
+}
+
+#[cfg(windows)]
+fn windows_local_codex_cli_candidates(local_app_data: &Path) -> Vec<PathBuf> {
+    let bin_dir = local_app_data.join("OpenAI").join("Codex").join("bin");
+    let Ok(entries) = std::fs::read_dir(&bin_dir) else {
+        return Vec::new();
+    };
+    let mut candidates = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("codex.exe"))
+        .filter(|candidate| candidate.is_file())
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let left_modified = left
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let right_modified = right
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        right_modified
+            .cmp(&left_modified)
+            .then_with(|| right.cmp(left))
+    });
+    candidates
 }
 
 async fn request_catalog(
@@ -525,7 +563,7 @@ async fn request_catalog(
         .ok_or_else(|| CatalogRequestError::Other("账号缺少 access_token".to_string()))?;
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
-        .user_agent(format!("codex-cli/{client_version}"))
+        .user_agent(format!("codex_cli_rs/{client_version}"))
         .build()
         .map_err(|_| CatalogRequestError::Other("创建官方目录客户端失败".to_string()))?;
     let endpoint = std::env::var("CODEX_PLUS_OFFICIAL_MODEL_CATALOG_URL")
@@ -537,8 +575,7 @@ async fn request_catalog(
         .query(&[("client_version", client_version)])
         .bearer_auth(access_token)
         .header("ChatGPT-Account-ID", account_id)
-        .header("X-Codex-Client-Version", client_version)
-        .header("X-Client-Version", client_version)
+        .header("originator", "codex_cli_rs")
         .header(reqwest::header::ACCEPT, "application/json");
     if let Some(etag) = etag.filter(|value| !value.trim().is_empty()) {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
@@ -714,6 +751,20 @@ fn compatibility_entries(include_future: bool) -> Vec<Value> {
         .collect()
 }
 
+fn merge_catalog_entries(primary: Vec<Value>, fallback: Vec<Value>) -> Vec<Value> {
+    let mut entries = Vec::with_capacity(primary.len() + fallback.len());
+    let mut seen = HashSet::new();
+    for entry in primary.into_iter().chain(fallback) {
+        let Some(slug) = entry.get("slug").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen.insert(slug.to_ascii_lowercase()) {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
 fn catalog_models(contents: &str) -> Vec<Value> {
     serde_json::from_str::<Value>(contents)
         .ok()
@@ -722,40 +773,35 @@ fn catalog_models(contents: &str) -> Vec<Value> {
 }
 
 async fn discover_client_version(settings: &BackendSettings) -> String {
+    let mut versions = Vec::new();
     for candidate in codex_cli_candidates(settings) {
         if let Some(version) = command_version(&candidate).await {
-            return version;
+            versions.push(version);
         }
     }
-    if let Some(app_dir) = crate::app_paths::resolve_codex_app_dir_with_saved(
-        None,
-        Some(settings.codex_app_path.as_str()),
-    ) {
-        if let Some(version) = crate::app_paths::codex_app_version(&app_dir) {
-            if !version.trim().is_empty() {
-                return version;
-            }
-        }
+    if let Some(version) = cached_codex_client_version() {
+        versions.push(version);
     }
-    discover_client_version_sync(settings)
+    latest_client_version(versions).unwrap_or_else(|| "unknown".to_string())
 }
 
 fn discover_client_version_sync(settings: &BackendSettings) -> String {
+    let mut versions = Vec::new();
     for candidate in codex_cli_candidates(settings) {
         if let Some(version) = command_version_sync(&candidate) {
-            return version;
+            versions.push(version);
         }
     }
-    crate::app_paths::resolve_codex_app_dir_with_saved(None, Some(settings.codex_app_path.as_str()))
-        .and_then(|path| crate::app_paths::codex_app_version(&path))
-        .filter(|version| !version.trim().is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+    if let Some(version) = cached_codex_client_version() {
+        versions.push(version);
+    }
+    latest_client_version(versions).unwrap_or_else(|| "unknown".to_string())
 }
 
 async fn command_version(candidate: &Path) -> Option<String> {
     let candidate_text = candidate.to_string_lossy();
     if let Some(version) = candidate_text.strip_prefix("__version__:") {
-        return Some(version.to_string());
+        return normalize_client_version(version);
     }
     let output = timeout(
         COMMAND_TIMEOUT,
@@ -769,18 +815,17 @@ async fn command_version(candidate: &Path) -> Option<String> {
     .await
     .ok()?
     .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    if text.is_empty() {
+    if !output.status.success() {
         return None;
     }
-    Some(text.chars().take(64).collect())
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_codex_cli_version_output(&text)
 }
 
 fn command_version_sync(candidate: &Path) -> Option<String> {
     let candidate_text = candidate.to_string_lossy();
     if let Some(version) = candidate_text.strip_prefix("__version__:") {
-        return Some(version.to_string());
+        return normalize_client_version(version);
     }
     let mut child = StdCommand::new(candidate)
         .arg("--version")
@@ -807,8 +852,62 @@ fn command_version_sync(candidate: &Path) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.chars().take(64).collect())
+    parse_codex_cli_version_output(&text)
+}
+
+fn parse_codex_cli_version_output(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let command = fields.next()?;
+        if !command.eq_ignore_ascii_case("codex-cli") {
+            return None;
+        }
+        normalize_client_version(fields.next()?)
+    })
+}
+
+fn normalize_client_version(value: &str) -> Option<String> {
+    let core = value
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split(['-', '+'])
+        .next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{major}.{minor}.{patch}"))
+}
+
+fn latest_client_version(versions: Vec<String>) -> Option<String> {
+    versions
+        .into_iter()
+        .filter_map(|version| {
+            let normalized = normalize_client_version(&version)?;
+            let parts = normalized
+                .split('.')
+                .map(str::parse::<u64>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            Some(((parts[0], parts[1], parts[2]), normalized))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, version)| version)
+}
+
+fn cached_codex_client_version() -> Option<String> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")))?;
+    let payload = std::fs::read(codex_home.join("models_cache.json")).ok()?;
+    let value = serde_json::from_slice::<Value>(&payload).ok()?;
+    value
+        .get("client_version")
+        .and_then(Value::as_str)
+        .and_then(normalize_client_version)
 }
 
 fn sanitize_error(error: &str) -> String {
@@ -880,6 +979,107 @@ mod tests {
             vec!["gpt-6-astra", "gpt-7-internal"]
         );
         assert_eq!(visible_slugs(&entries), vec!["gpt-6-astra"]);
+    }
+
+    #[test]
+    fn parses_only_real_codex_cli_versions() {
+        assert_eq!(
+            parse_codex_cli_version_output("codex-cli 0.154.0\n"),
+            Some("0.154.0".to_string())
+        );
+        assert_eq!(
+            parse_codex_cli_version_output("codex-cli 0.154.0-alpha.2\n"),
+            Some("0.154.0".to_string())
+        );
+        assert_eq!(parse_codex_cli_version_output("26.908.4834.0\n"), None);
+        assert_eq!(
+            parse_codex_cli_version_output("请在已有的应用会话中打开。\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn bundled_catalog_keeps_priority_and_appends_compatibility_models() {
+        let bundled = vec![json!({
+            "slug": "gpt-5.5",
+            "display_name": "Bundled GPT-5.5",
+            "visibility": "list",
+            "supported_in_api": true
+        })];
+        let merged = merge_catalog_entries(bundled, compatibility_entries(true));
+        assert_eq!(
+            merged[0].get("display_name").and_then(Value::as_str),
+            Some("Bundled GPT-5.5")
+        );
+        assert!(
+            visible_slugs(&merged)
+                .iter()
+                .any(|slug| slug == "gpt-6-astra")
+        );
+    }
+
+    #[test]
+    fn latest_client_version_prefers_the_newest_numeric_source() {
+        assert_eq!(
+            latest_client_version(vec![
+                "0.139.0".to_string(),
+                "0.149.0".to_string(),
+                "0.148.7".to_string(),
+            ]),
+            Some("0.149.0".to_string())
+        );
+    }
+
+    #[test]
+    fn etag_is_not_reused_for_forced_or_new_client_catalog_requests() {
+        let snapshot = CachedOfficialCatalog {
+            account_id: "account-1".to_string(),
+            fetched_at: 1,
+            client_version: "0.149.0".to_string(),
+            etag: Some("etag-149".to_string()),
+            source: "account_snapshot".to_string(),
+            models: Vec::new(),
+        };
+        assert_eq!(
+            cached_etag_for_request(Some(&snapshot), "0.149.0", false),
+            Some("etag-149")
+        );
+        assert_eq!(
+            cached_etag_for_request(Some(&snapshot), "0.154.0", false),
+            None
+        );
+        assert_eq!(
+            cached_etag_for_request(Some(&snapshot), "0.149.0", true),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discovers_desktop_managed_codex_cli_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp
+            .path()
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")
+            .join("first")
+            .join("codex.exe");
+        let second = temp
+            .path()
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")
+            .join("second")
+            .join("codex.exe");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+
+        let candidates = windows_local_codex_cli_candidates(temp.path());
+        assert!(candidates.contains(&first));
+        assert!(candidates.contains(&second));
     }
 
     #[test]
