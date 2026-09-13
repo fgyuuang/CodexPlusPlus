@@ -407,7 +407,7 @@
   const zedRemoteOpenInMenuVersion = "1";
   const zedRemoteOpenInMenuActivationWindowMs = 600;
   const styleId = "codex-delete-style";
-  const codexDeleteStyleVersion = "17";
+  const codexDeleteStyleVersion = "18";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
   const codexPlusPageClass = "codex-plus-page-overlay";
@@ -1012,15 +1012,18 @@
       }
       .${codexPlusPageClass} .codex-plus-modal-header {
         width: min(960px, 100%);
+        box-sizing: border-box;
         margin: 0 auto;
         padding: 24px 32px 12px;
       }
       .${codexPlusPageClass} .codex-plus-tabs {
         width: min(960px, 100%);
+        box-sizing: border-box;
         margin-inline: auto;
       }
       .${codexPlusPageClass} .codex-plus-modal-body {
         width: min(960px, 100%);
+        box-sizing: border-box;
         margin: 0 auto;
         padding: 4px 32px 32px;
       }
@@ -1149,10 +1152,60 @@
       .${codexServiceTierBadgeClass}[data-tier="unsupported"] { border-color: rgba(251,191,36,.48); background: rgba(251,191,36,.13); color: #fbbf24; }
       .${codexServiceTierBadgeClass}[data-disabled="true"] { cursor: not-allowed; opacity: .78; }
       .codex-plus-about { color: #a1a1aa; line-height: 1.5; }
-      .codex-plus-tabs { display: flex; gap: 8px; padding: 0 20px 6px; flex: 0 0 auto; }
-      .codex-plus-tab-button { border: 1px solid rgba(255,255,255,.14); border-radius: 999px; background: transparent; color: #d1d5db; font: 12px system-ui, sans-serif; padding: 5px 10px; }
+      .codex-plus-tabs { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 8px; padding: 0 20px 6px; }
+      .codex-plus-tab-button { border: 1px solid rgba(255,255,255,.14); border-radius: 999px; background: transparent; color: #d1d5db; font: 12px system-ui, sans-serif; padding: 5px 10px; white-space: nowrap; }
       .codex-plus-tab-button[data-active="true"] { background: #10a37f; color: white; border-color: #10a37f; }
       .codex-plus-panel[hidden] { display: none; }
+      .codex-plus-official-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 8px 0 14px; }
+      .codex-plus-official-heading { min-width: 0; }
+      .codex-plus-official-heading h2 { margin: 0; font-size: 15px; font-weight: 600; line-height: 1.35; }
+      .codex-plus-official-heading p { margin: 3px 0 0; color: var(--codex-plus-text-secondary); font-size: 11px; line-height: 1.45; }
+      .codex-plus-official-toolbar-actions { display: flex; flex: 0 0 auto; gap: 6px; }
+      .codex-plus-official-list { display: grid; gap: 0; }
+      .codex-plus-official-empty,
+      .codex-plus-official-notice { border-top: 1px solid var(--codex-plus-border-subtle); color: var(--codex-plus-text-secondary); font-size: 12px; line-height: 1.5; padding: 18px 0; text-align: center; }
+      .codex-plus-official-notice[data-status="failed"] { color: var(--codex-plus-danger); }
+      .codex-plus-official-account { position: relative; min-width: 0; padding: 14px 0; }
+      .codex-plus-official-account + .codex-plus-official-account::before { position: absolute; top: 0; right: 0; left: 0; height: 1px; background: linear-gradient(to right, transparent 0, color-mix(in srgb, var(--codex-plus-border) 65%, transparent) 20%, color-mix(in srgb, var(--codex-plus-border) 65%, transparent) 80%, transparent 100%); content: ""; }
+      .codex-plus-official-account[data-enabled="false"] { opacity: .58; }
+      .codex-plus-official-account-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 12px; }
+      .codex-plus-official-identity { display: flex; min-width: 0; align-items: center; gap: 9px; }
+      .codex-plus-official-avatar { display: grid; width: 28px; height: 28px; flex: 0 0 28px; place-items: center; border: 1px solid var(--codex-plus-border); border-radius: 50%; background: var(--codex-plus-bg-secondary); color: var(--codex-plus-text); font-size: 11px; font-weight: 650; }
+      .codex-plus-official-title-block { min-width: 0; }
+      .codex-plus-official-title-line { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+      .codex-plus-official-name { overflow: hidden; font-size: 12px; font-weight: 600; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+      .codex-plus-official-badge { display: inline-flex; flex: 0 0 auto; align-items: center; min-height: 17px; border: 1px solid var(--codex-plus-border); border-radius: 5px; color: var(--codex-plus-text-secondary); font-size: 9px; line-height: 1; padding: 2px 5px; }
+      .codex-plus-official-badge[data-kind="request"] { border-color: color-mix(in srgb, #22c7c9 45%, var(--codex-plus-border)); color: #159fa2; }
+      .codex-plus-official-badge[data-kind="live"] { color: var(--codex-plus-success); }
+      .codex-plus-official-email { color: var(--codex-plus-text-secondary); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
+      .codex-plus-official-meta { overflow: hidden; color: var(--codex-plus-text-secondary); font-size: 10px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+      .codex-plus-official-head-right { display: grid; justify-items: end; gap: 5px; }
+      .codex-plus-official-plan { color: var(--codex-plus-text-secondary); font-size: 10px; line-height: 1.2; text-transform: capitalize; }
+      .codex-plus-official-actions { display: flex; gap: 5px; }
+      .codex-plus-official-button { min-height: 24px; border: 1px solid var(--codex-plus-border); border-radius: 6px; background: var(--codex-plus-bg-secondary); color: var(--codex-plus-text); font: inherit; font-size: 10px; line-height: 1; padding: 5px 7px; cursor: pointer; }
+      .codex-plus-official-button:hover,
+      .codex-plus-official-button:focus-visible { border-color: color-mix(in srgb, #22c7c9 45%, var(--codex-plus-border)); background: var(--codex-plus-bg-hover); outline: none; }
+      .codex-plus-official-button:disabled { cursor: default; opacity: .5; }
+      .codex-plus-official-windows { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin-top: 11px; }
+      .codex-plus-official-window { display: grid; min-width: 0; gap: 5px; }
+      .codex-plus-official-window-head { display: flex; min-width: 0; justify-content: space-between; gap: 8px; color: var(--codex-plus-text-secondary); font-size: 10px; }
+      .codex-plus-official-window-head span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .codex-plus-official-window-head strong { color: var(--codex-plus-text); font-weight: 500; white-space: nowrap; }
+      .codex-plus-official-meter { width: 100%; height: 6px; overflow: hidden; border-radius: 3px; background: color-mix(in srgb, var(--codex-plus-text-tertiary) 18%, transparent); }
+      .codex-plus-official-meter-fill { width: var(--codex-plus-quota, 0%); height: 100%; border-radius: inherit; background: #22c7c9; transition: width 320ms ease; }
+      .codex-plus-official-meter-fill[data-level="low"] { background: var(--codex-plus-danger); }
+      .codex-plus-official-meter-fill[data-level="warn"] { background: var(--codex-plus-warning); }
+      .codex-plus-official-reset { min-height: 13px; overflow: hidden; color: var(--codex-plus-text-tertiary); font-size: 9px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+      .codex-plus-official-no-usage { margin-top: 10px; color: var(--codex-plus-text-secondary); font-size: 10px; }
+      @media (max-width: 680px) {
+        .codex-plus-official-toolbar { align-items: stretch; flex-direction: column; }
+        .codex-plus-official-toolbar-actions { justify-content: flex-start; }
+        .codex-plus-official-windows { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 460px) {
+        .codex-plus-official-account-head { grid-template-columns: minmax(0, 1fr); }
+        .codex-plus-official-head-right { display: flex; align-items: center; justify-content: space-between; }
+      }
       .codex-plus-action-button,
       .codex-plus-issue-button { border: 1px solid rgba(255,255,255,.18); border-radius: 7px; background: #3f3f46; color: #f3f4f6; font: 12px system-ui, sans-serif; padding: 6px 8px; }
       .codex-plus-worktree-actions {
@@ -4642,6 +4695,9 @@
   }
 
   let codexPlusUserScripts = { enabled: true, builtin_dir: "", user_dir: "", scripts: [] };
+  let codexPlusOfficialAccounts = { status: "idle", message: "", accounts: [], activeAccountId: "", liveAccountId: "", codexRunning: false };
+  let codexPlusOfficialAccountRefreshId = "";
+  let codexPlusOfficialAccountsRefreshingAll = false;
   let codexPlusBackendStatus = window.__codexPlusBackendStatus || { status: "checking", message: "正在检查后端…" };
   let codexPlusBackendCheckSeq = 0;
   let codexPlusBackendCheckInFlight = false;
@@ -4721,8 +4777,8 @@
     }
   }
 
-  async function openManagerFromCodex() {
-    const result = await postJson("/manager/open", {});
+  async function openManagerFromCodex(navigation = {}) {
+    const result = await postJson("/manager/open", navigation);
     if (result.status === "ok") {
       showToast("管理工具已打开", null);
     } else {
@@ -4886,6 +4942,191 @@
     }
   }
 
+  function normalizeOfficialAccounts(payload) {
+    const value = payload && typeof payload === "object" ? payload : {};
+    return {
+      status: String(value.status || "failed"),
+      message: String(value.message || ""),
+      accounts: Array.isArray(value.accounts) ? value.accounts.filter((account) => account && typeof account === "object") : [],
+      activeAccountId: String(value.activeAccountId || ""),
+      liveAccountId: String(value.liveAccountId || ""),
+      codexRunning: value.codexRunning === true,
+    };
+  }
+
+  function officialAccountPlanLabel(plan) {
+    const value = String(plan || "").trim();
+    if (!value) return "未知套餐";
+    return ({ free: "Free", plus: "Plus", pro: "Pro", team: "Team", business: "Business", enterprise: "Enterprise" })[value.toLowerCase()] || value;
+  }
+
+  function officialAccountStatusLabel(account) {
+    if (account.enabled === false) return "已禁用";
+    return ({ ready: "已登录", needsReauth: "需要重新登录" })[account.status] || account.status || "状态未知";
+  }
+
+  function officialAccountTime(timestamp) {
+    const seconds = Number(timestamp);
+    if (!Number.isFinite(seconds) || seconds <= 0) return "尚未更新";
+    const date = new Date(seconds * 1000);
+    const delta = Date.now() - date.getTime();
+    if (delta >= 0 && delta < 60_000) return "刚刚更新";
+    if (delta >= 0 && delta < 3_600_000) return `${Math.max(1, Math.floor(delta / 60_000))} 分钟前更新`;
+    if (delta >= 0 && delta < 86_400_000) return `${Math.max(1, Math.floor(delta / 3_600_000))} 小时前更新`;
+    return `${date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })} 更新`;
+  }
+
+  function officialAccountResetLabel(timestamp) {
+    const seconds = Number(timestamp);
+    if (!Number.isFinite(seconds) || seconds <= 0) return "未提供重置时间";
+    const date = new Date(seconds * 1000);
+    const delta = date.getTime() - Date.now();
+    const relative = delta <= 0
+      ? "即将重置"
+      : delta < 3_600_000
+        ? `${Math.max(1, Math.ceil(delta / 60_000))} 分钟后重置`
+        : delta < 86_400_000
+          ? `${Math.max(1, Math.ceil(delta / 3_600_000))} 小时后重置`
+          : `${Math.max(1, Math.ceil(delta / 86_400_000))} 天后重置`;
+    return `${relative} · ${date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })}`;
+  }
+
+  function officialAccountWindowLabel(window, fallback) {
+    const minutes = Number(window?.windowMinutes);
+    if (minutes === 300) return "5 小时";
+    if (minutes === 10080) return "每周";
+    if (Number.isFinite(minutes) && minutes > 0 && minutes % 1440 === 0) return `${minutes / 1440} 天`;
+    if (Number.isFinite(minutes) && minutes > 0 && minutes % 60 === 0) return `${minutes / 60} 小时`;
+    return fallback;
+  }
+
+  function renderOfficialAccountWindow(window, fallback) {
+    if (!window) return "";
+    const rawUsed = window.usedPercent;
+    const used = rawUsed == null || rawUsed === "" ? null : Number(rawUsed);
+    const remaining = Number.isFinite(used) ? Math.max(0, Math.min(100, 100 - used)) : null;
+    const level = remaining !== null && remaining <= 10 ? "low" : remaining !== null && remaining <= 30 ? "warn" : "ok";
+    return `
+      <div class="codex-plus-official-window">
+        <div class="codex-plus-official-window-head"><span>${escapeHtml(officialAccountWindowLabel(window, fallback))}</span><strong>${remaining === null ? "--" : `${Math.round(remaining)}% 剩余`}</strong></div>
+        <div class="codex-plus-official-meter"><div class="codex-plus-official-meter-fill" data-level="${level}" style="--codex-plus-quota:${remaining === null ? 0 : remaining}%"></div></div>
+        <div class="codex-plus-official-reset">${escapeHtml(officialAccountResetLabel(window.resetsAt))}</div>
+      </div>
+    `;
+  }
+
+  function renderOfficialAccount(account) {
+    const active = account.id === codexPlusOfficialAccounts.activeAccountId;
+    const live = account.id === codexPlusOfficialAccounts.liveAccountId;
+    const usage = account.usage && typeof account.usage === "object" ? account.usage : null;
+    const windows = [
+      renderOfficialAccountWindow(usage?.primary, "短周期"),
+      renderOfficialAccountWindow(usage?.secondary, "长周期"),
+    ].filter(Boolean).join("");
+    const title = String(account.name || account.email || account.id || "未命名账号");
+    const initial = Array.from(title.trim())[0]?.toUpperCase() || "?";
+    const refreshing = codexPlusOfficialAccountsRefreshingAll || codexPlusOfficialAccountRefreshId === account.id;
+    const updatedAt = usage?.fetchedAt || account.lastRefreshAt || account.updatedAt;
+    const status = officialAccountStatusLabel(account);
+    return `
+      <div class="codex-plus-official-account" data-enabled="${String(account.enabled !== false)}">
+        <div class="codex-plus-official-account-head">
+          <div class="codex-plus-official-identity">
+            <div class="codex-plus-official-avatar" aria-hidden="true">${escapeHtml(initial)}</div>
+            <div class="codex-plus-official-title-block">
+              <div class="codex-plus-official-title-line">
+                <span class="codex-plus-official-name" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
+                ${active ? '<span class="codex-plus-official-badge" data-kind="request">请求账号</span>' : ""}
+                ${live ? '<span class="codex-plus-official-badge" data-kind="live">本机登录</span>' : ""}
+              </div>
+              <div class="codex-plus-official-email" title="${escapeHtml(account.email || "")}">${escapeHtml(account.email || "未提供邮箱")}</div>
+              <div class="codex-plus-official-meta">${escapeHtml(status)} · ${escapeHtml(officialAccountTime(updatedAt))}${usage?.error ? " · 上次刷新失败" : ""}</div>
+            </div>
+          </div>
+          <div class="codex-plus-official-head-right">
+            <div class="codex-plus-official-plan">${escapeHtml(officialAccountPlanLabel(account.planType))}</div>
+            <div class="codex-plus-official-actions">
+              <button type="button" class="codex-plus-official-button" data-codex-official-refresh-account="${escapeHtml(account.id || "")}" ${refreshing || account.enabled === false ? "disabled" : ""}>${refreshing ? "刷新中" : "刷新"}</button>
+              ${active ? "" : '<button type="button" class="codex-plus-official-button" data-codex-official-manage="true" title="在管理工具中确认重启切换">切换…</button>'}
+            </div>
+          </div>
+        </div>
+        ${windows ? `<div class="codex-plus-official-windows">${windows}</div>` : '<div class="codex-plus-official-no-usage">尚未获取额度信息，点击“刷新”后重试。</div>'}
+      </div>
+    `;
+  }
+
+  function renderOfficialAccounts() {
+    document.querySelectorAll("[data-codex-official-count]").forEach((node) => {
+      node.textContent = String(codexPlusOfficialAccounts.accounts.length);
+    });
+    document.querySelectorAll("[data-codex-official-account-list]").forEach((list) => {
+      if (codexPlusOfficialAccounts.status === "loading" && !codexPlusOfficialAccounts.accounts.length) {
+        list.innerHTML = '<div class="codex-plus-official-empty">正在读取官方账号…</div>';
+        return;
+      }
+      if (!codexPlusOfficialAccounts.accounts.length) {
+        const message = codexPlusOfficialAccounts.status === "failed" ? (codexPlusOfficialAccounts.message || "读取官方账号失败。") : "尚未添加官方账号。";
+        list.innerHTML = `<div class="codex-plus-official-notice" data-status="${escapeHtml(codexPlusOfficialAccounts.status)}">${escapeHtml(message)}</div>`;
+        return;
+      }
+      const notice = codexPlusOfficialAccounts.status === "failed"
+        ? `<div class="codex-plus-official-notice" data-status="failed">${escapeHtml(codexPlusOfficialAccounts.message || "部分账号刷新失败，已保留上次数据。")}</div>`
+        : "";
+      list.innerHTML = `${notice}${codexPlusOfficialAccounts.accounts.map(renderOfficialAccount).join("")}`;
+    });
+    document.querySelectorAll("[data-codex-official-refresh-all]").forEach((button) => {
+      button.disabled = codexPlusOfficialAccountsRefreshingAll;
+      button.textContent = codexPlusOfficialAccountsRefreshingAll ? "刷新中" : "全部刷新";
+    });
+  }
+
+  async function loadOfficialAccounts(force = false) {
+    if (!force && ["ok", "loading"].includes(codexPlusOfficialAccounts.status)) {
+      renderOfficialAccounts();
+      return codexPlusOfficialAccounts;
+    }
+    codexPlusOfficialAccounts = { ...codexPlusOfficialAccounts, status: "loading", message: "" };
+    renderOfficialAccounts();
+    codexPlusOfficialAccounts = normalizeOfficialAccounts(await postJson("/official-accounts/list", {}));
+    renderOfficialAccounts();
+    return codexPlusOfficialAccounts;
+  }
+
+  async function refreshOfficialAccount(accountId) {
+    if (!accountId || codexPlusOfficialAccountRefreshId || codexPlusOfficialAccountsRefreshingAll) return;
+    codexPlusOfficialAccountRefreshId = accountId;
+    renderOfficialAccounts();
+    try {
+      codexPlusOfficialAccounts = normalizeOfficialAccounts(await postJson("/official-accounts/refresh", { accountId }));
+      if (codexPlusOfficialAccounts.status === "failed") showToast(codexPlusOfficialAccounts.message || "刷新官方账号失败", null);
+    } finally {
+      codexPlusOfficialAccountRefreshId = "";
+      renderOfficialAccounts();
+    }
+  }
+
+  async function refreshAllOfficialAccounts() {
+    if (codexPlusOfficialAccountsRefreshingAll) return;
+    if (!codexPlusOfficialAccounts.accounts.length) await loadOfficialAccounts(true);
+    const accountIds = codexPlusOfficialAccounts.accounts.filter((account) => account.enabled !== false).map((account) => account.id).filter(Boolean);
+    codexPlusOfficialAccountsRefreshingAll = true;
+    renderOfficialAccounts();
+    let lastFailure = "";
+    try {
+      for (const accountId of accountIds) {
+        const result = normalizeOfficialAccounts(await postJson("/official-accounts/refresh", { accountId }));
+        codexPlusOfficialAccounts = result;
+        if (result.status === "failed") lastFailure = result.message;
+        renderOfficialAccounts();
+      }
+      if (lastFailure) showToast(lastFailure, null);
+    } finally {
+      codexPlusOfficialAccountsRefreshingAll = false;
+      renderOfficialAccounts();
+    }
+  }
+
   function selectCodexPlusTab(tab) {
     document.querySelectorAll(".codex-plus-modal-content").forEach((modal) => {
       modal.dataset.codexPlusActiveTab = tab;
@@ -4897,6 +5138,7 @@
       panel.hidden = panel.getAttribute("data-codex-plus-panel") !== tab;
     });
     if (tab === "userScripts") loadUserScripts();
+    if (tab === "officialAccounts") loadOfficialAccounts(true);
   }
 
   function setCodexPlusSidebarNavActive(active) {
@@ -4996,6 +5238,7 @@
         </div>
         <div class="codex-plus-tabs" role="tablist" aria-label="Codex++">
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="home" data-active="true">主页</button>
+          <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="officialAccounts" data-active="false">官方账号 <span data-codex-official-count="true">${codexPlusOfficialAccounts.accounts.length}</span></button>
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="userScripts" data-active="false">用户脚本</button>
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="sponsor" data-active="false">推荐内容</button>
         </div>
@@ -5119,6 +5362,19 @@
               <button type="button" class="codex-plus-issue-button" data-codex-plus-issue="true">提出问题</button>
             </div>
           </div>
+          <div class="codex-plus-panel" data-codex-plus-panel="officialAccounts" hidden>
+            <div class="codex-plus-official-toolbar">
+              <div class="codex-plus-official-heading">
+                <h2>Codex 官方账号</h2>
+                <p>集中查看各账号登录状态、套餐和剩余额度。当前任务保持原账号，重启切换由管理工具确认。</p>
+              </div>
+              <div class="codex-plus-official-toolbar-actions">
+                <button type="button" class="codex-plus-official-button" data-codex-official-refresh-all="true">全部刷新</button>
+                <button type="button" class="codex-plus-official-button" data-codex-official-manage="true">管理账号</button>
+              </div>
+            </div>
+            <div class="codex-plus-official-list" data-codex-official-account-list="true"><div class="codex-plus-official-empty">正在读取官方账号…</div></div>
+          </div>
           <div class="codex-plus-panel" data-codex-plus-panel="userScripts" hidden>
             <div class="codex-plus-row" data-codex-user-scripts-section="true">
               <div>
@@ -5182,6 +5438,19 @@
       }
       if (target?.closest("[data-codex-open-manager]")) {
         openManagerFromCodex();
+        return;
+      }
+      if (target?.closest("[data-codex-official-manage]")) {
+        openManagerFromCodex({ page: "relay", section: "official" });
+        return;
+      }
+      if (target?.closest("[data-codex-official-refresh-all]")) {
+        void refreshAllOfficialAccounts();
+        return;
+      }
+      const officialRefreshButton = target?.closest("[data-codex-official-refresh-account]");
+      if (officialRefreshButton) {
+        void refreshOfficialAccount(officialRefreshButton.getAttribute("data-codex-official-refresh-account"));
         return;
       }
       if (target?.closest("[data-codex-plus-discord]")) {

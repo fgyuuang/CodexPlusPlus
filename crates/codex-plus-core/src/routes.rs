@@ -89,6 +89,12 @@ pub trait BridgeRuntimeService: Send + Sync {
     }
     async fn backend_status(&self) -> anyhow::Result<Value>;
     async fn codex_model_catalog(&self) -> anyhow::Result<Value>;
+    async fn official_accounts(&self) -> anyhow::Result<Value> {
+        official_accounts_value("ok", "官方账号已加载。")
+    }
+    async fn refresh_official_account(&self, payload: Value) -> anyhow::Result<Value> {
+        refresh_official_account_value(payload).await
+    }
     async fn ads(&self) -> anyhow::Result<Value>;
     async fn create_share(&self, payload: Value) -> anyhow::Result<Value> {
         crate::share::create_share(payload).await
@@ -189,6 +195,8 @@ pub async fn handle_bridge_request(
             ctx.settings.get_settings().await,
         ),
         "/codex-model-catalog" | "/codex-config-model" => ctx.runtime.codex_model_catalog().await,
+        "/official-accounts/list" => ctx.runtime.official_accounts().await,
+        "/official-accounts/refresh" => ctx.runtime.refresh_official_account(payload.clone()).await,
         "/diagnostics/log" => diagnostic_log_value(payload.clone()),
         "/llm-proxy" => llm_proxy_value(payload.clone()).await,
         "/ads" => ctx.runtime.ads().await,
@@ -667,6 +675,112 @@ fn backend_status_value(
         object.insert("hideOfficialUsageAlert".to_string(), Value::Bool(hide));
     }
     Ok(status)
+}
+
+fn official_accounts_value(status: &str, message: &str) -> anyhow::Result<Value> {
+    let settings_store = SettingsStore::default();
+    let mut settings = settings_store.load()?;
+    let home = crate::codex_home::default_codex_home_dir();
+    let migration =
+        crate::official_accounts::migrate_legacy_official_accounts(&mut settings, &home)?;
+    if migration.changed {
+        settings_store.save(&settings)?;
+    }
+    let accounts = crate::official_accounts::OfficialAccountStore::default()
+        .list()?
+        .into_iter()
+        .map(|account| {
+            json!({
+                "id": account.id,
+                "name": account.name,
+                "email": account.email,
+                "group": account.group,
+                "tags": account.tags,
+                "enabled": account.enabled,
+                "status": account.status,
+                "planType": account.plan_type,
+                "createdAt": account.created_at,
+                "updatedAt": account.updated_at,
+                "lastRefreshAt": account.last_refresh_at,
+                "lastUsedAt": account.last_used_at,
+                "usage": account.usage,
+            })
+        })
+        .collect::<Vec<_>>();
+    let live_account_id = std::fs::read(home.join("auth.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|auth| crate::official_accounts::parse_official_auth(&auth).ok())
+        .map(|auth| auth.id)
+        .unwrap_or_default();
+    Ok(json!({
+        "status": status,
+        "message": message,
+        "accounts": accounts,
+        "activeAccountId": settings.active_official_account_id,
+        "liveAccountId": live_account_id,
+        "codexRunning": crate::watcher::codex_processes_running(),
+    }))
+}
+
+async fn refresh_official_account_value(payload: Value) -> anyhow::Result<Value> {
+    let account_id = payload
+        .get("accountId")
+        .or_else(|| payload.get("account_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if account_id.is_empty() {
+        return official_accounts_value("failed", "官方账号 ID 不能为空。");
+    }
+    let store = crate::official_accounts::OfficialAccountStore::default();
+    let account = match store.get(account_id) {
+        Ok(account) if account.enabled => account,
+        Ok(_) => return official_accounts_value("failed", "目标官方账号已禁用。"),
+        Err(error) => return official_accounts_value("failed", &error.to_string()),
+    };
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let is_active = settings.active_official_account_id == account.id;
+    let home = crate::codex_home::default_codex_home_dir();
+    let live_auth = std::fs::read(home.join("auth.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if is_active
+        && crate::watcher::codex_processes_running()
+        && let Some(auth) = live_auth.as_ref()
+        && let Ok(parsed) = crate::official_accounts::parse_official_auth(auth)
+    {
+        if parsed.id != account.id {
+            return official_accounts_value(
+                "failed",
+                "本机 auth.json 属于另一个官方账号，请在管理工具中确认账号状态。",
+            );
+        }
+        let stored = store.get_auth_json(account_id)?;
+        match crate::official_accounts::official_auth_merge_decision(&stored, auth)? {
+            crate::official_accounts::OfficialAuthMergeDecision::KeepStored => {}
+            crate::official_accounts::OfficialAuthMergeDecision::UseCandidate => {
+                store.replace_auth_json(account_id, auth.clone())?;
+            }
+            crate::official_accounts::OfficialAuthMergeDecision::Conflict => {
+                return official_accounts_value(
+                    "failed",
+                    "本机登录与账号库凭据存在冲突，请在管理工具中重新登录后刷新。",
+                );
+            }
+        }
+    }
+    let result = if is_active && crate::watcher::codex_processes_running() {
+        store
+            .refresh_usage_with_current_token(account_id, true)
+            .await
+    } else {
+        store.refresh_usage(account_id, true).await
+    };
+    match result {
+        Ok(_) => official_accounts_value("ok", "官方账号用量已刷新。"),
+        Err(error) => official_accounts_value("failed", &format!("刷新官方账号失败：{error}")),
+    }
 }
 
 fn result_value<T>(result: anyhow::Result<T>) -> anyhow::Result<Value>

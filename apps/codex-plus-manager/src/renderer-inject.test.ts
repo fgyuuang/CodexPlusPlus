@@ -231,6 +231,22 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /document\.querySelectorAll\(`#\$\{codexPlusMenuId\}/);
   });
 
+  it("renders the official multi-account quota monitor through safe bridge routes", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /data-codex-plus-tab="officialAccounts"/);
+    assert.match(renderer, /function renderOfficialAccountWindow\(window, fallback\)/);
+    assert.match(renderer, /function renderOfficialAccount\(account\)/);
+    assert.match(renderer, /\/official-accounts\/list/);
+    assert.match(renderer, /\/official-accounts\/refresh/);
+    assert.match(renderer, /100 - used/);
+    assert.match(renderer, /请求账号/);
+    assert.match(renderer, /本机登录/);
+    assert.match(renderer, /\.codex-plus-official-email \{[^}]*overflow-wrap: anywhere/);
+    assert.match(renderer, /openManagerFromCodex\(\{ page: "relay", section: "official" \}\)/);
+    assert.doesNotMatch(renderer, /accessToken|refreshToken|authorizationHeader/);
+  });
+
   it("does not install Codex++ UI in embedded browser documents", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 

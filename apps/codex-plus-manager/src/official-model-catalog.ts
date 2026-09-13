@@ -1,6 +1,6 @@
-import bundledCatalog from "../../../crates/codex-plus-core/assets/codex-models.json";
-import gpt56Compatibility from "../../../assets/gpt56-model-metadata-compat.json";
-import futureCompatibility from "../../../assets/astra-model-metadata-compat.json";
+import bundledCatalog from "../../../crates/codex-plus-core/assets/codex-models.json" with { type: "json" };
+import gpt56Compatibility from "../../../assets/gpt56-model-metadata-compat.json" with { type: "json" };
+import futureCompatibility from "../../../assets/astra-model-metadata-compat.json" with { type: "json" };
 
 type CatalogEntry = {
   slug?: string;

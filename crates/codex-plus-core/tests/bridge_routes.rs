@@ -35,6 +35,11 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/backend/status", json!({})),
         ("/codex-model-catalog", json!({})),
         ("/codex-config-model", json!({})),
+        ("/official-accounts/list", json!({})),
+        (
+            "/official-accounts/refresh",
+            json!({"accountId": "official-1"}),
+        ),
         (
             "/llm-proxy",
             json!({"url": "http://example.com", "method": "POST"}),
@@ -1298,6 +1303,34 @@ impl BridgeRuntimeService for FakeRuntime {
             "models": ["qwen3-coder"],
             "sources": []
         }))
+    }
+
+    async fn official_accounts(&self) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "ok",
+            "message": "官方账号已加载。",
+            "accounts": [{
+                "id": "official-1",
+                "name": "Primary",
+                "email": "primary@example.com",
+                "enabled": true,
+                "status": "ready",
+                "planType": "plus",
+                "usage": {
+                    "fetchedAt": 1,
+                    "primary": {"usedPercent": 25.0, "windowMinutes": 300, "resetsAt": 2},
+                    "secondary": {"usedPercent": 50.0, "windowMinutes": 10080, "resetsAt": 3}
+                }
+            }],
+            "activeAccountId": "official-1",
+            "liveAccountId": "official-1",
+            "codexRunning": true
+        }))
+    }
+
+    async fn refresh_official_account(&self, payload: Value) -> anyhow::Result<Value> {
+        assert_eq!(payload["accountId"], json!("official-1"));
+        self.official_accounts().await
     }
 
     async fn ads(&self) -> anyhow::Result<Value> {

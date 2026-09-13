@@ -44,6 +44,17 @@ fn bridge_script_defines_expected_globals_and_binding() {
 }
 
 #[test]
+fn injection_script_includes_safe_official_account_monitor_routes() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("/official-accounts/list"));
+    assert!(script.contains("/official-accounts/refresh"));
+    assert!(script.contains("data-codex-plus-tab=\"officialAccounts\""));
+    assert!(script.contains("请求账号"));
+    assert!(script.contains("本机登录"));
+}
+
+#[test]
 fn screenshot_command_uses_png_from_surface() {
     assert_eq!(
         bridge::capture_screenshot_params(),

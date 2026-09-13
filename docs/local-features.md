@@ -44,6 +44,7 @@
 | 混合模式应用 | `crates/codex-plus-core/src/relay_switch.rs`、`relay_config.rs` | 先恢复官方登录，再原子写入第三方/聚合配置；聚合成员不包含官方 API。 |
 | 官方账号库 | `crates/codex-plus-core/src/official_accounts.rs` | 多账号身份去重、DPAPI/本地文件凭据保护、OAuth/设备码、按需令牌刷新与用量刷新、凭据新旧判定、加密导入导出、旧 profile 迁移。 |
 | Manager 账号维护 | `apps/codex-plus-manager/src-tauri/src/commands.rs`、`apps/codex-plus-manager/src/App.tsx` | 独立账号列表、元数据维护、显式切换、运行中重启确认；凭据不返回前端。 |
+| Codex 注入页账号监控 | `crates/codex-plus-core/src/routes.rs`、`assets/inject/renderer-inject.js` | 左上角 Codex++ 的“官方账号”页按紧凑列表展示完整邮箱、套餐、请求账号/本机登录状态、主次额度与重置时间；桥接只返回安全摘要，刷新不返回令牌，切换进入 Manager 原有重启确认流程。 |
 
 **合并确认点**：普通纯 API 切换后 `auth.json` 不应被覆写且 `requires_openai_auth = false`；官方登录混合模式下必须先从 `activeOfficialAccountId` 恢复所选官方 `auth.json`，随后第三方/聚合配置应同时包含 `experimental_bearer_token` 与 `requires_openai_auth = true`，官方 API 不得进入 aggregate members。多账号切换前只允许较新的 live 凭据回存，旧 refresh token 不得覆盖账号库；身份或同版本令牌冲突不得静默覆盖。`/v1/images/generations` 与 `/v1/images/edits` 必须使用官方认证且官方失败不得连接任何供应商。
 

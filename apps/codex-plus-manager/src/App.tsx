@@ -1113,10 +1113,9 @@ type StartupResult = CommandResult<{
   showUpdate: boolean;
 }>;
 
-type ManagerNavigationIntent = {
-  page: "settings";
-  section?: "stepwise";
-};
+type ManagerNavigationIntent =
+  | { page: "settings"; section?: "stepwise" }
+  | { page: "relay"; section?: "official" };
 
 /** 顶栏工具切换条的工具标识。后端 `list_tools` 返回同名字符串。 */
 type ToolId = string;
@@ -1297,6 +1296,7 @@ export function App() {
   const [theme, setTheme] = useState<Theme>(() => loadInitialTheme());
   const [route, setRoute] = useState<Route>(() => loadInitialRoute());
   const [pendingSettingsSection, setPendingSettingsSection] = useState<ManagerNavigationIntent["section"] | null>(null);
+  const [pendingRelaySection, setPendingRelaySection] = useState<ManagerNavigationIntent["section"] | null>(null);
   const [notice, setNotice] = useState<{ title: string; message: string; status?: Status } | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
@@ -2798,6 +2798,12 @@ export function App() {
         await refreshSettings(true);
         return true;
       }
+      if (navigation.page === "relay") {
+        setPendingRelaySection(navigation.section ?? null);
+        setRoute("relay");
+        await refreshRelay();
+        return true;
+      }
     } catch (error) {
       logDiagnostic("manager.navigation_failed", { error: stringifyError(error) });
     }
@@ -3701,6 +3707,12 @@ export function App() {
   }, [pendingSettingsSection, route]);
 
   useEffect(() => {
+    if (route !== "relay" || pendingRelaySection !== "official") return;
+    const frame = window.requestAnimationFrame(() => setPendingRelaySection(null));
+    return () => window.cancelAnimationFrame(frame);
+  }, [pendingRelaySection, route]);
+
+  useEffect(() => {
     if (getLanguage() === "en") {
       void invoke("update_tray_labels", {
         showLabel: "Show window",
@@ -4194,6 +4206,7 @@ export function App() {
           ) : null}
           {route === "relay" ? (
             <RelayScreen
+              initialView={pendingRelaySection === "official" ? "official" : undefined}
               settings={settings}
               officialAccounts={officialAccounts}
               officialModelCatalog={officialModelCatalog}
@@ -5261,6 +5274,7 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
 }
 
 function RelayScreen({
+  initialView,
   settings: _settings,
   officialAccounts,
   officialModelCatalog,
@@ -5277,6 +5291,7 @@ function RelayScreen({
   onFormChange,
   actions,
 }: {
+  initialView?: "official";
   settings: SettingsResult | null;
   officialAccounts: OfficialAccountsResult | null;
   officialModelCatalog: OfficialModelCatalogResult | null;
@@ -5302,6 +5317,9 @@ function RelayScreen({
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
+  useEffect(() => {
+    if (initialView) setRelayView(initialView);
+  }, [initialView]);
   const detailProfile = newProfileDraft || (detailProfileId
     ? normalized.relayProfiles.find((profile) => profile.id === detailProfileId) || null
     : null);
