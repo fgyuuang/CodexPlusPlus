@@ -336,7 +336,7 @@ pub fn cached_official_model_entries_for_settings(settings: &BackendSettings) ->
         .unwrap_or_default()
 }
 
-fn cached_official_model_entries_for_account(account_id: &str) -> Option<Vec<Value>> {
+pub fn cached_official_model_entries_for_account(account_id: &str) -> Option<Vec<Value>> {
     if account_id.trim().is_empty() {
         return None;
     }
@@ -493,10 +493,16 @@ fn codex_cli_candidates(settings: &BackendSettings) -> Vec<PathBuf> {
         if let Some(cli) = crate::app_paths::find_bundled_codex_cli(&app_dir) {
             candidates.push(cli);
         }
-        candidates.push(crate::app_paths::build_codex_executable(&app_dir));
+        push_cli_candidate(
+            &mut candidates,
+            crate::app_paths::build_codex_executable(&app_dir),
+        );
     }
     if let Some(cli_dir) = crate::app_paths::find_standalone_codex_app_dir() {
-        candidates.push(crate::app_paths::build_codex_executable(&cli_dir));
+        push_cli_candidate(
+            &mut candidates,
+            crate::app_paths::build_codex_executable(&cli_dir),
+        );
     }
     #[cfg(windows)]
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
@@ -510,6 +516,35 @@ fn codex_cli_candidates(settings: &BackendSettings) -> Vec<PathBuf> {
         .into_iter()
         .filter(|candidate| seen.insert(candidate.to_string_lossy().to_ascii_lowercase()))
         .collect()
+}
+
+/// 判断候选可执行文件是否为桌面端 GUI 宿主，而不是可执行的 Codex CLI。
+///
+/// Windows 上 Store/MSIX 包内的 `ChatGPT.exe`（以及便携版的 `Codex.exe`）是桌面端入口：
+/// 直接 spawn 出来的进程**没有程序包标识（package identity）**，新版桌面端会在
+/// bootstrap 阶段失败并弹出 “ChatGPT failed to start.” 对话框，导致用户被反复打扰。
+/// 这类路径只能通过包激活（AUMID）启动，绝不能当 CLI 执行。
+///
+/// 注意 `Codex.exe` 必须按大小写精确匹配：包内真正的 CLI 是小写的
+/// `app/resources/codex.exe`，忽略大小写会把它一起误杀。
+#[cfg(windows)]
+fn is_windows_desktop_gui_executable(path: &Path) -> bool {
+    path.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("ChatGPT.exe") || name == "Codex.exe")
+}
+
+#[cfg(not(windows))]
+fn is_windows_desktop_gui_executable(_path: &Path) -> bool {
+    false
+}
+
+/// 只在确认是 CLI 时才加入候选，避免把桌面端 GUI 当 CLI 执行。
+fn push_cli_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if is_windows_desktop_gui_executable(&candidate) {
+        return;
+    }
+    candidates.push(candidate);
 }
 
 fn cached_etag_for_request<'a>(
@@ -1080,6 +1115,43 @@ mod tests {
         let candidates = windows_local_codex_cli_candidates(temp.path());
         assert!(candidates.contains(&first));
         assert!(candidates.contains(&second));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cli_candidates_never_include_the_desktop_gui_host() {
+        // Store/MSIX 包里的 ChatGPT.exe 直接 spawn 会丢失程序包标识，
+        // 新版桌面端会 bootstrap 失败并弹出 “ChatGPT failed to start.”。
+        // 它只能通过包激活启动，绝不能进入 CLI 候选。
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp
+            .path()
+            .join("OpenAI.Codex_26.1.0_x64__2p2nqsd0c76g0")
+            .join("app");
+        let bundled_cli = app_dir.join("resources").join("codex.exe");
+        std::fs::create_dir_all(bundled_cli.parent().unwrap()).unwrap();
+        std::fs::write(&bundled_cli, b"cli").unwrap();
+        std::fs::write(app_dir.join("ChatGPT.exe"), b"gui").unwrap();
+        std::fs::write(app_dir.join("Codex.exe"), b"gui").unwrap();
+
+        let mut collected = Vec::new();
+        push_cli_candidate(&mut collected, app_dir.join("ChatGPT.exe"));
+        push_cli_candidate(&mut collected, app_dir.join("Codex.exe"));
+        push_cli_candidate(&mut collected, bundled_cli.clone());
+        assert_eq!(collected, vec![bundled_cli]);
+
+        // 真实解析路径（Store 注册包或便携安装）同样不得混入 GUI 宿主。
+        let settings = BackendSettings {
+            codex_app_path: app_dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let resolved = codex_cli_candidates(&settings);
+        assert!(
+            resolved
+                .iter()
+                .all(|candidate| !is_windows_desktop_gui_executable(candidate)),
+            "桌面端 GUI 不得进入 CLI 候选：{resolved:?}"
+        );
     }
 
     #[test]

@@ -319,7 +319,17 @@ pub fn resolve_codex_app_dir_with_saved(
 ) -> Option<PathBuf> {
     if let Some(app_dir) = app_dir {
         // 显式 --app-path 仅接受有效 Codex 应用；无效时不回退，避免静默启动错误目录
-        return normalize_codex_app_path(app_dir);
+        let path = normalize_codex_app_path(app_dir)?;
+        #[cfg(windows)]
+        if is_codex_store_package_dir(&path) {
+            // Manager 会把界面中的路径作为显式 --app-path 传给 launcher。
+            // Store 更新后旧目录可能仍存在，因此显式路径也必须重新查询当前注册包。
+            return Some(resolve_registered_store_path(
+                path,
+                find_latest_codex_app_dir_from_appx_package(),
+            ));
+        }
+        return Some(path);
     }
     if let Some(saved) = saved_app_path
         .map(str::trim)
@@ -331,7 +341,7 @@ pub fn resolve_codex_app_dir_with_saved(
             if is_codex_store_package_dir(&path) {
                 // Store 更新会生成新的版本目录；注册查询成功时选择当前最高版本，
                 // 查询失败则保留已保存路径，兼容离线或受限环境。
-                return Some(resolve_saved_store_path(
+                return Some(resolve_registered_store_path(
                     path,
                     find_latest_codex_app_dir_from_appx_package(),
                 ));
@@ -343,7 +353,7 @@ pub fn resolve_codex_app_dir_with_saved(
 }
 
 #[cfg(windows)]
-fn resolve_saved_store_path(
+fn resolve_registered_store_path(
     saved_path: PathBuf,
     current: anyhow::Result<Option<PathBuf>>,
 ) -> PathBuf {
@@ -760,7 +770,7 @@ fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::resolve_saved_store_path;
+    use super::resolve_registered_store_path;
     use std::path::PathBuf;
 
     #[test]
@@ -768,7 +778,7 @@ mod tests {
         let saved = PathBuf::from(r"C:\old\app");
         let current = PathBuf::from(r"C:\new\app");
         assert_eq!(
-            resolve_saved_store_path(saved, Ok(Some(current.clone()))),
+            resolve_registered_store_path(saved, Ok(Some(current.clone()))),
             current
         );
     }
@@ -776,9 +786,12 @@ mod tests {
     #[test]
     fn saved_store_path_falls_back_when_registration_is_unavailable() {
         let saved = PathBuf::from(r"C:\old\app");
-        assert_eq!(resolve_saved_store_path(saved.clone(), Ok(None)), saved);
         assert_eq!(
-            resolve_saved_store_path(saved.clone(), Err(anyhow::anyhow!("query failed"))),
+            resolve_registered_store_path(saved.clone(), Ok(None)),
+            saved
+        );
+        assert_eq!(
+            resolve_registered_store_path(saved.clone(), Err(anyhow::anyhow!("query failed"))),
             saved
         );
     }

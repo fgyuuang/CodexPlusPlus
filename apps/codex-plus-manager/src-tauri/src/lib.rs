@@ -64,6 +64,7 @@ pub fn run() {
             install_tray(app)?;
             commands::start_weixin_connect_from_saved_settings();
             register_main_window_events(main_window, transient);
+            cliproxy::start_cliproxy_from_saved_settings(transient);
             // 目录刷新是后台增强能力；失败时仍由核心回退目录保证 Codex 可启动。
             tauri::async_runtime::spawn(async {
                 commands::refresh_official_model_catalog_in_background().await;
@@ -90,6 +91,13 @@ pub fn run() {
             commands::weixin_connect_status,
             commands::weixin_connect_start,
             commands::weixin_connect_stop,
+            commands::weixin_connect_restart,
+            commands::weixin_connect_inbox,
+            commands::weixin_connect_pairing,
+            commands::weixin_connect_retry_message,
+            commands::weixin_connect_skip_message,
+            commands::weixin_connect_models,
+            commands::weixin_connect_test_model,
             commands::find_desktop_codex_cli,
             commands::list_official_accounts,
             commands::get_official_model_catalog_status,
@@ -174,6 +182,7 @@ pub fn run() {
             commands::enable_watcher,
             commands::disable_watcher,
             commands::read_latest_logs,
+            commands::codex_app_tools_status,
             commands::clear_logs,
             commands::copy_diagnostics,
             commands::reset_settings,
@@ -210,6 +219,7 @@ pub fn run() {
             cliproxy::cliproxy_test_api,
             cliproxy::cliproxy_save_api_key,
             cliproxy::cliproxy_save_connection,
+            cliproxy::cliproxy_set_auto_start,
             cliproxy::cliproxy_apply_profile,
             cliproxy::cliproxy_disable_official_profile,
             cliproxy::cliproxy_disable_integration,

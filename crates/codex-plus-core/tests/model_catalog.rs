@@ -459,7 +459,7 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
     );
 
     assert_eq!(result["default_model"], "gpt-6-astra");
-    assert_eq!(result["model_provider"], "custom");
+    assert_eq!(result["model_provider"], "openai");
     assert_eq!(result["officialModels"], json!(["gpt-6-astra"]));
     assert!(
         result["trustedOfficialModels"]
@@ -497,9 +497,27 @@ async fn model_catalog_displays_official_auth_before_aggregate_provider_targets(
         result["modelMetadata"]["gpt-6-astra(供应商一|供应商二:vendor-gpt-6-astra)"]["displayName"],
         "gpt-6-astra(供应商一|供应商二:vendor-gpt-6-astra)"
     );
+    assert!(result["modelMetadata"]["gpt-6-astra(供应商一|供应商二:vendor-gpt-6-astra)"]["displaySuffix"].is_null());
+    let aggregate_route = result["routeDescriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|route| route["routingSlug"] == "gpt-6-astra(供应商一|供应商二:vendor-gpt-6-astra)")
+        .unwrap();
+    assert_eq!(
+        aggregate_route["providerId"],
+        "codex_plus_aggregate_aggregate"
+    );
+    assert_eq!(aggregate_route["capabilitySlug"], "gpt-6-astra");
     assert_eq!(
         result["modelMetadata"]["CLIProxyAPI:gpt-6-astra"]["displayName"],
         "CLIProxyAPI:gpt-6-astra"
+    );
+    assert!(
+        result["modelMetadata"]["CLIProxyAPI:gpt-6-astra"]["priority"]
+            .as_i64()
+            .unwrap()
+            >= 1000
     );
     assert_eq!(
         result["modelMetadata"]["CLIProxyAPI:gpt-6-astra"]["supportedReasoningEfforts"][5]["reasoningEffort"],

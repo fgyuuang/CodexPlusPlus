@@ -1015,6 +1015,7 @@ pub fn responses_stream_failure_from_upstream(
 }
 
 pub fn is_responses_proxy_path(path: &str) -> bool {
+    let path = crate::official_experience::route_operation_path(path);
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     matches!(
         path,
@@ -1030,6 +1031,7 @@ pub fn is_responses_proxy_path(path: &str) -> bool {
 }
 
 pub fn is_responses_compact_proxy_path(path: &str) -> bool {
+    let path = crate::official_experience::route_operation_path(path);
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     matches!(
         path,
@@ -1041,6 +1043,7 @@ pub fn is_responses_compact_proxy_path(path: &str) -> bool {
 }
 
 pub fn is_chat_completions_proxy_path(path: &str) -> bool {
+    let path = crate::official_experience::route_operation_path(path);
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     matches!(
         path,
@@ -1052,6 +1055,7 @@ pub fn is_chat_completions_proxy_path(path: &str) -> bool {
 }
 
 pub fn is_models_proxy_path(path: &str) -> bool {
+    let path = crate::official_experience::route_operation_path(path);
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     matches!(
         path,
@@ -1093,6 +1097,7 @@ impl ImageProxyOperation {
 }
 
 pub fn image_proxy_operation(path: &str) -> Option<ImageProxyOperation> {
+    let path = crate::official_experience::route_operation_path(path);
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     match path {
         "/images/generations"
@@ -1111,7 +1116,32 @@ pub async fn open_official_images_proxy_request(
     operation: ImageProxyOperation,
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_images_proxy_request_for_path(body, operation, original_user_agent, "/v1/images").await
+}
+
+pub async fn open_images_proxy_request_for_path(
+    body: &str,
+    operation: ImageProxyOperation,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
+    let provider_id = crate::official_experience::route_provider_id_from_path(request_path);
+    if let Some(provider_id) = provider_id.as_deref() {
+        if provider_id == crate::official_experience::PRIMARY_OFFICIAL_PROVIDER_ID {
+            anyhow::bail!("主官方图片请求必须使用官方客户端原生链路")
+        }
+        if provider_id != crate::official_experience::LEGACY_CUSTOM_PROVIDER_ID {
+            return open_source_images_proxy_request(
+                body,
+                &settings,
+                operation,
+                original_user_agent,
+                provider_id,
+            )
+            .await;
+        }
+    }
     open_official_images_proxy_request_with_settings_and_endpoint_and_user_agent(
         body,
         settings,
@@ -1120,6 +1150,201 @@ pub async fn open_official_images_proxy_request(
         original_user_agent,
     )
     .await
+}
+
+async fn open_source_images_proxy_request(
+    body: &str,
+    settings: &crate::settings::BackendSettings,
+    operation: ImageProxyOperation,
+    original_user_agent: Option<&str>,
+    provider_id: &str,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    if !settings.official_experience.enabled {
+        anyhow::bail!("扩展图片来源未启用；请先启动 Codex++")
+    }
+    let request_json: Value = serde_json::from_str(body).context("图片请求必须是 JSON")?;
+    let routing_slug = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .context("图片请求缺少模型，无法验证来源归属")?
+        .to_string();
+    let descriptors = crate::official_experience::model_route_descriptors(settings);
+    let matching_model = descriptors
+        .iter()
+        .find(|descriptor| descriptor.routing_slug.eq_ignore_ascii_case(&routing_slug));
+    if let Some(descriptor) = matching_model
+        && descriptor.source_kind != crate::settings::OfficialExperienceSourceKind::MainOfficial
+        && !descriptor.provider_id.eq_ignore_ascii_case(provider_id)
+    {
+        anyhow::bail!(
+            "图片模型「{}」不属于来源 provider「{}」，已关闭式拒绝",
+            routing_slug,
+            provider_id
+        )
+    }
+    let descriptor = matching_model
+        .or_else(|| {
+            descriptors
+                .iter()
+                .find(|descriptor| descriptor.provider_id == provider_id)
+        })
+        .with_context(|| format!("图片来源 provider「{}」不可用", provider_id))?;
+    if descriptor.source_kind == crate::settings::OfficialExperienceSourceKind::DirectOfficial {
+        if !descriptor.routing_slug.eq_ignore_ascii_case(&routing_slug) {
+            anyhow::bail!("图片模型「{}」不属于所选官方账号", routing_slug)
+        }
+        let mut upstream_json = request_json;
+        upstream_json["model"] = Value::String(descriptor.upstream_model.clone());
+        let auth = resolve_stored_official_account_auth(&descriptor.source_id).await?;
+        let client =
+            crate::http_client::proxied_client(&effective_user_agent("", original_user_agent))?;
+        let upstream = send_upstream_request_with_header_timeout(
+            client
+                .post(operation.official_endpoint())
+                .bearer_auth(&auth.access_token)
+                .header("ChatGPT-Account-Id", &auth.account_id)
+                .header("originator", "codex_cli_rs")
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&upstream_json),
+            UPSTREAM_IMAGE_HEADER_TIMEOUT,
+        )
+        .await
+        .context("所选官方账号图片请求失败；不会切换账号")?;
+        let status_code = upstream.status().as_u16();
+        let content_type = upstream
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/json; charset=utf-8")
+            .to_string();
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.direct_official_image_response",
+            json!({"sourceId": descriptor.source_id, "operation": operation.name(), "statusCode": status_code}),
+        );
+        return Ok(UpstreamProxyResponse {
+            status_code,
+            is_stream: false,
+            content_type,
+            wire_api: match operation {
+                ImageProxyOperation::Generate => UpstreamWireApi::ImageGenerations,
+                ImageProxyOperation::Edit => UpstreamWireApi::ImageEdits,
+            },
+            capacity_retryable: false,
+            capacity_retry_enabled: false,
+            capacity_retry_key: None,
+            capacity_retry_max_attempts: 0,
+            prefetched_chunk: Vec::new(),
+            response: upstream,
+        });
+    }
+    let relay = crate::official_experience::source_profile_for_descriptor(settings, &descriptor)
+        .with_context(|| format!("图片来源不存在或不支持图片端点：{}", descriptor.source_id))?;
+    let endpoint = match descriptor.source_kind {
+        crate::settings::OfficialExperienceSourceKind::CliOfficial
+        | crate::settings::OfficialExperienceSourceKind::CliGeneral => {
+            let base_url = crate::relay_config::relay_profile_base_url(relay);
+            if base_url.trim().is_empty() {
+                anyhow::bail!("该来源不支持图片：CLIProxyAPI 未配置 API Base URL")
+            }
+            format!(
+                "{}/images/{}",
+                base_url.trim().trim_end_matches('/'),
+                match operation {
+                    ImageProxyOperation::Generate => "generations",
+                    ImageProxyOperation::Edit => "edits",
+                }
+            )
+        }
+        crate::settings::OfficialExperienceSourceKind::Relay => {
+            let endpoints = settings
+                .official_experience
+                .source_image_endpoints
+                .get(&descriptor.source_id)
+                .context("该来源不支持图片：未配置独立图片端点")?;
+            let endpoint = match operation {
+                ImageProxyOperation::Generate => endpoints.generations_url.trim(),
+                ImageProxyOperation::Edit => endpoints.edits_url.trim(),
+            };
+            if endpoint.is_empty() {
+                anyhow::bail!("该来源不支持图片：当前操作没有配置端点")
+            }
+            endpoint.to_string()
+        }
+        _ => anyhow::bail!("该来源不支持图片"),
+    };
+    let mut upstream_json = request_json;
+    if descriptor.routing_slug.eq_ignore_ascii_case(&routing_slug) {
+        upstream_json["model"] = Value::String(descriptor.upstream_model.clone());
+    }
+    let client = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?;
+    let mut request = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&upstream_json);
+    if !relay.uses_no_auth() {
+        let api_key = crate::relay_config::relay_profile_api_key(relay);
+        if api_key.trim().is_empty() {
+            anyhow::bail!("该来源不支持图片：未配置来源认证")
+        }
+        request = request.bearer_auth(api_key);
+    }
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.source_image_request",
+        json!({
+            "providerId": provider_id,
+            "sourceKind": descriptor.source_kind,
+            "sourceId": descriptor.source_id,
+            "operation": operation.name(),
+            "willFailover": false
+        }),
+    );
+    let upstream =
+        send_upstream_request_with_header_timeout(request, UPSTREAM_IMAGE_HEADER_TIMEOUT)
+            .await
+            .with_context(|| {
+                format!(
+                    "来源「{}」图片请求失败；已禁止借用其他账号或供应商",
+                    descriptor.source_id
+                )
+            })?;
+    let status_code = upstream.status().as_u16();
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json; charset=utf-8")
+        .to_string();
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.source_image_response",
+        json!({
+            "providerId": provider_id,
+            "sourceKind": descriptor.source_kind,
+            "sourceId": descriptor.source_id,
+            "operation": operation.name(),
+            "statusCode": status_code,
+            "willFailover": false
+        }),
+    );
+    Ok(UpstreamProxyResponse {
+        status_code,
+        is_stream: false,
+        content_type,
+        wire_api: match operation {
+            ImageProxyOperation::Generate => UpstreamWireApi::ImageGenerations,
+            ImageProxyOperation::Edit => UpstreamWireApi::ImageEdits,
+        },
+        capacity_retryable: false,
+        capacity_retry_enabled: false,
+        capacity_retry_key: None,
+        capacity_retry_max_attempts: 0,
+        prefetched_chunk: Vec::new(),
+        response: upstream,
+    })
 }
 
 #[doc(hidden)]
@@ -1214,6 +1439,7 @@ async fn open_official_images_proxy_request_with_settings_and_endpoint_and_user_
 }
 
 pub fn is_image_generations_proxy_path(path: &str) -> bool {
+    let path = crate::official_experience::route_operation_path(path);
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     matches!(
         path,
@@ -1225,6 +1451,7 @@ pub fn is_image_generations_proxy_path(path: &str) -> bool {
 }
 
 pub fn is_image_edits_proxy_path(path: &str) -> bool {
+    let path = crate::official_experience::route_operation_path(path);
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     matches!(
         path,
@@ -1305,12 +1532,25 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
 
 async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_endpoint(
     body: &str,
-    settings: crate::settings::BackendSettings,
+    mut settings: crate::settings::BackendSettings,
     original_user_agent: Option<&str>,
     request_path: &str,
     official_endpoint: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
+    let codex_app_tools_filter =
+        crate::codex_app_tools_compat::filter_stale_codex_app_dynamic_tools(&mut request_json);
+    if codex_app_tools_filter.observed() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.codex_app_tools_compat",
+            json!({
+                "mcpSeen": codex_app_tools_filter.mcp_seen,
+                "legacyDynamicCount": codex_app_tools_filter.legacy_dynamic_count,
+                "filteredCount": codex_app_tools_filter.filtered_count,
+                "changed": codex_app_tools_filter.changed(),
+            }),
+        );
+    }
     let capacity_retry_key = settings
         .codex_app_capacity_retry
         .then(|| capacity_retry_request_key(&request_json));
@@ -1324,7 +1564,103 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
         .map(str::trim)
         .unwrap_or("")
         .to_string();
-    let model_route = select_model_route(&settings, &source_model)?;
+    let route_provider_id = crate::official_experience::route_provider_id_from_path(request_path);
+    let official_endpoint_for_path = if is_responses_compact_proxy_path(request_path) {
+        format!("{}/compact", official_endpoint.trim_end_matches('/'))
+    } else {
+        official_endpoint.to_string()
+    };
+    let route_descriptor = match route_provider_id.as_deref() {
+        Some(crate::official_experience::PRIMARY_OFFICIAL_PROVIDER_ID) => {
+            anyhow::bail!("主官方模型不得经过 Codex++ 本地协议代理")
+        }
+        Some(crate::official_experience::LEGACY_CUSTOM_PROVIDER_ID) | None => None,
+        Some(provider_id) => {
+            if !settings.official_experience.enabled {
+                anyhow::bail!("扩展模型路由未启用；请先启动 Codex++")
+            }
+            let descriptor = crate::official_experience::descriptor_for_provider_and_model(
+                &settings,
+                provider_id,
+                &source_model,
+            )
+            .with_context(|| {
+                format!(
+                    "模型「{}」不属于来源 provider「{}」，已关闭式拒绝",
+                    source_model, provider_id
+                )
+            })?;
+            if descriptor.failover_policy != "strict" {
+                anyhow::bail!("扩展模型路由仅允许 strict 失败策略")
+            }
+            if descriptor.source_kind == crate::settings::OfficialExperienceSourceKind::Aggregate {
+                let aggregate_id = descriptor.source_id.clone();
+                let aggregate_relay = settings
+                    .relay_profiles
+                    .iter()
+                    .find(|profile| {
+                        profile.id == aggregate_id
+                            && profile.relay_mode == crate::settings::RelayMode::Aggregate
+                    })
+                    .with_context(|| format!("聚合来源不存在：{aggregate_id}"))?;
+                settings.active_relay_id = aggregate_relay.id.clone();
+                settings.active_aggregate_relay_id = aggregate_id;
+            }
+            Some(descriptor)
+        }
+    };
+    let model_route = if let Some(descriptor) = route_descriptor.as_ref() {
+        if descriptor.source_kind == crate::settings::OfficialExperienceSourceKind::Aggregate
+            || descriptor.source_kind
+                == crate::settings::OfficialExperienceSourceKind::DirectOfficial
+        {
+            None
+        } else {
+            let relay =
+                crate::official_experience::source_profile_for_descriptor(&settings, descriptor)
+                    .cloned()
+                    .with_context(|| {
+                        format!("扩展模型来源不存在或类型不匹配：{}", descriptor.source_id)
+                    })?;
+            if relay.protocol != RelayProtocol::Responses {
+                anyhow::bail!(
+                    "来源「{}」未声明完整 Responses 能力，无法承载官方能力模板",
+                    descriptor.source_id
+                )
+            }
+            Some(ModelRouteSelection {
+                relay,
+                source_relay_id: descriptor.source_id.clone(),
+                source_model: descriptor.routing_slug.clone(),
+                upstream_model: descriptor.upstream_model.clone(),
+            })
+        }
+    } else {
+        select_model_route(&settings, &source_model)?
+    };
+    if let Some(descriptor) = route_descriptor.as_ref()
+        && descriptor.upstream_model != source_model
+    {
+        request_json["model"] = Value::String(descriptor.upstream_model.clone());
+    }
+    if let Some(descriptor) = route_descriptor.as_ref()
+        && descriptor.source_kind == crate::settings::OfficialExperienceSourceKind::DirectOfficial
+    {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.direct_official_request",
+            json!({"sourceId": descriptor.source_id, "operation": "responses", "providerId": descriptor.provider_id}),
+        );
+        let auth = resolve_stored_official_account_auth(&descriptor.source_id).await?;
+        return open_official_chatgpt_responses_request(
+            &settings,
+            request_json,
+            is_stream,
+            original_user_agent,
+            &official_endpoint_for_path,
+            Some(auth),
+        )
+        .await;
+    }
     if let Some(route) = &model_route
         && route.upstream_model != source_model
     {
@@ -1342,6 +1678,12 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
         .filter(|model| !model.is_empty());
     let (relay, relays, track_aggregate_rotation) = if let Some(route) = &model_route {
         (route.relay.clone(), vec![route.relay.clone()], false)
+    } else if route_descriptor.as_ref().is_some_and(|descriptor| {
+        descriptor.source_kind == crate::settings::OfficialExperienceSourceKind::Aggregate
+    }) {
+        let relay =
+            crate::relay_rotation::select_relay_for_request(&settings, context, requested_model)?;
+        (relay.clone(), vec![relay], false)
     } else {
         let route = crate::relay_rotation::classify_mixed_model_route(&settings, requested_model);
         let (relay, track_aggregate_rotation) = match route {
@@ -1351,7 +1693,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
                     request_json,
                     is_stream,
                     original_user_agent,
-                    official_endpoint,
+                    &official_endpoint_for_path,
+                    None,
                 )
                 .await;
             }
@@ -1420,6 +1763,15 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
                     "sourceModel": route.source_model,
                     "targetRelayId": route.relay.id,
                     "upstreamModel": route.upstream_model
+                })),
+                "routeDescriptor": route_descriptor.as_ref().map(|descriptor| json!({
+                    "providerId": descriptor.provider_id,
+                    "sourceKind": descriptor.source_kind,
+                    "sourceId": descriptor.source_id,
+                    "routingSlug": descriptor.routing_slug,
+                    "upstreamModel": descriptor.upstream_model,
+                    "capabilitySlug": descriptor.capability_slug,
+                    "failoverPolicy": descriptor.failover_policy
                 }))
             }),
         );
@@ -1648,6 +2000,13 @@ fn select_model_route(
     if model.is_empty() || settings.active_aggregate_relay_profile().is_some() {
         return Ok(None);
     }
+    if settings.active_relay_uses_official_login_auth()
+        && crate::aggregate_model_alias::is_trusted_official_codex_model_for_settings(
+            model, settings,
+        )
+    {
+        return Ok(None);
+    }
 
     let source = settings.active_relay_profile();
     let Some(route) = source
@@ -1691,6 +2050,96 @@ fn select_model_route(
 struct OfficialChatGptAuth {
     access_token: String,
     account_id: String,
+}
+
+async fn resolve_stored_official_account_auth(
+    account_id: &str,
+) -> anyhow::Result<OfficialChatGptAuth> {
+    let store = crate::official_accounts::OfficialAccountStore::default();
+    resolve_stored_official_account_auth_from_store(&store, account_id).await
+}
+
+async fn resolve_stored_official_account_auth_from_store(
+    store: &crate::official_accounts::OfficialAccountStore,
+    account_id: &str,
+) -> anyhow::Result<OfficialChatGptAuth> {
+    let account = store.get(account_id)?;
+    anyhow::ensure!(
+        account.enabled && account.status == "ready",
+        "所选官方账号不可用"
+    );
+    store.refresh_tokens(account_id, false).await?;
+    let auth_json = store.get_auth_json(account_id)?;
+    let parsed = crate::official_accounts::parse_official_auth(&auth_json)?;
+    anyhow::ensure!(parsed.id == account_id, "官方账号凭据身份不匹配");
+    let account_id = if parsed.chatgpt_account_id.is_empty() {
+        parsed.workspace_id
+    } else {
+        parsed.chatgpt_account_id
+    };
+    let access_token = crate::official_accounts::auth_token(&auth_json, "access_token")
+        .context("所选官方账号缺少访问令牌")?
+        .to_string();
+    Ok(OfficialChatGptAuth {
+        access_token,
+        account_id,
+    })
+}
+
+#[cfg(test)]
+mod direct_official_auth_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn jwt(value: Value) -> String {
+        let encoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "{}.{}.sig",
+            encoder.encode(br#"{"alg":"none"}"#),
+            encoder.encode(serde_json::to_vec(&value).unwrap())
+        )
+    }
+
+    fn auth(subject: &str, account_id: &str) -> Value {
+        json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": jwt(json!({"sub": subject})),
+                "access_token": jwt(json!({
+                    "sub": subject,
+                    "exp": 4_102_444_800_i64,
+                    "https://api.openai.com/auth": {"chatgpt_account_id": account_id}
+                })),
+                "account_id": account_id,
+                "refresh_token": "test-refresh"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn explicit_account_route_reads_only_its_own_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::official_accounts::OfficialAccountStore::new(
+            temp.path().join("accounts.json"),
+            temp.path().join("secrets.json"),
+        );
+        let (first, _) = store.upsert_auth_json(auth("first", "chatgpt-1")).unwrap();
+        let (second, _) = store.upsert_auth_json(auth("second", "chatgpt-2")).unwrap();
+        let first_auth = resolve_stored_official_account_auth_from_store(&store, &first.id)
+            .await
+            .unwrap();
+        let second_auth = resolve_stored_official_account_auth_from_store(&store, &second.id)
+            .await
+            .unwrap();
+        assert_eq!(first_auth.account_id, "chatgpt-1");
+        assert_eq!(second_auth.account_id, "chatgpt-2");
+        assert_ne!(first_auth.access_token, second_auth.access_token);
+        assert!(
+            resolve_stored_official_account_auth_from_store(&store, "unknown")
+                .await
+                .is_err()
+        );
+    }
 }
 
 fn official_chatgpt_auth_from_contents(contents: &str) -> Option<OfficialChatGptAuth> {
@@ -1746,13 +2195,17 @@ async fn open_official_chatgpt_responses_request(
     is_stream: bool,
     original_user_agent: Option<&str>,
     official_endpoint: &str,
+    auth_override: Option<OfficialChatGptAuth>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     normalize_responses_input_items(&mut request_json);
     normalize_responses_item_ids(&mut request_json);
     let capacity_retry_key = settings
         .codex_app_capacity_retry
         .then(|| capacity_retry_request_key(&request_json));
-    let auth = resolve_official_chatgpt_auth(settings)?;
+    let auth = match auth_override {
+        Some(auth) => auth,
+        None => resolve_official_chatgpt_auth(settings)?,
+    };
     let configured_user_agent = settings
         .official_login_relay_profile()
         .map(|profile| profile.user_agent.as_str())
@@ -1903,8 +2356,10 @@ fn normalize_responses_input_items(request: &mut Value) {
     };
     items.retain(|item| {
         item.get("type").and_then(Value::as_str) != Some("reasoning")
-            || item.get("reasoning_content").is_none()
-            || item.get("encrypted_content").is_some()
+            || item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| !content.trim().is_empty())
     });
     for item in items {
         if item.get("type").and_then(Value::as_str) != Some("message") {
@@ -1924,7 +2379,7 @@ fn aggregate_upstream_model_override(
     relay: &crate::settings::RelayProfile,
     requested_model: Option<&str>,
 ) -> Option<String> {
-    settings.active_aggregate_relay_profile()?;
+    let aggregate = settings.active_aggregate_relay_profile()?;
     let requested_model = requested_model.map(str::trim).unwrap_or("");
     let normalized_model =
         crate::aggregate_model_alias::normalize_requested_model_name(requested_model);
@@ -1933,6 +2388,26 @@ fn aggregate_upstream_model_override(
             || relay.model_mappings.contains_key(&normalized_model))
     {
         return None;
+    }
+    // 聚合别名必须按实际选中的成员解析。不能用该成员的默认 model 覆盖
+    // `deepseek:deepseek-v4-pro` 这类显式选择，否则多个模型会误发到同一个 API 模型。
+    let members = aggregate
+        .members
+        .iter()
+        .filter_map(|member| {
+            settings
+                .relay_profiles
+                .iter()
+                .find(|profile| profile.id == member.relay_id)
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    if let Some(alias) =
+        crate::aggregate_model_alias::aggregate_catalog_aliases(&aggregate, &members)
+            .into_iter()
+            .find(|alias| alias.alias == requested_model && alias.provider_id == relay.id)
+    {
+        return Some(alias.target_model);
     }
     let model = crate::relay_config::relay_profile_model(relay);
     let model = model.trim();

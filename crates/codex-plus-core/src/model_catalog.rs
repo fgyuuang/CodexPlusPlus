@@ -75,6 +75,9 @@ pub async fn read_codex_model_catalog() -> Value {
 }
 
 fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) -> Value {
+    if settings.official_experience.enabled {
+        return official_experience_model_catalog_value(home, settings);
+    }
     let profile = crate::relay_config::effective_active_relay_profile_for_codex(settings);
     if let Some(aggregate) = settings.active_aggregate_relay_profile() {
         return aggregate_relay_model_catalog_value(home, settings, &profile, &aggregate);
@@ -124,6 +127,83 @@ fn relay_profile_model_catalog_value(home: &Path, settings: &BackendSettings) ->
                 "responses_api": responses_api_status("unknown", "", "")
             }
         ],
+        "responses_api": responses_api_status("unknown", "", "")
+    })
+}
+
+fn official_experience_model_catalog_value(home: &Path, settings: &BackendSettings) -> Value {
+    let descriptors = crate::official_experience::model_route_descriptors(settings);
+    let models = descriptors
+        .iter()
+        .map(|descriptor| descriptor.routing_slug.clone())
+        .collect::<Vec<_>>();
+    let official_models = descriptors
+        .iter()
+        .filter(|descriptor| {
+            descriptor.source_kind == crate::settings::OfficialExperienceSourceKind::MainOfficial
+        })
+        .map(|descriptor| descriptor.routing_slug.clone())
+        .collect::<Vec<_>>();
+    let default_model = official_models.first().cloned().unwrap_or_default();
+    let mut model_metadata = Map::new();
+    let mut extension_priority =
+        crate::official_experience::extension_model_priority_start(settings);
+    for descriptor in &descriptors {
+        let mut metadata = crate::model_suffix::model_ui_metadata(&descriptor.capability_slug)
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        // 路由显示名已包含来源；能力模板的后缀不能再附加到真实模型名上。
+        metadata.remove("displaySuffix");
+        metadata.insert(
+            "displayName".to_string(),
+            Value::String(descriptor.display_name.clone()),
+        );
+        metadata.insert(
+            "capabilitySlug".to_string(),
+            Value::String(descriptor.capability_slug.clone()),
+        );
+        metadata.insert(
+            "providerId".to_string(),
+            Value::String(descriptor.provider_id.clone()),
+        );
+        metadata.insert(
+            "sourceKind".to_string(),
+            serde_json::to_value(descriptor.source_kind).unwrap_or(Value::Null),
+        );
+        metadata.insert(
+            "sourceId".to_string(),
+            Value::String(descriptor.source_id.clone()),
+        );
+        metadata.insert(
+            "upstreamModel".to_string(),
+            Value::String(descriptor.upstream_model.clone()),
+        );
+        metadata.insert(
+            "failoverPolicy".to_string(),
+            Value::String("strict".to_string()),
+        );
+        if descriptor.source_kind != crate::settings::OfficialExperienceSourceKind::MainOfficial {
+            metadata.insert("priority".to_string(), json!(extension_priority));
+            extension_priority = extension_priority.saturating_add(1);
+        }
+        model_metadata.insert(descriptor.routing_slug.clone(), Value::Object(metadata));
+    }
+
+    json!({
+        "status": if models.is_empty() { "not_configured" } else { "ok" },
+        "path": home.join("config.toml").to_string_lossy(),
+        "service_tier": config_service_tier_value(home),
+        "model": default_model,
+        "model_provider": "openai",
+        "codex_model_provider": "openai",
+        "provider_name": "OpenAI",
+        "default_model": default_model,
+        "models": models,
+        "officialModels": official_models,
+        "trustedOfficialModels": crate::official_model_catalog::trusted_official_model_slugs_for_settings(settings),
+        "modelMetadata": model_metadata,
+        "routeDescriptors": descriptors,
+        "sources": [],
         "responses_api": responses_api_status("unknown", "", "")
     })
 }

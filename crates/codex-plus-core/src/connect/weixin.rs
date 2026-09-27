@@ -1,8 +1,11 @@
 use std::time::Duration;
 
+use aes::Aes128;
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 use anyhow::{Context, bail};
 use base64::Engine;
 use futures_util::StreamExt;
+use md5::{Digest, Md5};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -12,6 +15,8 @@ const CHANNEL_VERSION: &str = "codex-plus-weixin/1.0";
 const MAX_REPLY_CHARS: usize = 3_800;
 const MAX_API_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SMALL_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_MEDIA_BYTES: usize = 25 * 1024 * 1024;
+const CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 
 #[derive(Debug, Clone)]
 pub struct WeixinClient {
@@ -42,6 +47,8 @@ pub struct WeixinQrStatus {
     pub baseurl: String,
     #[serde(default)]
     pub ilink_user_id: String,
+    #[serde(default)]
+    pub redirect_host: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,7 +67,7 @@ pub struct WeixinUpdates {
     pub longpolling_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WeixinMessage {
     #[serde(default)]
     pub seq: i64,
@@ -80,9 +87,13 @@ pub struct WeixinMessage {
     pub item_list: Vec<WeixinMessageItem>,
     #[serde(default)]
     pub context_token: String,
+    #[serde(default)]
+    pub room_id: String,
+    #[serde(default)]
+    pub chat_room_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WeixinMessageItem {
     #[serde(default, rename = "type")]
     pub item_type: i64,
@@ -92,21 +103,27 @@ pub struct WeixinMessageItem {
     pub voice_item: Option<WeixinVoiceItem>,
     #[serde(default)]
     pub ref_msg: Option<WeixinReferenceMessage>,
+    #[serde(default)]
+    pub image_item: Option<serde_json::Value>,
+    #[serde(default)]
+    pub file_item: Option<serde_json::Value>,
+    #[serde(default)]
+    pub video_item: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WeixinTextItem {
     #[serde(default)]
     pub text: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WeixinVoiceItem {
     #[serde(default)]
     pub text: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WeixinReferenceMessage {
     #[serde(default)]
     pub title: String,
@@ -246,6 +263,189 @@ impl WeixinClient {
         Ok(updates)
     }
 
+    async fn post_api(
+        &self,
+        endpoint: &str,
+        mut body: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        body["base_info"] = json!({ "channel_version": CHANNEL_VERSION });
+        let response = self
+            .client
+            .post(self.endpoint(endpoint)?)
+            .headers(self.auth_headers()?)
+            .json(&body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .with_context(|| format!("微信 {endpoint} 请求失败"))?;
+        let (status, bytes) =
+            read_response_limited(response, MAX_SMALL_RESPONSE_BYTES, "微信 API").await?;
+        if !status.is_success() {
+            bail!("微信 {endpoint} 返回 HTTP {status}");
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).context("微信 API 响应格式无效")?;
+        let ret = value["ret"].as_i64().unwrap_or(0);
+        let errcode = value["errcode"].as_i64().unwrap_or(0);
+        if ret != 0 || errcode != 0 {
+            bail!("微信 {endpoint} 被拒绝：ret={ret} errcode={errcode}");
+        }
+        Ok(value)
+    }
+
+    pub async fn send_typing(
+        &self,
+        peer: &str,
+        context_token: &str,
+        active: bool,
+    ) -> anyhow::Result<()> {
+        let config = self
+            .post_api(
+                "ilink/bot/getconfig",
+                json!({
+                    "ilink_user_id": peer, "context_token": context_token
+                }),
+            )
+            .await?;
+        let ticket = config["typing_ticket"].as_str().unwrap_or_default();
+        if ticket.is_empty() {
+            return Ok(());
+        }
+        self.post_api(
+            "ilink/bot/sendtyping",
+            json!({
+                "ilink_user_id": peer, "typing_ticket": ticket,
+                "status": if active { 1 } else { 2 }
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn download_media(
+        &self,
+        item: &serde_json::Value,
+        image_aeskey: Option<&str>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let media = &item["media"];
+        let encrypted_query_param = media["encrypt_query_param"].as_str().unwrap_or_default();
+        let url = if !encrypted_query_param.is_empty() {
+            let mut url = reqwest::Url::parse(&format!("{CDN_BASE_URL}/download"))?;
+            url.query_pairs_mut()
+                .append_pair("encrypted_query_param", encrypted_query_param);
+            url
+        } else {
+            let full_url = media["full_url"].as_str().context("微信媒体缺少下载地址")?;
+            checked_cdn_url(full_url)?
+        };
+        let response = self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .context("下载微信媒体失败")?;
+        let (status, mut bytes) =
+            read_response_limited(response, MAX_MEDIA_BYTES, "微信媒体").await?;
+        if !status.is_success() {
+            bail!("下载微信媒体失败：HTTP {status}");
+        }
+        let key = if let Some(hex) = image_aeskey.filter(|value| !value.is_empty()) {
+            parse_hex_key(hex)?
+        } else if let Some(encoded) = media["aes_key"].as_str().filter(|value| !value.is_empty()) {
+            parse_media_key(encoded)?
+        } else {
+            return Ok(bytes);
+        };
+        decrypt_media(&mut bytes, &key)?;
+        Ok(bytes)
+    }
+
+    pub async fn send_file(
+        &self,
+        peer: &str,
+        context_token: &str,
+        path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let bytes = std::fs::read(path).context("读取待发送文件失败")?;
+        if bytes.len() > MAX_MEDIA_BYTES {
+            bail!("附件超过 25 MiB 限制");
+        }
+        let key = Uuid::new_v4().into_bytes();
+        let file_key = Uuid::new_v4().simple().to_string();
+        let digest = format!("{:x}", Md5::digest(&bytes));
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("附件文件名无效")?;
+        let is_image = matches!(
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "jpg" | "jpeg" | "png" | "webp" | "gif"
+        );
+        let mut encrypted = bytes.clone();
+        encrypt_media(&mut encrypted, &key);
+        let upload = self
+            .post_api(
+                "ilink/bot/getuploadurl",
+                json!({
+                    "filekey": file_key, "media_type": if is_image { 1 } else { 3 },
+                    "to_user_id": peer, "rawsize": bytes.len(), "rawfilemd5": digest,
+                    "filesize": encrypted.len(), "no_need_thumb": true,
+                    "aeskey": hex_key(&key)
+                }),
+            )
+            .await?;
+        let upload_url =
+            if let Some(full_url) = upload["upload_full_url"].as_str().filter(|s| !s.is_empty()) {
+                checked_cdn_url(full_url)?
+            } else {
+                let param = upload["upload_param"]
+                    .as_str()
+                    .context("微信未返回上传地址")?;
+                let mut url = reqwest::Url::parse(&format!("{CDN_BASE_URL}/upload"))?;
+                url.query_pairs_mut()
+                    .append_pair("encrypted_query_param", param)
+                    .append_pair("filekey", &file_key);
+                url
+            };
+        let response = self
+            .client
+            .post(upload_url)
+            .header("Content-Type", "application/octet-stream")
+            .body(encrypted.clone())
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .context("上传微信附件失败")?;
+        if !response.status().is_success() {
+            bail!("上传微信附件失败：HTTP {}", response.status());
+        }
+        let encrypted_param = response
+            .headers()
+            .get("x-encrypted-param")
+            .and_then(|header| header.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .context("微信附件上传缺少 encrypted-param")?
+            .to_string();
+        let aes_key = base64::engine::general_purpose::STANDARD.encode(hex_key(&key));
+        let media = json!({ "encrypt_query_param": encrypted_param, "aes_key": aes_key, "encrypt_type": 1 });
+        let item = if is_image {
+            json!({ "type": 2, "image_item": { "media": media, "mid_size": encrypted.len() } })
+        } else {
+            json!({ "type": 4, "file_item": { "media": media, "file_name": filename, "len": bytes.len().to_string() } })
+        };
+        self.post_api("ilink/bot/sendmessage", json!({
+            "msg": { "from_user_id": "", "to_user_id": peer, "client_id": Uuid::new_v4().to_string(),
+                "message_type": 2, "message_state": 2, "item_list": [item], "context_token": context_token },
+            "base_info": { "channel_version": CHANNEL_VERSION }
+        })).await?;
+        Ok(())
+    }
+
     pub async fn send_text_chunks(
         &self,
         to_user_id: &str,
@@ -336,6 +536,11 @@ impl WeixinClient {
 
     fn route_headers(&self, qr_status: bool) -> anyhow::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
+        headers.insert("ilink-app-id", HeaderValue::from_static("bot"));
+        headers.insert(
+            "ilink-app-clientversion",
+            HeaderValue::from_static("131584"),
+        );
         if qr_status {
             headers.insert("ilink-app-clientversion", HeaderValue::from_static("1"));
         }
@@ -354,6 +559,86 @@ pub fn render_qr_svg(content: &str) -> anyhow::Result<String> {
         .dark_color(qrcode::render::svg::Color("#111827"))
         .light_color(qrcode::render::svg::Color("#ffffff"))
         .build())
+}
+
+fn checked_cdn_url(value: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value).context("微信媒体地址无效")?;
+    if url.scheme() != "https"
+        || !matches!(
+            url.host_str(),
+            Some(
+                "novac2c.cdn.weixin.qq.com"
+                    | "ilinkai.weixin.qq.com"
+                    | "wx.qlogo.cn"
+                    | "thirdwx.qlogo.cn"
+                    | "res.wx.qq.com"
+                    | "mmbiz.qpic.cn"
+                    | "mmbiz.qlogo.cn"
+            )
+        )
+    {
+        bail!("微信媒体地址不在允许的 CDN 域名内");
+    }
+    Ok(url)
+}
+
+fn parse_hex_key(value: &str) -> anyhow::Result<[u8; 16]> {
+    if value.len() != 32 {
+        bail!("微信媒体 AES 密钥长度无效");
+    }
+    let mut key = [0_u8; 16];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .context("微信媒体 AES 密钥格式无效")?;
+    }
+    Ok(key)
+}
+
+fn parse_media_key(value: &str) -> anyhow::Result<[u8; 16]> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .context("微信媒体 AES 密钥编码无效")?;
+    if raw.len() == 16 {
+        return raw
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("微信媒体 AES 密钥长度无效"));
+    }
+    let hex = std::str::from_utf8(&raw).context("微信媒体 AES 密钥格式无效")?;
+    parse_hex_key(hex)
+}
+
+fn hex_key(key: &[u8; 16]) -> String {
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn encrypt_media(bytes: &mut Vec<u8>, key: &[u8; 16]) {
+    let pad = 16 - bytes.len() % 16;
+    bytes.extend(std::iter::repeat_n(pad as u8, pad));
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    for block in bytes.chunks_exact_mut(16) {
+        cipher.encrypt_block(GenericArray::from_mut_slice(block));
+    }
+}
+
+fn decrypt_media(bytes: &mut Vec<u8>, key: &[u8; 16]) -> anyhow::Result<()> {
+    if bytes.is_empty() || bytes.len() % 16 != 0 {
+        bail!("微信媒体密文长度无效");
+    }
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    for block in bytes.chunks_exact_mut(16) {
+        cipher.decrypt_block(GenericArray::from_mut_slice(block));
+    }
+    let pad = *bytes.last().unwrap() as usize;
+    if pad == 0
+        || pad > 16
+        || !bytes[bytes.len() - pad..]
+            .iter()
+            .all(|byte| *byte as usize == pad)
+    {
+        bail!("微信媒体解密校验失败");
+    }
+    bytes.truncate(bytes.len() - pad);
+    Ok(())
 }
 
 async fn read_response_limited(
@@ -509,5 +794,17 @@ mod tests {
         let svg = render_qr_svg("https://example.test/login").unwrap();
         assert!(svg.starts_with("<?xml"));
         assert!(svg.contains("<svg"));
+    }
+
+    #[test]
+    fn media_crypto_round_trip_and_rejects_untrusted_url() {
+        let key = [7_u8; 16];
+        let mut bytes = b"private image data".to_vec();
+        encrypt_media(&mut bytes, &key);
+        assert_ne!(bytes, b"private image data");
+        decrypt_media(&mut bytes, &key).unwrap();
+        assert_eq!(bytes, b"private image data");
+        assert!(checked_cdn_url("https://evil.example/media").is_err());
+        assert!(checked_cdn_url("http://novac2c.cdn.weixin.qq.com/media").is_err());
     }
 }

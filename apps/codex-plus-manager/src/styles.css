@@ -3872,13 +3872,33 @@ body {
 .weixin-connect-page {
   display: grid;
   gap: 16px;
-  width: min(100%, 1120px);
+  width: min(100%, 1180px);
   margin: 0 auto;
+}
+
+details.official-model-catalog-status > summary {
+  cursor: pointer;
+}
+
+details.official-model-catalog-status:not([open]) > :not(summary) {
+  display: none;
+}
+
+.weixin-main-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(310px, 0.9fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.weixin-main-grid > * {
+  min-width: 0;
 }
 
 .panel.weixin-status-panel {
   position: relative;
   overflow: hidden;
+  background: radial-gradient(circle at 100% 0%, hsl(var(--status-success) / 0.11), transparent 38%), hsl(var(--card));
 }
 
 .weixin-status-panel::before {
@@ -3898,31 +3918,33 @@ body {
 }
 
 .weixin-status-content {
-  padding: 16px 18px 14px !important;
+  padding: 24px !important;
 }
 
 .weixin-connect-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
+  gap: 18px;
+  flex-wrap: wrap;
 }
 
 .weixin-status-primary {
   display: grid;
-  grid-template-columns: 38px minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: 48px minmax(0, 1fr);
+  gap: 14px;
   align-items: center;
   min-width: 0;
+  flex: 1 1 360px;
 }
 
 .weixin-status-icon {
   display: grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
+  width: 48px;
+  height: 48px;
   border: 1px solid hsl(var(--border));
-  border-radius: 8px;
+  border-radius: 12px;
   background: hsl(var(--surface-raised));
   color: hsl(var(--muted-foreground));
 }
@@ -3935,20 +3957,21 @@ body {
 
 .weixin-connect-head h2 {
   margin: 0;
-  font-size: 18px;
+  font-size: 20px;
   letter-spacing: 0;
 }
 
 .weixin-connect-head .muted {
-  margin: 4px 0 0;
-  font-size: 12px;
-  line-height: 1.4;
+  margin: 7px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .weixin-connect-actions {
   flex: 0 0 auto;
   justify-content: flex-end;
   margin-top: 0;
+  flex-wrap: wrap;
 }
 
 .weixin-connect-actions button {
@@ -3957,42 +3980,119 @@ body {
 
 .weixin-runtime-meta {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 112px minmax(0, 1.15fr);
-  gap: 16px;
-  margin-top: 14px;
-  border-top: 1px solid hsl(var(--border));
-  padding-top: 13px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 24px;
 }
 
 .weixin-runtime-meta > div {
   min-width: 0;
+  border: 1px solid hsl(var(--border));
+  border-radius: 12px;
+  background: hsl(var(--background) / 0.7);
+  padding: 15px 16px;
 }
 
 .weixin-runtime-meta span,
-.weixin-runtime-meta strong,
-.weixin-runtime-meta code {
+.weixin-runtime-meta strong {
   display: block;
 }
 
 .weixin-runtime-meta span {
-  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 8px;
   color: hsl(var(--muted-foreground));
-  font-size: 11px;
-  font-weight: 500;
-}
-
-.weixin-runtime-meta strong,
-.weixin-runtime-meta code {
-  overflow: hidden;
-  color: hsl(var(--foreground));
   font-size: 12px;
   font-weight: 600;
+}
+
+.weixin-runtime-meta strong {
+  overflow: hidden;
+  color: hsl(var(--foreground));
+  font-size: 18px;
+  font-weight: 700;
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.weixin-runtime-meta code {
+.weixin-stage.is-connected,
+.weixin-stage.is-ready {
+  border-color: hsl(var(--status-success) / 0.4);
+  background: hsl(var(--status-success) / 0.065);
+}
+
+.weixin-stage.is-connected span svg,
+.weixin-stage.is-ready span svg {
+  color: hsl(var(--status-success));
+}
+
+.weixin-stage.is-error,
+.weixin-stage.is-needs_login {
+  border-color: hsl(var(--status-error) / 0.42);
+  background: hsl(var(--status-error) / 0.06);
+}
+
+.weixin-stage.is-error span svg,
+.weixin-stage.is-needs_login span svg {
+  color: hsl(var(--status-error));
+}
+
+.weixin-runtime-details {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(100px, 0.6fr) minmax(0, 1fr);
+  gap: 16px;
+  margin-top: 16px;
+  padding-top: 15px;
+  border-top: 1px solid hsl(var(--border) / 0.75);
+}
+
+.weixin-runtime-details > div {
+  min-width: 0;
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  font-size: 11px;
+}
+
+.weixin-runtime-details span {
+  flex: 0 0 auto;
+  color: hsl(var(--muted-foreground));
+}
+
+.weixin-runtime-details strong,
+.weixin-runtime-details code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: hsl(var(--foreground));
+  font-size: 11px;
+}
+
+.weixin-status-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 14px;
+  border: 1px solid hsl(var(--status-error) / 0.25);
+  border-radius: 9px;
+  background: hsl(var(--status-error) / 0.075);
+  padding: 11px 13px;
+  color: hsl(var(--foreground));
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.weixin-status-alert svg {
+  flex: 0 0 auto;
+  color: hsl(var(--status-error));
+}
+
+.weixin-runtime-details code {
   font-family: var(--font-mono);
 }
 
@@ -4019,8 +4119,8 @@ body {
 
 .weixin-form-section {
   display: grid;
-  grid-template-columns: 140px minmax(0, 1fr);
-  gap: 22px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
   padding: 20px;
 }
 
@@ -4033,7 +4133,7 @@ body {
   align-items: center;
   align-self: start;
   gap: 8px;
-  min-height: 40px;
+  min-height: 22px;
   color: hsl(var(--muted-foreground));
 }
 
@@ -4045,8 +4145,115 @@ body {
 
 .weixin-form-fields {
   display: grid;
-  gap: 15px;
-  width: min(100%, 760px);
+  gap: 16px;
+  width: 100%;
+}
+
+.weixin-model-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 40px auto;
+  gap: 8px;
+}
+
+.weixin-model-picker > button {
+  width: 40px;
+  height: 40px;
+}
+
+.weixin-model-warning {
+  color: hsl(var(--status-error));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.weixin-model-success {
+  color: hsl(var(--status-success));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.weixin-inbox-sections {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.weixin-inbox-sections > strong {
+  margin-top: 12px;
+  border-top: 1px solid hsl(var(--border));
+  padding-top: 16px;
+  font-size: 13px;
+}
+
+.weixin-inbox-sections > strong:first-child {
+  margin-top: 0;
+  border-top: 0;
+  padding-top: 0;
+}
+
+.weixin-inbox-sections > small {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.weixin-inbox-count {
+  display: inline-block;
+  min-width: 22px;
+  margin-left: 4px;
+  border-radius: 999px;
+  background: hsl(var(--muted));
+  padding: 2px 6px;
+  text-align: center;
+}
+
+.weixin-inbox-row,
+.weixin-failed-row {
+  border: 1px solid hsl(var(--border));
+  border-radius: 9px;
+  background: hsl(var(--surface-raised));
+  padding: 10px;
+}
+
+.weixin-inbox-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.weixin-inbox-row code,
+.weixin-failed-row code {
+  min-width: 0;
+  margin-right: auto;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.weixin-failed-row {
+  display: grid;
+  gap: 9px;
+  border-color: hsl(var(--status-error) / 0.2);
+}
+
+.weixin-failed-row small,
+.weixin-queue-hint {
+  margin: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.weixin-failed-actions {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.weixin-queue-hint {
+  border-radius: 8px;
+  background: hsl(var(--accent) / 0.1);
+  padding: 9px 10px;
 }
 
 .weixin-connect-form .field {
@@ -4229,6 +4436,12 @@ body {
   height: auto;
 }
 
+@media (max-width: 980px) {
+  .weixin-main-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 @media (max-width: 760px) {
   .weixin-connect-head {
     display: grid;
@@ -4240,7 +4453,20 @@ body {
 
   .weixin-runtime-meta,
   .weixin-form-section {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .weixin-runtime-details {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+  }
+
+  .weixin-model-picker {
+    grid-template-columns: minmax(0, 1fr) 40px;
+  }
+
+  .weixin-model-picker > button:last-child {
+    grid-column: 1 / -1;
   }
 
   .weixin-form-section {

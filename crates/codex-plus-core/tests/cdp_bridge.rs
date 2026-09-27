@@ -2887,7 +2887,8 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"8\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"10\""));
+    assert!(script.contains("patchCodexVscodeRequestTransport"));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -2900,7 +2901,10 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("modelWhitelistUnlock"));
     assert!(!script.contains("|| settingsResp.relayProfiles[0]"));
     assert!(script.contains("refreshCodexModelWhitelistFromScan"));
-    assert!(script.contains("codexPlusModelListRequestIds.size === 0"));
+    assert!(script.contains(
+        "requestMethod !== \"model/list\" && !codexPlusModelListRequestIds.has(requestId)"
+    ));
+    assert!(script.contains("Object.getOwnPropertyDescriptor(MessageEvent.prototype, \"data\")"));
     assert!(!script.contains("function patchReactModelState"));
     assert!(!script.contains("function patchObjectGraphForModels"));
     assert!(!script.contains("window.dispatchEvent = function patchedCodexPlusDispatchEvent"));
@@ -2918,7 +2922,7 @@ fn injection_script_unlocks_custom_model_catalog() {
 fn model_whitelist_never_claims_the_host_default_model() {
     let script = assets::injection_script(57321);
     let start = script
-        .find("function codexPlusModelDescriptor(modelName)")
+        .find("function codexPlusModelDescriptor(modelName, availableModels = [])")
         .expect("model descriptor patch should exist");
     let end = script[start..]
         .find("\n  function statsigClients()")
@@ -2938,6 +2942,7 @@ const codexModelCatalog = {{
   model_provider: "custom",
 }};
 const codexPlusModelMetadata = () => null;
+const codexPlusModelDisplayName = (_metadata, modelName) => modelName;
 const modelReasoningEfforts = () => [];
 const applyCodexPlusModelMetadata = () => false;
 const codexPlusModelNames = () => ["supplier-default", "extra-model"];
@@ -3131,7 +3136,9 @@ fn injection_script_discovers_app_server_request_clients_without_hardcoded_hash(
 
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
-    assert!(script.contains("[\"use-host-config-\", \"app-server-manager-signals-\"]"));
+    assert!(
+        script.contains("[\"use-host-config-\", \"app-server-manager-signals-\", \"app-shared-\"]")
+    );
     assert!(script.contains("loadOptionalCodexAppModule(assetPrefix)"));
     assert!(script.contains("candidateCount: candidates.length"));
     assert!(script.contains("discovery:"));

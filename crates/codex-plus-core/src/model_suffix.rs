@@ -422,19 +422,24 @@ fn model_template_entry(slug: &str) -> (Value, bool) {
 }
 
 fn trusted_official_metadata_slug(slug: &str) -> Option<String> {
-    let normalized = crate::aggregate_model_alias::normalize_requested_model_name(slug);
-    let candidate = if crate::aggregate_model_alias::is_trusted_official_codex_model(&normalized) {
-        normalized.as_str()
+    let trimmed = slug.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 只有裸官方 slug 或 Codex++ 自己生成的 CLIProxyAPI: 别名可以继承官方
+    // capability。不能把任意“供应商:gpt-*”或 provider/model 路径伪装成官方模型。
+    let candidate = if crate::official_model_catalog::is_trusted_official_model(trimmed) {
+        trimmed
+    } else if let Some(target) = trimmed
+        .strip_prefix("CLIProxyAPI:")
+        .or_else(|| trimmed.strip_prefix("cliproxyapi:"))
+    {
+        target.trim().rsplit('/').next().unwrap_or_default().trim()
     } else {
-        slug.trim()
-            .rsplit_once(':')
-            .map(|(_, model)| model)
-            .unwrap_or(slug)
-            .trim()
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
+        return None;
     };
+
     crate::official_model_catalog::is_trusted_official_model(candidate)
         .then(|| candidate.to_string())
 }

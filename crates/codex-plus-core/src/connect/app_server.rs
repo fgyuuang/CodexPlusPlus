@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -13,6 +14,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// app-server 起不来时保留多少行 stderr 用于报错。
 const STDERR_TAIL_LINES: usize = 8;
 const TURN_TIMEOUT: Duration = Duration::from_secs(600);
+const RECONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct AppServerConfig {
@@ -92,6 +94,40 @@ fn validate_codex_executable(executable: &str) -> anyhow::Result<()> {
 }
 
 impl CodexAppServer {
+    pub async fn list_models(&mut self) -> anyhow::Result<Vec<String>> {
+        let mut cursor: Option<String> = None;
+        let mut models = Vec::new();
+        let mut seen = HashSet::new();
+        for _ in 0..10 {
+            let params = cursor.as_ref().map_or_else(
+                || json!({ "includeHidden": true }),
+                |value| json!({ "cursor": value, "includeHidden": true }),
+            );
+            let result = self.request("model/list", params, REQUEST_TIMEOUT).await?;
+            let data = result["data"]
+                .as_array()
+                .context("Codex 模型列表格式无效")?;
+            for item in data {
+                if let Some(id) = item["id"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    && seen.insert(id.to_string())
+                {
+                    models.push(id.to_string());
+                }
+            }
+            cursor = result["nextCursor"]
+                .as_str()
+                .map(str::to_string)
+                .filter(|value| !value.is_empty());
+            if cursor.is_none() {
+                return Ok(models);
+            }
+        }
+        bail!("Codex 模型列表分页过多，无法完整读取")
+    }
+
     pub async fn start(config: AppServerConfig) -> anyhow::Result<Self> {
         let executable = if config.executable.trim().is_empty() {
             "codex"
@@ -107,6 +143,8 @@ impl CodexAppServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
         let mut child = command.spawn().map_err(|error| {
             let hint = match error.kind() {
                 std::io::ErrorKind::NotFound => {
@@ -189,14 +227,24 @@ impl CodexAppServer {
         thread_id: &str,
         prompt: &str,
     ) -> anyhow::Result<AppServerTurnResult> {
+        self.run_turn_items(
+            thread_id,
+            vec![json!({
+                "type": "text", "text": prompt, "text_elements": []
+            })],
+        )
+        .await
+    }
+
+    pub async fn run_turn_items(
+        &mut self,
+        thread_id: &str,
+        input: Vec<Value>,
+    ) -> anyhow::Result<AppServerTurnResult> {
         let id = self.take_request_id();
         let mut params = json!({
             "threadId": thread_id,
-            "input": [{
-                "type": "text",
-                "text": prompt,
-                "text_elements": []
-            }],
+            "input": input,
             "approvalPolicy": "never"
         });
         if !self.config.model.trim().is_empty() {
@@ -216,12 +264,28 @@ impl CodexAppServer {
         let mut model = self.config.model.trim().to_string();
         let mut usage = TurnUsage::default();
         let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
+        let mut reconnect_until: Option<tokio::time::Instant> = None;
         while !response_received || !turn_completed {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 bail!("等待 Codex 回复超时");
             }
-            let message = self.read_message(remaining).await?;
+            let wait = reconnect_until.map_or(remaining, |until| {
+                remaining.min(until.saturating_duration_since(tokio::time::Instant::now()))
+            });
+            if wait.is_zero() {
+                bail!("Codex 网络重连超过 60 秒，请检查当前模型与网络后手动重试消息");
+            }
+            let message = match self.read_message(wait).await {
+                Ok(message) => message,
+                Err(error)
+                    if reconnect_until
+                        .is_some_and(|until| tokio::time::Instant::now() >= until) =>
+                {
+                    bail!("Codex 网络重连超过 60 秒：{error}")
+                }
+                Err(error) => return Err(error),
+            };
             if is_server_request(&message) {
                 self.reject_server_request(&message).await?;
                 continue;
@@ -254,18 +318,34 @@ impl CodexAppServer {
             match message.get("method").and_then(Value::as_str) {
                 Some("item/completed") => {
                     if let Some(text) = extract_completed_agent_text(&message) {
+                        reconnect_until = None;
                         if !reply_parts.iter().any(|part| part == &text) {
                             reply_parts.push(text);
                         }
                     }
                 }
-                Some("turn/completed") => turn_completed = true,
-                Some("thread/status/changed") if thread_status_is_idle(&message) => {
+                Some("turn/completed") => {
+                    if let Some(error) = turn_failure_message(&message) {
+                        bail!("Codex 回合失败：{error}");
+                    }
+                    turn_completed = true;
+                }
+                Some("thread/status/changed")
+                    if thread_status_is_idle(&message)
+                        && !reply_parts.is_empty()
+                        && reconnect_until.is_none() =>
+                {
                     turn_completed = true;
                 }
                 Some("error") => {
                     let error = deep_string(message.get("params"), &["message", "error"])
                         .unwrap_or_else(|| "Codex app-server 返回未知错误".to_string());
+                    if is_reconnect_notice(&error) {
+                        reconnect_until.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + RECONNECT_WAIT_TIMEOUT
+                        });
+                        continue;
+                    }
                     bail!("{error}");
                 }
                 _ => {}
@@ -574,6 +654,24 @@ fn thread_status_is_idle(message: &Value) -> bool {
         == Some("idle")
 }
 
+fn is_reconnect_notice(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("reconnecting") && message.contains("network")
+}
+
+fn turn_failure_message(message: &Value) -> Option<String> {
+    let turn = message.pointer("/params/turn")?;
+    let status = turn["status"]
+        .as_str()
+        .or_else(|| turn["status"]["type"].as_str())?;
+    if !matches!(status, "failed" | "interrupted" | "cancelled") {
+        return None;
+    }
+    Some(
+        deep_string(turn.get("error"), &["message", "error"]).unwrap_or_else(|| status.to_string()),
+    )
+}
+
 fn deep_string(value: Option<&Value>, keys: &[&str]) -> Option<String> {
     let value = value?;
     if let Some(text) = value.as_str() {
@@ -614,6 +712,25 @@ mod tests {
             extract_turn_id(&json!({"turn": {"id": "turn-1"}})).as_deref(),
             Some("turn-1")
         );
+    }
+
+    #[test]
+    fn reconnect_notice_is_transient_and_failed_turn_is_not_success() {
+        assert!(is_reconnect_notice("Reconnecting... waiting for network"));
+        assert!(!is_reconnect_notice("invalid model"));
+        let failed = json!({
+            "method": "turn/completed",
+            "params": {"turn": {"status": "failed", "error": {"message": "unknown model"}}}
+        });
+        assert_eq!(
+            turn_failure_message(&failed).as_deref(),
+            Some("unknown model")
+        );
+        let completed = json!({
+            "method": "turn/completed",
+            "params": {"turn": {"status": "completed"}}
+        });
+        assert_eq!(turn_failure_message(&completed), None);
     }
 
     #[test]

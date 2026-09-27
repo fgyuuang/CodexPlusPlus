@@ -179,7 +179,7 @@ fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
 }
 
 #[test]
-fn trusted_provider_gpt_aliases_inherit_native_codex_tool_experience() {
+fn only_cliproxy_official_aliases_inherit_official_model_metadata() {
     let entries = collect_catalog_entries(
         "CLIProxyAPI:gpt-5.5\n供应商一:gpt-5.5\ngpt-5.5(供应商一)",
         &HashMap::new(),
@@ -190,32 +190,34 @@ fn trusted_provider_gpt_aliases_inherit_native_codex_tool_experience() {
         serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
     let models = catalog["models"].as_array().unwrap();
 
-    for slug in [
-        "CLIProxyAPI:gpt-5.5",
-        "供应商一:gpt-5.5",
-        "gpt-5.5(供应商一)",
-    ] {
-        let model = models.iter().find(|model| model["slug"] == slug).unwrap();
-        assert_eq!(model["display_name"], slug);
-        assert_eq!(model["tool_mode"], "code_mode_only");
-        assert_eq!(model["shell_type"], "shell_command");
-        assert_eq!(model["apply_patch_tool_type"], "freeform");
-        assert_eq!(model["supports_search_tool"], true);
-        assert!(
-            model["supported_reasoning_levels"]
-                .as_array()
-                .is_some_and(|levels| levels.iter().any(|level| level["effort"] == "xhigh"))
-        );
-        assert!(
-            model["additional_speed_tiers"]
-                .as_array()
-                .is_some_and(|tiers| tiers.iter().any(|tier| tier == "fast"))
-        );
-        assert!(
-            model["base_instructions"]
-                .as_str()
-                .is_some_and(|instructions| !instructions.trim().is_empty())
-        );
+    let cliproxy_model = models
+        .iter()
+        .find(|model| model["slug"] == "CLIProxyAPI:gpt-5.5")
+        .unwrap();
+    assert_eq!(cliproxy_model["display_name"], "CLIProxyAPI:gpt-5.5");
+    assert_eq!(cliproxy_model["tool_mode"], "code_mode_only");
+    assert_eq!(cliproxy_model["shell_type"], "shell_command");
+    assert_eq!(cliproxy_model["apply_patch_tool_type"], "freeform");
+    assert_eq!(cliproxy_model["supports_search_tool"], true);
+    assert!(
+        cliproxy_model["supported_reasoning_levels"]
+            .as_array()
+            .is_some_and(|levels| levels.iter().any(|level| level["effort"] == "xhigh"))
+    );
+    assert!(
+        cliproxy_model["additional_speed_tiers"]
+            .as_array()
+            .is_some_and(|tiers| tiers.iter().any(|tier| tier == "fast"))
+    );
+    assert!(
+        cliproxy_model["base_instructions"]
+            .as_str()
+            .is_some_and(|instructions| !instructions.trim().is_empty())
+    );
+
+    for slug in ["供应商一:gpt-5.5", "gpt-5.5(供应商一)"] {
+        assert!(!requires_bundled_metadata_catalog(slug));
+        assert!(model_ui_metadata(slug).is_none());
     }
 
     assert_eq!(

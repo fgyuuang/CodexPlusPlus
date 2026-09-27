@@ -1901,6 +1901,64 @@ enabled = true
 }
 
 #[test]
+fn sync_live_config_context_entries_preserves_codex_app_host_configuration() {
+    let live = r#"model = "gpt-5"
+
+[mcp_servers.codex_app]
+enabled_tools = ["read_thread", "list_threads"]
+disabled_tools = ["delete_thread"]
+startup_timeout_sec = 12
+tool_timeout_sec = 90
+
+[plugins."codex-app-tools@openai-bundled"]
+enabled = true
+"#;
+    let managed = r#"[mcp_servers.codex_app]
+enabled_tools = ["read_thread"]
+startup_timeout_sec = 2
+
+[plugins."codex-app-tools@openai-bundled"]
+enabled = false
+"#;
+
+    let updated = sync_live_config_context_entries(live, managed).unwrap();
+
+    assert!(updated.contains("[mcp_servers.codex_app]"));
+    assert!(updated.contains("startup_timeout_sec = 12"));
+    assert!(updated.contains("tool_timeout_sec = 90"));
+    assert!(updated.contains("disabled_tools = [\"delete_thread\"]"));
+    assert!(updated.contains("[plugins.\"codex-app-tools@openai-bundled\"]"));
+    assert!(updated.contains("enabled = true"));
+}
+
+#[test]
+fn merge_common_config_does_not_replace_codex_app_host_subtables() {
+    let target = r#"[mcp_servers.codex_app]
+enabled_tools = ["read_thread"]
+startup_timeout_sec = 12
+
+[plugins."codex-app-tools@openai-bundled"]
+enabled = true
+"#;
+    let common = r#"[mcp_servers.codex_app]
+enabled_tools = ["list_threads"]
+startup_timeout_sec = 2
+tool_timeout_sec = 90
+
+[plugins."codex-app-tools@openai-bundled"]
+enabled = false
+"#;
+
+    let merged =
+        codex_plus_core::relay_config::merge_common_config_into_config(target, common).unwrap();
+
+    assert!(merged.contains("enabled_tools = [\"read_thread\"]"));
+    assert!(merged.contains("startup_timeout_sec = 12"));
+    assert!(merged.contains("tool_timeout_sec = 90"));
+    assert!(merged.contains("enabled = true"));
+}
+
+#[test]
 fn upserts_and_deletes_context_entry_in_common_config() {
     let common = upsert_context_entry_in_common_config(
         "",
@@ -5937,6 +5995,80 @@ experimental_bearer_token = "sk-new"
     assert!(
         config.contains("/mnt/external/catalog.json"),
         "普通路径不属于本次修复范围，必须原样保留：{config}"
+    );
+}
+
+// 官方体验目录写在 CODEX_HOME 根目录。切回聚合/独立 profile 时必须整体替换它，
+// 否则 apply_model_catalog_to_config 会把它当成“用户自定义 catalog”复制进
+// model-catalogs/<profile>.json：模型列表里全是 codex_plus_* / CLIProxyAPI:* 条目，
+// 而 config.toml 里没有对应 provider，选中后既发不出去也提示模型不支持。
+#[test]
+fn switching_from_official_experience_replaces_its_root_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let official_catalog = serde_json::json!({
+        "models": [
+            {"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list"},
+            {"slug": "codex_plus_official_account_2d_2:gpt-6-astra", "visibility": "hide"},
+            {"slug": "CLIProxyAPI:gpt-6-luna", "visibility": "hide"},
+        ]
+    });
+    std::fs::write(
+        temp.path()
+            .join("codex-plus-official-experience-model-catalog.json"),
+        serde_json::to_vec_pretty(&official_catalog).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model_provider = "openai"
+model = "gpt-6-astra"
+model_catalog_json = "codex-plus-official-experience-model-catalog.json"
+
+[model_providers.openai]
+name = "openai"
+wire_api = "responses"
+prefer_websockets = false
+
+[model_providers.codex_plus_cli_official]
+name = "codex_plus_cli_official"
+base_url = "http://127.0.0.1:57321/v1/routes/codex_plus_cli_official"
+"#,
+    )
+    .unwrap();
+
+    let profile = RelayProfile {
+        id: "aggregate".to_string(),
+        name: "聚合".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        model: "deepseek:deepseek-v4-flash".to_string(),
+        model_list: "deepseek:deepseek-v4-flash".to_string(),
+        ..RelayProfile::default()
+    };
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(
+        config.contains(r#"model_catalog_json = "model-catalogs/aggregate.json""#),
+        "{config}"
+    );
+    assert!(
+        !config.contains("codex-plus-official-experience-model-catalog.json"),
+        "官方体验目录的指针必须被替换掉：{config}"
+    );
+
+    let catalog =
+        std::fs::read_to_string(temp.path().join("model-catalogs/aggregate.json")).unwrap();
+    assert!(
+        !catalog.contains("codex_plus_official_"),
+        "官方账号 provider 条目不能泄漏进聚合目录：{catalog}"
+    );
+    assert!(
+        !catalog.contains("CLIProxyAPI:gpt-6-luna"),
+        "CLIProxyAPI 条目不能泄漏进聚合目录：{catalog}"
+    );
+    assert!(
+        catalog.contains("deepseek:deepseek-v4-flash"),
+        "聚合目录必须来自当前 profile：{catalog}"
     );
 }
 

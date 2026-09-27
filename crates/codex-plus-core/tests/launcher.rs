@@ -15,7 +15,7 @@ use codex_plus_core::launcher::{
     build_macos_cleanup_command, build_macos_open_command,
     build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
     build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
-    select_macos_debug_launch_action,
+    select_macos_debug_launch_action, should_restart_existing_windows_codex_before_launch,
 };
 #[cfg(windows)]
 use codex_plus_core::launcher::{WindowsProcessControlStrategy, windows_process_control_strategy};
@@ -127,19 +127,29 @@ fn app_paths_find_latest_windows_package_checks_roots_before_fallback() {
     assert!(latest.ends_with("OpenAI.Codex_26.513.3673.0_x64__abc/app"));
 }
 
-#[cfg(windows)]
 #[test]
-fn app_paths_keep_explicit_store_path_override_without_re_resolving() {
+fn app_paths_keep_explicit_standalone_path() {
     let temp = tempfile::tempdir().unwrap();
-    let explicit = temp
-        .path()
-        .join("OpenAI.Codex_26.707.3748.0_x64__abc")
-        .join("app");
+    let explicit = temp.path().join("portable-codex");
     std::fs::create_dir_all(&explicit).unwrap();
+    std::fs::write(explicit.join("Codex.exe"), "").unwrap();
 
     let resolved = resolve_codex_app_dir_with_saved(Some(&explicit), None);
 
     assert_eq!(resolved.as_deref(), Some(explicit.as_path()));
+}
+
+#[test]
+fn windows_launch_restarts_existing_codex_without_requested_debug_port() {
+    assert!(should_restart_existing_windows_codex_before_launch(
+        true, false
+    ));
+    assert!(!should_restart_existing_windows_codex_before_launch(
+        true, true
+    ));
+    assert!(!should_restart_existing_windows_codex_before_launch(
+        false, false
+    ));
 }
 
 #[test]

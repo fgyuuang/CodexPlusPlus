@@ -106,6 +106,169 @@ function usageAlertRuntime(renderer: string, cards: FakeElement[], managed: Fake
   return { runtime: create(windowValue, document, FakeElement), selectors, windowValue };
 }
 
+type UsageLimitNodeInit = {
+  text?: string;
+  position?: string;
+  dismissLabel?: string;
+  inert?: boolean;
+  pointerEvents?: string;
+};
+
+class UsageLimitNode {
+  attributes = new Map<string, string>();
+  children: UsageLimitNode[] = [];
+  parentElement: UsageLimitNode | null = null;
+  style: Record<string, string> = {};
+  innerText: string;
+  clickCount = 0;
+  disabled = false;
+  readonly positionValue: string;
+  private readonly dismissLabel: string;
+
+  constructor(init: UsageLimitNodeInit = {}) {
+    this.innerText = init.text ?? "";
+    this.positionValue = init.position ?? "";
+    this.dismissLabel = init.dismissLabel ?? "";
+    if (init.inert) this.attributes.set("inert", "");
+    if (init.pointerEvents) this.style.pointerEvents = init.pointerEvents;
+  }
+
+  get textContent() {
+    return this.innerText;
+  }
+
+  appendChild(child: UsageLimitNode) {
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+
+  closest() {
+    return null;
+  }
+
+  getAttribute(name: string) {
+    if (name === "aria-label") return this.dismissLabel || null;
+    return this.attributes.get(name) ?? null;
+  }
+
+  setAttribute(name: string, value: string) {
+    this.attributes.set(name, value);
+  }
+
+  hasAttribute(name: string) {
+    return this.attributes.has(name);
+  }
+
+  removeAttribute(name: string) {
+    this.attributes.delete(name);
+  }
+
+  click() {
+    this.clickCount += 1;
+  }
+
+  querySelectorAll(selector: string) {
+    if (selector.startsWith("button")) return this.children.filter((child) => child.dismissLabel);
+    return [];
+  }
+}
+
+type UsageLimitUnblockRuntime = {
+  refreshCodexUsageLimitUnblock: () => void;
+  refreshCodexUsageLimitComposerUnblock: () => void;
+};
+
+function usageLimitUnblockRuntime(
+  renderer: string,
+  dialogs: UsageLimitNode[],
+  composer: UsageLimitNode | null,
+  sendButton: UsageLimitNode | null,
+) {
+  const start = renderer.indexOf("  const codexUsageLimitDialogAttribute = ");
+  const end = renderer.indexOf("\n  let zedRemoteStatusPromise", start);
+  assert.ok(start >= 0 && end > start, "usage limit unblock block not found");
+  const source = renderer.slice(start, end);
+  const diagnostics: Array<{ event: string; detail: Record<string, unknown> }> = [];
+  const body = new UsageLimitNode();
+  const documentElement = new UsageLimitNode();
+  const documentValue = {
+    body,
+    documentElement,
+    querySelectorAll(selector: string) {
+      return selector.includes("aria-modal") ? dialogs : [];
+    },
+  };
+  const windowValue: Record<string, unknown> = {
+    getComputedStyle: (node: UsageLimitNode) => ({ position: node.positionValue }),
+  };
+  const runtimeState = { active: new Set<string>(), pending: new Set<string>() };
+  const create = new Function(
+    "window",
+    "document",
+    "HTMLElement",
+    "sendCodexPlusDiagnostic",
+    "visibleElement",
+    "codexQuotaResumeTextHasMarker",
+    "codexServiceTierFindComposerEl",
+    "codexQuotaResumeNativeSendButton",
+    "codexQuotaResumeEditorIsEmpty",
+    "validThreadScrollSessionKey",
+    "currentSessionRef",
+    "codexQuotaResumeRuntime",
+    "codexPlusSettings",
+    `${source}\nreturn { refreshCodexUsageLimitUnblock, refreshCodexUsageLimitComposerUnblock };`,
+  ) as (
+    windowValue: Record<string, unknown>,
+    documentValue: unknown,
+    elementType: unknown,
+    diagnostic: (event: string, detail: Record<string, unknown>) => void,
+    visible: () => boolean,
+    hasMarker: (text: string) => boolean,
+    findComposer: () => UsageLimitNode | null,
+    findSendButton: () => UsageLimitNode | null,
+    editorIsEmpty: () => boolean,
+    normalizeThreadId: (value: string) => string,
+    currentSession: () => { session_id: string },
+    quotaRuntime: () => typeof runtimeState,
+    settings: () => { quotaResume: boolean },
+  ) => UsageLimitUnblockRuntime;
+  const runtime = create(
+    windowValue,
+    documentValue,
+    UsageLimitNode,
+    (event, detail) => diagnostics.push({ event, detail }),
+    () => true,
+    (text: string) => /usage\s*limit|quota|insufficient|额度|配额|限流/.test(String(text).toLowerCase()),
+    () => composer,
+    () => sendButton,
+    () => false,
+    (value: string) => value,
+    () => ({ session_id: "thread-1" }),
+    () => runtimeState,
+    () => ({ quotaResume: true }),
+  );
+  return { runtime, diagnostics, body, runtimeState };
+}
+
+function codexAppToolsProbeRuntime(renderer: string) {
+  const start = renderer.indexOf("  const codexAppToolsProbeSchemaVersion = ");
+  const end = renderer.indexOf("\n  installCodexAppToolsProbe();", start);
+  assert.ok(start >= 0 && end > start, "codex_app probe block not found");
+  const source = renderer.slice(start, end);
+  const diagnostics: Array<{ event: string; detail: Record<string, unknown> }> = [];
+  const factory = new Function(
+    "window",
+    "sendCodexPlusDiagnostic",
+    `${source}\nreturn codexAppToolsProbeEvent;`,
+  ) as (
+    windowValue: Record<string, unknown>,
+    diagnostic: (event: string, detail: Record<string, unknown>) => void,
+  ) => (direction: string, value: unknown) => void;
+  const event = factory({}, (name, detail) => diagnostics.push({ event: name, detail }));
+  return { diagnostics, event };
+}
+
 function installRendererStyle(renderer: string) {
   const start = renderer.indexOf("  function installStyle()");
   const end = renderer.indexOf("\n  function defaultCodexPlusSettings", start);
@@ -143,6 +306,103 @@ function installRendererStyle(renderer: string) {
 }
 
 describe("renderer injection header compatibility", () => {
+  it("keeps source labels and route identities separate from the capability template", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const start = renderer.indexOf("  function codexPlusModelDisplayName(");
+    const end = renderer.indexOf("\n  function modelArrayLooksPatchable", start);
+    assert.ok(start >= 0 && end > start);
+    const routes = new Map([
+      ["codex_plus_official_account_2:gpt-5.4", {
+        displayName: "gpt-5.4(官方账号 2)", displaySuffix: "（模板）",
+        capabilitySlug: "gpt-5.4", sourceKind: "directOfficial", providerId: "codex_plus_official_account_2", priority: 1000,
+      }],
+      ["gpt-5.4(NEW|ECNU:ecnu-reasoner)", {
+        displayName: "gpt-5.4(NEW|ECNU:ecnu-reasoner)", displaySuffix: "（模板）",
+        capabilitySlug: "gpt-5.4", sourceKind: "aggregate", providerId: "codex_plus_aggregate_new",
+      }],
+      ["CLIProxyAPI:qwen3", {
+        displayName: "CLIProxyAPI:qwen3", displaySuffix: "（模板）",
+        capabilitySlug: "gpt-5.4", sourceKind: "cliGeneral", providerId: "codex_plus_cli_general",
+      }],
+      ["CLIProxyAPI:gpt-5.4", {
+        displayName: "CLIProxyAPI:gpt-5.4", displaySuffix: "（模板）",
+        capabilitySlug: "gpt-5.4", sourceKind: "cliOfficial", providerId: "codex_plus_cli_official", priority: 1001,
+      }],
+    ]);
+    const create = new Function(
+      "codexPlusModelMetadata", "modelReasoningEfforts", "codexModelCatalog",
+      `${renderer.slice(start, end)}\nreturn { applyCodexPlusModelMetadata, codexPlusModelDescriptor };`,
+    ) as (
+      metadata: (model: string) => Record<string, string | number | undefined> | undefined,
+      efforts: () => Array<{ reasoningEffort: string }>,
+      catalog: Record<string, string>,
+    ) => {
+      applyCodexPlusModelMetadata: (descriptor: Record<string, unknown>, model: string) => boolean;
+      codexPlusModelDescriptor: (model: string, available: Array<Record<string, unknown>>) => Record<string, unknown>;
+    };
+    const runtime = create((model) => routes.get(model), () => [{ reasoningEffort: "high" }], {});
+    const officialTemplate = { model: "gpt-5.4", displayName: "GPT-5.4", contextWindow: 272000 };
+    for (const [routingSlug, metadata] of routes) {
+      const descriptor = runtime.codexPlusModelDescriptor(routingSlug, [officialTemplate]);
+      assert.equal(descriptor.model, routingSlug);
+      assert.equal(descriptor.slug, routingSlug);
+      assert.equal(descriptor.displayName, metadata.displayName);
+      assert.equal(descriptor.modelProvider, metadata.providerId);
+      assert.equal(descriptor.contextWindow, 272000);
+      if (metadata.priority !== undefined) assert.equal(descriptor.priority, metadata.priority);
+
+      const existing: Record<string, unknown> = { model: routingSlug, displayName: "GPT-5.4", modelProvider: "openai" };
+      assert.equal(runtime.applyCodexPlusModelMetadata(existing, routingSlug), true);
+      assert.equal(existing.model, routingSlug);
+      assert.equal(existing.displayName, metadata.displayName);
+      assert.equal(existing.modelProvider, metadata.providerId);
+      if (metadata.priority !== undefined) assert.equal(existing.priority, metadata.priority);
+    }
+  });
+
+  it("patches current model/list MCP responses without a writable Electron bridge", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const start = renderer.indexOf("  function patchMcpModelResponseData(data) {");
+    const end = renderer.indexOf("\n  function appServerModelRequestMethod", start);
+    assert.ok(start >= 0 && end > start);
+    const patch = new Function(
+      "codexPlusModelUnlockEnabled", "codexPlusModelListRequestIds", "patchModelArray",
+      `${renderer.slice(start, end)}\nreturn patchMcpModelResponseData;`,
+    ) as (enabled: () => boolean, ids: Set<string>, patchArray: (models: unknown[], allowEmpty: boolean) => boolean) => (data: unknown) => boolean;
+    const ids = new Set<string>();
+    const patchArray = (models: unknown[] | undefined, allowEmpty: boolean) => {
+      assert.equal(allowEmpty, true);
+      if (!Array.isArray(models)) return false;
+      models.push({ model: "CLIProxyAPI:deepseek-chat" });
+      return true;
+    };
+    const handle = patch(() => true, ids, patchArray);
+    const response = { type: "mcp-response", requestMethod: "model/list", message: { id: 17, result: { data: [{ model: "gpt-5.4" }] } } };
+    assert.equal(handle(response), true);
+    assert.equal(response.message.result.data.length, 2);
+    assert.equal(handle({ type: "mcp-response", requestMethod: "thread/list", message: { id: 18, result: { data: [] } } }), false);
+  });
+
+  it("patches message data before an already registered Codex listener reads it", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const start = renderer.indexOf("  function patchAppServerModelMessages() {");
+    const end = renderer.indexOf("\n  function patchMcpModelResponseData", start);
+    assert.ok(start >= 0 && end > start);
+    class FakeMessageEvent {
+      private readonly payload: { patched?: boolean };
+      constructor(payload: { patched?: boolean }) { this.payload = payload; }
+      get data() { return this.payload; }
+    }
+    const fakeWindow = { addEventListener() {}, __codexPlusModelMessagePatchInstalled: false };
+    const install = new Function(
+      "window", "MessageEvent", "patchMcpModelResponseData",
+      `${renderer.slice(start, end)}\nreturn patchAppServerModelMessages;`,
+    ) as (windowValue: typeof fakeWindow, eventType: typeof FakeMessageEvent, patch: (data: { patched?: boolean }) => void) => () => void;
+    install(fakeWindow, FakeMessageEvent, (data) => { data.patched = true; })();
+    const event = new FakeMessageEvent({});
+    assert.equal(event.data.patched, true);
+  });
+
   it("纯 API 会话使用当前真实 provider，不强行改成 custom", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
@@ -152,6 +412,17 @@ describe("renderer injection header compatibility", () => {
     );
     assert.match(renderer, /codexPlusBackendSettings\.activeRelayCodexProvider/);
     assert.match(renderer, /codexModelCatalog\?\.codex_model_provider/);
+  });
+
+  it("裸 JSON-RPC 形态的 turn/start 也要被套上第三方 provider", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    // 新版桌面端把 app-server 请求以 { method, params } 派发，不带 send-cli-request-for-host
+    // / start-turn-for-host 这类 type。缺少兜底分支时 provider 覆盖永不生效，
+    // 第三方模型会留在内置 openai provider 上并被 ChatGPT 账号侧拒绝。
+    assert.match(renderer, /String\(message\.method \|\| ""\)\.trim\(\)/);
+    assert.match(renderer, /codexRemoteSessionProviderRequestMethod\(directMethod\)/);
+    // provider 覆盖不能只挂在“模型白名单解锁”这一个开关上。
+    assert.match(renderer, /codexPlusModelUnlockEnabled\(\) \|\| codexRemoteSessionProviderOverrideEnabled\(\)/);
   });
 
   it("adds the session copy shortcut through the native fork action", async () => {
@@ -313,6 +584,38 @@ describe("renderer injection header compatibility", () => {
     assert.doesNotMatch(renderer, /container\.style\.(?:setProperty|removeProperty)\("display"/);
   });
 
+  it("dismisses the upstream usage-limit dialog and leaves other dialogs alone", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const quotaDialog = new UsageLimitNode({
+      text: "You've reached your usage limit. Your limit resets at 3:00 PM.",
+    });
+    const dismissButton = new UsageLimitNode({ dismissLabel: "Close" });
+    quotaDialog.appendChild(dismissButton);
+    const unrelatedDialog = new UsageLimitNode({ text: "Delete this conversation?" });
+    const sendButton = new UsageLimitNode({ dismissLabel: "Send message" });
+    sendButton.disabled = true;
+    const composer = new UsageLimitNode({ inert: true, pointerEvents: "none" });
+    const { runtime, diagnostics } = usageLimitUnblockRuntime(
+      renderer,
+      [quotaDialog, unrelatedDialog],
+      composer,
+      sendButton,
+    );
+
+    runtime.refreshCodexUsageLimitUnblock();
+
+    assert.equal(quotaDialog.getAttribute("data-codex-plus-usage-limit-hidden"), "true");
+    assert.equal(unrelatedDialog.getAttribute("data-codex-plus-usage-limit-hidden"), null);
+    assert.equal(dismissButton.clickCount, 1);
+    assert.equal(diagnostics[diagnostics.length - 1]?.event, "usage_limit_dialog_dismissed");
+
+    runtime.refreshCodexUsageLimitComposerUnblock();
+
+    assert.equal(sendButton.disabled, false);
+    assert.equal(composer.hasAttribute("inert"), false);
+    assert.equal(composer.style.pointerEvents, "");
+  });
+
   it("keeps Windows Dream Skin compatible with the modern Codex main surface", async () => {
     const dreamSkinRenderer = await readFile(
       new URL("../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js", import.meta.url),
@@ -329,6 +632,68 @@ describe("renderer injection header compatibility", () => {
     assert.match(cidalaRenderer, /MainContentSurface/);
     assert.match(cidalaRenderer, /data-codex-plus-dream-surface/);
     assert.match(cidalaRenderer, /ensureShellMain/);
+  });
+});
+
+describe("renderer injection codex_app tool probe", () => {
+  const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  it("resets accumulated tool evidence when a new task scope starts", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const eventStart = renderer.indexOf("  function codexAppToolsProbeEvent(");
+    const eventEnd = renderer.indexOf("\n  function installCodexAppToolsProbe()", eventStart);
+    assert.ok(eventStart >= 0 && eventEnd > eventStart, "codex_app probe event block not found");
+    const eventSource = renderer.slice(eventStart, eventEnd);
+
+    const reset = eventSource.indexOf("if (startsNewThreadScope) resetCodexAppToolsProbeState();");
+    const turnReset = eventSource.indexOf("else if (startsNewTurnScope) resetCodexAppToolsProbeState(true);");
+    const accumulate = eventSource.indexOf("codexAppToolsProbeState.mcpSeen =");
+    assert.ok(reset >= 0 && turnReset > reset && accumulate > turnReset);
+  });
+
+  it("counts tools only after the event is identified as codex_app MCP", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const eventStart = renderer.indexOf("  function codexAppToolsProbeEvent(");
+    const eventEnd = renderer.indexOf("\n  function installCodexAppToolsProbe()", eventStart);
+    assert.ok(eventStart >= 0 && eventEnd > eventStart, "codex_app probe event block not found");
+    const eventSource = renderer.slice(eventStart, eventEnd);
+
+    assert.match(eventSource, /const mcpToolNames = mcpSeen \? toolNames : null;/);
+    assert.match(eventSource, /if \(mcpToolNames\) \{[\s\S]*?mcpToolCount = mcpToolNames\.length;/);
+  });
+
+  it("does not log unrelated thread traffic without tool or model evidence", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const eventStart = renderer.indexOf("  function codexAppToolsProbeEvent(");
+    const eventEnd = renderer.indexOf("\n  function installCodexAppToolsProbe()", eventStart);
+    assert.ok(eventStart >= 0 && eventEnd > eventStart, "codex_app probe event block not found");
+    const eventSource = renderer.slice(eventStart, eventEnd);
+
+    assert.match(eventSource, /const hasContextEvidence = Boolean\(/);
+    assert.match(
+      eventSource,
+      /if \(!mcpSeen && !legacyDynamicCodexApp && !mcpToolNames && !hasContextEvidence\) return;/,
+    );
+    assert.doesNotMatch(eventSource, /const isTurnOrThread =/);
+  });
+
+  it("recognizes a nested mcp__codex_app read_thread tool event", async () => {
+    const runtime = codexAppToolsProbeRuntime(await readFile(rendererPath, "utf8"));
+
+    runtime.event("incoming", {
+      method: "item/completed",
+      params: {
+        item: {
+          namespace: "mcp__codex_app",
+          tool: "read_thread",
+        },
+      },
+    });
+
+    assert.equal(runtime.diagnostics.length, 1);
+    assert.equal(runtime.diagnostics[0]?.event, "codex_app_tools_probe");
+    assert.equal(runtime.diagnostics[0]?.detail.mcpSeen, true);
+    assert.equal(runtime.diagnostics[0]?.detail.mcpHasReadThread, true);
   });
 });
 
@@ -780,6 +1145,119 @@ describe("relay pureApi provider resolution", () => {
     );
 
     assert.equal(runtime.codexRemoteSessionTargetProvider(), "deepseek");
+  });
+});
+
+describe("official experience model and provider switching", () => {
+  it("keeps the selected route on a model-less turn and returns to the official account", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const start = renderer.indexOf("  function codexRemoteSessionActiveProfile(");
+    const end = renderer.indexOf("\n  function codexRemoteSessionStartedThreadId(", start);
+    assert.ok(start >= 0 && end > start);
+    const source = renderer.slice(start, end);
+    const catalog = {
+      default_model: "gpt-6-sol",
+      routeDescriptors: [
+        { routingSlug: "deepseek:deepseek-v4-flash", providerId: "codex_plus_relay_deepseek" },
+        { routingSlug: "gpt-6-sol", providerId: "openai" },
+      ],
+    };
+    const create = new Function(
+      "codexPlusBackendSettings", "codexModelCatalog", "codexCatalogOfficialModels", "sendCodexPlusDiagnostic",
+      `${source}\nreturn { apply: applyCodexRemoteSessionProviderOverride, target: codexRemoteSessionTargetProvider };`,
+    ) as (
+      settings: object,
+      catalog: object,
+      officialModels: () => string[],
+      diagnostic: () => void,
+    ) => {
+      apply: (method: string, params: Record<string, unknown>) => Record<string, unknown>;
+      target: (model?: string) => string;
+    };
+    const runtime = create({ officialExperience: { enabled: true } }, catalog, () => ["gpt-6-sol"], () => {});
+    const threadId = "thread-route-switch";
+    assert.equal(runtime.target(), "", "an absent model must not inherit the catalog default");
+
+    const selected = runtime.apply("thread/settings/update", {
+      threadId, model: "deepseek:deepseek-v4-flash", modelProvider: "openai", reasoningEffort: "high",
+    });
+    assert.deepEqual(selected, {
+      threadId, model: "deepseek:deepseek-v4-flash", modelProvider: "codex_plus_relay_deepseek", reasoningEffort: "high",
+    });
+    const explicitTurn = runtime.apply("turn/start", {
+      threadId, model: "deepseek:deepseek-v4-flash", modelProvider: "openai", input: [],
+    });
+    assert.equal(explicitTurn.modelProvider, "codex_plus_relay_deepseek");
+    const inheritedTurn = runtime.apply("turn/start", { threadId, modelProvider: "openai", input: [] });
+    assert.equal(inheritedTurn.model, "deepseek:deepseek-v4-flash");
+    assert.equal(inheritedTurn.modelProvider, "codex_plus_relay_deepseek");
+    assert.deepEqual(runtime.apply("turn/start", { threadId: "unseen-thread", input: [] }), {
+      threadId: "unseen-thread", input: [],
+    });
+
+    const officialSelection = runtime.apply("thread/settings/update", {
+      threadId, model: "gpt-6-sol", modelProvider: "codex_plus_relay_deepseek", reasoningEffort: "medium",
+    });
+    assert.equal(officialSelection.modelProvider, "openai");
+    const officialTurn = runtime.apply("turn/start", { threadId, input: [] });
+    assert.equal(officialTurn.model, "gpt-6-sol");
+    assert.equal(officialTurn.modelProvider, "openai");
+    assert.throws(() => runtime.apply("turn/start", {
+      threadId, model: "unknown:outside-catalog", modelProvider: "openai", input: [],
+    }), /没有可用的来源路由/);
+  });
+});
+
+describe("vscode model transport routing", () => {
+  it("routes official account 2 and returns to the main official account", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const start = renderer.indexOf("  function patchCodexVscodeRequestTransport(");
+    const end = renderer.indexOf("\n  const appServerModelRequestPatchMaxMisses", start);
+    assert.ok(start >= 0 && end > start);
+    const sent: Array<{ method: string; url: string; options: { body: string } }> = [];
+    const transport = {
+      pendingRequests: new Map(),
+      async sendRequest(method: string, url: string, options: { body: string }) {
+        // Match the current Codex transport shape used for discovery.
+        if (url.startsWith("vscode://codex/") && this.pendingRequests) sent.push({ method, url, options });
+        return { status: 200 };
+      },
+    };
+    const Transport = class { static getInstance() { return transport; } };
+    const catalog = { routeDescriptors: [{ routingSlug: "CLIProxyAPI:gpt-6-sol", providerId: "codex_plus_cli_official" }] };
+    const settings = { officialExperience: { enabled: true } };
+    const create = new Function(
+      "catalog", "settings", "diagnostics", "Transport",
+      `const codexAppServerModelRequestPatchVersion = "9";
+       const codexModelCatalog = catalog;
+       const codexPlusBackendSettings = settings;
+       const appServerModelRequestMethod = (url) => url.slice("vscode://codex/".length);
+       const codexRemoteSessionProviderRequestMethod = (method) => ["thread/start", "turn/start", "thread/settings/update", "thread/resume"].includes(method);
+       const codexRemoteSessionProviderPatchEnabled = () => true;
+       const loadBackendSettingsState = async () => true;
+       const loadCodexModelCatalog = async () => catalog;
+       const codexOfficialExperienceRouteDescriptor = (model) => catalog.routeDescriptors.find((item) => item.routingSlug === model);
+       const normalizeCodexModelReasoningParams = (_method, params) => ({ ...params, modelProvider: params.model.startsWith("CLIProxyAPI:") ? "codex_plus_cli_official" : "openai" });
+       const sendCodexPlusDiagnostic = (event) => diagnostics.push(event);
+       const codexRateLimitUnlockRequestMethod = () => "";
+       const neutralizeCodexRateLimitPayload = (payload) => payload;
+       ${renderer.slice(start, end)}
+       return patchCodexVscodeRequestTransport({ Transport });`,
+    ) as (catalog: object, settings: object, diagnostics: string[], Transport: object) => boolean;
+    const diagnostics: string[] = [];
+    assert.equal(create(catalog, settings, diagnostics, Transport), true);
+    for (const model of ["gpt-6-sol", "CLIProxyAPI:gpt-6-sol", "gpt-6-sol"]) {
+      await transport.sendRequest("POST", "vscode://codex/thread/start", { body: JSON.stringify({ model }) });
+    }
+    assert.deepEqual(sent.map((entry) => JSON.parse(entry.options.body).modelProvider), [
+      "openai", "codex_plus_cli_official", "openai",
+    ]);
+    await assert.rejects(
+      transport.sendRequest("POST", "vscode://codex/thread/start", { body: JSON.stringify({ model: "Unknown:model" }) }),
+      /没有可用的来源路由/,
+    );
+    assert.equal(sent.length, 3);
+    assert.deepEqual(diagnostics, ["model_vscode_request_patch_installed"]);
   });
 });
 

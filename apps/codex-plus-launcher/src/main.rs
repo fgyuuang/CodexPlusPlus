@@ -334,6 +334,11 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     if helper_started {
         hooks.start_helper(helper_port).await?;
     }
+    // 已有 launcher 实例只做窗口激活，绝不在此杀掉/重启桌面端：
+    // 用户正在使用的 ChatGPT 窗口（含 Store 自动更新后无 CDP 的窗口）
+    // 必须保持原样；接管重启只允许发生在用户显式发起的主启动路径
+    // （launch_and_inject_with_hooks → prepare_codex_launch）或 Manager
+    // 显式重启（restart_codex_plus 先停止再拉起）中。
     let launch_result = hooks
         .launch_codex(
             &app_dir,
@@ -509,6 +514,10 @@ impl LaunchHooks for LauncherHooks {
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
         let settings = SettingsStore::default().load().unwrap_or_default();
+        if settings.official_experience.enabled {
+            // 新任务按模型显式保存稳定 provider；启动时不得把共享历史批量改写。
+            return Ok(());
+        }
         let target_provider = codex_plus_data::provider_sync_target_for_settings(&settings);
         let result = tokio::task::spawn_blocking(move || {
             codex_plus_data::run_provider_sync_with_target(None, Some(target_provider))
@@ -682,6 +691,10 @@ impl LaunchHooks for LauncherHooks {
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
         self.core.start_helper(helper_port).await
+    }
+
+    async fn prepare_codex_launch(&self, debug_port: u16) -> anyhow::Result<()> {
+        self.core.prepare_codex_launch(debug_port).await
     }
 
     async fn launch_codex(
@@ -1395,10 +1408,28 @@ mod tests {
             .expect("next function after existing launcher activation");
         let body = &source[start..end];
 
-        assert!(!body.contains("hooks.start_helper"));
-        assert!(!body.contains("hooks.ensure_injection"));
-        assert!(!body.contains("hooks.start_bridge_watchdog"));
-        assert!(body.contains("can_connect_loopback_port(options.helper_port)"));
+        assert!(
+            body.contains("if helper_started {\n        hooks.start_helper(helper_port).await?")
+        );
+        assert!(body.contains(".start_bridge_watchdog(options.debug_port, helper_port)"));
+        assert!(body.contains("can_connect_loopback_port(helper_port)"));
+    }
+
+    #[test]
+    fn existing_launcher_activation_never_restarts_the_desktop() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn activate_existing_codex_app")
+            .expect("existing launcher activation function");
+        let end = source[start..]
+            .find("fn should_finalize_pending_remote_control_recovery")
+            .map(|offset| start + offset)
+            .expect("next function after existing launcher activation");
+        let body = &source[start..end];
+
+        // 二实例激活只聚焦现有窗口，不得杀掉/重启用户正在使用的桌面端。
+        assert!(!body.contains("hooks.prepare_codex_launch("));
+        assert!(body.contains("let launch_result = hooks"));
     }
 
     #[test]

@@ -13,6 +13,9 @@ use crate::settings::{
 const RELAY_PROVIDER: &str = "custom";
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodexPlusPlus", "CodexPP"];
 const CC_SWITCH_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
+/// 官方体验模式的 model catalog 落在 CODEX_HOME 根目录，文件名固定。
+const OFFICIAL_EXPERIENCE_MODEL_CATALOG_FILENAME: &str =
+    "codex-plus-official-experience-model-catalog.json";
 const CHAT_UPSTREAM_BASE_URL_KEY: &str = "codex_plus_chat_base_url";
 const PROVIDER_SPECIFIC_COMMON_ROOT_KEYS: &[&str] = &[
     "model",
@@ -108,7 +111,7 @@ pub fn default_relay_status() -> RelayStatus {
 pub fn set_codex_goals_feature_in_home(home: &Path, enabled: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let existing = read_optional_text(&config_path)?;
     let updated = match parse_toml_document(&existing) {
         Ok(mut doc) => {
             if enabled {
@@ -291,6 +294,9 @@ pub fn ensure_active_protocol_proxy_config_in_home(
     home: &Path,
     settings: &BackendSettings,
 ) -> anyhow::Result<bool> {
+    if settings.official_experience.enabled {
+        return ensure_official_experience_config_in_home(home, settings);
+    }
     let profile = settings.active_relay_profile();
     let transport_uses_proxy = settings.active_relay_transport_uses_protocol_proxy();
     let openai_identity_uses_proxy = settings.active_relay_session_provider()
@@ -356,6 +362,219 @@ pub fn ensure_active_protocol_proxy_config_in_home(
         ensure_trailing_newline(doc.to_string()).as_bytes(),
     )?;
     Ok(true)
+}
+
+pub fn ensure_official_experience_config_in_home(
+    home: &Path,
+    settings: &BackendSettings,
+) -> anyhow::Result<bool> {
+    std::fs::create_dir_all(home)?;
+    let config_path = home.join("config.toml");
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let mut doc = parse_toml_document(&existing)?;
+
+    let catalog_filename = OFFICIAL_EXPERIENCE_MODEL_CATALOG_FILENAME;
+    let catalog_path = home.join(catalog_filename);
+    let mut catalog = crate::official_experience::build_model_catalog(settings);
+    if let Some(existing_pointer) = doc.get("model_catalog_json").and_then(Item::as_str)
+        && !existing_pointer.trim().is_empty()
+        && existing_pointer.trim() != catalog_filename
+        && !is_codex_plus_managed_model_catalog(home, existing_pointer)
+    {
+        let external_path = Path::new(existing_pointer);
+        let external_path = if external_path.is_absolute() {
+            external_path.to_path_buf()
+        } else {
+            home.join(external_path)
+        };
+        if let Ok(contents) = std::fs::read_to_string(&external_path)
+            && let Ok(external) = serde_json::from_str::<Value>(&contents)
+            && let Some(external_models) = external.get("models").and_then(Value::as_array)
+            && let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut)
+        {
+            let known = models
+                .iter()
+                .filter_map(|model| model.get("slug").and_then(Value::as_str))
+                .map(str::to_ascii_lowercase)
+                .collect::<HashSet<_>>();
+            models.extend(
+                external_models
+                    .iter()
+                    .filter(|model| {
+                        model
+                            .get("slug")
+                            .and_then(Value::as_str)
+                            .is_some_and(|slug| !known.contains(&slug.to_ascii_lowercase()))
+                    })
+                    .cloned(),
+            );
+        }
+    }
+    let catalog_bytes = serde_json::to_vec_pretty(&catalog)?;
+    let catalog_changed =
+        std::fs::read(&catalog_path).ok().as_deref() != Some(catalog_bytes.as_slice());
+    if catalog_changed {
+        crate::settings::atomic_write(&catalog_path, &catalog_bytes)?;
+    }
+    doc["model_catalog_json"] = toml_edit::value(catalog_filename);
+
+    // 根配置始终使用官方原生 provider。扩展模型由会话请求显式选择各自的
+    // codex_plus_* provider；改变根 provider 无法改变已有会话的请求来源。
+    doc["model_provider"] = toml_edit::value("openai");
+    update_remote_control_openai_base_url(&mut doc, false);
+    if let Some(openai) = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .and_then(|providers| providers.get_mut("openai"))
+        .and_then(Item::as_table_mut)
+        && openai
+            .get("base_url")
+            .and_then(Item::as_str)
+            .is_some_and(is_managed_protocol_proxy_url)
+    {
+        openai.remove("base_url");
+    }
+    let descriptors = crate::official_experience::model_route_descriptors(settings);
+
+    let trusted_models =
+        crate::official_model_catalog::visible_official_model_slugs_for_settings(settings);
+    let current_model = doc
+        .get("model")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let current_is_official = trusted_models
+        .iter()
+        .any(|model| model.eq_ignore_ascii_case(current_model));
+    // 根 model 与根 provider 必须同属主官方账号。扩展模型的选择属于会话状态，
+    // 不能写成下一次直接启动官方客户端时的默认模型。
+    if !current_is_official && let Some(default_model) = trusted_models.first() {
+        doc["model"] = toml_edit::value(default_model.as_str());
+    }
+
+    // 只有直连官方账号的路由（DirectOfficial）才允许使用 ChatGPT 登录鉴权。
+    // 这类 provider 一旦带 `requires_openai_auth = true`，Codex 就会把会话当作
+    // ChatGPT 账号会话并按账号限制可选模型，聚合 / CLIProxyAPI / `供应商:模型`
+    // 等非官方模型会被直接拒绝，报
+    // “The 'X' model is not supported when using Codex with a ChatGPT account.”。
+    let chatgpt_auth_provider_ids = descriptors
+        .iter()
+        .filter(|descriptor| {
+            descriptor.source_kind == crate::settings::OfficialExperienceSourceKind::DirectOfficial
+        })
+        .map(|descriptor| descriptor.provider_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut provider_ids = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.provider_id != "openai")
+        .map(|descriptor| descriptor.provider_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let legacy_custom_is_managed = doc
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get("custom"))
+        .and_then(Item::as_table)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+        .is_some_and(is_managed_protocol_proxy_url);
+    if legacy_custom_is_managed {
+        provider_ids.insert(crate::official_experience::LEGACY_CUSTOM_PROVIDER_ID.to_string());
+        let custom = ensure_provider_table(&mut doc, RELAY_PROVIDER)?;
+        custom["name"] = toml_edit::value(RELAY_PROVIDER);
+        custom["wire_api"] = toml_edit::value("responses");
+        custom["requires_openai_auth"] = toml_edit::value(false);
+        custom["base_url"] = toml_edit::value(managed_openai_base_url());
+        custom["experimental_bearer_token"] =
+            toml_edit::value(crate::protocol_proxy::NO_AUTH_PROXY_BEARER_TOKEN);
+        custom["prefer_websockets"] = toml_edit::value(false);
+        custom.remove("env_key");
+    }
+
+    if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
+        let stale = providers
+            .iter()
+            .map(|(key, _)| key.to_string())
+            .filter(|key| key.starts_with("codex_plus_") && !provider_ids.contains(key))
+            .collect::<Vec<_>>();
+        for key in stale {
+            providers.remove(&key);
+        }
+    }
+
+    for provider_id in provider_ids {
+        if provider_id == crate::official_experience::LEGACY_CUSTOM_PROVIDER_ID {
+            continue;
+        }
+        let provider = ensure_provider_table(&mut doc, &provider_id)?;
+        let requires_chatgpt_auth = chatgpt_auth_provider_ids.contains(&provider_id);
+        provider["name"] = toml_edit::value(provider_id.as_str());
+        provider["wire_api"] = toml_edit::value("responses");
+        provider["requires_openai_auth"] = toml_edit::value(requires_chatgpt_auth);
+        provider["prefer_websockets"] = toml_edit::value(false);
+        provider["base_url"] = toml_edit::value(crate::official_experience::local_route_base_url(
+            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            &provider_id,
+        ));
+        provider.remove("env_key");
+        if requires_chatgpt_auth {
+            provider.remove("experimental_bearer_token");
+        } else {
+            // 非官方通道由本地协议代理自带第三方凭据，客户端不需要 ChatGPT 登录；
+            // 给一个固定占位 bearer，避免被部分客户端版本判成无效 provider。
+            provider["experimental_bearer_token"] =
+                toml_edit::value(crate::protocol_proxy::NO_AUTH_PROXY_BEARER_TOKEN);
+        }
+    }
+
+    let updated = move_model_providers_before_profiles(&ensure_trailing_newline(doc.to_string()));
+    if updated == ensure_trailing_newline(existing) {
+        return Ok(catalog_changed);
+    }
+    backup_official_experience_config(&config_path)?;
+    write_codex_live_atomic(home, Some(&updated), None)?;
+    Ok(true)
+}
+
+fn backup_official_experience_config(config_path: &Path) -> anyhow::Result<()> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read(config_path)?;
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let filename = format!("config.toml.bak.{timestamp}");
+    let parent = config_path.parent().context("配置文件缺少父目录")?;
+    let mut backup_path = parent.join(&filename);
+    for sequence in 1.. {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(mut backup) => {
+                use std::io::Write;
+                backup.write_all(&contents)?;
+                backup.sync_all()?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                backup_path = parent.join(format!("{filename}.{sequence}"));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!()
+}
+
+pub fn apply_official_experience_to_home(
+    home: &Path,
+    settings: &BackendSettings,
+) -> anyhow::Result<RelayApplyResult> {
+    ensure_official_experience_config_in_home(home, settings)?;
+    Ok(RelayApplyResult {
+        config_path: home.join("config.toml").to_string_lossy().to_string(),
+        backup_path: None,
+        configured: true,
+    })
 }
 
 pub fn apply_relay_config_to_home(
@@ -778,6 +997,12 @@ fn managed_openai_base_url() -> String {
     )
 }
 
+fn is_managed_protocol_proxy_url(value: &str) -> bool {
+    let base = managed_openai_base_url();
+    let value = value.trim().trim_end_matches('/');
+    value == base || value.starts_with(&format!("{base}/routes/"))
+}
+
 fn update_remote_control_openai_base_url(doc: &mut DocumentMut, enabled: bool) {
     let managed = managed_openai_base_url();
     let current = doc
@@ -1029,7 +1254,10 @@ pub fn merge_common_config_into_config(
         .and_then(|features| features.get("goals"))
         .and_then(Item::as_bool);
     let source_doc = parse_toml_document(trimmed)?;
-    merge_toml_table_like(target_doc.as_table_mut(), source_doc.as_table());
+    merge_common_config_tables_preserving_codex_app(
+        target_doc.as_table_mut(),
+        source_doc.as_table(),
+    );
     if let Some(enabled) = profile_goals_override {
         table_mut_or_insert(&mut target_doc, "features")?["goals"] = toml_edit::value(enabled);
     }
@@ -1167,7 +1395,85 @@ fn merge_managed_context_table(
         return;
     };
     for (id, item) in managed_table.iter() {
-        target_table.insert(id, item.clone());
+        if is_protected_codex_app_context(table_name, id) {
+            if let Some(target_item) = target_table.get_mut(id) {
+                merge_toml_item_preserving_target(target_item, item);
+            } else {
+                target_table.insert(id, item.clone());
+            }
+        } else {
+            target_table.insert(id, item.clone());
+        }
+    }
+}
+
+fn merge_common_config_tables_preserving_codex_app(
+    target: &mut toml_edit::Table,
+    source: &toml_edit::Table,
+) {
+    for (key, source_item) in source.iter() {
+        if matches!(key, "mcp_servers" | "plugins") {
+            continue;
+        }
+        match target.get_mut(key) {
+            Some(target_item) => merge_toml_item(target_item, source_item),
+            None => {
+                target.insert(key, source_item.clone());
+            }
+        }
+    }
+
+    for table_name in ["mcp_servers", "plugins"] {
+        let Some(source_table) = source.get(table_name).and_then(Item::as_table_like) else {
+            continue;
+        };
+        if target.get(table_name).is_none() {
+            target[table_name] = toml_edit::table();
+        }
+        let Some(target_table) = target.get_mut(table_name).and_then(Item::as_table_like_mut)
+        else {
+            target[table_name] = toml_edit::table();
+            continue;
+        };
+        for (id, source_item) in source_table.iter() {
+            if is_protected_codex_app_context(table_name, id) {
+                if let Some(target_item) = target_table.get_mut(id) {
+                    merge_toml_item_preserving_target(target_item, source_item);
+                } else {
+                    target_table.insert(id, source_item.clone());
+                }
+            } else {
+                match target_table.get_mut(id) {
+                    Some(target_item) => merge_toml_item(target_item, source_item),
+                    None => {
+                        target_table.insert(id, source_item.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_protected_codex_app_context(table_name: &str, id: &str) -> bool {
+    (table_name == "mcp_servers"
+        && id.eq_ignore_ascii_case(crate::codex_app_tools_compat::CODEX_APP_MCP_SERVER))
+        || (table_name == "plugins"
+            && id.eq_ignore_ascii_case(crate::codex_app_tools_compat::CODEX_APP_PLUGIN_ID))
+}
+
+fn merge_toml_item_preserving_target(target: &mut Item, source: &Item) {
+    let Some(source_table) = source.as_table_like() else {
+        return;
+    };
+    let Some(target_table) = target.as_table_like_mut() else {
+        return;
+    };
+    for (key, source_item) in source_table.iter() {
+        if let Some(target_item) = target_table.get_mut(key) {
+            merge_toml_item_preserving_target(target_item, source_item);
+        } else {
+            target_table.insert(key, source_item.clone());
+        }
     }
 }
 
@@ -1192,6 +1498,9 @@ fn remove_managed_context_entry_table(
         return;
     };
     for (id, _) in managed_table.iter() {
+        if is_protected_codex_app_context(table_name, id) {
+            continue;
+        }
         target_table.remove(id);
     }
 }
@@ -1252,6 +1561,9 @@ fn remove_disabled_context_tables(table: &mut toml_edit::Table) {
         let disabled_ids: Vec<String> = context_table
             .iter()
             .filter_map(|(id, item)| {
+                if is_protected_codex_app_context(table_name, id) {
+                    return None;
+                }
                 let enabled = item.as_table().map(context_entry_enabled).unwrap_or(true);
                 (!enabled).then_some(id.to_string())
             })
@@ -2309,6 +2621,17 @@ fn is_codex_plus_managed_model_catalog(home: &Path, path: &str) -> bool {
     if relative.to_ascii_lowercase().starts_with("model-catalogs/") {
         return true;
     }
+    // 官方体验目录写在 CODEX_HOME 根目录（codex-plus-official-experience-model-catalog.json），
+    // 同样是 Codex++ 管理的 catalog：切到其它 profile 时必须整体替换。
+    // 否则 apply_model_catalog_to_config 会把官方体验模型复制进目标 profile 的 catalog，
+    // 而 config.toml 里没有对应的 codex_plus_* provider，模型列表就会出现发不出去的条目。
+    if normalized
+        .rsplit('/')
+        .next()
+        .is_some_and(is_codex_plus_managed_catalog_filename)
+    {
+        return true;
+    }
     let normalized_lower = normalized.to_ascii_lowercase();
     if normalized_lower.contains("/model-catalogs/")
         || normalized_lower.ends_with("/model-catalogs")
@@ -2328,6 +2651,14 @@ fn is_codex_plus_managed_model_catalog(home: &Path, path: &str) -> bool {
                 .as_bytes()
                 .get(managed_root.len())
                 .is_some_and(|byte| *byte == b'/')
+}
+
+/// Codex++ 自己生成的 catalog 文件名（例如
+/// codex-plus-official-experience-model-catalog.json）。这些文件无论落在
+/// model-catalogs/ 目录还是 CODEX_HOME 根目录，都必须被视为受管产物。
+fn is_codex_plus_managed_catalog_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("codex-plus-") && lower.ends_with("-model-catalog.json")
 }
 
 fn sanitize_catalog_filename(id: &str) -> String {

@@ -21,6 +21,8 @@ use crate::status::{LaunchStatus, StatusStore};
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
 const BRIDGE_HEALTH_FAILURE_THRESHOLD: u8 = 2;
+const BRIDGE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+const BRIDGE_WATCHDOG_MAX_CDP_BACKOFF: Duration = Duration::from_secs(60);
 const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 5_000;
 const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 
@@ -190,6 +192,9 @@ pub trait LaunchHooks: Send + Sync {
         Ok(())
     }
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
+    async fn prepare_codex_launch(&self, _debug_port: u16) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn launch_codex(
         &self,
         app_dir: &Path,
@@ -438,6 +443,7 @@ where
             hooks.ensure_active_protocol_proxy_config(&settings).await?;
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
+        hooks.prepare_codex_launch(debug_port).await?;
         if settings.enhancements_enabled || protocol_proxy_enabled {
             // macOS 重启时旧 launcher 的 socket 释放可能稍晚于进程退出。
             let bind_retry_timeout_ms =
@@ -703,6 +709,25 @@ impl LaunchHooks for DefaultLaunchHooks {
         if !settings.relay_profiles_enabled {
             return Ok(());
         }
+        if settings.official_experience.enabled {
+            let home = crate::relay_config::default_codex_home_dir();
+            let account_id = settings
+                .official_experience
+                .primary_official_account_id
+                .trim();
+            if !account_id.is_empty() {
+                let auth = crate::official_accounts::OfficialAccountStore::default()
+                    .get_auth_json(account_id)?;
+                crate::official_accounts::parse_official_auth(&auth)?;
+                let auth_contents = serde_json::to_string_pretty(&auth)?;
+                let live = std::fs::read_to_string(home.join("auth.json")).unwrap_or_default();
+                if live.trim() != auth_contents.trim() {
+                    crate::relay_config::apply_official_auth_to_home(&home, &auth_contents)?;
+                }
+            }
+            crate::relay_config::ensure_official_experience_config_in_home(&home, settings)?;
+            return Ok(());
+        }
         let profile = crate::relay_config::effective_active_relay_profile_for_codex(settings);
         let home = crate::relay_config::default_codex_home_dir();
         let common_config = crate::relay_config::normalize_config_text(
@@ -829,6 +854,35 @@ impl LaunchHooks for DefaultLaunchHooks {
             shutdown: shutdown_tx,
             task,
         });
+        Ok(())
+    }
+
+    async fn prepare_codex_launch(&self, debug_port: u16) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        {
+            let process_ids = crate::watcher::find_codex_processes();
+            let cdp_available = crate::cdp::endpoint_available(debug_port);
+            if should_restart_existing_windows_codex_before_launch(
+                !process_ids.is_empty(),
+                cdp_available,
+            ) {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.windows_existing_app_without_cdp_restart_requested",
+                    serde_json::json!({
+                        "debug_port": debug_port,
+                        "process_ids": process_ids,
+                    }),
+                );
+                crate::watcher::stop_codex_processes_and_wait();
+                let remaining_process_ids = crate::watcher::find_codex_processes();
+                if !remaining_process_ids.is_empty() {
+                    anyhow::bail!(
+                        "Codex 旧实例未能在启动前退出，剩余进程：{:?}",
+                        remaining_process_ids
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -980,14 +1034,45 @@ impl LaunchHooks for DefaultLaunchHooks {
             let pet_cursor_task = tokio::spawn(run_pet_real_mouse_cursor_driver(debug_port));
             let mut observed_browser_id: Option<String> = None;
             let mut bridge_health_failures = 0u8;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut cdp_unavailable_streak = 0u32;
+            let mut next_probe_delay = Duration::ZERO;
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
-                    _ = interval.tick() => {
+                    _ = tokio::time::sleep(next_probe_delay) => {
                         let current_browser_id = match crate::cdp::browser_identity(debug_port).await {
-                            Ok(identity) => identity.browser_id().ok(),
-                            Err(_) => None,
+                            Ok(identity) => {
+                                if cdp_unavailable_streak > 0 {
+                                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                                        "bridge.cdp_recovered",
+                                        serde_json::json!({
+                                            "debug_port": debug_port,
+                                            "helper_port": helper_port,
+                                            "failed_probes": cdp_unavailable_streak,
+                                        }),
+                                    );
+                                }
+                                cdp_unavailable_streak = 0;
+                                next_probe_delay = BRIDGE_WATCHDOG_INTERVAL;
+                                identity.browser_id().ok()
+                            }
+                            Err(error) => {
+                                cdp_unavailable_streak = cdp_unavailable_streak.saturating_add(1);
+                                next_probe_delay = bridge_watchdog_cdp_backoff(cdp_unavailable_streak);
+                                if should_log_bridge_cdp_unavailable(cdp_unavailable_streak) {
+                                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                                        "bridge.cdp_unavailable",
+                                        serde_json::json!({
+                                            "debug_port": debug_port,
+                                            "helper_port": helper_port,
+                                            "failed_probes": cdp_unavailable_streak,
+                                            "next_probe_ms": next_probe_delay.as_millis(),
+                                            "message": error.to_string(),
+                                        }),
+                                    );
+                                }
+                                continue;
+                            }
                         };
                         let identity_changed = current_browser_id
                             .as_deref()
@@ -1401,10 +1486,10 @@ fn decode_protocol_proxy_request_body(
         body.to_vec()
     } else if encoding.eq_ignore_ascii_case("zstd") {
         let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body))?;
-        let mut limited = decoder.take((MAX_HTTP_BODY_BYTES + 1) as u64);
+        let mut limited = decoder.take((MAX_RESPONSES_HTTP_BODY_BYTES + 1) as u64);
         let mut decoded = Vec::new();
         limited.read_to_end(&mut decoded)?;
-        if decoded.len() > MAX_HTTP_BODY_BYTES {
+        if decoded.len() > MAX_RESPONSES_HTTP_BODY_BYTES {
             anyhow::bail!("解压后的请求体超过大小限制");
         }
         decoded
@@ -1425,10 +1510,11 @@ async fn handle_official_images_proxy_connection(
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
-    let upstream = match crate::protocol_proxy::open_official_images_proxy_request(
+    let upstream = match crate::protocol_proxy::open_images_proxy_request_for_path(
         request_body,
         operation,
         request_user_agent,
+        path,
     )
     .await
     {
@@ -2334,7 +2420,9 @@ mod computer_use_tests {
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_HTTP_ENCODED_BODY_BYTES: usize = 64 * 1024 * 1024;
+// Responses 请求会把多张图片以内联 base64 放进 JSON；单独提高该路由上限，
+// 其余 helper 接口仍保持原有 32 MiB 边界。
+const MAX_RESPONSES_HTTP_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 struct HttpRequest {
     headers: Vec<u8>,
@@ -2355,10 +2443,10 @@ impl HttpRequestReadError {
         }
     }
 
-    fn payload_too_large() -> Self {
+    fn payload_too_large(max_body_bytes: usize) -> Self {
         Self {
             status: "413 Payload Too Large",
-            message: format!("HTTP 请求体超过 {MAX_HTTP_BODY_BYTES} 字节限制"),
+            message: format!("HTTP 请求体超过 {max_body_bytes} 字节限制"),
         }
     }
 
@@ -2408,7 +2496,11 @@ struct ChunkedScanState {
 }
 
 impl ChunkedScanState {
-    fn advance(&mut self, encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
+    fn advance(
+        &mut self,
+        encoded: &[u8],
+        max_body_bytes: usize,
+    ) -> Result<ChunkedBodyScan, HttpRequestReadError> {
         if self.complete {
             return Ok(ChunkedBodyScan::Complete);
         }
@@ -2460,13 +2552,13 @@ impl ChunkedScanState {
             let next_decoded_len = self
                 .decoded_len
                 .checked_add(chunk_size)
-                .ok_or_else(HttpRequestReadError::payload_too_large)?;
-            if next_decoded_len > MAX_HTTP_BODY_BYTES {
-                return Err(HttpRequestReadError::payload_too_large());
+                .ok_or_else(|| HttpRequestReadError::payload_too_large(max_body_bytes))?;
+            if next_decoded_len > max_body_bytes {
+                return Err(HttpRequestReadError::payload_too_large(max_body_bytes));
             }
             let chunk_end = data_start
                 .checked_add(chunk_size)
-                .ok_or_else(HttpRequestReadError::payload_too_large)?;
+                .ok_or_else(|| HttpRequestReadError::payload_too_large(max_body_bytes))?;
             if encoded.len() < chunk_end + 2 {
                 return Ok(ChunkedBodyScan::Incomplete);
             }
@@ -2487,6 +2579,7 @@ async fn read_http_request(
     let mut header_end = None;
     let mut framing = HttpBodyFraming::Empty;
     let mut chunked_scan = ChunkedScanState::default();
+    let mut max_body_bytes = MAX_HTTP_BODY_BYTES;
 
     loop {
         let read = stream.read(&mut chunk).await?;
@@ -2501,26 +2594,27 @@ async fn read_http_request(
                     return Err(HttpRequestReadError::bad_request("HTTP 请求头过大"));
                 }
                 framing = http_body_framing(&buffer[..end])?;
+                max_body_bytes = http_body_limit(&buffer[..end]);
             } else if buffer.len() > MAX_HTTP_HEADER_BYTES {
                 return Err(HttpRequestReadError::bad_request("HTTP 请求头过大"));
             }
         }
         if let Some(end) = header_end {
             let body = &buffer[end + 4..];
-            if body.len() > MAX_HTTP_ENCODED_BODY_BYTES {
-                return Err(HttpRequestReadError::payload_too_large());
+            if body.len() > max_body_bytes.saturating_mul(2) {
+                return Err(HttpRequestReadError::payload_too_large(max_body_bytes));
             }
             match framing {
                 HttpBodyFraming::Empty => break,
                 HttpBodyFraming::ContentLength(content_length) => {
-                    if content_length > MAX_HTTP_BODY_BYTES {
-                        return Err(HttpRequestReadError::payload_too_large());
+                    if content_length > max_body_bytes {
+                        return Err(HttpRequestReadError::payload_too_large(max_body_bytes));
                     }
                     if body.len() >= content_length {
                         break;
                     }
                 }
-                HttpBodyFraming::Chunked => match chunked_scan.advance(body)? {
+                HttpBodyFraming::Chunked => match chunked_scan.advance(body, max_body_bytes)? {
                     ChunkedBodyScan::Incomplete => {}
                     ChunkedBodyScan::Complete => break,
                 },
@@ -2535,9 +2629,9 @@ async fn read_http_request(
     let body = match framing {
         HttpBodyFraming::Empty => Vec::new(),
         HttpBodyFraming::ContentLength(content_length) => {
-            content_length_body(encoded_body, content_length)?
+            content_length_body(encoded_body, content_length, max_body_bytes)?
         }
-        HttpBodyFraming::Chunked => match decode_chunked_body(encoded_body)? {
+        HttpBodyFraming::Chunked => match decode_chunked_body(encoded_body, max_body_bytes)? {
             ChunkedBody::Complete(body) => body,
             ChunkedBody::Incomplete => {
                 return Err(HttpRequestReadError::bad_request(
@@ -2552,6 +2646,20 @@ async fn read_http_request(
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn http_body_limit(headers: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(headers);
+    let path = text
+        .lines()
+        .next()
+        .and_then(|request_line| request_line.split_whitespace().nth(1))
+        .unwrap_or_default();
+    if crate::protocol_proxy::is_responses_proxy_path(path) {
+        MAX_RESPONSES_HTTP_BODY_BYTES
+    } else {
+        MAX_HTTP_BODY_BYTES
+    }
 }
 
 fn http_body_framing(headers: &[u8]) -> Result<HttpBodyFraming, HttpRequestReadError> {
@@ -2605,9 +2713,10 @@ fn http_body_framing(headers: &[u8]) -> Result<HttpBodyFraming, HttpRequestReadE
 fn content_length_body(
     encoded: &[u8],
     content_length: usize,
+    max_body_bytes: usize,
 ) -> Result<Vec<u8>, HttpRequestReadError> {
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(HttpRequestReadError::payload_too_large());
+    if content_length > max_body_bytes {
+        return Err(HttpRequestReadError::payload_too_large(max_body_bytes));
     }
     if encoded.len() < content_length {
         return Err(HttpRequestReadError::bad_request("HTTP 请求体不完整"));
@@ -2615,7 +2724,10 @@ fn content_length_body(
     Ok(encoded[..content_length].to_vec())
 }
 
-fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadError> {
+fn decode_chunked_body(
+    encoded: &[u8],
+    max_body_bytes: usize,
+) -> Result<ChunkedBody, HttpRequestReadError> {
     let mut decoded = Vec::new();
     let mut position = 0;
     loop {
@@ -2659,12 +2771,12 @@ fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadErr
                 position += trailer_end_offset + 2;
             }
         }
-        if decoded.len().saturating_add(chunk_size) > MAX_HTTP_BODY_BYTES {
-            return Err(HttpRequestReadError::payload_too_large());
+        if decoded.len().saturating_add(chunk_size) > max_body_bytes {
+            return Err(HttpRequestReadError::payload_too_large(max_body_bytes));
         }
         let chunk_end = position
             .checked_add(chunk_size)
-            .ok_or_else(HttpRequestReadError::payload_too_large)?;
+            .ok_or_else(|| HttpRequestReadError::payload_too_large(max_body_bytes))?;
         if encoded.len() < chunk_end + 2 {
             return Ok(ChunkedBody::Incomplete);
         }
@@ -2677,8 +2789,11 @@ fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadErr
 }
 
 #[cfg(test)]
-fn scan_chunked_body(encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
-    ChunkedScanState::default().advance(encoded)
+fn scan_chunked_body(
+    encoded: &[u8],
+    max_body_bytes: usize,
+) -> Result<ChunkedBodyScan, HttpRequestReadError> {
+    ChunkedScanState::default().advance(encoded, max_body_bytes)
 }
 
 fn header_value_from_headers(headers: &str, header_name: &str) -> Option<String> {
@@ -2839,8 +2954,26 @@ pub fn browser_identity_changed(previous: Option<&str>, current: &str) -> bool {
     previous.is_some_and(|previous| previous != current)
 }
 
+fn bridge_watchdog_cdp_backoff(unavailable_streak: u32) -> Duration {
+    let shift = unavailable_streak.saturating_sub(1).min(4);
+    BRIDGE_WATCHDOG_INTERVAL
+        .saturating_mul(1u32 << shift)
+        .min(BRIDGE_WATCHDOG_MAX_CDP_BACKOFF)
+}
+
+fn should_log_bridge_cdp_unavailable(unavailable_streak: u32) -> bool {
+    unavailable_streak.is_power_of_two()
+}
+
 fn launcher_target_alive(has_codex_process: bool, cdp_available: bool) -> bool {
     has_codex_process || cdp_available
+}
+
+pub fn should_restart_existing_windows_codex_before_launch(
+    has_codex_process: bool,
+    cdp_available: bool,
+) -> bool {
+    has_codex_process && !cdp_available
 }
 
 fn should_probe_launcher_cdp(is_windows: bool, has_codex_process: bool) -> bool {
@@ -3662,13 +3795,15 @@ mod tests {
         let mut exact = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES).into_bytes();
         exact.resize(exact.len() + MAX_HTTP_BODY_BYTES, b'a');
         exact.extend_from_slice(b"\r\n0\r\n\r\n");
-        let ChunkedBody::Complete(decoded) = decode_chunked_body(&exact).unwrap() else {
+        let ChunkedBody::Complete(decoded) =
+            decode_chunked_body(&exact, MAX_HTTP_BODY_BYTES).unwrap()
+        else {
             panic!("expected complete chunked body");
         };
         assert_eq!(decoded.len(), MAX_HTTP_BODY_BYTES);
 
         let oversized = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES + 1).into_bytes();
-        let error = decode_chunked_body(&oversized).unwrap_err();
+        let error = decode_chunked_body(&oversized, MAX_HTTP_BODY_BYTES).unwrap_err();
         assert_eq!(error.status(), "413 Payload Too Large");
     }
 
@@ -3677,16 +3812,18 @@ mod tests {
         let encoded = b"3;name=value\r\n\x00\x80\xff\r\n2\r\nAB\r\n0\r\nX-Trace: yes\r\n\r\n";
         for prefix_len in 0..encoded.len() {
             assert!(matches!(
-                scan_chunked_body(&encoded[..prefix_len]).unwrap(),
+                scan_chunked_body(&encoded[..prefix_len], MAX_HTTP_BODY_BYTES).unwrap(),
                 ChunkedBodyScan::Incomplete
             ));
         }
 
         assert!(matches!(
-            scan_chunked_body(encoded).unwrap(),
+            scan_chunked_body(encoded, MAX_HTTP_BODY_BYTES).unwrap(),
             ChunkedBodyScan::Complete
         ));
-        let ChunkedBody::Complete(decoded) = decode_chunked_body(encoded).unwrap() else {
+        let ChunkedBody::Complete(decoded) =
+            decode_chunked_body(encoded, MAX_HTTP_BODY_BYTES).unwrap()
+        else {
             panic!("expected complete chunked body");
         };
         assert_eq!(decoded, [0x00, 0x80, 0xff, b'A', b'B']);
@@ -3695,12 +3832,12 @@ mod tests {
     #[test]
     fn chunked_decoder_rejects_oversized_size_lines_and_trailers() {
         let oversized_size_line = vec![b'f'; MAX_HTTP_HEADER_BYTES + 1];
-        let error = scan_chunked_body(&oversized_size_line).unwrap_err();
+        let error = scan_chunked_body(&oversized_size_line, MAX_HTTP_BODY_BYTES).unwrap_err();
         assert_eq!(error.status(), "400 Bad Request");
 
         let mut oversized_trailer = b"0\r\nX-Large: ".to_vec();
         oversized_trailer.resize(MAX_HTTP_HEADER_BYTES + 16, b'a');
-        let error = scan_chunked_body(&oversized_trailer).unwrap_err();
+        let error = scan_chunked_body(&oversized_trailer, MAX_HTTP_BODY_BYTES).unwrap_err();
         assert_eq!(error.status(), "400 Bad Request");
     }
 
@@ -3708,14 +3845,65 @@ mod tests {
     fn content_length_body_accepts_exact_limit_and_rejects_one_byte_more() {
         let exact = vec![b'a'; MAX_HTTP_BODY_BYTES];
         assert_eq!(
-            content_length_body(&exact, MAX_HTTP_BODY_BYTES)
+            content_length_body(&exact, MAX_HTTP_BODY_BYTES, MAX_HTTP_BODY_BYTES)
                 .unwrap()
                 .len(),
             MAX_HTTP_BODY_BYTES
         );
 
-        let error = content_length_body(&[], MAX_HTTP_BODY_BYTES + 1).unwrap_err();
+        let error =
+            content_length_body(&[], MAX_HTTP_BODY_BYTES + 1, MAX_HTTP_BODY_BYTES).unwrap_err();
         assert_eq!(error.status(), "413 Payload Too Large");
+    }
+
+    #[test]
+    fn bridge_watchdog_backs_off_and_rate_limits_missing_cdp() {
+        assert_eq!(bridge_watchdog_cdp_backoff(1), Duration::from_secs(5));
+        assert_eq!(bridge_watchdog_cdp_backoff(2), Duration::from_secs(10));
+        assert_eq!(bridge_watchdog_cdp_backoff(3), Duration::from_secs(20));
+        assert_eq!(bridge_watchdog_cdp_backoff(4), Duration::from_secs(40));
+        assert_eq!(bridge_watchdog_cdp_backoff(5), Duration::from_secs(60));
+        assert_eq!(
+            bridge_watchdog_cdp_backoff(u32::MAX),
+            Duration::from_secs(60)
+        );
+
+        assert!(should_log_bridge_cdp_unavailable(1));
+        assert!(should_log_bridge_cdp_unavailable(2));
+        assert!(!should_log_bridge_cdp_unavailable(3));
+        assert!(should_log_bridge_cdp_unavailable(4));
+        assert!(!should_log_bridge_cdp_unavailable(5));
+        assert!(!should_log_bridge_cdp_unavailable(0));
+    }
+
+    #[test]
+    fn responses_requests_use_larger_body_limit() {
+        assert_eq!(
+            http_body_limit(b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:57321"),
+            MAX_RESPONSES_HTTP_BODY_BYTES
+        );
+        assert_eq!(
+            http_body_limit(b"POST /v1/responses/compact HTTP/1.1\r\nHost: 127.0.0.1:57321"),
+            MAX_RESPONSES_HTTP_BODY_BYTES
+        );
+        assert_eq!(
+            http_body_limit(b"POST /v1/audio/transcriptions HTTP/1.1\r\nHost: 127.0.0.1:57321"),
+            MAX_HTTP_BODY_BYTES
+        );
+
+        let incomplete =
+            content_length_body(&[], MAX_HTTP_BODY_BYTES + 1, MAX_RESPONSES_HTTP_BODY_BYTES)
+                .unwrap_err();
+        assert_eq!(incomplete.status(), "400 Bad Request");
+
+        let oversized = content_length_body(
+            &[],
+            MAX_RESPONSES_HTTP_BODY_BYTES + 1,
+            MAX_RESPONSES_HTTP_BODY_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(oversized.status(), "413 Payload Too Large");
+        assert!(oversized.to_string().contains("134217728"));
     }
 
     #[tokio::test]
@@ -3737,6 +3925,32 @@ mod tests {
         let response = send_raw_helper_request(request.as_bytes()).await;
 
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 413 Payload Too Large"));
+    }
+
+    #[tokio::test]
+    async fn responses_request_above_default_limit_is_accepted_by_the_http_reader() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let reader = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            match read_http_request(&mut stream).await {
+                Ok(_) => panic!("expected incomplete Responses request"),
+                Err(error) => error,
+            }
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            MAX_HTTP_BODY_BYTES + 1
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let error = reader.await.unwrap();
+        assert_eq!(error.status(), "400 Bad Request");
+        assert_eq!(error.to_string(), "HTTP 请求体不完整");
     }
 
     #[tokio::test]

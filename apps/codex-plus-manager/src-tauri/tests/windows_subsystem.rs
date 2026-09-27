@@ -41,6 +41,19 @@ fn manager_repeated_launch_activates_existing_window() {
 }
 
 #[test]
+fn manager_auto_starts_cliproxy_without_auto_starting_codex() {
+    let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read manager lib.rs");
+    let commands_rs =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
+            .expect("read manager commands.rs");
+
+    assert!(lib_rs.contains("cliproxy::start_cliproxy_from_saved_settings(transient);"));
+    assert!(!lib_rs.contains("start_codex_from_saved_settings"));
+    assert!(!commands_rs.contains("auto_start_launch_request"));
+}
+
+#[test]
 fn manager_main_window_uses_default_window_icon_explicitly() {
     let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("read manager lib.rs");
@@ -222,7 +235,7 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
 
     assert!(!app_tsx.contains("snapshotActiveRelayFilesBeforeSwitch"));
     assert!(!app_tsx.contains("backfill_relay_profile_from_live"));
-    assert!(app_tsx.contains("relayProfileSwitchValidation(selectedBeforeSave)"));
+    assert!(app_tsx.contains("relayProfileSwitchValidation(selectedBeforeSave, switchSettings)"));
     assert!(app_tsx.contains("缺少独立 config.toml"));
     assert!(app_tsx.contains("const command = relayProfileSwitchCommand(selectedAfterSave)"));
     assert!(app_tsx.contains("function relayProfileSwitchCommand"));
@@ -232,7 +245,7 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
     assert!(app_tsx.contains("onClick={createNewAggregateProfile}"));
     assert!(app_tsx.contains("已打开聚合供应商详情"));
     assert!(app_tsx.contains(
-        "buildRelayConfigToml(profile, { includeBearerToken: false, requiresOpenAiAuth: true })"
+        "buildRelayConfigToml(profile, { includeBearerToken: true, requiresOpenAiAuth: true })"
     ));
     assert!(
         app_tsx.contains(
@@ -245,17 +258,19 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
 }
 
 #[test]
-fn manager_exposes_official_login_hybrid_mode_without_adding_official_to_rotation() {
+fn manager_exposes_official_experience_routes_without_adding_official_to_rotation() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
     let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
 
     assert!(app_tsx.contains("officialLoginMixedMode"));
     assert!(app_tsx.contains("officialLoginRelayId"));
-    assert!(app_tsx.contains("官方登录混合模式"));
-    assert!(app_tsx.contains("官方 API 不加入聚合轮转"));
-    assert!(app_tsx.contains("gpt-5.4(openai;供应商1|供应商2:真实模型)"));
-    assert!(app_tsx.contains("!isAggregateRelayProfile(profile) && isApiRelayProfile(profile)"));
+    assert!(app_tsx.contains("官方体验多来源路由"));
+    assert!(app_tsx.contains("主官方账号始终是默认入口"));
+    assert!(app_tsx.contains("capabilityBindings"));
+    assert!(app_tsx.contains("&& !isAggregateRelayProfile(profile)"));
+    assert!(app_tsx.contains("&& !isCliproxyManagedProfile(profile)"));
+    assert!(app_tsx.contains("&& isApiRelayProfile(profile)"));
 }
 
 #[test]
@@ -419,7 +434,7 @@ fn provider_sync_ui_keeps_explicit_targets_and_provider_counts() {
     assert!(app_tsx.contains("rolloutSessionCount: number"));
     assert!(app_tsx.contains("sqliteSessionCount: number"));
     assert!(app_tsx.contains("{ targetProvider }"));
-    assert!(app_tsx.contains("同步全部历史会话到 {0}"));
+    assert!(app_tsx.contains("修复历史会话"));
     assert!(commands.contains("target_provider: Option<String>"));
     assert!(commands.contains("run_provider_sync_with_target(None, target_provider.as_deref())"));
     assert!(!commands.contains("normalize_all_session_providers_to_custom(None)"));

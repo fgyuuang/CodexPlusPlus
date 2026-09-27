@@ -137,6 +137,103 @@ pub struct RelayModelRoute {
     pub target_model: String,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum OfficialExperienceSourceKind {
+    #[default]
+    MainOfficial,
+    DirectOfficial,
+    CliOfficial,
+    CliGeneral,
+    Relay,
+    Aggregate,
+    LegacyCustom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapabilityBinding {
+    #[serde(rename = "routingSlug", default)]
+    pub routing_slug: String,
+    #[serde(rename = "capabilitySlug", default)]
+    pub capability_slug: String,
+    #[serde(rename = "sourceKind", default)]
+    pub source_kind: OfficialExperienceSourceKind,
+    #[serde(rename = "sourceId", default)]
+    pub source_id: String,
+    #[serde(rename = "upstreamModel", default)]
+    pub upstream_model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceImageEndpoints {
+    #[serde(rename = "generationsUrl", default)]
+    pub generations_url: String,
+    #[serde(rename = "editsUrl", default)]
+    pub edits_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouteDescriptor {
+    #[serde(rename = "routingSlug")]
+    pub routing_slug: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "providerId")]
+    pub provider_id: String,
+    #[serde(rename = "sourceKind")]
+    pub source_kind: OfficialExperienceSourceKind,
+    #[serde(rename = "sourceId")]
+    pub source_id: String,
+    #[serde(rename = "upstreamModel")]
+    pub upstream_model: String,
+    #[serde(rename = "capabilitySlug")]
+    pub capability_slug: String,
+    #[serde(rename = "failoverPolicy")]
+    pub failover_policy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialExperienceSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(rename = "primaryOfficialAccountId", default)]
+    pub primary_official_account_id: String,
+    #[serde(rename = "cliOfficialEnabled", default)]
+    pub cli_official_enabled: bool,
+    #[serde(rename = "cliOfficialLabel", default = "default_cli_official_label")]
+    pub cli_official_label: String,
+    #[serde(rename = "cliGeneralEnabled", default)]
+    pub cli_general_enabled: bool,
+    #[serde(rename = "capabilityBindings", default)]
+    pub capability_bindings: Vec<ModelCapabilityBinding>,
+    #[serde(rename = "sourceImageEndpoints", default)]
+    pub source_image_endpoints: HashMap<String, SourceImageEndpoints>,
+}
+
+impl Default for OfficialExperienceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            primary_official_account_id: String::new(),
+            cli_official_enabled: false,
+            cli_official_label: default_cli_official_label(),
+            cli_general_enabled: false,
+            capability_bindings: Vec::new(),
+            source_image_endpoints: HashMap::new(),
+        }
+    }
+}
+
+pub fn default_cli_official_label() -> String {
+    "官方账号 2".to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum AggregateRelayStrategy {
@@ -619,6 +716,8 @@ pub struct BackendSettings {
     pub official_login_relay_id: String,
     #[serde(rename = "activeOfficialAccountId", default)]
     pub active_official_account_id: String,
+    #[serde(rename = "officialExperience", default)]
+    pub official_experience: OfficialExperienceSettings,
     #[serde(rename = "relayCommonConfigContents", default)]
     pub relay_common_config_contents: String,
     #[serde(rename = "relayContextConfigContents", default)]
@@ -715,6 +814,7 @@ impl Default for BackendSettings {
             official_login_mixed_mode: false,
             official_login_relay_id: String::new(),
             active_official_account_id: String::new(),
+            official_experience: OfficialExperienceSettings::default(),
             relay_common_config_contents: String::new(),
             relay_context_config_contents: String::new(),
             active_relay_id: default_active_relay_id(),
@@ -901,7 +1001,7 @@ impl BackendSettings {
     }
 
     pub fn active_relay_uses_official_login_auth(&self) -> bool {
-        self.official_login_mixed_mode
+        (self.official_experience.enabled || self.official_login_mixed_mode)
             && self.active_relay_profile().relay_mode != RelayMode::Official
     }
 
@@ -1315,6 +1415,10 @@ impl SettingsStore {
             "relayContextConfigContents".to_string(),
             Value::String(settings.relay_context_config_contents.clone()),
         );
+        raw.insert(
+            "officialExperience".to_string(),
+            serde_json::to_value(&settings.official_experience)?,
+        );
         // 归一化把扁平字段镜像进了 tools.codex，这里写回原始对象，
         // 否则 update 路径保存的分片会停留在迁移前的旧值。
         raw.insert(
@@ -1629,6 +1733,11 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
             Value::String(value.trim().to_string()),
         );
     }
+    if let Some(value) = source.get("officialExperience")
+        && serde_json::from_value::<OfficialExperienceSettings>(value.clone()).is_ok()
+    {
+        target.insert("officialExperience".to_string(), value.clone());
+    }
     if let Some(value) = source
         .get("relayCommonConfigContents")
         .and_then(Value::as_str)
@@ -1884,11 +1993,88 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
             .map(|profile| profile.id.clone())
             .unwrap_or_default();
     }
+    normalize_official_experience_settings(&mut settings);
     // 扁平字段始终是 Codex 的唯一事实来源，这里把它镜像进 tools.codex；
     // 其它工具的分片原样保留。放在函数末尾，所有 load / save / update 路径
     // 都会经过，两边不会漂移。
     settings.sync_tool_shards();
     settings
+}
+
+fn normalize_official_experience_settings(settings: &mut BackendSettings) {
+    let experience = &mut settings.official_experience;
+    if settings.official_login_mixed_mode {
+        experience.enabled = true;
+    }
+    experience.primary_official_account_id =
+        experience.primary_official_account_id.trim().to_string();
+    if experience.primary_official_account_id.is_empty() {
+        experience.primary_official_account_id = settings.active_official_account_id.clone();
+    }
+    experience.cli_official_label = experience.cli_official_label.trim().to_string();
+    if experience.cli_official_label.is_empty() {
+        experience.cli_official_label = default_cli_official_label();
+    }
+
+    let has_cli_official = settings.relay_profiles.iter().any(|profile| {
+        profile.id.trim() == "managed-cliproxy-official"
+            || profile
+                .integration_type
+                .trim()
+                .eq_ignore_ascii_case("cliproxy-official")
+    });
+    let has_cli_general = settings.relay_profiles.iter().any(|profile| {
+        profile.id.trim() == "managed-cliproxy"
+            || profile
+                .integration_type
+                .trim()
+                .eq_ignore_ascii_case("cliproxy")
+    });
+    if settings.official_login_mixed_mode {
+        experience.cli_official_enabled |= has_cli_official;
+        experience.cli_general_enabled |= has_cli_general;
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    experience.capability_bindings = experience
+        .capability_bindings
+        .drain(..)
+        .filter_map(|mut binding| {
+            binding.routing_slug = binding.routing_slug.trim().to_string();
+            binding.capability_slug = binding.capability_slug.trim().to_string();
+            binding.source_id = binding.source_id.trim().to_string();
+            binding.upstream_model = binding.upstream_model.trim().to_string();
+            if binding.routing_slug.is_empty()
+                || binding.capability_slug.is_empty()
+                || !seen.insert(binding.routing_slug.to_ascii_lowercase())
+            {
+                return None;
+            }
+            if binding.upstream_model.is_empty() {
+                binding.upstream_model = binding.routing_slug.clone();
+            }
+            Some(binding)
+        })
+        .collect();
+    experience.capability_bindings.sort_by(|left, right| {
+        left.routing_slug
+            .to_ascii_lowercase()
+            .cmp(&right.routing_slug.to_ascii_lowercase())
+    });
+    experience.source_image_endpoints = experience
+        .source_image_endpoints
+        .drain()
+        .filter_map(|(source_id, mut endpoints)| {
+            let source_id = source_id.trim().to_string();
+            if source_id.is_empty() {
+                return None;
+            }
+            endpoints.generations_url = endpoints.generations_url.trim().to_string();
+            endpoints.edits_url = endpoints.edits_url.trim().to_string();
+            (!endpoints.generations_url.is_empty() || !endpoints.edits_url.is_empty())
+                .then_some((source_id, endpoints))
+        })
+        .collect();
 }
 
 fn prune_excluded_aggregate_members(settings: &mut BackendSettings) {

@@ -458,7 +458,7 @@ fn official_login_mixed_mode_restores_official_auth_before_aggregate_api_overrid
     let live_auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
 
     assert!(result.configured);
-    assert!(live_config.contains(r#"model_provider = "custom""#));
+    assert!(live_config.contains(r#"model_provider = "openai""#));
     let configured_model = live_config
         .lines()
         .find_map(|line| line.trim().strip_prefix("model = \"")?.strip_suffix('"'))
@@ -471,8 +471,7 @@ fn official_login_mixed_mode_restores_official_auth_before_aggregate_api_overrid
         .iter()
         .any(|model| model.eq_ignore_ascii_case(configured_model))
     );
-    assert!(live_config.contains("requires_openai_auth = true"));
-    assert!(live_config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+    assert!(!live_config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&live_auth).unwrap(),
         serde_json::from_str::<serde_json::Value>(official_auth).unwrap()
@@ -512,9 +511,9 @@ fn official_login_mixed_mode_applies_single_provider_after_official_auth() {
     let live_auth: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
 
-    assert!(live_config.contains(r#"base_url = "https://api.example/v1""#));
-    assert!(live_config.contains("requires_openai_auth = true"));
-    assert!(live_config.contains(r#"experimental_bearer_token = "sk-api""#));
+    assert!(live_config.contains(r#"model_provider = "openai""#));
+    assert!(!live_config.contains(r#"base_url = "https://api.example/v1""#));
+    assert!(!live_config.contains(r#"experimental_bearer_token = "sk-api""#));
     assert_eq!(live_auth["auth_mode"], "chatgpt");
     assert_eq!(live_auth["tokens"]["access_token"], "official-account");
 }

@@ -473,11 +473,12 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "9";
-  const codexAppServerModelRequestPatchVersion = "8";
+  const codexAppServerModelRequestPatchVersion = "10";
   const codexRemoteSessionRecoveryVersion = "5";
   const codexQuotaResumeVersion = "1";
   const codexPluginMarketplaceUnlockVersion = "15";
   const codexModelRequestBridgePatchVersion = "2";
+  const codexRateLimitUnlockVersion = "3";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -832,6 +833,7 @@
         white-space: nowrap;
       }
       [data-codex-plus-usage-alert-hidden="true"] { display: none !important; }
+      [data-codex-plus-usage-limit-hidden="true"] { display: none !important; }
       .codex-archive-delete-all {
         border: 1px solid var(--color-border-danger, #dc2626);
         border-radius: var(--border-radius-sm, 6px);
@@ -3327,7 +3329,7 @@
     const urls = codexAppAssetCandidateUrls();
     const preferred = urls.filter((url) => {
       const name = (url.split("/").pop() || "").toLowerCase();
-      return /use-host-config|app-server-manager-signals|app-initial|app-main|page-|chatg|signals|server-manager|gwqc41kz|c1urrgy0|hsvsqcnf/.test(name);
+      return /use-host-config|app-server-manager-signals|app-shared|app-initial|app-main|page-|chatg|signals|server-manager|gwqc41kz|c1urrgy0|hsvsqcnf/.test(name);
     });
     // Prefer known request-client modules, then the larger application bundles.
     preferred.sort((left, right) => {
@@ -3378,7 +3380,7 @@
       modules.push(module);
       sources.push(source);
     };
-    for (const assetPrefix of ["use-host-config-", "app-server-manager-signals-"]) {
+    for (const assetPrefix of ["use-host-config-", "app-server-manager-signals-", "app-shared-"]) {
       try {
         const module = await loadOptionalCodexAppModule(assetPrefix);
         if (module) pushModule(module, assetPrefix);
@@ -4102,6 +4104,7 @@
   }
 
   function codexRemoteSessionProviderPatchEnabled() {
+    if (codexPlusBackendSettings?.officialExperience?.enabled === true) return true;
     const profile = codexRemoteSessionActiveProfile();
     if (!profile) return false;
     const relayMode = String(profile.relayMode || "");
@@ -4120,6 +4123,7 @@
   }
 
   function codexRemoteSessionProviderOverrideEnabled() {
+    if (codexPlusBackendSettings?.officialExperience?.enabled === true) return true;
     const profile = codexRemoteSessionActiveProfile();
     if (!profile) return false;
     const relayMode = String(profile.relayMode || "");
@@ -4133,7 +4137,41 @@
     return match ? String(match[1]).trim() : "";
   }
 
-  function codexRemoteSessionTargetProvider() {
+  function codexOfficialExperienceRouteDescriptor(modelName) {
+    const normalized = String(modelName || "").trim().toLowerCase();
+    if (!normalized) return null;
+    const descriptors = Array.isArray(codexModelCatalog?.routeDescriptors)
+      ? codexModelCatalog.routeDescriptors
+      : [];
+    return descriptors.find((descriptor) => String(descriptor?.routingSlug || "").trim().toLowerCase() === normalized) || null;
+  }
+
+  // turn/start may omit model after thread/settings/update. Keep only explicit
+  // selections for that thread; the catalog default must never choose a route
+  // for an existing conversation.
+  const codexOfficialThreadModelRoutes = new Map();
+  function codexOfficialThreadRouteKey(params) {
+    return String(params?.threadId || params?.conversationId || params?.thread_id || "").trim();
+  }
+
+  function rememberCodexOfficialThreadModel(threadId, modelName) {
+    if (!threadId || !modelName) return;
+    codexOfficialThreadModelRoutes.delete(threadId);
+    codexOfficialThreadModelRoutes.set(threadId, modelName);
+    while (codexOfficialThreadModelRoutes.size > 120) {
+      codexOfficialThreadModelRoutes.delete(codexOfficialThreadModelRoutes.keys().next().value);
+    }
+  }
+
+  function codexRemoteSessionTargetProvider(modelName = "") {
+    if (codexPlusBackendSettings?.officialExperience?.enabled === true) {
+      const requestedModel = String(modelName || "").trim();
+      if (!requestedModel) return "";
+      const descriptor = codexOfficialExperienceRouteDescriptor(requestedModel);
+      if (descriptor) return String(descriptor.providerId || "").trim();
+      const isOfficial = codexCatalogOfficialModels().some((model) => model.toLowerCase() === requestedModel.toLowerCase());
+      return isOfficial ? "openai" : "";
+    }
     const profile = codexRemoteSessionActiveProfile();
     const relayMode = String(profile?.relayMode || "");
     // 解析中继实际写进 config.toml 的 model_provider（比如
@@ -4164,6 +4202,8 @@
     // when the caller supplies none of those overrides.
     return [
       "thread/start",
+      "thread/resume",
+      "thread/settings/update",
       "start-conversation",
       "start-thread-for-host",
       "thread-prewarm-start",
@@ -4177,22 +4217,45 @@
     if (!codexRemoteSessionProviderRequestMethod(requestMethod)) return params;
     if (!codexRemoteSessionProviderOverrideEnabled()) return params;
     if (!params || typeof params !== "object" || Array.isArray(params)) return params;
+    const officialExperience = codexPlusBackendSettings?.officialExperience?.enabled === true;
+    if (officialExperience && params.params && typeof params.params === "object" && !Array.isArray(params.params)) {
+      const nestedParams = applyCodexRemoteSessionProviderOverride(requestMethod, params.params);
+      return nestedParams === params.params ? params : { ...params, params: nestedParams };
+    }
     const profile = codexRemoteSessionActiveProfile();
     const pureApi = String(profile?.relayMode || "") === "pureApi";
-    if (requestMethod === "turn/start" && !pureApi) return params;
+    // 旧会话恢复时保留会话自身的 provider；新框架按显式模型描述符处理。
+    if (!officialExperience && requestMethod === "thread/resume") return params;
+    if (requestMethod === "turn/start" && !pureApi && !officialExperience) return params;
     const hasModelProvider = Object.prototype.hasOwnProperty.call(params, "modelProvider")
       || Object.prototype.hasOwnProperty.call(params, "model_provider");
-    if (requestMethod === "turn/start" && !hasModelProvider) return params;
-    const targetProvider = codexRemoteSessionTargetProvider();
-    if (!targetProvider || targetProvider === "openai") return params;
+    if (requestMethod === "turn/start" && !hasModelProvider && !officialExperience) return params;
+    const threadId = officialExperience ? codexOfficialThreadRouteKey(params) : "";
+    const explicitModel = String(params.model || params.modelId || params.model_id || "").trim();
+    const requestedModel = explicitModel || (officialExperience && requestMethod === "turn/start"
+      ? codexOfficialThreadModelRoutes.get(threadId) || ""
+      : "");
+    if (officialExperience && !requestedModel) return params;
+    const targetProvider = codexRemoteSessionTargetProvider(requestedModel);
+    if (officialExperience && !targetProvider) {
+      throw new Error(`模型 ${requestedModel} 没有可用的来源路由`);
+    }
+    if (!targetProvider) return params;
+    if (officialExperience && explicitModel) rememberCodexOfficialThreadModel(threadId, explicitModel);
     const requestedProvider = String(params.modelProvider || params.model_provider || "").trim();
-    if (requestedProvider && requestedProvider !== "openai" && requestedProvider !== targetProvider) {
+    if (!officialExperience && requestedProvider && requestedProvider !== "openai" && requestedProvider !== targetProvider) {
       return params;
     }
-    if (requestedProvider === targetProvider && !Object.prototype.hasOwnProperty.call(params, "model_provider")) {
+    const missingModel = officialExperience && !explicitModel && requestMethod === "turn/start";
+    if (requestedProvider === targetProvider && !missingModel
+        && !Object.prototype.hasOwnProperty.call(params, "model_provider")) {
       return params;
     }
-    const nextParams = { ...params, modelProvider: targetProvider };
+    const nextParams = {
+      ...params,
+      ...(missingModel ? { model: requestedModel } : {}),
+      modelProvider: targetProvider,
+    };
     delete nextParams.model_provider;
     sendCodexPlusDiagnostic("remote_session_provider_override_applied", {
       method: requestMethod,
@@ -6663,6 +6726,236 @@
     }).catch(() => {});
   }
 
+  // 只记录宿主工具装配的结构字段。这里故意不读取 prompt、tool arguments、
+  // thread 内容、认证头或响应正文，便于区分 MCP 缺失与旧 dynamic_tools 冲突。
+  const codexAppToolsProbeSchemaVersion = 1;
+  const codexAppToolsProbeState = window.__codexPlusCodexAppToolsProbe || {
+    appServerVersion: "",
+    model: "",
+    modelProvider: "",
+    toolMode: "",
+    mcpServer: "",
+    mcpSeen: false,
+    mcpToolCount: null,
+    mcpHasReadThread: false,
+    legacyDynamicCodexApp: false,
+    lastSignature: "",
+  };
+  window.__codexPlusCodexAppToolsProbe = codexAppToolsProbeState;
+
+  function resetCodexAppToolsProbeState(preserveContext = false) {
+    if (!preserveContext) {
+      codexAppToolsProbeState.appServerVersion = "";
+      codexAppToolsProbeState.model = "";
+      codexAppToolsProbeState.modelProvider = "";
+      codexAppToolsProbeState.toolMode = "";
+    }
+    codexAppToolsProbeState.mcpServer = "";
+    codexAppToolsProbeState.mcpSeen = false;
+    codexAppToolsProbeState.mcpToolCount = null;
+    codexAppToolsProbeState.mcpHasReadThread = false;
+    codexAppToolsProbeState.legacyDynamicCodexApp = false;
+    codexAppToolsProbeState.lastSignature = "";
+  }
+
+  function codexAppToolsProbeText(value, maxLength = 160) {
+    if (typeof value !== "string") return "";
+    const text = value.trim();
+    return text.length > maxLength ? text.slice(0, maxLength) : text;
+  }
+
+  function codexAppToolsProbeObject(value) {
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  }
+
+  function codexAppToolsProbeToolNames(value) {
+    const object = codexAppToolsProbeObject(value);
+    const candidates = [
+      object.tools,
+      object.result?.tools,
+      object.result?.data,
+      object.result?.toolDefinitions,
+      object.message?.result?.tools,
+      object.message?.result?.data,
+      object.response?.result?.tools,
+      object.response?.result?.data,
+    ];
+    const tools = candidates.find(Array.isArray);
+    if (!Array.isArray(tools)) return null;
+    return tools
+      .map((tool) => codexAppToolsProbeText(tool?.name || tool?.tool?.name, 120))
+      .filter(Boolean);
+  }
+
+  function codexAppToolsProbeDynamicNamespace(value) {
+    const object = codexAppToolsProbeObject(value);
+    const namespaces = [
+      object.namespace,
+      object.toolNamespace,
+      object.dynamicNamespace,
+      object.dynamic_tools?.namespace,
+      object.dynamicTools?.namespace,
+      object.result?.namespace,
+      object.result?.dynamic_tools?.namespace,
+      object.result?.dynamicTools?.namespace,
+    ].map((item) => codexAppToolsProbeText(item, 120).toLowerCase());
+    if (namespaces.some((item) => item === "codex_app" || item.startsWith("codex_app__"))) return true;
+
+    for (const candidate of [object.dynamic_tools, object.dynamicTools, object.result?.dynamic_tools, object.result?.dynamicTools]) {
+      if (Array.isArray(candidate) && candidate.some((item) => {
+        const name = codexAppToolsProbeText(item?.name || item?.namespace, 120).toLowerCase();
+        return name === "codex_app" || name.startsWith("codex_app__");
+      })) return true;
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)
+          && Object.keys(candidate).some((key) => key.toLowerCase() === "codex_app")) return true;
+    }
+    return false;
+  }
+
+  function codexAppToolsProbeVersion(value) {
+    const object = codexAppToolsProbeObject(value);
+    return codexAppToolsProbeText(
+      object.appServerVersion
+      || object.app_server_version
+      || object.codexAppVersion
+      || object.codex_app_version
+      || object.version
+      || window.__CODEX_APP_SERVER_VERSION__
+      || window.__CODEX_APP_VERSION__,
+      80,
+    );
+  }
+
+  function codexAppToolsProbeEvent(direction, value) {
+    const root = codexAppToolsProbeObject(value);
+    const message = codexAppToolsProbeObject(root.message || root.response || root);
+    const request = codexAppToolsProbeObject(root.request || message.request);
+    const params = codexAppToolsProbeObject(request.params || root.params || message.params);
+    const result = codexAppToolsProbeObject(message.result || root.result);
+    const item = codexAppToolsProbeObject(
+      params.item || root.item || message.item || result.item || params.toolCall || params.tool_call,
+    );
+    const method = codexAppToolsProbeText(
+      request.method || root.method || message.method || params.method,
+      120,
+    );
+    const methodLower = method.toLowerCase();
+    const mcpServer = codexAppToolsProbeText(
+      params.server || params.serverName || result.server || message.server
+      || item.server || item.serverName || item.server_name,
+      120,
+    );
+    const namespace = codexAppToolsProbeText(
+      request.namespace || root.namespace || message.namespace || params.namespace || item.namespace,
+      120,
+    );
+    const mcpToolName = codexAppToolsProbeText(
+      item.tool || item.name || item.toolName || item.tool_name,
+      120,
+    );
+    const toolNames = codexAppToolsProbeToolNames(root);
+    const mcpSeen = mcpServer.toLowerCase() === "codex_app"
+      || namespace.toLowerCase() === "mcp__codex_app"
+      || (methodLower.includes("tools/list") && mcpServer.toLowerCase() === "codex_app");
+    const legacyDynamicCodexApp = codexAppToolsProbeDynamicNamespace(root)
+      || namespace.toLowerCase() === "codex_app"
+      || namespace.toLowerCase().startsWith("codex_app__");
+    const model = codexAppToolsProbeText(
+      params.model || root.model || message.model || result.model,
+      160,
+    );
+    const modelProvider = codexAppToolsProbeText(
+      params.modelProvider || params.model_provider || root.modelProvider || root.model_provider
+      || message.modelProvider || message.model_provider,
+      120,
+    );
+    const toolMode = codexAppToolsProbeText(
+      params.toolMode || params.tool_mode || root.toolMode || root.tool_mode,
+      80,
+    );
+    const startsNewThreadScope = direction === "outgoing"
+      && /^thread\/(?:start|resume|fork)$/.test(methodLower);
+    const startsNewTurnScope = direction === "outgoing" && methodLower === "turn/start";
+    if (startsNewThreadScope) resetCodexAppToolsProbeState();
+    else if (startsNewTurnScope) resetCodexAppToolsProbeState(true);
+    const version = codexAppToolsProbeVersion(root) || codexAppToolsProbeVersion(message);
+
+    // 普通 MCP 或 Responses 的全局 tools 列表不能证明其中包含 codex_app。
+    // 只有已识别为 codex_app MCP 的事件才允许更新 MCP 工具数量和 read_thread。
+    const mcpToolNames = mcpSeen ? toolNames : null;
+    const hasContextEvidence = Boolean(
+      model || modelProvider || toolMode || version
+      || startsNewThreadScope || startsNewTurnScope,
+    );
+    if (!mcpSeen && !legacyDynamicCodexApp && !mcpToolNames && !hasContextEvidence) return;
+
+    if (model) codexAppToolsProbeState.model = model;
+    if (modelProvider) codexAppToolsProbeState.modelProvider = modelProvider;
+    if (toolMode) codexAppToolsProbeState.toolMode = toolMode;
+    if (version) codexAppToolsProbeState.appServerVersion = version;
+    if (mcpServer) codexAppToolsProbeState.mcpServer = mcpServer;
+    codexAppToolsProbeState.mcpSeen = codexAppToolsProbeState.mcpSeen || mcpSeen;
+    if (mcpToolNames) {
+      codexAppToolsProbeState.mcpToolCount = mcpToolNames.length;
+      codexAppToolsProbeState.mcpHasReadThread = mcpToolNames.some((name) => {
+        const normalized = name.toLowerCase();
+        return normalized === "read_thread" || normalized.endsWith("__read_thread");
+      });
+    }
+    if (mcpSeen && mcpToolName) {
+      const normalized = mcpToolName.toLowerCase();
+      codexAppToolsProbeState.mcpHasReadThread = codexAppToolsProbeState.mcpHasReadThread
+        || normalized === "read_thread" || normalized.endsWith("__read_thread");
+    }
+    codexAppToolsProbeState.legacyDynamicCodexApp = codexAppToolsProbeState.legacyDynamicCodexApp
+      || legacyDynamicCodexApp;
+
+    const signature = JSON.stringify([
+      direction,
+      method,
+      codexAppToolsProbeState.appServerVersion,
+      codexAppToolsProbeState.model,
+      codexAppToolsProbeState.modelProvider,
+      codexAppToolsProbeState.mcpSeen,
+      codexAppToolsProbeState.mcpToolCount,
+      codexAppToolsProbeState.mcpHasReadThread,
+      codexAppToolsProbeState.legacyDynamicCodexApp,
+    ]);
+    if (signature === codexAppToolsProbeState.lastSignature) return;
+    codexAppToolsProbeState.lastSignature = signature;
+    sendCodexPlusDiagnostic("codex_app_tools_probe", {
+      schemaVersion: codexAppToolsProbeSchemaVersion,
+      appServerVersion: codexAppToolsProbeState.appServerVersion,
+      model: codexAppToolsProbeState.model,
+      modelProvider: codexAppToolsProbeState.modelProvider,
+      toolMode: codexAppToolsProbeState.toolMode,
+      direction,
+      requestMethod: method,
+      responseKind: message.error ? "error" : message.result ? "result" : "event",
+      mcpServer: codexAppToolsProbeState.mcpServer,
+      mcpSeen: codexAppToolsProbeState.mcpSeen,
+      mcpToolCount: codexAppToolsProbeState.mcpToolCount,
+      mcpHasReadThread: codexAppToolsProbeState.mcpHasReadThread,
+      legacyDynamicCodexApp: codexAppToolsProbeState.legacyDynamicCodexApp,
+    });
+  }
+
+  function installCodexAppToolsProbe() {
+    if (window.__codexPlusCodexAppToolsProbeInstalled) return;
+    window.__codexPlusCodexAppToolsProbeInstalled = true;
+    window.addEventListener("codex-message-from-view", (event) => {
+      try { codexAppToolsProbeEvent("outgoing", event?.detail); } catch (_) {}
+    }, true);
+    window.addEventListener("message", (event) => {
+      try { codexAppToolsProbeEvent("incoming", event?.data); } catch (_) {}
+    }, true);
+    sendCodexPlusDiagnostic("codex_app_tools_probe_installed", {
+      schemaVersion: codexAppToolsProbeSchemaVersion,
+    });
+  }
+
+  installCodexAppToolsProbe();
+
   sendCodexPlusDiagnostic("script_loaded", {
     version: codexPlusVersion,
     build: codexPlusBuild,
@@ -7688,23 +7981,24 @@
   }
 
   function normalizeCodexModelReasoningParams(method, params) {
-    const target = codexModelReasoningTarget(method, params);
-    if (!target) return params;
+    const providerParams = applyCodexRemoteSessionProviderOverride(method, params);
+    const target = codexModelReasoningTarget(method, providerParams);
+    if (!target) return providerParams;
     const modelKey = ["model", "modelId", "model_id"].find((key) => typeof target.params[key] === "string" && target.params[key].trim());
-    if (!modelKey) return params;
+    if (!modelKey) return providerParams;
     const modelName = target.params[modelKey].trim();
     const supported = codexModelReasoningEffortValues(modelName);
-    if (!supported.length) return params;
+    if (!supported.length) return providerParams;
     const effortKey = ["reasoningEffort", "reasoning_effort", "effort"].find((key) => Object.prototype.hasOwnProperty.call(target.params, key));
     const current = effortKey ? String(target.params[effortKey] || "").trim() : "";
-    if (current && supported.includes(current)) return params;
+    if (current && supported.includes(current)) return providerParams;
     const configuredDefault = String(
       codexPlusModelMetadata(modelName)?.defaultReasoningEffort
       || codexBuiltInReasoningMetadata(modelName)?.defaultEffort
       || ""
     ).trim();
     const nextEffort = supported.includes(configuredDefault) ? configuredDefault : supported[0];
-    if (!effortKey && target.method !== "thread/settings/update") return params;
+    if (!effortKey && target.method !== "thread/settings/update") return providerParams;
     const nextParams = {
       ...target.params,
       [effortKey || "reasoningEffort"]: nextEffort,
@@ -7749,11 +8043,38 @@
       const params = normalizeCodexModelReasoningParams("turn/start", message.params);
       return params === message.params ? message : { ...message, params };
     }
+    // 新版桌面端把 `turn/start`、`thread/start`、`thread/resume`、
+    // `thread/settings/update` 这类 app-server 请求以**裸 JSON-RPC 形态**
+    // （`{ method, params }`，没有 `type`，或 type 不在上面那几种里）派发出去。
+    // 缺少这一支时 provider 覆盖永远不会执行：会话一直留在内置的 `openai`
+    // provider 上直连 chatgpt.com，第三方模型被 ChatGPT 账号侧拒绝，报
+    // “The 'X' model is not supported when using Codex with a ChatGPT account.”。
+    const directMethod = String(message.method || "").trim();
+    if (directMethod
+        && codexRemoteSessionProviderRequestMethod(directMethod)
+        && message.params
+        && typeof message.params === "object") {
+      const params = normalizeCodexModelReasoningParams(directMethod, message.params);
+      return params === message.params ? message : { ...message, params };
+    }
+    const nested = message.request && typeof message.request === "object" ? message.request : null;
+    const nestedMethod = nested ? String(nested.method || "").trim() : "";
+    if (nestedMethod
+        && codexRemoteSessionProviderRequestMethod(nestedMethod)
+        && nested.params
+        && typeof nested.params === "object") {
+      const params = normalizeCodexModelReasoningParams(nestedMethod, nested.params);
+      if (params !== nested.params) return { ...message, request: { ...nested, params } };
+    }
     return message;
   }
 
   function installCodexModelRequestBridgePatch() {
-    if (!codexPlusModelUnlockEnabled() && !codexPlusSettings().quotaResume) return;
+    // provider 覆盖是第三方接入的命脉，不能只挂在“模型白名单解锁”这一个开关上：
+    // 关掉解锁就会静默退回内置 openai provider，第三方模型全被账号侧拒绝。
+    if (!codexPlusModelUnlockEnabled()
+        && !codexPlusSettings().quotaResume
+        && !codexRemoteSessionProviderOverrideEnabled()) return;
     const bridge = window.electronBridge;
     if (!bridge || typeof bridge.sendMessageFromView !== "function") return;
     if (bridge.__codexPlusModelRequestBridgePatch === codexModelRequestBridgePatchVersion) return;
@@ -7761,7 +8082,7 @@
     bridge.sendMessageFromView = function codexPlusModelPatchedSendMessageFromView(message) {
       let nextMessage = message;
       try {
-        if (codexPlusModelUnlockEnabled()) {
+        if (codexPlusModelUnlockEnabled() || codexRemoteSessionProviderOverrideEnabled()) {
           nextMessage = patchCodexModelReasoningRequestMessage(message);
         }
         rememberCodexQuotaResumeBridgeMessage(nextMessage);
@@ -7770,11 +8091,24 @@
           errorName: error?.name || "",
           errorMessage: error?.message || String(error),
         });
+        if (codexPlusBackendSettings?.officialExperience?.enabled === true) throw error;
       }
       return originalSendMessageFromView(nextMessage);
     };
     bridge.__codexPlusModelRequestBridgePatch = codexModelRequestBridgePatchVersion;
     sendCodexPlusDiagnostic("model_reasoning_bridge_patch_installed", {});
+  }
+
+  function codexPlusModelDisplayName(metadata, modelName, fallbackDisplayName = "") {
+    const displayName = typeof metadata?.displayName === "string" && metadata.displayName.trim()
+      ? metadata.displayName.trim()
+      : (fallbackDisplayName || modelName);
+    // Source routes already carry a complete label. Legacy catalogs may still use a suffix.
+    if (metadata?.sourceKind) return displayName;
+    const displaySuffix = typeof metadata?.displaySuffix === "string" ? metadata.displaySuffix.trim() : "";
+    return displaySuffix && !displayName.endsWith(displaySuffix)
+      ? `${displayName}${displaySuffix}`
+      : displayName;
   }
 
   function applyCodexPlusModelMetadata(descriptor, modelName) {
@@ -7787,15 +8121,17 @@
         changed = true;
       }
     }
-    const displaySuffix = typeof metadata.displaySuffix === "string" ? metadata.displaySuffix.trim() : "";
-    const baseDisplayName = typeof metadata.displayName === "string" && metadata.displayName
-      ? metadata.displayName
-      : (typeof descriptor.displayName === "string" && descriptor.displayName ? descriptor.displayName : modelName);
-    const displayName = displaySuffix && !baseDisplayName.endsWith(displaySuffix)
-      ? `${baseDisplayName}${displaySuffix}`
-      : baseDisplayName;
+    const displayName = codexPlusModelDisplayName(metadata, modelName, descriptor.displayName);
     if (descriptor.displayName !== displayName) {
       descriptor.displayName = displayName;
+      changed = true;
+    }
+    if (metadata.providerId && descriptor.modelProvider !== metadata.providerId) {
+      descriptor.modelProvider = metadata.providerId;
+      changed = true;
+    }
+    if (Number.isInteger(metadata.priority) && descriptor.priority !== metadata.priority) {
+      descriptor.priority = metadata.priority;
       changed = true;
     }
     if (Array.isArray(metadata.supportedReasoningEfforts) && metadata.supportedReasoningEfforts.length > 0) {
@@ -7816,19 +8152,25 @@
     return changed;
   }
 
-  function codexPlusModelDescriptor(modelName) {
+  function codexPlusModelDescriptor(modelName, availableModels = []) {
     const metadata = codexPlusModelMetadata(modelName);
-    const displayName = metadata?.displayName || modelName;
-    const displaySuffix = typeof metadata?.displaySuffix === "string" ? metadata.displaySuffix.trim() : "";
+    const displayName = codexPlusModelDisplayName(metadata, modelName);
+    const capabilitySlug = String(metadata?.capabilitySlug || "").trim();
+    const officialTemplate = capabilitySlug && Array.isArray(availableModels)
+      ? availableModels.find((item) => String(item?.model || item?.slug || "").trim().toLowerCase() === capabilitySlug.toLowerCase())
+      : null;
     return {
+      ...(officialTemplate && typeof officialTemplate === "object" ? { ...officialTemplate } : {}),
       model: modelName,
       id: modelName,
       slug: modelName,
       name: modelName,
-      displayName: displaySuffix && !displayName.endsWith(displaySuffix) ? `${displayName}${displaySuffix}` : displayName,
+      displayName,
       description: metadata?.description || codexModelCatalog.provider_name || codexModelCatalog.model_provider || "Custom model",
       hidden: false,
       isDefault: false,
+      ...(metadata?.providerId ? { modelProvider: metadata.providerId } : {}),
+      ...(Number.isInteger(metadata?.priority) ? { priority: metadata.priority } : {}),
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
       ...(Array.isArray(metadata?.additionalSpeedTiers)
@@ -7881,7 +8223,7 @@
     });
     customModels.forEach((modelName) => {
       if (!existing.has(modelName)) {
-        models.push(codexPlusModelDescriptor(modelName));
+        models.push(codexPlusModelDescriptor(modelName, models));
         changed = true;
       }
     });
@@ -8048,6 +8390,24 @@
   function patchAppServerModelMessages() {
     if (window.__codexPlusModelMessagePatchInstalled) return;
     window.__codexPlusModelMessagePatchInstalled = true;
+    // Codex may have registered its message listener before this script was attached.
+    // Patch on data access so its listener sees the catalog even in an existing document.
+    const messageData = Object.getOwnPropertyDescriptor(MessageEvent.prototype, "data");
+    if (messageData?.configurable && typeof messageData.get === "function") {
+      Object.defineProperty(MessageEvent.prototype, "data", {
+        ...messageData,
+        get() {
+          const data = messageData.get.call(this);
+          try {
+            patchMcpModelResponseData(data);
+          } catch (error) {
+            window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
+            window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
+          }
+          return data;
+        },
+      });
+    }
     window.addEventListener("codex-message-from-view", (event) => {
       try {
         const detail = event?.detail;
@@ -8084,8 +8444,9 @@
     if (data?.type !== "mcp-response") return false;
     const message = data.message || data.response;
     const requestId = message?.id != null ? String(message.id) : "";
-    if (codexPlusModelListRequestIds.size === 0 || !codexPlusModelListRequestIds.has(requestId)) return false;
-    codexPlusModelListRequestIds.delete(requestId);
+    const requestMethod = String(data.requestMethod || data.request?.method || "");
+    if (requestMethod !== "model/list" && !codexPlusModelListRequestIds.has(requestId)) return false;
+    if (requestId) codexPlusModelListRequestIds.delete(requestId);
     let changed = false;
     if (patchModelArray(message?.result?.data, true)) changed = true;
     if (patchModelArray(message?.result?.models, true)) changed = true;
@@ -8107,7 +8468,7 @@
   }
 
   function patchAppServerModelResult(method, result) {
-    if (method !== "list-models-for-host") return result;
+    if (method !== "list-models-for-host" && method !== "model/list") return result;
     try {
       if (Array.isArray(result)) patchModelArray(result, true);
       if (Array.isArray(result?.data)) patchModelArray(result.data, true);
@@ -8190,9 +8551,10 @@
         if (providerRefreshFailed) {
           sendCodexPlusDiagnostic("remote_session_provider_refresh_failed", {});
         }
-      } else if (codexRemoteSessionProviderRequestMethod(requestMethod)
+      }
+      if (codexRemoteSessionProviderRequestMethod(requestMethod)
           && codexRemoteSessionProviderOverrideEnabled()
-          && !codexRemoteSessionTargetProvider()) {
+          && !Array.isArray(codexModelCatalog?.routeDescriptors)) {
         await loadCodexModelCatalog();
       }
       const nextParams = providerRefreshFailed
@@ -8237,6 +8599,9 @@
         }
         throw error;
       }
+      if (codexRateLimitUnlockRequestMethod(requestMethod)) {
+        neutralizeCodexRateLimitPayload(result);
+      }
       const threadState = codexThreadModelRequestState(requestMethod, nextParams, result);
       if (modelContextRefresh !== false && threadState.threadId && threadState.model
           && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
@@ -8250,6 +8615,338 @@
     return true;
   }
 
+  // 账号额度用尽后，上游会把输入框和发送按钮一起锁死（coreRateLimitBlocked /
+  // selectedModelRateLimitReached）。判定只依赖 rateLimits 响应里的四个布尔字段，
+  // 这里在传输层把它们改写为“未触达”，让用户始终可以换模型继续发送；
+  // 真实额度判定仍在服务端，被改写只影响客户端阻断状态。
+  const codexRateLimitUnlockMaxTrackedRequests = 64;
+
+  function codexRateLimitUnlockEnabled() {
+    return codexPlusSettings().quotaResume === true;
+  }
+
+  function codexRateLimitUnlockRequestMethod(value) {
+    const method = appServerModelRequestMethod(String(value || ""));
+    return method === "account/rateLimits/read"
+      || method === "account/usage/read"
+      || method === "account/read" ? method : "";
+  }
+
+  function neutralizeCodexRateLimitValue(value, depth = 0) {
+    if (!value || typeof value !== "object" || depth > 6) return false;
+    let changed = false;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (neutralizeCodexRateLimitValue(item, depth + 1)) changed = true;
+      }
+      return changed;
+    }
+    for (const key of Object.keys(value)) {
+      const item = value[key];
+      if (key === "rate_limit_reached_type") {
+        if (item != null) {
+          value[key] = null;
+          changed = true;
+        }
+        continue;
+      }
+      if (key === "limit_reached" || key === "blocked" || key === "reached" || key === "overage_limit_reached") {
+        if (item !== false) {
+          value[key] = false;
+          changed = true;
+        }
+        continue;
+      }
+      if (key === "allowed") {
+        if (item !== true) {
+          value[key] = true;
+          changed = true;
+        }
+        continue;
+      }
+      // 桌面端还会看 credits.has_credits/unlimited 兜底判断是否“额度耗尽”
+      // （has_credits=false 且 unlimited=false 时直接判定受限）。这里把
+      // has_credits 视为可用，只影响客户端阻断状态，真实额度仍在服务端。
+      if (key === "has_credits") {
+        if (item !== true) {
+          value[key] = true;
+          changed = true;
+        }
+        continue;
+      }
+      if (item && typeof item === "object" && neutralizeCodexRateLimitValue(item, depth + 1)) {
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  function neutralizeCodexRateLimitPayload(payload) {
+    if (!codexRateLimitUnlockEnabled() || !payload || typeof payload !== "object") return payload;
+    try {
+      if (neutralizeCodexRateLimitValue(payload)) {
+        sendCodexPlusDiagnostic("usage_limit_payload_neutralized", {});
+      }
+    } catch (error) {
+      sendCodexPlusDiagnostic("usage_limit_payload_neutralize_failed", {
+        errorName: error?.name || "",
+        errorMessage: error?.message || String(error),
+      });
+    }
+    return payload;
+  }
+
+
+  function rememberCodexRateLimitRequest(message) {
+    if (!codexRateLimitUnlockEnabled()) return;
+    if (!message || typeof message !== "object" || message.type !== "fetch") return;
+    if (!codexRateLimitUnlockRequestMethod(message.url || message.method || "")) return;
+    const requestId = message.requestId != null ? String(message.requestId) : "";
+    if (!requestId) return;
+    if (!(window.__codexPlusRateLimitRequestIds instanceof Set)) {
+      window.__codexPlusRateLimitRequestIds = new Set();
+    }
+    const requestIds = window.__codexPlusRateLimitRequestIds;
+    requestIds.add(requestId);
+    while (requestIds.size > codexRateLimitUnlockMaxTrackedRequests) {
+      const oldest = requestIds.values().next().value;
+      if (oldest === undefined) break;
+      requestIds.delete(oldest);
+    }
+  }
+
+  function patchCodexRateLimitResponseData(data) {
+    if (!codexRateLimitUnlockEnabled()) return false;
+    if (!data || typeof data !== "object" || data.type !== "fetch-response") return false;
+    const requestIds = window.__codexPlusRateLimitRequestIds;
+    if (!(requestIds instanceof Set) || requestIds.size === 0) return false;
+    const requestId = data.requestId != null ? String(data.requestId) : "";
+    if (!requestId || !requestIds.has(requestId)) return false;
+    requestIds.delete(requestId);
+    if (typeof data.bodyJsonString !== "string" || !data.bodyJsonString.trim()) return false;
+    try {
+      const parsed = JSON.parse(data.bodyJsonString);
+      if (!neutralizeCodexRateLimitValue(parsed)) return false;
+      data.bodyJsonString = JSON.stringify(parsed);
+      sendCodexPlusDiagnostic("usage_limit_bridge_payload_neutralized", {});
+      return true;
+    } catch (error) {
+      sendCodexPlusDiagnostic("usage_limit_bridge_payload_patch_failed", {
+        errorName: error?.name || "",
+        errorMessage: error?.message || String(error),
+      });
+      return false;
+    }
+  }
+
+  function installCodexRateLimitResponsePatch() {
+    if (window.__codexPlusRateLimitResponsePatch === codexRateLimitUnlockVersion) return;
+    if (!codexRateLimitUnlockEnabled()) return;
+    const bridge = window.electronBridge;
+    if (!bridge || typeof bridge.sendMessageFromView !== "function") return;
+    if (!bridge.__codexPlusRateLimitOriginalSendMessageFromView) {
+      bridge.__codexPlusRateLimitOriginalSendMessageFromView = bridge.sendMessageFromView.bind(bridge);
+      bridge.sendMessageFromView = function codexPlusRateLimitPatchedSendMessageFromView(message) {
+        let nextMessage = message;
+        try {
+          rememberCodexRateLimitRequest(message);
+        } catch (error) {
+          sendCodexPlusDiagnostic("usage_limit_bridge_request_patch_failed", {
+            errorName: error?.name || "",
+            errorMessage: error?.message || String(error),
+          });
+        }
+        return bridge.__codexPlusRateLimitOriginalSendMessageFromView(nextMessage);
+      };
+    }
+    if (!window.__codexPlusRateLimitResponseListenerInstalled) {
+      window.__codexPlusRateLimitResponseListenerInstalled = true;
+      window.addEventListener("message", (event) => {
+        try {
+          patchCodexRateLimitResponseData(event?.data);
+        } catch (error) {
+          sendCodexPlusDiagnostic("usage_limit_bridge_response_patch_failed", {
+            errorName: error?.name || "",
+            errorMessage: error?.message || String(error),
+          });
+        }
+      }, true);
+    }
+    window.__codexPlusRateLimitResponsePatch = codexRateLimitUnlockVersion;
+    sendCodexPlusDiagnostic("usage_limit_bridge_patch_installed", {});
+  }
+
+  function patchCodexUsageHttpTransport(module) {
+    if (!codexRateLimitUnlockEnabled()) return false;
+    for (const candidate of Object.values(module || {})) {
+      if (typeof candidate !== "function" || typeof candidate.getInstance !== "function") continue;
+      let transport;
+      try { transport = candidate.getInstance(); } catch { continue; }
+      if (!transport || typeof transport.fetch !== "function" || typeof transport.stream !== "function"
+          || !(transport.streamControllers instanceof Map)) continue;
+      if (transport.__codexPlusUsageHttpPatch === codexRateLimitUnlockVersion) return true;
+      let streamSource = "";
+      try { streamSource = Function.prototype.toString.call(transport.stream); } catch {}
+      if (!streamSource.includes("fetch-stream-event") || !streamSource.includes("streamControllers")) continue;
+      const originalFetch = transport.fetch.bind(transport);
+      const originalStream = transport.stream.bind(transport);
+      transport.fetch = async function codexPlusUsageFetch(url, options) {
+        const response = await originalFetch(url, options);
+        if (!codexRateLimitUnlockEnabled() || typeof url !== "string"
+            || !/^\/wham\/usage(?:\?|$)/.test(url) || !response?.ok) return response;
+        try {
+          const payload = await response.clone().json();
+          if (!payload || typeof payload !== "object" || !neutralizeCodexRateLimitValue(payload)) return response;
+          const headers = new Headers(response.headers);
+          headers.delete("content-length");
+          headers.delete("content-encoding");
+          sendCodexPlusDiagnostic("usage_limit_http_payload_neutralized", {});
+          return new Response(JSON.stringify(payload), {
+            status: response.status,
+            statusText: response.statusText,
+            headers,
+          });
+        } catch (error) {
+          sendCodexPlusDiagnostic("usage_limit_http_payload_patch_failed", {
+            errorName: error?.name || "",
+          });
+          return response;
+        }
+      };
+      transport.stream = function codexPlusUsageStream(method, url, options) {
+        if (!codexRateLimitUnlockEnabled() || method !== "GET" || typeof url !== "string"
+            || !/^\/wham\/usage\/stream(?:\?|$)/.test(url)
+            || typeof options?.onEvent !== "function") {
+          return originalStream(method, url, options);
+        }
+        return originalStream(method, url, {
+          ...options,
+          onEvent(event) {
+            if (event?.event === "usage.snapshot" && event.data?.usage) {
+              try {
+                if (neutralizeCodexRateLimitValue(event.data.usage)) {
+                  sendCodexPlusDiagnostic("usage_limit_stream_payload_neutralized", {});
+                }
+              } catch (error) {
+                sendCodexPlusDiagnostic("usage_limit_stream_payload_patch_failed", {
+                  errorName: error?.name || "",
+                });
+              }
+            }
+            return options.onEvent(event);
+          },
+        });
+      };
+      transport.__codexPlusUsageHttpPatch = codexRateLimitUnlockVersion;
+      sendCodexPlusDiagnostic("usage_limit_http_patch_installed", {});
+      return true;
+    }
+    return false;
+  }
+
+  let codexUsageQueryClient = null;
+
+  function findCodexUsageQueryClient() {
+    if (codexUsageQueryClient?.getQueryCache && codexUsageQueryClient?.setQueryData) {
+      return codexUsageQueryClient;
+    }
+    const roots = [document.getElementById("root"), document.body, document.documentElement].filter(Boolean);
+    const queue = [];
+    for (const root of roots) {
+      for (const key of Object.keys(root)) {
+        if (key.startsWith("__reactContainer$") || key.startsWith("__reactFiber$")) queue.push(root[key]?.current || root[key]);
+      }
+    }
+    const seen = new Set();
+    for (let index = 0; index < queue.length && index < 30000; index += 1) {
+      const fiber = queue[index];
+      if (!fiber || seen.has(fiber)) continue;
+      seen.add(fiber);
+      const client = fiber.memoizedProps?.client;
+      if (client && typeof client.getQueryCache === "function" && typeof client.setQueryData === "function") {
+        codexUsageQueryClient = client;
+        return client;
+      }
+      if (fiber.child) queue.push(fiber.child);
+      if (fiber.sibling) queue.push(fiber.sibling);
+    }
+    return null;
+  }
+
+  function refreshCodexUsageLimitQueryCache() {
+    if (!codexRateLimitUnlockEnabled()) return;
+    const client = findCodexUsageQueryClient();
+    if (!client) return;
+    let changed = 0;
+    for (const query of client.getQueryCache().findAll({ queryKey: ["rate-limit-status"] })) {
+      if (!Array.isArray(query.queryKey) || query.queryKey[0] !== "rate-limit-status"
+          || !query.state?.data || typeof query.state.data !== "object") continue;
+      try {
+        const data = structuredClone(query.state.data);
+        if (!neutralizeCodexRateLimitValue(data)) continue;
+        client.setQueryData(query.queryKey, data);
+        changed += 1;
+      } catch (error) {
+        sendCodexPlusDiagnostic("usage_limit_cache_patch_failed", {
+          errorName: error?.name || "",
+        });
+      }
+    }
+    if (changed) sendCodexPlusDiagnostic("usage_limit_cache_neutralized", { queries: changed });
+  }
+
+  // Recent Codex builds send app-server requests through a shared vscode://codex/
+  // transport. The preload bridge is frozen and the old sendRequest client is
+  // no longer exported, so patch the transport before it forwards the request.
+  function patchCodexVscodeRequestTransport(module) {
+    for (const candidate of Object.values(module || {})) {
+      if (typeof candidate !== "function" || typeof candidate.getInstance !== "function") continue;
+      let transport;
+      try { transport = candidate.getInstance(); } catch { continue; }
+      if (!transport || typeof transport.sendRequest !== "function"
+          || !(transport.pendingRequests instanceof Map)) continue;
+      let source = "";
+      try { source = Function.prototype.toString.call(transport.sendRequest); } catch {}
+      if (!source.includes("vscode://codex/") || !source.includes("pendingRequests")) continue;
+      if (transport.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
+      const originalSendRequest = transport.sendRequest.bind(transport);
+      transport.sendRequest = async function codexPlusVscodeModelRequest(method, url, options) {
+        const requestMethod = appServerModelRequestMethod(url);
+        if (codexRateLimitUnlockRequestMethod(url)) {
+          const rateLimitResult = await originalSendRequest(method, url, options);
+          return neutralizeCodexRateLimitPayload(rateLimitResult);
+        }
+        if (method !== "POST" || !codexRemoteSessionProviderRequestMethod(requestMethod)
+            || !options || typeof options.body !== "string") {
+          return originalSendRequest(method, url, options);
+        }
+        let params;
+        try { params = JSON.parse(options.body); } catch { return originalSendRequest(method, url, options); }
+        const requestedModel = String(params?.model || params?.modelId || params?.model_id || "").trim();
+        const looksExtended = requestedModel.includes(":") || /\(.+\)/.test(requestedModel);
+        if (looksExtended || codexRemoteSessionProviderPatchEnabled()) {
+          const settingsLoaded = await loadBackendSettingsState();
+          if (!settingsLoaded && looksExtended) {
+            throw new Error("扩展模型来源配置不可用，请保持 Codex++ 运行并重试");
+          }
+          if (!Array.isArray(codexModelCatalog?.routeDescriptors)) await loadCodexModelCatalog();
+          if (codexPlusBackendSettings?.officialExperience?.enabled === true
+              && looksExtended
+              && !codexOfficialExperienceRouteDescriptor(requestedModel)) {
+            throw new Error(`扩展模型 ${requestedModel} 没有可用的来源路由`);
+          }
+        }
+        const nextParams = normalizeCodexModelReasoningParams(requestMethod, params);
+        if (nextParams === params) return originalSendRequest(method, url, options);
+        return originalSendRequest(method, url, { ...options, body: JSON.stringify(nextParams) });
+      };
+      transport.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
+      sendCodexPlusDiagnostic("model_vscode_request_patch_installed", {});
+      return true;
+    }
+    return false;
+  }
+
   const appServerModelRequestPatchMaxMisses = 8;
   let appServerModelRequestPatchMissCount = 0;
   let appServerModelRequestPatchDisabled = false;
@@ -8259,10 +8956,13 @@
   function scheduleAppServerModelRequestPatchRetry() {
     if (!codexRemoteSessionProviderPatchEnabled() && !codexPlusSettings().quotaResume) return;
     if (appServerModelRequestPatchRetryTimer) return;
+    const retryMs = codexPlusBackendSettings?.officialExperience?.enabled === true
+      ? Math.min(10000, 500 * (2 ** Math.min(appServerModelRequestPatchMissCount, 5)))
+      : 250;
     appServerModelRequestPatchRetryTimer = window.setTimeout(() => {
       appServerModelRequestPatchRetryTimer = 0;
       installAppServerModelRequestPatch();
-    }, 250);
+    }, retryMs);
   }
 
   function noteAppServerModelRequestPatchMiss(event, detail) {
@@ -8299,6 +8999,7 @@
   function installAppServerModelRequestPatch() {
     if (window.__codexPlusAppServerModelRequestPatchInstalled === codexAppServerModelRequestPatchVersion) return;
     if (appServerModelRequestPatchDisabled) return;
+    if (appServerModelRequestPatchRetryTimer) return;
     if (appServerModelRequestPatchPromise) return;
     const patch = async () => {
       try {
@@ -8310,10 +9011,34 @@
           return;
         }
         let patchedCount = 0;
-        for (const candidate of candidates) {
-          if (patchAppServerModelRequestClient(candidate)) patchedCount += 1;
+        let providerTransportPatched = false;
+        let vscodeTransportPatched = false;
+        for (const module of modules) {
+          if (patchCodexUsageHttpTransport(module)) patchedCount += 1;
+          if (patchCodexVscodeRequestTransport(module)) {
+            patchedCount += 1;
+            providerTransportPatched = true;
+            vscodeTransportPatched = true;
+          }
         }
-        if (patchedCount > 0) {
+        for (const candidate of candidates) {
+          if (!vscodeTransportPatched && candidate && typeof candidate === "object"
+              && Object.values(candidate).slice(0, 50).some((value) =>
+                typeof value === "function" && typeof value.getInstance === "function")
+              && patchCodexVscodeRequestTransport(candidate)) {
+            patchedCount += 1;
+            providerTransportPatched = true;
+            vscodeTransportPatched = true;
+          }
+          if (patchAppServerModelRequestClient(candidate)) {
+            patchedCount += 1;
+            providerTransportPatched = true;
+          }
+        }
+        const officialExperience = codexPlusBackendSettings?.officialExperience?.enabled === true;
+        const providerReady = !codexRemoteSessionProviderPatchEnabled()
+          || (officialExperience ? vscodeTransportPatched : providerTransportPatched);
+        if (patchedCount > 0 && providerReady) {
           clearTimeout(appServerModelRequestPatchRetryTimer);
           appServerModelRequestPatchRetryTimer = 0;
           appServerModelRequestPatchMissCount = 0;
@@ -8322,6 +9047,7 @@
             moduleCount: modules.length,
             candidateCount: candidates.length,
             patchedCount,
+            vscodeTransportPatched,
             sources,
             discovery,
           });
@@ -10700,6 +11426,10 @@
   function scanLightweight() {
     installStyle();
     refreshOfficialUsageAlertVisibility();
+    refreshCodexUsageLimitUnblock();
+    refreshCodexUsageLimitComposerUnblock();
+    refreshCodexUsageLimitQueryCache();
+    installCodexRateLimitResponsePatch();
     installCodexServiceTierDispatcherPatch();
     installCodexRemoteSessionRecoveryListener();
     installCodexQuotaResumeListener();
@@ -10759,6 +11489,166 @@
     officialUsageAlertCards().forEach((card) => {
       const container = officialUsageAlertContainer(card);
       container.dataset.codexPlusUsageAlertHidden = "true";
+    });
+  }
+
+  const codexUsageLimitDialogAttribute = "data-codex-plus-usage-limit-hidden";
+  const codexUsageLimitDialogRetryMs = 1200;
+  let codexUsageLimitDialogLastAttemptAt = 0;
+  let codexUsageLimitLastDismissalAt = 0;
+  let codexUsageLimitDialogDismissals = 0;
+
+  function codexUsageLimitDialogCandidates() {
+    return Array.from(document.querySelectorAll(
+      '[role="dialog"][aria-modal="true"], [role="alertdialog"], [data-state="open"][aria-modal="true"]',
+    )).filter((node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      if (node.closest(`[data-codex-plus-dialog="true"], .codex-plus-modal-overlay, .codex-plus-page-overlay`)) return false;
+      const text = String(node.innerText || node.textContent || "").trim();
+      if (!text) return false;
+      return codexQuotaResumeTextHasMarker(text);
+    });
+  }
+
+  function codexUsageLimitDialogDismissButton(dialog) {
+    const buttons = Array.from(dialog.querySelectorAll('button, [role="button"]'));
+    return buttons.find((button) => {
+      if (!visibleElement(button)) return false;
+      const label = [button.getAttribute("aria-label"), button.textContent]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!label) return false;
+      return /dismiss|close|got it|okay|^ok$|continue|understand|知道了|我知道了|关闭|继续|稍后|确定/i.test(label);
+    }) || null;
+  }
+
+  function codexUsageLimitDialogTopLayer(dialog) {
+    let node = dialog;
+    let candidate = null;
+    while (node && node !== document.body && node instanceof HTMLElement) {
+      let position = "";
+      try {
+        position = String(window.getComputedStyle(node).position || "");
+      } catch (_) {}
+      if (position === "fixed") candidate = node;
+      node = node.parentElement;
+    }
+    return candidate || dialog;
+  }
+
+  function codexUsageLimitReleaseInputLocks() {
+    for (const node of [document.body, document.documentElement]) {
+      if (!(node instanceof HTMLElement)) continue;
+      if (node.style.pointerEvents === "none") node.style.pointerEvents = "";
+      if (node.hasAttribute("inert")) node.removeAttribute("inert");
+      if (node.getAttribute("aria-hidden") === "true" && node !== document.body) {
+        node.removeAttribute("aria-hidden");
+      }
+    }
+    document.querySelectorAll('[inert][data-codex-plus-usage-limit-inert="true"]').forEach((node) => {
+      if (node instanceof HTMLElement) node.removeAttribute("inert");
+    });
+  }
+
+  function codexUsageLimitComposerSendButton() {
+    const composer = codexServiceTierFindComposerEl();
+    if (!composer) return null;
+    return codexQuotaResumeNativeSendButton(composer);
+  }
+
+  function codexUsageLimitComposerIsBusy() {
+    const threadId = validThreadScrollSessionKey(currentSessionRef().session_id);
+    if (!threadId) return false;
+    return codexQuotaResumeRuntime().active.has(threadId);
+  }
+
+  function refreshCodexUsageLimitComposerUnblock() {
+    if (!codexPlusSettings().quotaResume) return;
+    if (codexUsageLimitComposerIsBusy()) return;
+    const composer = codexServiceTierFindComposerEl();
+    if (!composer) return;
+    const threadId = validThreadScrollSessionKey(currentSessionRef().session_id);
+    const quotaPending = !!threadId && codexQuotaResumeRuntime().pending.has(threadId);
+    const draftPending = !codexQuotaResumeEditorIsEmpty(composer);
+    // 账号额度用尽后上游会锁住整个输入区。只在用户确实要发送（输入框有草稿或在补发空回合）
+    // 时解除，避免干扰上游正常的“回合进行中”状态。
+    if (!quotaPending && !draftPending) return;
+    let changed = false;
+    let node = composer;
+    while (node && node !== document.body && node instanceof HTMLElement) {
+      if (node.hasAttribute("inert")) {
+        node.removeAttribute("inert");
+        changed = true;
+      }
+      if (node.style.pointerEvents === "none") {
+        node.style.pointerEvents = "";
+        changed = true;
+      }
+      node = node.parentElement;
+    }
+    const sendButton = codexUsageLimitComposerSendButton();
+    if (sendButton?.disabled) {
+      sendButton.disabled = false;
+      sendButton.removeAttribute("aria-disabled");
+      sendButton.removeAttribute("data-disabled");
+      changed = true;
+    }
+    if (changed) {
+      sendCodexPlusDiagnostic("usage_limit_composer_unblocked", {
+        sendEnabled: !!sendButton && !sendButton.disabled,
+      });
+    }
+  }
+
+  /**
+   * 上游在限额后插入的阻断弹窗不一定会触发常规 DOM 扫描，
+   * 这里用固定间隔只做一次轻量的弹窗探测，发现才写入，避免自喂扫描循环。
+   */
+  function installCodexUsageLimitWatcher() {
+    if (window.__codexPlusUsageLimitWatcherVersion === codexQuotaResumeVersion) return;
+    clearInterval(window.__codexPlusUsageLimitWatcherTimer);
+    window.__codexPlusUsageLimitWatcherTimer = setInterval(() => {
+      try {
+        refreshCodexUsageLimitUnblock();
+        refreshCodexUsageLimitComposerUnblock();
+      } catch (error) {
+        sendCodexPlusDiagnostic("usage_limit_unblock_failed", {
+          errorName: error?.name || "",
+          errorMessage: error?.message || String(error),
+        });
+      }
+    }, 1200);
+    window.__codexPlusUsageLimitWatcherVersion = codexQuotaResumeVersion;
+  }
+
+  function refreshCodexUsageLimitUnblock() {
+    if (!codexPlusSettings().quotaResume) return;
+    const dialogs = codexUsageLimitDialogCandidates();
+    const now = Date.now();
+    if (dialogs.length === 0) {
+      codexUsageLimitDialogLastAttemptAt = 0;
+      return;
+    }
+    if (now - codexUsageLimitDialogLastAttemptAt < codexUsageLimitDialogRetryMs) return;
+    codexUsageLimitDialogLastAttemptAt = now;
+    for (const dialog of dialogs) {
+      const dismissButton = codexUsageLimitDialogDismissButton(dialog);
+      if (dismissButton) {
+        try { dismissButton.click(); } catch (_) {}
+      }
+      const layer = codexUsageLimitDialogTopLayer(dialog);
+      if (layer instanceof HTMLElement) layer.setAttribute(codexUsageLimitDialogAttribute, "true");
+      dialog.setAttribute(codexUsageLimitDialogAttribute, "true");
+    }
+    codexUsageLimitReleaseInputLocks();
+    codexUsageLimitDialogDismissals += dialogs.length;
+    codexUsageLimitLastDismissalAt = now;
+    refreshCodexUsageLimitComposerUnblock();
+    sendCodexPlusDiagnostic("usage_limit_dialog_dismissed", {
+      dialogs: dialogs.length,
+      totalDismissals: codexUsageLimitDialogDismissals,
     });
   }
 
@@ -11805,6 +12695,7 @@
   void loadBackendSettingsForStartup();
   installUpstreamBranchDropdownAdapter();
   installUpstreamWorktreeNativeAdapter();
+  installCodexUsageLimitWatcher();
   scan();
   scheduleSidebarNavStartupRetry();
   window.removeEventListener("resize", window.__codexPlusResizeHandler);

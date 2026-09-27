@@ -170,9 +170,6 @@ pub fn classify_mixed_model_route(
     settings: &BackendSettings,
     model: Option<&str>,
 ) -> MixedModelRoute {
-    if settings.active_aggregate_relay_profile().is_none() {
-        return MixedModelRoute::Aggregate;
-    }
     let official_auth_first = settings.active_relay_uses_official_login_auth();
     let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
         return if official_auth_first {
@@ -187,6 +184,13 @@ pub fn classify_mixed_model_route(
         )
     {
         return MixedModelRoute::Official;
+    }
+    if settings.active_aggregate_relay_profile().is_none() {
+        return if official_auth_first {
+            MixedModelRoute::Reject
+        } else {
+            MixedModelRoute::Aggregate
+        };
     }
     if crate::aggregate_model_alias::cliproxy_direct_api_aliases_for_settings(
         &settings.relay_profiles,

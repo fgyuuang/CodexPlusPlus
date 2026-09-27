@@ -36,6 +36,7 @@ import {
   GripVertical,
   Info,
   ImagePlus,
+  Inbox,
   Github,
   ExternalLink,
   Hammer,
@@ -66,6 +67,7 @@ import {
   ShieldCheck,
   ShieldAlert,
   Star,
+  Sparkles,
   Store,
   Stethoscope,
   Sun,
@@ -88,6 +90,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import {
   aggregateCodexAlias,
+  aggregateCapabilityModelSlugs,
   aggregateDisplayModelEntries,
   aggregateEffectiveMappings,
   aggregateMappingKeyOptions,
@@ -103,6 +106,7 @@ import {
   trustedOfficialModelSlugs,
   visibleOfficialModelSlugs,
 } from "./official-model-catalog.ts";
+import { bindUnmappedSourceModels } from "./capabilityBindings.ts";
 import { tokenizeCode, type CodeLanguage } from "./code-highlight";
 import { filterModelGroups } from "./model-groups";
 import { codexGoalsFeatureState, setCodexGoalsFeatureInConfig } from "./goals-config";
@@ -313,6 +317,33 @@ type OfficialLoginSessionResult = CommandResult<{
   error: string | null;
 }>;
 
+type OfficialExperienceSourceKind =
+  | "mainOfficial"
+  | "directOfficial"
+  | "cliOfficial"
+  | "cliGeneral"
+  | "relay"
+  | "aggregate"
+  | "legacyCustom";
+
+type ModelCapabilityBinding = {
+  routingSlug: string;
+  capabilitySlug: string;
+  sourceKind: OfficialExperienceSourceKind;
+  sourceId: string;
+  upstreamModel: string;
+};
+
+type OfficialExperienceSettings = {
+  enabled: boolean;
+  primaryOfficialAccountId: string;
+  cliOfficialEnabled: boolean;
+  cliOfficialLabel: string;
+  cliGeneralEnabled: boolean;
+  capabilityBindings: ModelCapabilityBinding[];
+  sourceImageEndpoints: Record<string, { generationsUrl: string; editsUrl: string }>;
+};
+
 type BackendSettings = {
   codexAppPath: string;
   codexExtraArgs: string[];
@@ -385,6 +416,7 @@ type BackendSettings = {
   officialLoginMixedMode: boolean;
   officialLoginRelayId: string;
   activeOfficialAccountId: string;
+  officialExperience: OfficialExperienceSettings;
   aggregateRelayProfiles: AggregateRelayProfile[];
   activeAggregateRelayId: string;
   relayCommonConfigContents: string;
@@ -583,7 +615,22 @@ type WeixinConnectStatusResult = CommandResult<{
   lastPeerId: string;
   lastMessageAtMs: number;
   processedMessages: number;
+  weixinState: string;
+  codexState: string;
+  runtimeActive: boolean;
+  recentError: string;
+  pendingMessages: number;
+  failedMessages: number;
 }>;
+
+type WeixinInboxResult = CommandResult<{
+  messages: Array<{ key: string; peerId: string; state: string; error: string; receivedAtMs: number }>;
+  pendingPairings: Array<{ peerId: string; requestedAtMs: number }>;
+  approvedPeers: string[];
+}>;
+
+type WeixinModelsResult = CommandResult<{ models: string[] }>;
+type WeixinModelTestResult = CommandResult<unknown>;
 
 type WeixinQrResult = CommandResult<{
   qrStatus: string;
@@ -736,6 +783,7 @@ type CliproxyStatusResult = CommandResult<{
   configPath: string;
   baseUrl: string;
   managementUrl: string;
+  autoStart: boolean;
   apiKey: string;
   managementKey: string;
   profileInstalled: boolean;
@@ -752,6 +800,26 @@ type CliproxyTestResult = CommandResult<{
   httpStatus: number;
   endpoint: string;
   model: string;
+}>;
+
+type CodexAppToolsStatusResult = CommandResult<{
+  agentStatus: string;
+  guidance: string;
+  appServerGeneration: string;
+  probe: {
+    appServerVersion: string;
+    model: string;
+    modelProvider: string;
+    toolMode: string;
+    direction: string;
+    requestMethod: string;
+    responseKind: string;
+    mcpServer: string;
+    mcpSeen: boolean;
+    mcpToolCount: number | null;
+    mcpHasReadThread: boolean;
+    legacyDynamicCodexApp: boolean;
+  } | null;
 }>;
 
 type CliproxyApplyResult = CommandResult<{
@@ -1282,6 +1350,15 @@ const defaultSettings: BackendSettings = {
   officialLoginMixedMode: false,
   officialLoginRelayId: "",
   activeOfficialAccountId: "",
+  officialExperience: {
+    enabled: false,
+    primaryOfficialAccountId: "",
+    cliOfficialEnabled: false,
+    cliOfficialLabel: "官方账号 2",
+    cliGeneralEnabled: false,
+    capabilityBindings: [],
+    sourceImageEndpoints: {},
+  },
   relayCommonConfigContents: "",
   relayContextConfigContents: "",
   activeRelayId: "default",
@@ -1313,10 +1390,17 @@ export function App() {
   const [settings, setSettings] = useState<SettingsResult | null>(null);
   const [weixinStatus, setWeixinStatus] = useState<WeixinConnectStatusResult | null>(null);
   const [weixinQr, setWeixinQr] = useState<WeixinQrResult | null>(null);
+  const [weixinInbox, setWeixinInbox] = useState<WeixinInboxResult | null>(null);
+  const [weixinModels, setWeixinModels] = useState<WeixinModelsResult | null>(null);
+  const [weixinModelsLoading, setWeixinModelsLoading] = useState(false);
+  const [weixinModelTesting, setWeixinModelTesting] = useState(false);
+  const [weixinModelTest, setWeixinModelTest] = useState<WeixinModelTestResult | null>(null);
+
   const [relay, setRelay] = useState<RelayResult | null>(null);
   const [officialAccounts, setOfficialAccounts] = useState<OfficialAccountsResult | null>(null);
   const [officialModelCatalog, setOfficialModelCatalogStatus] = useState<OfficialModelCatalogResult | null>(null);
   const [cliproxy, setCliproxy] = useState<CliproxyStatusResult | null>(null);
+  const [codexAppToolsStatus, setCodexAppToolsStatus] = useState<CodexAppToolsStatusResult | null>(null);
   const [cliproxyModels, setCliproxyModels] = useState<CliproxyModelsResult | null>(null);
   const [cliproxyTest, setCliproxyTest] = useState<CliproxyTestResult | null>(null);
   const [newapi, setNewapi] = useState<NewapiStatusResult | null>(null);
@@ -1361,6 +1445,9 @@ export function App() {
   });
   const prevLaunchStatusRef = useRef<string | null>(null);
   const [settingsForm, setSettingsForm] = useState<BackendSettings>({ ...defaultSettings });
+  useEffect(() => {
+    setWeixinModelTest(null);
+  }, [settingsForm.weixinConnectModel, settingsForm.weixinConnectWorkDir, settingsForm.weixinConnectCodexPath]);
   // 顶栏工具切换条的数据源。后端是唯一事实来源，不落 localStorage —— 多窗口
   // 同时开着时才不会各说各话。
   const [toolEntries, setToolEntries] = useState<ToolEntry[]>([]);
@@ -1671,7 +1758,7 @@ export function App() {
       await refreshOfficialModelCatalog(true);
     }
     showResultNotice(t("切换官方账号"), result);
-    if (confirmRestart && result.restartRequired) await restart();
+    if (confirmRestart && result.restartRequired) await restart("official_account_switch");
     return result;
   };
 
@@ -1743,6 +1830,22 @@ export function App() {
     return result;
   };
 
+  const refreshWeixinInbox = async () => {
+    const result = await run(() => call<WeixinInboxResult>("weixin_connect_inbox"));
+    if (result) setWeixinInbox(result);
+  };
+
+  const refreshCodexAppToolsStatus = async (silent = false) => {
+    const result = await run(() => call<CodexAppToolsStatusResult>("codex_app_tools_status"));
+    if (result) {
+      setCodexAppToolsStatus(result);
+      if (!silent || !isSuccessStatus(result.status)) {
+        showResultNotice(t("Codex Agent 工具状态"), result, { silentSuccess: true });
+      }
+    }
+    return result;
+  };
+
   const runCliproxyStatusAction = async (
     command: "cliproxy_install" | "cliproxy_start" | "cliproxy_stop" | "cliproxy_restart",
     title: string,
@@ -1751,6 +1854,17 @@ export function App() {
     if (result) {
       setCliproxy(result);
       showResultNotice(title, result);
+    }
+    return result;
+  };
+
+  const setCliproxyAutoStart = async (enabled: boolean) => {
+    const result = await run(() =>
+      call<CliproxyStatusResult>("cliproxy_set_auto_start", { request: { enabled } }),
+    );
+    if (result) {
+      setCliproxy(result);
+      showResultNotice(t("CLIProxyAPI 自启动"), result);
     }
     return result;
   };
@@ -1865,8 +1979,8 @@ export function App() {
       setSettings((current) => current ? { ...current, settings: normalized } : current);
       setCliproxy((current) => current ? {
         ...current,
-        profileInstalled: false,
-        officialProfileInstalled: false,
+        profileInstalled: current.officialProfileInstalled,
+        officialProfileInstalled: current.officialProfileInstalled,
         generalProfileInstalled: false,
       } : current);
       showResultNotice(t("CLIProxyAPI 接入"), result);
@@ -1876,10 +1990,6 @@ export function App() {
 
   const setCliproxyOfficialModelsEnabled = async (enabled: boolean) => {
     if (enabled) {
-      if (!cliproxy?.generalProfileInstalled) {
-        showNotice(t("CLIProxyAPI 官方登录"), t("请先启用 CLIProxyAPI 接入。"), "failed");
-        return null;
-      }
       const modelsResult = cliproxyModels && isSuccessStatus(cliproxyModels.status)
         ? cliproxyModels
         : await refreshCliproxyModels(true);
@@ -2737,6 +2847,7 @@ export function App() {
       await refreshOfficialAccounts(true);
       await refreshOfficialModelCatalog(true);
       await refreshCliproxy(true);
+      await refreshCodexAppToolsStatus(true);
       await refreshNewapi(true);
       await refreshRelayFiles(true);
       await refreshEnvConflicts(true);
@@ -2822,8 +2933,8 @@ export function App() {
     showLaunchCompletionNotice(t("启动任务"), completion);
   };
 
-  const restart = async (syncActiveRelay = false) => {
-    const result = await launchCommand("restart_codex_plus", syncActiveRelay);
+  const restart = async (restartSource: RestartSource, syncActiveRelay = false) => {
+    const result = await launchCommand("restart_codex_plus", syncActiveRelay, restartSource);
     if (!result) return false;
     if (!isSuccessStatus(result.status)) {
       showNotice(t("重启 Codex++"), result.message, result.status);
@@ -2840,7 +2951,11 @@ export function App() {
     return succeeded;
   };
 
-  const launchCommand = async (command: "launch_codex_plus" | "restart_codex_plus", syncActiveRelay = false) => {
+  const launchCommand = async (
+    command: "launch_codex_plus" | "restart_codex_plus",
+    syncActiveRelay = false,
+    restartSource: RestartSource | "" = "",
+  ) => {
     if (settingsForm.officialLoginMixedMode && settingsForm.activeOfficialAccountId.trim()) {
       // 目录刷新是增强能力；失败时继续启动，使用当前账号快照或 bundled 回退。
       await refreshOfficialModelCatalog(true, true);
@@ -2852,6 +2967,7 @@ export function App() {
           debugPort: numberOrDefault(launchForm.debugPort, 9229),
           helperPort: numberOrDefault(launchForm.helperPort, 57321),
           syncActiveRelay,
+          restartSource,
         },
       }),
     );
@@ -3134,7 +3250,56 @@ export function App() {
     showResultNotice(t("微信扫码登录"), result, { silentSuccess: true });
   };
 
+  const refreshWeixinModels = async () => {
+    setWeixinModelsLoading(true);
+    try {
+      const result = await call<WeixinModelsResult>("weixin_connect_models", {
+        workDir: settingsForm.weixinConnectWorkDir,
+        codexPath: settingsForm.weixinConnectCodexPath,
+      });
+      setWeixinModels(result);
+      return result;
+    } catch (error) {
+      const result: WeixinModelsResult = { status: "failed", message: stringifyError(error), models: [] };
+      setWeixinModels(result);
+      return result;
+    } finally {
+      setWeixinModelsLoading(false);
+    }
+  };
+
+  const ensureWeixinModel = async () => {
+    const selected = settingsForm.weixinConnectModel.trim();
+    if (!selected) return true;
+    const result = await refreshWeixinModels();
+    if (!isSuccessStatus(result.status)) {
+      showResultNotice(t("选择微信模型"), result);
+      return false;
+    }
+    if (result.models.includes(selected)) return true;
+    showNotice(t("模型不可用"), tf("当前 Codex 没有模型「{0}」。请从下拉列表重新选择。", [selected]), "failed");
+    return false;
+  };
+
+  const testWeixinModel = async () => {
+    setWeixinModelTesting(true);
+    setWeixinModelTest(null);
+    try {
+      const result = await call<WeixinModelTestResult>("weixin_connect_test_model", {
+        workDir: settingsForm.weixinConnectWorkDir,
+        codexPath: settingsForm.weixinConnectCodexPath,
+        model: settingsForm.weixinConnectModel,
+      });
+      setWeixinModelTest(result);
+    } catch (error) {
+      setWeixinModelTest({ status: "failed", message: stringifyError(error) });
+    } finally {
+      setWeixinModelTesting(false);
+    }
+  };
+
   const startWeixinConnect = async () => {
+    if (!await ensureWeixinModel()) return;
     const saved = await saveSettingsValue(settingsForm, true);
     if (!saved) return;
     const result = await run(() => call<WeixinConnectStatusResult>("weixin_connect_start"));
@@ -3142,6 +3307,60 @@ export function App() {
     setWeixinStatus(result);
     showResultNotice(t("微信连接"), result);
     await refreshSettings(true);
+  };
+
+  const restartWeixinConnect = async () => {
+    if (!await ensureWeixinModel()) return;
+    const saved = await saveSettingsValue(settingsForm, true);
+    if (!saved) return;
+    const result = await run(() => call<WeixinConnectStatusResult>("weixin_connect_restart"));
+    if (result) {
+      setWeixinStatus(result);
+      showResultNotice(t("微信连接"), result);
+    }
+  };
+
+  const saveWeixinSettings = async () => {
+    if (!await ensureWeixinModel()) return;
+    const saved = await saveSettingsValue(settingsForm, false);
+    if (saved && (weixinStatus?.runtimeActive || saved.weixinConnectEnabled)) {
+      const result = await run(() => call<WeixinConnectStatusResult>("weixin_connect_restart"));
+      if (result) setWeixinStatus(result);
+    }
+  };
+
+  const updateWeixinPairing = async (peerId: string, action: "approve" | "reject" | "revoke") => {
+    const result = await run(() => call<WeixinInboxResult>("weixin_connect_pairing", { peerId, action }));
+    if (result) {
+      setWeixinInbox(result);
+      showResultNotice(t("微信配对"), result, { silentSuccess: true });
+    }
+  };
+
+  const retryWeixinMessage = async (key: string) => {
+    const result = await run(() => call<WeixinInboxResult>("weixin_connect_retry_message", { key }));
+    if (result) {
+      setWeixinInbox(result);
+      showResultNotice(t("微信消息重试"), result, { silentSuccess: true });
+    }
+  };
+
+  const skipWeixinMessage = async (key: string) => {
+    const confirmed = await new Promise<boolean>((resolve) => {
+      setConfirmDialog({
+        title: t("跳过失败消息"),
+        message: t("跳过后，这条消息不会重新交给 Codex；同一联系人的后续消息会继续处理。"),
+        confirmText: t("跳过并继续"),
+        cancelText: t("取消"),
+        resolve,
+      });
+    });
+    if (!confirmed) return;
+    const result = await run(() => call<WeixinInboxResult>("weixin_connect_skip_message", { key }));
+    if (result) {
+      setWeixinInbox(result);
+      showResultNotice(t("微信消息"), result, { silentSuccess: true });
+    }
   };
 
   const stopWeixinConnect = async () => {
@@ -3733,7 +3952,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!weixinQr || !["", "wait", "scaned"].includes(weixinQr.qrStatus)) return;
+    if (!weixinQr || !["", "wait", "scaned", "scaned_but_redirect"].includes(weixinQr.qrStatus)) return;
     let cancelled = false;
     let timer: number | undefined;
     const poll = async () => {
@@ -3744,7 +3963,12 @@ export function App() {
         if (result.qrStatus === "confirmed") {
           await refreshSettings(true);
           await refreshWeixinStatus(true);
+          await refreshWeixinInbox();
           showNotice(t("微信扫码登录"), result.message, result.status);
+          return;
+        }
+        if (result.qrStatus === "expired") {
+          await beginWeixinQrLogin();
           return;
         }
         if (!isSuccessStatus(result.status) || result.qrStatus === "expired") {
@@ -3765,7 +3989,12 @@ export function App() {
 
   useEffect(() => {
     if (route !== "weixin") return;
-    const timer = window.setInterval(() => void refreshWeixinStatus(true), 2_000);
+    void refreshWeixinInbox();
+    void refreshWeixinModels();
+    const timer = window.setInterval(() => {
+      void refreshWeixinStatus(true);
+      void refreshWeixinInbox();
+    }, 2_000);
     return () => window.clearInterval(timer);
   }, [route]);
 
@@ -4003,10 +4232,12 @@ export function App() {
       importOfficialAccounts,
       exportOfficialAccounts,
       refreshCliproxy,
+      refreshCodexAppToolsStatus,
       installCliproxy: () => runCliproxyStatusAction("cliproxy_install", t("安装 CLIProxyAPI")),
       startCliproxy: () => runCliproxyStatusAction("cliproxy_start", t("启动 CLIProxyAPI")),
       stopCliproxy: () => runCliproxyStatusAction("cliproxy_stop", t("停止 CLIProxyAPI")),
       restartCliproxy: () => runCliproxyStatusAction("cliproxy_restart", t("重启 CLIProxyAPI")),
+      setCliproxyAutoStart,
       openCliproxyManagement,
       refreshCliproxyModels,
       testCliproxyApi,
@@ -4184,7 +4415,15 @@ export function App() {
             >
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </Button>
-            <Button onClick={() => void actions.restart()} title={t("重启 Codex++")} variant="outline">
+            <Button
+              onClick={(event) => {
+                if (!event.isTrusted) return;
+                if (!window.confirm(t("确定要启动或重启 Codex 吗？"))) return;
+                void actions.restart("topbar");
+              }}
+              title={t("重启 Codex++")}
+              variant="outline"
+            >
               <Rocket className="h-4 w-4" />
               {t("重启 Codex++")}
             </Button>
@@ -4211,6 +4450,7 @@ export function App() {
               officialAccounts={officialAccounts}
               officialModelCatalog={officialModelCatalog}
               cliproxy={cliproxy}
+              codexAppToolsStatus={codexAppToolsStatus}
               cliproxyModels={cliproxyModels}
               cliproxyTest={cliproxyTest}
               newapi={newapi}
@@ -4255,13 +4495,24 @@ export function App() {
             <WeixinConnectScreen
               form={settingsForm}
               status={weixinStatus}
+              inbox={weixinInbox}
+              models={weixinModels}
+              modelsLoading={weixinModelsLoading}
+              modelTesting={weixinModelTesting}
+              modelTest={weixinModelTest}
               qr={weixinQr}
               sessions={localSessions?.sessions ?? []}
               onFormChange={setSettingsForm}
-              onSave={() => void saveSettings()}
+              onSave={() => void saveWeixinSettings()}
               onQrLogin={() => void beginWeixinQrLogin()}
               onStart={() => void startWeixinConnect()}
               onStop={() => void stopWeixinConnect()}
+              onRestart={() => void restartWeixinConnect()}
+              onPairing={(peerId, action) => void updateWeixinPairing(peerId, action)}
+              onRetryMessage={(key) => void retryWeixinMessage(key)}
+              onSkipMessage={(key) => void skipWeixinMessage(key)}
+              onRefreshModels={() => void refreshWeixinModels()}
+              onTestModel={() => void testWeixinModel()}
               onChooseWorkDir={() => void chooseWeixinPath("workDir")}
               onChooseCodexPath={() => void chooseWeixinPath("codexPath")}
               onUseDesktopCodexCli={() => void useDesktopCodexCli()}
@@ -4414,10 +4665,12 @@ export function App() {
   );
 }
 
+type RestartSource = "topbar" | "official_account_switch" | "dream_skin_apply" | "model_route_save";
+
 type Actions = {
   refreshCurrent: () => Promise<void>;
   launch: () => Promise<void>;
-  restart: (syncActiveRelay?: boolean) => Promise<boolean>;
+  restart: (restartSource: RestartSource, syncActiveRelay?: boolean) => Promise<boolean>;
   repairPluginMarketplace: () => Promise<void>;
   refreshRemotePluginMarketplace: (silent?: boolean) => Promise<RemotePluginMarketplaceResult | null>;
   repairRemotePluginMarketplace: () => Promise<void>;
@@ -4474,10 +4727,12 @@ type Actions = {
   importOfficialAccounts: (password: string) => Promise<OfficialAccountsResult | null>;
   exportOfficialAccounts: (accountIds: string[], password: string) => Promise<OfficialAccountsResult | null>;
   refreshCliproxy: (silent?: boolean) => Promise<CliproxyStatusResult | null>;
+  refreshCodexAppToolsStatus: (silent?: boolean) => Promise<CodexAppToolsStatusResult | null>;
   installCliproxy: () => Promise<CliproxyStatusResult | null>;
   startCliproxy: () => Promise<CliproxyStatusResult | null>;
   stopCliproxy: () => Promise<CliproxyStatusResult | null>;
   restartCliproxy: () => Promise<CliproxyStatusResult | null>;
+  setCliproxyAutoStart: (enabled: boolean) => Promise<CliproxyStatusResult | null>;
   openCliproxyManagement: () => Promise<void>;
   refreshCliproxyModels: (silent?: boolean) => Promise<CliproxyModelsResult | null>;
   testCliproxyApi: (model: string) => Promise<CliproxyTestResult | null>;
@@ -4733,6 +4988,11 @@ function SearchableSessionPicker({
 function WeixinConnectScreen({
   form,
   status,
+  inbox,
+  models,
+  modelsLoading,
+  modelTesting,
+  modelTest,
   qr,
   sessions,
   onFormChange,
@@ -4740,6 +5000,12 @@ function WeixinConnectScreen({
   onQrLogin,
   onStart,
   onStop,
+  onRestart,
+  onPairing,
+  onRetryMessage,
+  onSkipMessage,
+  onRefreshModels,
+  onTestModel,
   onChooseWorkDir,
   onChooseCodexPath,
   onUseDesktopCodexCli,
@@ -4748,6 +5014,11 @@ function WeixinConnectScreen({
 }: {
   form: BackendSettings;
   status: WeixinConnectStatusResult | null;
+  inbox: WeixinInboxResult | null;
+  models: WeixinModelsResult | null;
+  modelsLoading: boolean;
+  modelTesting: boolean;
+  modelTest: WeixinModelTestResult | null;
   qr: WeixinQrResult | null;
   sessions: LocalSession[];
   onFormChange: (value: BackendSettings) => void;
@@ -4755,6 +5026,12 @@ function WeixinConnectScreen({
   onQrLogin: () => void;
   onStart: () => void;
   onStop: () => void;
+  onRestart: () => void;
+  onPairing: (peerId: string, action: "approve" | "reject" | "revoke") => void;
+  onRetryMessage: (key: string) => void;
+  onSkipMessage: (key: string) => void;
+  onRefreshModels: () => void;
+  onTestModel: () => void;
   onChooseWorkDir: () => void;
   onChooseCodexPath: () => void;
   onUseDesktopCodexCli: () => void;
@@ -4767,7 +5044,7 @@ function WeixinConnectScreen({
     [sessions],
   );
   const runtimeState = status?.state ?? "stopped";
-  const running = ["starting", "running", "retrying"].includes(runtimeState);
+  const running = status?.runtimeActive ?? ["starting", "running", "retrying"].includes(runtimeState);
   const stopping = runtimeState === "stopping";
   const statusLabel = {
     starting: t("正在启动"),
@@ -4777,6 +5054,16 @@ function WeixinConnectScreen({
     error: t("异常"),
     stopped: t("已停止"),
   }[runtimeState] ?? runtimeState;
+  const weixinPhase = {
+    stopped: t("已停止"), connecting: t("连接中"), connected: t("已连接"), retrying: t("正在重试"), needs_login: t("需要重新登录"),
+  }[status?.weixinState ?? "stopped"] ?? status?.weixinState;
+  const codexPhase = {
+    stopped: t("已停止"), checking: t("检查中"), ready: t("就绪"), error: t("异常"),
+  }[status?.codexState ?? "stopped"] ?? status?.codexState;
+  const modelChoices = models?.models ?? [];
+  const selectedModelMissing = !!form.weixinConnectModel && isSuccessStatus(models?.status) && !modelChoices.includes(form.weixinConnectModel);
+  const pendingCount = inbox?.messages.filter((item) => item.state === "pending").length ?? 0;
+  const failedMessages = inbox?.messages.filter((item) => item.state === "failed") ?? [];
 
   return (
     <div className="weixin-connect-page">
@@ -4806,20 +5093,25 @@ function WeixinConnectScreen({
                 <ScanLine className="h-4 w-4" />
                 {form.weixinConnectToken ? t("重新登录") : t("扫码登录")}
               </Button>
-              {running || stopping ? (
-                <Button disabled={stopping} onClick={onStop} variant="outline">
-                  <PowerOff className="h-4 w-4" />
-                  {stopping ? t("正在停止") : t("停止")}
-                </Button>
-              ) : (
-                <Button disabled={!form.weixinConnectToken} onClick={onStart}>
-                  <Play className="h-4 w-4" />
-                  {t("启动")}
-                </Button>
-              )}
+              {running ? <Button onClick={onStop} variant="outline"><PowerOff className="h-4 w-4" />{t("停止")}</Button> : null}
+              <Button disabled={!form.weixinConnectToken || stopping} onClick={running ? onRestart : onStart}>
+                <Play className="h-4 w-4" />{running ? t("重启连接") : t("启动")}
+              </Button>
             </div>
           </div>
           <div className="weixin-runtime-meta">
+            <div className={`weixin-stage is-${status?.weixinState ?? "stopped"}`}>
+              <span><MessageCircle className="h-4 w-4" />{t("微信收消息")}</span><strong>{weixinPhase}</strong>
+            </div>
+            <div className={`weixin-stage is-${status?.codexState ?? "stopped"}`}>
+              <span><Sparkles className="h-4 w-4" />{t("Codex 可回复")}</span><strong>{codexPhase}</strong>
+            </div>
+            <div className={`weixin-stage is-${failedMessages.length ? "error" : "queue"}`}>
+              <span><Inbox className="h-4 w-4" />{t("待处理 / 失败")}</span>
+              <strong>{status?.pendingMessages ?? 0} / {status?.failedMessages ?? 0}</strong>
+            </div>
+          </div>
+          <div className="weixin-runtime-details">
             <div>
               <span>{t("账号")}</span>
               <code title={status?.accountId || form.weixinConnectAccountId || t("未登录")}>
@@ -4835,6 +5127,7 @@ function WeixinConnectScreen({
               <code title={status?.lastPeerId || t("暂无")}>{status?.lastPeerId || t("暂无")}</code>
             </div>
           </div>
+          {status?.recentError ? <div className="weixin-status-alert" role="alert"><ShieldAlert className="h-4 w-4" /><span>{status.recentError}</span></div> : null}
         </CardContent>
       </Panel>
 
@@ -4863,6 +5156,7 @@ function WeixinConnectScreen({
         </Panel>
       ) : null}
 
+      <div className="weixin-main-grid">
       <Panel className="weixin-settings-panel">
         <CardHeader className="weixin-settings-head">
           <div>
@@ -4871,6 +5165,8 @@ function WeixinConnectScreen({
           </div>
         </CardHeader>
         <CardContent className="weixin-connect-form">
+          <details className="weixin-advanced-settings">
+            <summary>{t("高级账户设置")}</summary>
           <section className="weixin-form-section">
             <div className="weixin-form-section-title">
               <KeyRound className="h-4 w-4" />
@@ -4925,6 +5221,7 @@ function WeixinConnectScreen({
               </label>
             </div>
           </section>
+          </details>
 
           <section className="weixin-form-section">
             <div className="weixin-form-section-title">
@@ -4932,6 +5229,32 @@ function WeixinConnectScreen({
               <strong>{t("会话管理")}</strong>
             </div>
             <div className="weixin-form-fields">
+              <label className="field">
+                <span>{t("模型")}</span>
+                <div className="weixin-model-picker">
+                  <select
+                    className="field-select"
+                    onChange={(event) => onFormChange({ ...form, weixinConnectModel: event.target.value })}
+                    value={form.weixinConnectModel}
+                  >
+                    <option value="">{t("跟随 Codex 默认模型")}</option>
+                    {form.weixinConnectModel && !modelChoices.includes(form.weixinConnectModel) ? (
+                      <option value={form.weixinConnectModel}>{form.weixinConnectModel} · {t("当前设置")}</option>
+                    ) : null}
+                    {modelChoices.map((model) => <option key={model} value={model}>{model}</option>)}
+                  </select>
+                  <Button onClick={onRefreshModels} disabled={modelsLoading} size="icon" title={t("刷新可选模型")} type="button" variant="outline">
+                    <RefreshCw className={`h-4 w-4${modelsLoading ? " animate-spin" : ""}`} />
+                  </Button>
+                  <Button disabled={!form.weixinConnectModel || modelTesting || selectedModelMissing} onClick={onTestModel} type="button" variant="outline">
+                    {modelTesting ? t("测试中…") : t("测试回复")}
+                  </Button>
+                </div>
+                {selectedModelMissing ? <small className="weixin-model-warning">{t("当前模型不在 Codex 模型列表中，请重新选择后保存。")}</small> : null}
+                {models && !isSuccessStatus(models.status) ? <small className="weixin-model-warning">{models.message}</small> : null}
+                {models && isSuccessStatus(models.status) ? <small className="weixin-field-hint">{tf("已读取 {0} 个已配置模型；选择后可测试是否真的能回复。", [modelChoices.length])}</small> : null}
+                {modelTest ? <small className={isSuccessStatus(modelTest.status) ? "weixin-model-success" : "weixin-model-warning"}>{modelTest.message}</small> : null}
+              </label>
               <label className="field">
                 <span>{t("工作目录")}</span>
                 <div className="weixin-path-row">
@@ -4962,15 +5285,6 @@ function WeixinConnectScreen({
                 <small className="weixin-field-hint">{t("选择后自动带入该会话的工作目录，微信联系人仍保持独立会话。")}</small>
               </label>
               <label className="field">
-                <span>{t("模型")}</span>
-                <Input
-                  className="h-10"
-                  onChange={(event) => onFormChange({ ...form, weixinConnectModel: event.target.value })}
-                  placeholder={t("留空时使用 Codex 当前默认模型")}
-                  value={form.weixinConnectModel}
-                />
-              </label>
-              <label className="field">
                 <span>{t("沙箱权限")}</span>
                 <select
                   className="field-select"
@@ -4988,6 +5302,8 @@ function WeixinConnectScreen({
             </div>
           </section>
 
+          <details className="weixin-advanced-settings">
+            <summary>{t("高级 Codex CLI 设置")}</summary>
           <section className="weixin-form-section">
             <div className="weixin-form-section-title">
               <Settings className="h-4 w-4" />
@@ -5021,8 +5337,42 @@ function WeixinConnectScreen({
               </label>
             </div>
           </section>
+          </details>
         </CardContent>
       </Panel>
+      <Panel className="weixin-inbox-panel">
+        <CardHeader><CardTitle>{t("配对与消息")}</CardTitle><CardDescription>{t("陌生联系人需经批准；失败消息只会在你手动重试后再次执行。")}</CardDescription></CardHeader>
+        <CardContent>
+          <div className="weixin-inbox-sections">
+            <strong>{t("待批准")}</strong>
+            {inbox?.pendingPairings.length ? inbox.pendingPairings.map((item) => (
+              <div className="weixin-inbox-row" key={item.peerId}><code>{item.peerId}</code>
+                <Button onClick={() => onPairing(item.peerId, "approve")} size="sm">{t("批准")}</Button>
+                <Button onClick={() => onPairing(item.peerId, "reject")} size="sm" variant="outline">{t("拒绝")}</Button>
+              </div>
+            )) : <small>{t("暂无待批准请求")}</small>}
+            <strong>{t("已批准联系人")}</strong>
+            {inbox?.approvedPeers.length ? inbox.approvedPeers.map((peer) => (
+              <div className="weixin-inbox-row" key={peer}><code>{peer}</code>
+                <Button onClick={() => onPairing(peer, "revoke")} size="sm" variant="outline">{t("撤销")}</Button>
+              </div>
+            )) : <small>{t("暂无额外批准的联系人")}</small>}
+            <strong>{t("失败消息")} <span className="weixin-inbox-count">{failedMessages.length}</span></strong>
+            {failedMessages.length && pendingCount ? <p className="weixin-queue-hint">{tf("另有 {0} 条后续消息正在等待处理；请重试或跳过前面的失败消息。", [pendingCount])}</p> : null}
+            {failedMessages.length ? failedMessages.map((item) => (
+              <div className="weixin-failed-row" key={item.key}>
+                <code>{item.peerId}</code>
+                <small>{item.error}</small>
+                <div className="weixin-failed-actions">
+                  <Button onClick={() => onRetryMessage(item.key)} size="sm">{t("手动重试")}</Button>
+                  <Button onClick={() => onSkipMessage(item.key)} size="sm" variant="outline">{t("跳过并继续")}</Button>
+                </div>
+              </div>
+            )) : <small>{t("暂无失败消息")}</small>}
+          </div>
+        </CardContent>
+      </Panel>
+      </div>
     </div>
   );
 }
@@ -5279,6 +5629,7 @@ function RelayScreen({
   officialAccounts,
   officialModelCatalog,
   cliproxy,
+  codexAppToolsStatus,
   cliproxyModels,
   cliproxyTest,
   newapi,
@@ -5296,6 +5647,7 @@ function RelayScreen({
   officialAccounts: OfficialAccountsResult | null;
   officialModelCatalog: OfficialModelCatalogResult | null;
   cliproxy: CliproxyStatusResult | null;
+  codexAppToolsStatus: CodexAppToolsStatusResult | null;
   cliproxyModels: CliproxyModelsResult | null;
   cliproxyTest: CliproxyTestResult | null;
   newapi: NewapiStatusResult | null;
@@ -5368,6 +5720,7 @@ function RelayScreen({
         relayFiles={!isNewProfile && detailProfile.id === normalized.activeRelayId ? relayFiles : null}
         form={normalized}
         isNew={isNewProfile}
+        officialModels={officialModelCatalog?.visibleModels ?? []}
         onBack={() => {
           setNewProfileDraft(null);
           setDetailProfileId(null);
@@ -5416,6 +5769,10 @@ function RelayScreen({
         <OfficialAccountsPanel result={officialAccounts} actions={actions} />
       ) : relayView === "cliproxy" ? (
         <CliproxyPanel
+          settings={normalized}
+          officialModels={officialModelCatalog?.visibleModels ?? []}
+          onSettingsChange={saveRelaySettings}
+          codexAppToolsStatus={codexAppToolsStatus}
           models={cliproxyModels}
           result={cliproxy}
           test={cliproxyTest}
@@ -5456,27 +5813,32 @@ function RelayScreen({
           <div className="official-login-mixed-panel">
             <label className="switch-row relay-master-switch">
               <input
-                checked={normalized.officialLoginMixedMode}
+                checked={normalized.officialExperience.enabled}
                 disabled={!normalized.relayProfilesEnabled || !activeOfficialAccount}
                 onChange={(event) => {
                   const next = {
                     ...normalized,
-                    officialLoginMixedMode: event.currentTarget.checked,
+                    officialLoginMixedMode: false,
+                    officialExperience: {
+                      ...normalized.officialExperience,
+                      enabled: event.currentTarget.checked,
+                      primaryOfficialAccountId: activeOfficialAccount?.id || normalized.officialExperience.primaryOfficialAccountId,
+                    },
                   };
                   void actions.switchRelayProfile(next, normalized.activeRelayId);
                 }}
                 type="checkbox"
               />
               <span>
-                <strong>{t("官方登录混合模式")}</strong>
-                <small>{t("官方账号只负责优先认证；选择第三方或聚合供应商后，由其 API 配置覆盖实际请求，官方 API 不加入聚合轮转。")}</small>
+                <strong>{t("官方体验多来源路由")}</strong>
+                <small>{t("在模型列表选择“模型名(官方账号名)”即可热切换，无需重启；CLIProxyAPI 仍显示 CLIProxyAPI:模型名。")}</small>
               </span>
               <ToggleVisual />
             </label>
-            {normalized.officialLoginMixedMode ? (
+            {normalized.officialExperience.enabled ? (
               <>
                 <div className="relay-fields official-login-mixed-fields">
-                  <Field className="relay-field-official-login" label={t("认证账号")}>
+                  <Field className="relay-field-official-login" label={t("主官方账号")}>
                     <select
                       className="field-select"
                       value={officialAccounts?.activeAccountId || ""}
@@ -5489,13 +5851,29 @@ function RelayScreen({
                       ))}
                     </select>
                   </Field>
-                  <Field className="relay-field-request-target" label={t("请求目标")}>
-                    <Input readOnly value={selectedRequestTarget.name || selectedRequestTarget.id} />
+                  <Field className="relay-field-request-target" label={t("默认请求来源")}>
+                    <Input readOnly value={t("主官方账号（OpenAI）")} />
                     <p className="field-hint">
-                      {isOfficialLoginProfile(selectedRequestTarget)
-                        ? t("当前使用官方 API；点击其他供应商的“使用”即可覆写请求目标。")
-                        : tf("认证顺序：{0} → {1}。", [activeOfficialAccount?.name || activeOfficialAccount?.email || "openai", selectedRequestTarget.name || selectedRequestTarget.id])}
+                      {t("扩展模型通过稳定 provider 单独路由；普通官方新任务不会依赖本地 57321 代理。")}
                     </p>
+                  </Field>
+                  <Field className="relay-field-request-target" label={t("CLIProxyAPI 通道备注")}>
+                    <Input
+                      defaultValue={normalized.officialExperience.cliOfficialLabel}
+                      key={normalized.officialExperience.cliOfficialLabel}
+                      onBlur={(event) => {
+                        const cliOfficialLabel = event.currentTarget.value.trim() || t("官方账号 2");
+                        if (cliOfficialLabel === normalized.officialExperience.cliOfficialLabel) return;
+                        void saveRelaySettings({
+                          ...normalized,
+                          officialExperience: {
+                            ...normalized.officialExperience,
+                            cliOfficialLabel,
+                          },
+                        });
+                      }}
+                    />
+                    <p className="field-hint">{t("模型列表固定显示 CLIProxyAPI:模型名；此备注只用于通道管理。")}</p>
                   </Field>
                 </div>
                 <OfficialModelCatalogStatusPanel status={officialModelCatalog} actions={actions} />
@@ -5578,6 +5956,164 @@ function RelayScreen({
   );
 }
 
+function CapabilityBindingsEditor({
+  settings,
+  profile,
+  officialModels,
+  onChange,
+}: {
+  settings: BackendSettings;
+  profile: RelayProfile;
+  officialModels: string[];
+  onChange: (value: OfficialExperienceSettings) => void;
+}) {
+  const [bulkTemplate, setBulkTemplate] = useState("");
+  const candidates = (() => {
+    if (isOfficialLoginProfile(profile) || isCliproxyOfficialProfile(profile)) return [];
+    const sourceKind: OfficialExperienceSourceKind = isCliproxyGeneralProfile(profile)
+      ? "cliGeneral" : isAggregateRelayProfile(profile) ? "aggregate" : "relay";
+    const models = sourceKind === "aggregate" ? (() => {
+      const members = aggregateSelectedMemberProfiles(
+        normalizeAggregateConfig(profile.aggregate, aggregateMemberCandidates(settings, profile.id)),
+        aggregateMemberCandidates(settings, profile.id),
+      );
+      return aggregateCapabilityModelSlugs(
+        normalizeAggregateConfig(profile.aggregate, aggregateMemberCandidates(settings, profile.id)), members,
+      );
+    })() : relayProfileModels(profile);
+    return [...new Set(models)].map((upstreamModel) => ({
+      routingSlug: sourceKind === "cliGeneral" ? `CLIProxyAPI:${upstreamModel}`
+        : sourceKind === "aggregate" ? upstreamModel : `${profile.id}:${upstreamModel}`,
+      sourceKind,
+      sourceId: profile.id,
+      upstreamModel,
+      sourceLabel: profile.name || profile.id,
+    }));
+  })();
+  const bindingBySlug = new Map(
+    settings.officialExperience.capabilityBindings.map((binding) => [
+      `${binding.sourceKind}:${binding.sourceId}:${binding.routingSlug}:${binding.upstreamModel}`.toLowerCase(), binding,
+    ]),
+  );
+  const updateBinding = (candidate: (typeof candidates)[number], capabilitySlug: string) => {
+    const nextBindings = settings.officialExperience.capabilityBindings.filter(
+      (binding) => binding.routingSlug.toLowerCase() !== candidate.routingSlug.toLowerCase(),
+    );
+    if (capabilitySlug) {
+      nextBindings.push({
+        routingSlug: candidate.routingSlug,
+        capabilitySlug,
+        sourceKind: candidate.sourceKind,
+        sourceId: candidate.sourceId,
+        upstreamModel: candidate.upstreamModel,
+      });
+    }
+    onChange({
+      ...settings.officialExperience,
+      capabilityBindings: nextBindings,
+    });
+  };
+  const bindSourceModels = () => {
+    const nextBindings = bindUnmappedSourceModels(
+      settings.officialExperience.capabilityBindings,
+      candidates,
+      officialModels,
+      bulkTemplate,
+    );
+    if (nextBindings.length === settings.officialExperience.capabilityBindings.length) return;
+    onChange({ ...settings.officialExperience, capabilityBindings: nextBindings });
+  };
+  const updateImageEndpoint = (sourceId: string, key: "generationsUrl" | "editsUrl", url: string) => {
+    const previous = settings.officialExperience.sourceImageEndpoints[sourceId] || { generationsUrl: "", editsUrl: "" };
+    const next = { ...previous, [key]: url.trim() };
+    onChange({
+      ...settings.officialExperience,
+      sourceImageEndpoints: {
+        ...settings.officialExperience.sourceImageEndpoints,
+        [sourceId]: next,
+      },
+    });
+  };
+  const imageSources = profile.relayMode !== "official"
+    && profile.relayMode !== "aggregate" && !isCliproxyManagedProfile(profile) ? [profile] : [];
+
+  return (
+    <details className="official-model-catalog-status">
+      <summary className="official-model-catalog-head">
+        <div>
+          <strong>{t("扩展模型能力映射")}</strong>
+          <span>{tf("{0} 个来源模型 · 未绑定模型不会进入完整体验列表", [candidates.length])}</span>
+        </div>
+      </summary>
+      {candidates.length ? (
+        <div className="cliproxy-model-row">
+          <select className="field-select" value={bulkTemplate} onChange={(event) => setBulkTemplate(event.currentTarget.value)}>
+            <option value="">{t("选择此来源的官方能力模板")}</option>
+            {officialModels.map((model) => <option key={model} value={model}>{model}</option>)}
+          </select>
+          <Button disabled={!bulkTemplate} onClick={bindSourceModels} variant="outline" type="button">
+            {t("批量绑定未映射模型")}
+          </Button>
+        </div>
+      ) : null}
+      <div className="metric-list">
+        {candidates.length ? candidates.map((candidate) => {
+          const binding = bindingBySlug.get(`${candidate.sourceKind}:${candidate.sourceId}:${candidate.routingSlug}:${candidate.upstreamModel}`.toLowerCase());
+          const templateCandidate = candidate.sourceKind === "aggregate" && candidate.routingSlug.includes("(")
+            ? candidate.routingSlug.split("(", 1)[0] : candidate.upstreamModel;
+          const autoTemplate = officialModels.find((model) => model.toLowerCase() === templateCandidate.toLowerCase());
+          return (
+            <div className="provider-row" key={`${candidate.sourceKind}:${candidate.sourceId}:${candidate.routingSlug}`}>
+              <div className="provider-main">
+                <strong>{candidate.upstreamModel}</strong>
+                <small>{candidate.sourceLabel}</small>
+              </div>
+              <select
+                className="field-select"
+                disabled={Boolean(autoTemplate)}
+                value={binding?.capabilitySlug || autoTemplate || ""}
+                onChange={(event) => updateBinding(candidate, event.currentTarget.value)}
+              >
+                <option value="">{t("不显示（未绑定）")}</option>
+                {officialModels.map((model) => <option key={model} value={model}>{model}</option>)}
+              </select>
+            </div>
+          );
+        }) : <p className="field-hint">{t("暂无需要映射的扩展模型。")}</p>}
+      </div>
+      {imageSources.length ? (
+        <div className="metric-list">
+          <strong>{t("第三方图片端点")}</strong>
+          <p className="field-hint">{t("只调用该来源明确填写的地址；留空时该来源的对应图片操作不可用。")}</p>
+          {imageSources.map((profile) => {
+            const endpoints = settings.officialExperience.sourceImageEndpoints[profile.id];
+            return (
+              <div className="relay-fields" key={`image-source-${profile.id}`}>
+                <Field label={`${profile.name || profile.id} · ${t("生成")}`}>
+                  <Input
+                    defaultValue={endpoints?.generationsUrl || ""}
+                    key={`${profile.id}-generations-${endpoints?.generationsUrl || ""}`}
+                    onBlur={(event) => updateImageEndpoint(profile.id, "generationsUrl", event.currentTarget.value)}
+                    placeholder="https://example.com/v1/images/generations"
+                  />
+                </Field>
+                <Field label={`${profile.name || profile.id} · ${t("编辑")}`}>
+                  <Input
+                    defaultValue={endpoints?.editsUrl || ""}
+                    key={`${profile.id}-edits-${endpoints?.editsUrl || ""}`}
+                    onBlur={(event) => updateImageEndpoint(profile.id, "editsUrl", event.currentTarget.value)}
+                    placeholder="https://example.com/v1/images/edits"
+                  />
+                </Field>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
 function OfficialModelCatalogStatusPanel({
   status,
   actions,
@@ -5630,12 +6166,20 @@ function OfficialModelCatalogStatusPanel({
 }
 
 function CliproxyPanel({
+  settings,
+  officialModels,
+  onSettingsChange,
   result,
+  codexAppToolsStatus,
   models,
   test,
   actions,
 }: {
+  settings: BackendSettings;
+  officialModels: string[];
+  onSettingsChange: (value: BackendSettings) => Promise<BackendSettings | null>;
   result: CliproxyStatusResult | null;
+  codexAppToolsStatus: CodexAppToolsStatusResult | null;
   models: CliproxyModelsResult | null;
   test: CliproxyTestResult | null;
   actions: Actions;
@@ -5651,6 +6195,7 @@ function CliproxyPanel({
   const [baseUrl, setBaseUrl] = useState("");
   const [selectedModel, setSelectedModel] = useState("");
   const modelIds = models?.models ?? [];
+  const generalProfile = settings.relayProfiles.find(isCliproxyGeneralProfile);
   const modelIdsKey = modelIds.join("\n");
 
   useEffect(() => {
@@ -5738,23 +6283,24 @@ function CliproxyPanel({
   const officialLoginEnabled = result?.officialProfileInstalled === true;
   const integrationToggleDisabled = !!busy || (!integrationEnabled && (!running || !apiKey.trim()));
   const officialLoginToggleDisabled = !!busy
-    || !integrationEnabled
     || (!officialLoginEnabled && (!running || !apiKey.trim()));
-  const statusLabel = !result
+  const cliproxyStatusLabel = !result
     ? t("未检查")
     : running
       ? result.healthy ? t("运行正常") : t("运行异常")
       : installed ? t("已停止") : t("未安装");
+  const agentToolsStatus = codexAppToolsStatus?.agentStatus || "not_checked";
+  const agentToolsProbe = codexAppToolsStatus?.probe;
   const startedAt = result?.startedAt
     ? new Date(result.startedAt * 1000).toLocaleString()
     : t("无");
 
   return (
     <Panel>
-      <CardHead title="CLIProxyAPI" detail={statusLabel} />
+      <CardHead title="CLIProxyAPI" detail={cliproxyStatusLabel} />
       <CardContent>
         <div className="cliproxy-status-grid">
-          <Metric label={t("服务状态")} value={statusLabel} />
+          <Metric label={t("服务状态")} value={cliproxyStatusLabel} />
           <Metric label={t("版本")} value={result?.version || t("未知")} />
           <Metric label={t("进程 ID")} value={result?.pid ? String(result.pid) : t("无")} />
           <Metric label={t("启动时间")} value={startedAt} />
@@ -5786,6 +6332,57 @@ function CliproxyPanel({
             <ExternalLink className="h-4 w-4" />
             {t("管理页面")}
           </Button>
+        </div>
+
+        <div className="cliproxy-section">
+          <div className="cliproxy-section-head">
+            <strong>{t("Codex Agent 工具")}</strong>
+            <span className="inline-flex items-center gap-2">
+              <Badge status={agentToolsStatus} />
+              <Button
+                disabled={!!busy}
+                onClick={() => void runAction("agentToolsStatus", () => actions.refreshCodexAppToolsStatus())}
+                size="icon"
+                title={t("刷新 Agent 工具诊断")}
+                variant="outline"
+              >
+                <RefreshCw className={`h-4 w-4 ${busy === "agentToolsStatus" ? "spin" : ""}`} />
+              </Button>
+            </span>
+          </div>
+          <div className="metric-list">
+            <Metric label={t("宿主工具状态")} value={statusLabel(agentToolsStatus)} />
+            <Metric label={t("app-server 代际")} value={codexAppToolsStatus?.appServerGeneration || t("未知")} />
+            <Metric label={t("codex_app MCP 工具数")} value={agentToolsProbe?.mcpToolCount == null ? t("未读取") : String(agentToolsProbe.mcpToolCount)} />
+            <Metric label={t("read_thread")} value={agentToolsProbe?.mcpHasReadThread ? t("已发现") : t("未发现")} />
+          </div>
+          <div className="hint-line">
+            {codexAppToolsStatus?.guidance || t("启动一个新任务后再查看宿主 Agent 工具装配状态。")}
+          </div>
+          {agentToolsProbe?.model || agentToolsProbe?.modelProvider ? (
+            <div className="cliproxy-section-head">
+              <span>{tf("最近探针：{0} / {1}", [agentToolsProbe.model || t("未知模型"), agentToolsProbe.modelProvider || t("未知 provider")])}</span>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="cliproxy-section">
+          <label className="switch-row relay-master-switch">
+            <input
+              checked={result?.autoStart === true}
+              disabled={!!busy || (!installed && result?.autoStart !== true)}
+              onChange={(event) => {
+                const enabled = event.currentTarget.checked;
+                void runAction("autoStart", () => actions.setCliproxyAutoStart(enabled));
+              }}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("随 Codex++ 启动自动启动 CLIProxyAPI")}</strong>
+              <small>{t("开启后，正常启动 Codex++ Manager 时会在后台启动 CLIProxyAPI；临时 Manager 不会触发。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
         </div>
 
         <div className="cliproxy-section">
@@ -5930,8 +6527,8 @@ function CliproxyPanel({
                 type="checkbox"
               />
               <span>
-                <strong>{t("CLIProxyAPI 接入")}</strong>
-                <small>{t("将 CLIProxyAPI 作为受管直连供应商接入，包含官方和其他模型，不参与聚合调度。")}</small>
+                <strong>{t("CLI 其他模型")}</strong>
+                <small>{t("显示 CLIProxyAPI 提供的其他模型，使用独立通用通道并严格原路失败。")}</small>
               </span>
               <ToggleVisual />
             </label>
@@ -5946,13 +6543,23 @@ function CliproxyPanel({
                 type="checkbox"
               />
               <span>
-                <strong>{t("CLIProxyAPI 官方登录")}</strong>
-                <small>{t("在官方混合登录的模型列表中，于原生官方模型下方显示 CLIProxyAPI:模型名。")}</small>
+                <strong>{t("CLIProxyAPI 官方 API")}</strong>
+                <small>{t("通过 CLIProxyAPI 反代调用官方模型，列表显示 CLIProxyAPI:模型名；与直接切换官方登录账号分开。")}</small>
               </span>
               <ToggleVisual />
             </label>
           </div>
         </div>
+        {settings.officialExperience.enabled && generalProfile ? (
+          <CapabilityBindingsEditor
+            settings={settings}
+            profile={generalProfile}
+            officialModels={officialModels}
+            onChange={(officialExperience) => {
+              void onSettingsChange({ ...settings, officialExperience });
+            }}
+          />
+        ) : null}
 
       </CardContent>
     </Panel>
@@ -6546,6 +7153,7 @@ function OfficialAccountsPanel({ result, actions }: { result: OfficialAccountsRe
           </div>
         </div>
       ) : null}
+
     </Panel>
   );
 }
@@ -6985,7 +7593,7 @@ function DreamSkinScreen({
                   {t("当前运行")}：{pendingRestart.currentThemeName}。{t("配置已保存，可以继续浏览和编辑，稍后重启即可生效。")}
                 </small>
               </div>
-              <Button onClick={() => void actions.restart()}>
+              <Button onClick={() => void actions.restart("dream_skin_apply")}>
                 <Rocket className="h-4 w-4" />
                 {t("重启并应用")}
               </Button>
@@ -9172,6 +9780,7 @@ function RelayProfileDetail({
   relayFiles,
   form,
   isNew = false,
+  officialModels,
   onBack,
   onFormChange,
   onSaved,
@@ -9181,12 +9790,14 @@ function RelayProfileDetail({
   relayFiles: RelayFilesResult | null;
   form: BackendSettings;
   isNew?: boolean;
+  officialModels: string[];
   onBack: () => void;
   onFormChange: (value: BackendSettings) => Promise<BackendSettings | null>;
   onSaved?: () => void;
   actions: Actions;
 }) {
   const [draft, setDraft] = useState<RelayProfile>(profile);
+  const [officialExperienceDraft, setOfficialExperienceDraft] = useState<OfficialExperienceSettings>(form.officialExperience);
   const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
     modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm, profile.modelAutoCompact),
   );
@@ -9214,6 +9825,7 @@ function RelayProfileDetail({
       ? applyRelayProfilePatchToFiles(liveDraft, { apiKey: storedApiKey })
       : liveDraft;
     setDraft(nextDraft);
+    setOfficialExperienceDraft(form.officialExperience);
     setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm, nextDraft.modelAutoCompact));
   }, [profile.id, profile.modelList, profile.modelWindows, profile.modelAutoCompact, profile.modelMetadata, profile.modelVlm, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
@@ -9248,16 +9860,18 @@ function RelayProfileDetail({
     modelAutoCompact: currentModelState.modelAutoCompact,
     modelMetadata: currentModelState.modelMetadata,
     modelVlm: currentModelState.modelVlm,
-  }) !== JSON.stringify(persistedModelState);
+  }) !== JSON.stringify(persistedModelState)
+    || JSON.stringify(officialExperienceDraft) !== JSON.stringify(form.officialExperience);
   const saveDraft = async () => {
     if (savingDraft || validationError || modelRowsError) return;
     setSavingDraft(true);
     try {
       const draftWithWindows = draftWithModelRows();
       const normalizedDraft = isAggregateRelayProfile(draftWithWindows) ? normalizeAggregateRelayProfile(draftWithWindows, form) : deriveRelayProfileFromFiles(draftWithWindows);
+      const formWithCapabilities = { ...form, officialExperience: officialExperienceDraft };
       const next = normalizeSettings(isNew
-        ? addRelayProfile(form, normalizedDraft)
-        : updateRelayProfile(form, profile.id, normalizedDraft));
+        ? addRelayProfile(formWithCapabilities, normalizedDraft)
+        : updateRelayProfile(formWithCapabilities, profile.id, normalizedDraft));
       const settingsValidationError = relaySettingsValidation(next);
       if (settingsValidationError) return;
       const activeLiveBaseUrl = codexBaseUrlFromConfig(
@@ -9274,7 +9888,7 @@ function RelayProfileDetail({
       const savedSettings = await onFormChange(next);
       if (!savedSettings) return;
       if (requiresRestart) {
-        const restarted = await actions.restart(true);
+        const restarted = await actions.restart("model_route_save", true);
         if (!restarted) return;
         onSaved?.();
         return;
@@ -9372,6 +9986,14 @@ function RelayProfileDetail({
           modelWindowRows={modelWindowRows}
           setModelWindowRows={setModelWindowRows}
         />
+        {form.officialExperience.enabled && draft.relayMode !== "official" && !isCliproxyManagedProfile(draft) ? (
+          <CapabilityBindingsEditor
+            settings={{ ...form, officialExperience: officialExperienceDraft }}
+            profile={draftWithModelRows()}
+            officialModels={officialModels}
+            onChange={setOfficialExperienceDraft}
+          />
+        ) : null}
         {isAggregateRelayProfile(draft) ? null : (
         <RelayFileEditors
           contextProfile={profile}
@@ -13036,6 +13658,12 @@ function statusLabel(status: string) {
     failed: t("失败"),
     archived: t("已归档"),
     accepted: t("已受理"),
+    mcp_ready: t("MCP 可用"),
+    legacy_dynamic_conflict: t("MCP 与旧动态入口冲突"),
+    mcp_and_legacy: t("MCP 与旧入口并存"),
+    mcp_read_thread_missing: t("MCP 缺少 read_thread"),
+    legacy_dynamic_only: t("仅发现旧动态入口"),
+    no_codex_app_evidence: t("尚无工具装配证据"),
     not_checked: t("未检查"),
     not_implemented: t("未实现"),
     disabled: t("已禁用"),
@@ -13045,8 +13673,8 @@ function statusLabel(status: string) {
 }
 
 function statusClass(status: string) {
-  if (["found", "installed", "ok", "running", "running_degraded"].includes(status)) return "good";
-  if (["failed", "missing"].includes(status)) return "bad";
+  if (["found", "installed", "ok", "running", "running_degraded", "mcp_ready"].includes(status)) return "good";
+  if (["failed", "missing", "legacy_dynamic_conflict", "mcp_read_thread_missing", "legacy_dynamic_only"].includes(status)) return "bad";
   return "warn";
 }
 
@@ -13145,6 +13773,35 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   const officialLoginRelayId = officialLoginProfiles.some((profile) => profile.id === settings.officialLoginRelayId)
     ? settings.officialLoginRelayId
     : officialLoginProfiles[0]?.id || "";
+  const officialExperienceInput = settings.officialExperience || defaultSettings.officialExperience;
+  const bindingSlugs = new Set<string>();
+  const capabilityBindings = (officialExperienceInput.capabilityBindings || [])
+    .map((binding) => ({
+      routingSlug: (binding.routingSlug || "").trim(),
+      capabilitySlug: (binding.capabilitySlug || "").trim(),
+      sourceKind: binding.sourceKind,
+      sourceId: (binding.sourceId || "").trim(),
+      upstreamModel: (binding.upstreamModel || binding.routingSlug || "").trim(),
+    }))
+    .filter((binding) => {
+      const key = binding.routingSlug.toLowerCase();
+      if (!binding.routingSlug || !binding.capabilitySlug || bindingSlugs.has(key)) return false;
+      bindingSlugs.add(key);
+      return true;
+    });
+  const officialExperience: OfficialExperienceSettings = {
+    enabled: officialExperienceInput.enabled === true || settings.officialLoginMixedMode === true,
+    primaryOfficialAccountId: (
+      officialExperienceInput.primaryOfficialAccountId
+      || settings.activeOfficialAccountId
+      || ""
+    ).trim(),
+    cliOfficialEnabled: officialExperienceInput.cliOfficialEnabled === true,
+    cliOfficialLabel: (officialExperienceInput.cliOfficialLabel || "官方账号 2").trim() || "官方账号 2",
+    cliGeneralEnabled: officialExperienceInput.cliGeneralEnabled === true,
+    capabilityBindings,
+    sourceImageEndpoints: officialExperienceInput.sourceImageEndpoints || {},
+  };
   return syncLegacyRelayFields({
     ...defaultSettings,
     ...settings,
@@ -13171,6 +13828,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     officialLoginMixedMode: settings.officialLoginMixedMode === true,
     officialLoginRelayId,
     activeOfficialAccountId: (settings.activeOfficialAccountId || "").trim(),
+    officialExperience,
   });
 }
 

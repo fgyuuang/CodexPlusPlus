@@ -245,6 +245,14 @@ export function aggregateOrderedModelList(
   ];
 }
 
+export function aggregateCapabilityModelSlugs(
+  aggregate: RelayAggregateConfig,
+  selectedMembers: RelayProfileLike[],
+): string[] {
+  return aggregateOrderedModelList(aggregate, selectedMembers, [], true)
+    .filter((model) => model.includes(":") || model.includes("("));
+}
+
 function compareAggregateModelNames(left: string, right: string): number {
   const preferred = visibleOfficialModelSlugs().map((model) => model.trim().toLowerCase()).filter(Boolean);
   const normalizedLeft = left.trim().toLowerCase();

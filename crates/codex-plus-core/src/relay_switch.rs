@@ -133,6 +133,24 @@ fn apply_selected_relay_profile(
     settings: &BackendSettings,
     official_auth_override: Option<&str>,
 ) -> anyhow::Result<RelaySwitchResult> {
+    if settings.official_experience.enabled {
+        let selected_auth = if let Some(auth) = official_auth_override {
+            Some(auth.to_string())
+        } else {
+            selected_official_auth_contents(home, settings, false)?
+        };
+        let backup_path = if let Some(auth) = selected_auth.as_deref() {
+            crate::relay_config::apply_official_auth_to_home(home, auth)?.backup_path
+        } else {
+            None
+        };
+        crate::relay_config::ensure_official_experience_config_in_home(home, settings)?;
+        return Ok(RelaySwitchResult {
+            settings: settings.clone(),
+            configured: true,
+            backup_path,
+        });
+    }
     if !settings.relay_profiles_enabled {
         let auth_contents = official_auth_override.context("切换官方账号缺少目标凭据")?;
         let result = crate::relay_config::apply_official_auth_to_home(home, auth_contents)?;
@@ -209,7 +227,14 @@ fn selected_official_auth_contents(
     settings: &BackendSettings,
     required: bool,
 ) -> anyhow::Result<Option<String>> {
-    let account_id = settings.active_official_account_id.trim();
+    let account_id = if settings.official_experience.enabled {
+        settings
+            .official_experience
+            .primary_official_account_id
+            .trim()
+    } else {
+        settings.active_official_account_id.trim()
+    };
     if !account_id.is_empty() {
         let auth = crate::official_accounts::OfficialAccountStore::default()
             .get_auth_json(account_id)

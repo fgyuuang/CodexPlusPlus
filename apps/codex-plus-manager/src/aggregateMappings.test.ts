@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  aggregateCapabilityModelSlugs,
   aggregateDisplayModelEntries,
   aggregateOrderedModelList,
   type RelayAggregateConfig,
@@ -72,6 +73,19 @@ test("aggregate model list keeps official models first and provider models by me
     "供应商一:gpt-6-astra",
     "供应商一:gpt-7-orion",
     "供应商二:vendor-gpt-5.4",
+  ]);
+});
+
+test("capability candidates use selected aggregate members, not a cached aggregate model list", () => {
+  const selected: RelayProfileLike[] = [
+    { id: "ecnu", name: "Chat ECNU", model: "ecnu-reasoner", modelList: "ecnu-reasoner\ndeepseek-v4" },
+  ];
+  const aggregate: RelayAggregateConfig = {
+    strategy: "failover", modelMappingsEnabled: true,
+    members: [{ profileId: "ecnu", weight: 1 }], modelMappings: [],
+  };
+  assert.deepEqual(aggregateCapabilityModelSlugs(aggregate, selected), [
+    "Chat ECNU:ecnu-reasoner", "Chat ECNU:deepseek-v4",
   ]);
 });
 
