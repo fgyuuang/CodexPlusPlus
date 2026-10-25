@@ -67,11 +67,45 @@ pub fn default_skill_backups_dir() -> PathBuf {
 }
 
 pub fn default_official_accounts_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some((metadata, _)) = official_account_paths_for_tests() {
+        return metadata;
+    }
     default_app_state_dir().join(OFFICIAL_ACCOUNTS_FILE)
 }
 
 pub fn default_official_account_secrets_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some((_, secrets)) = official_account_paths_for_tests() {
+        return secrets;
+    }
     default_app_state_dir().join(OFFICIAL_ACCOUNT_SECRETS_FILE)
+}
+
+#[cfg(test)]
+static OFFICIAL_ACCOUNT_PATHS_FOR_TESTS: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn official_account_paths_for_tests() -> Option<(PathBuf, PathBuf)> {
+    OFFICIAL_ACCOUNT_PATHS_FOR_TESTS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn set_official_account_paths_for_tests(
+    paths: Option<(PathBuf, PathBuf)>,
+) -> Option<(PathBuf, PathBuf)> {
+    std::mem::replace(
+        &mut *OFFICIAL_ACCOUNT_PATHS_FOR_TESTS
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap(),
+        paths,
+    )
 }
 
 pub fn default_official_model_catalog_path() -> PathBuf {

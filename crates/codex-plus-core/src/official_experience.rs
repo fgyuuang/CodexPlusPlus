@@ -201,6 +201,16 @@ fn descriptor_from_binding(
 }
 
 pub fn model_route_descriptors(settings: &BackendSettings) -> Vec<ModelRouteDescriptor> {
+    model_route_descriptors_with_store(
+        settings,
+        &crate::official_accounts::OfficialAccountStore::default(),
+    )
+}
+
+fn model_route_descriptors_with_store(
+    settings: &BackendSettings,
+    store: &crate::official_accounts::OfficialAccountStore,
+) -> Vec<ModelRouteDescriptor> {
     if !settings.official_experience.enabled {
         return Vec::new();
     }
@@ -239,7 +249,7 @@ pub fn model_route_descriptors(settings: &BackendSettings) -> Vec<ModelRouteDesc
     } else {
         settings.active_official_account_id.trim()
     };
-    if let Ok(accounts) = crate::official_accounts::OfficialAccountStore::default().list() {
+    if let Ok(accounts) = store.list() {
         for account in accounts.into_iter().filter(|account| {
             account.enabled && account.status == "ready" && account.id != primary_id
         }) {
@@ -255,15 +265,62 @@ pub fn model_route_descriptors(settings: &BackendSettings) -> Vec<ModelRouteDesc
             } else {
                 account.name.trim()
             };
+            // 次账号的权限来自自己的官方目录，不与当前账号取交集。
+            let account_trusted = entries
+                .iter()
+                .filter_map(|entry| entry.get("slug").and_then(Value::as_str))
+                .map(str::to_ascii_lowercase)
+                .collect();
             for route in direct_official_descriptors_for_account(
                 &account.id,
                 label,
                 &entries,
-                &trusted_lower,
+                &account_trusted,
             ) {
                 if seen.insert(route.routing_slug.to_ascii_lowercase()) {
                     descriptors.push(route);
                 }
+            }
+        }
+    }
+
+    if settings.official_experience.account_schedule_enabled {
+        // 独立来源：不改 openai 或任何固定账号 provider，也不参与供应商聚合。
+        let accounts = crate::official_account_schedule::ordered_accounts(
+            settings,
+            store.list().unwrap_or_default(),
+        );
+        let catalogs = accounts
+            .iter()
+            .filter_map(|a| {
+                crate::official_model_catalog::cached_official_model_entries_for_account(&a.id)
+                    .map(|entries| (a, entries))
+            })
+            .collect::<Vec<_>>();
+        if catalogs.len() == accounts.len()
+            && let Some((first, entries)) = catalogs.first()
+        {
+            let common = entries
+                .iter()
+                .filter_map(|e| e.get("slug").and_then(Value::as_str))
+                .filter(|slug| {
+                    catalogs.iter().all(|(_, entries)| {
+                        entries.iter().any(|e| {
+                            e.get("slug")
+                                .and_then(Value::as_str)
+                                .is_some_and(|s| s.eq_ignore_ascii_case(slug))
+                                && crate::official_account_schedule::eligible_model_entry(e)
+                        })
+                    })
+                })
+                .map(str::to_ascii_lowercase)
+                .collect();
+            for mut route in
+                direct_official_descriptors_for_account(&first.id, "官方顺序调度", entries, &common)
+            {
+                route.provider_id = crate::official_account_schedule::PROVIDER_ID.to_string();
+                route.routing_slug = format!("{}:{}", route.provider_id, route.upstream_model);
+                descriptors.push(route);
             }
         }
     }
@@ -508,7 +565,65 @@ pub fn descriptor_for_provider_and_model(
         .into_iter()
         .find(|descriptor| {
             descriptor.provider_id.eq_ignore_ascii_case(provider_id)
-                && descriptor.routing_slug.eq_ignore_ascii_case(routing_slug)
+                && (descriptor.routing_slug.eq_ignore_ascii_case(routing_slug)
+                    || (provider_id == crate::official_account_schedule::PROVIDER_ID
+                        && descriptor.upstream_model.eq_ignore_ascii_case(routing_slug)))
+        })
+        .or_else(|| historical_official_descriptor(settings, provider_id, routing_slug))
+}
+
+// 当前主账号在菜单中使用 openai，但旧会话的账号专用 ID 仍绑定原账号。
+fn historical_official_descriptor(
+    settings: &BackendSettings,
+    provider_id: &str,
+    routing_slug: &str,
+) -> Option<ModelRouteDescriptor> {
+    historical_official_descriptor_from_store(
+        settings,
+        provider_id,
+        routing_slug,
+        &crate::official_accounts::OfficialAccountStore::default(),
+    )
+}
+
+fn historical_official_descriptor_from_store(
+    settings: &BackendSettings,
+    provider_id: &str,
+    routing_slug: &str,
+    store: &crate::official_accounts::OfficialAccountStore,
+) -> Option<ModelRouteDescriptor> {
+    if !settings.official_experience.enabled
+        || !provider_id.starts_with(DIRECT_OFFICIAL_PROVIDER_PREFIX)
+    {
+        return None;
+    }
+    let account = store.list().ok()?.into_iter().find(|account| {
+        account.enabled
+            && account.status == "ready"
+            && direct_official_provider_id(&account.id) == provider_id
+    })?;
+    let cached =
+        crate::official_model_catalog::cached_official_model_entries_for_account(&account.id);
+    // 原生请求的裸模型只能由目标账号自己的目录证明，不能借用当前账号目录。
+    if !routing_slug.contains(':') && cached.is_none() {
+        return None;
+    }
+    let entries = cached.unwrap_or_else(|| {
+        let mut account_settings = settings.clone();
+        account_settings.active_official_account_id = account.id.clone();
+        crate::official_model_catalog::official_model_entries_for_settings(&account_settings)
+    });
+    // 历史会话使用原账号的可信目录，不能用当前主账号的模型集合缩减它。
+    let trusted = entries
+        .iter()
+        .filter_map(|entry| entry.get("slug").and_then(Value::as_str))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    direct_official_descriptors_for_account(&account.id, &account.name, &entries, &trusted)
+        .into_iter()
+        .find(|descriptor| {
+            descriptor.routing_slug.eq_ignore_ascii_case(routing_slug)
+                || descriptor.upstream_model.eq_ignore_ascii_case(routing_slug)
         })
 }
 
@@ -609,5 +724,197 @@ mod direct_official_tests {
         assert_eq!(route.source_id, "account-2");
         assert_eq!(route.upstream_model, "gpt-6-luna");
         assert_eq!(route.failover_policy, "strict");
+    }
+
+    #[test]
+    fn historical_official_route_survives_becoming_primary_without_cross_account_fallback() {
+        use base64::Engine;
+        let _guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::official_accounts::OfficialAccountStore::new(
+            temp.path().join("accounts.json"),
+            temp.path().join("secrets.json"),
+        );
+        let jwt = |claims: Value| {
+            format!(
+                "e30.{}.sig",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(&claims).unwrap())
+            )
+        };
+        let (account, _) = store
+            .upsert_auth_json(json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": jwt(json!({"sub": "history-user"})),
+                    "access_token": jwt(json!({"sub": "history-user", "exp": 4000000000_i64,
+                        "https://api.openai.com/auth": {"chatgpt_account_id": "history-account"}})),
+                    "refresh_token": "test-refresh",
+                    "account_id": "history-account"
+                }
+            }))
+            .unwrap();
+        let mut settings = BackendSettings::default();
+        settings.official_experience.enabled = true;
+        settings.active_official_account_id = account.id.clone();
+        settings.official_experience.primary_official_account_id = account.id.clone();
+        // 使用该账号的真实目录结构，避免测试依赖本机 CLI 内置模型的变化。
+        let cache_path = temp.path().join("catalog.json");
+        let mut accounts = serde_json::Map::new();
+        accounts.insert(
+            account.id.clone(),
+            json!({
+                "accountId": account.id, "fetchedAt": 1, "clientVersion": "test",
+                "models": [{"slug": "gpt-6-luna", "visibility": "list", "supported_in_api": true}]
+            }),
+        );
+        accounts.insert(
+            "other-primary".to_string(),
+            json!({
+                "accountId": "other-primary", "fetchedAt": 1, "clientVersion": "test",
+                "models": [{"slug": "gpt-6-sol", "visibility": "list", "supported_in_api": true}]
+            }),
+        );
+        std::fs::write(
+            &cache_path,
+            serde_json::to_vec(&json!({"version": 1, "accounts": accounts})).unwrap(),
+        )
+        .unwrap();
+        struct RestoreCatalog(Option<std::path::PathBuf>);
+        impl Drop for RestoreCatalog {
+            fn drop(&mut self) {
+                crate::paths::set_official_model_catalog_path_for_tests(self.0.take());
+            }
+        }
+        let _restore = RestoreCatalog(crate::paths::set_official_model_catalog_path_for_tests(
+            Some(cache_path),
+        ));
+        let provider = direct_official_provider_id(&account.id);
+        let slug = direct_official_routing_slug(&account.id, "gpt-6-luna");
+        let route =
+            historical_official_descriptor_from_store(&settings, &provider, &slug, &store).unwrap();
+        assert_eq!(route.source_id, account.id);
+        assert_eq!(route.upstream_model, "gpt-6-luna");
+        // Codex 恢复/切换模型时也会使用账号 provider + 原生裸模型名。
+        assert_eq!(
+            historical_official_descriptor_from_store(&settings, &provider, "gpt-6-luna", &store)
+                .unwrap()
+                .source_id,
+            account.id
+        );
+        settings.active_official_account_id = "other-primary".to_string();
+        settings.official_experience.primary_official_account_id = "other-primary".to_string();
+        // 主账号只有 Sol，次账号的 Luna 仍必须以账号名称出现在菜单。
+        let routes = model_route_descriptors_with_store(&settings, &store);
+        let secondary = routes
+            .iter()
+            .find(|route| route.routing_slug == slug)
+            .unwrap();
+        assert_eq!(
+            secondary.display_name,
+            format!("gpt-6-luna({})", account.name)
+        );
+        assert_eq!(secondary.provider_id, provider);
+        assert!(routes.iter().any(|route| route.routing_slug == "gpt-6-sol"));
+        settings.active_official_account_id = account.id.clone();
+        assert!(
+            model_route_descriptors_with_store(&settings, &store)
+                .iter()
+                .all(|route| route.routing_slug != slug)
+        );
+        settings.active_official_account_id = "other-primary".to_string();
+        assert_eq!(
+            historical_official_descriptor_from_store(&settings, &provider, &slug, &store)
+                .unwrap()
+                .source_id,
+            account.id
+        );
+        assert_eq!(
+            route.source_kind,
+            OfficialExperienceSourceKind::DirectOfficial
+        );
+        assert_eq!(
+            historical_official_descriptor_from_store(&settings, &provider, "gpt-6-luna", &store)
+                .unwrap()
+                .source_id,
+            account.id
+        );
+        // 主账号拥有的 Sol 不能被当作这个只拥有 Luna 的账号模型。
+        assert!(
+            historical_official_descriptor_from_store(&settings, &provider, "gpt-6-sol", &store)
+                .is_none()
+        );
+        assert!(
+            historical_official_descriptor_from_store(
+                &settings,
+                "codex_plus_official_unknown",
+                "gpt-6-luna",
+                &store
+            )
+            .is_none()
+        );
+        let previous = crate::paths::set_official_model_catalog_path_for_tests(Some(
+            temp.path().join("missing-catalog.json"),
+        ));
+        assert!(
+            historical_official_descriptor_from_store(&settings, &provider, "gpt-6-luna", &store)
+                .is_none()
+        );
+        crate::paths::set_official_model_catalog_path_for_tests(previous);
+        assert!(
+            historical_official_descriptor_from_store(
+                &settings,
+                &provider,
+                &direct_official_routing_slug("other-account", "gpt-6-luna"),
+                &store
+            )
+            .is_none()
+        );
+        assert!(
+            historical_official_descriptor_from_store(
+                &settings,
+                &provider,
+                &direct_official_routing_slug(&account.id, "unknown-model"),
+                &store
+            )
+            .is_none()
+        );
+        store.mark_status(&account.id, "needsReauth").unwrap();
+        assert!(
+            historical_official_descriptor_from_store(&settings, &provider, "gpt-6-luna", &store)
+                .is_none()
+        );
+        assert!(
+            model_route_descriptors_with_store(&settings, &store)
+                .iter()
+                .all(|route| route.routing_slug != slug)
+        );
+        assert!(
+            historical_official_descriptor_from_store(&settings, &provider, &slug, &store)
+                .is_none()
+        );
+        store.mark_status(&account.id, "ready").unwrap();
+        store
+            .update(
+                &account.id,
+                crate::official_accounts::OfficialAccountPatch {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            historical_official_descriptor_from_store(&settings, &provider, "gpt-6-luna", &store)
+                .is_none()
+        );
+        assert!(
+            model_route_descriptors_with_store(&settings, &store)
+                .iter()
+                .all(|route| route.routing_slug != slug)
+        );
+        assert!(
+            historical_official_descriptor_from_store(&settings, &provider, &slug, &store)
+                .is_none()
+        );
     }
 }

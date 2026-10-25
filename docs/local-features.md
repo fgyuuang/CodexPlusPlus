@@ -3,6 +3,23 @@
 本文件记录本 fork 相对于上游 BigPizzaV3/CodexPlusPlus origin/main 的核心差异功能。
 每次上游合并后必须逐条确认回归，避免本地行为被上游简化行为覆盖。
 
+## 2026-10-25：后续兼容补丁与合并发布
+
+- 按 [更新审计](reports/2026-10-25-upstream-update-review.md) 选择吸纳模型级发送锁和供应商名称修复；不是整版 v1.11.2 合并，版本号保持不变。
+- 混入模式对 `additional_rate_limits` 仅解除客户端发送阻断；保留真实用量、重置时间及原始快照，退出混入模式恢复原始状态。服务端额度与账号调度判定不变。
+- 编辑供应商地址时保留已有非空显示名称；空名称才回退到 provider 标识，保留本地 `requires_openai_auth` 默认关闭的认证隔离规则。
+- 上述补丁与上次尚未交付的桥接修复统一通过后台发布；只有任务状态 `succeeded` 才代表检查及文件交付成功，运行进程仍需用户自行重启验收。
+
+## 2026-10-21：v1.10.1 兼容吸纳边界
+
+已核实上游 tag/main 为 `c541516c`；本地仅选择吸纳兼容补丁，未完成整版合并，版本号不改为 v1.10.1。分阶段计划及验收条件见 [审计报告](reports/2026-10-21-v1.10.1-local-integration-plan.md)。
+
+- 桥接：吸纳 `070685da` 中适用于本地的健康计数和看门狗判定。连续失败至少三次且成功心跳超过 15 秒时，不再被最近失败尝试误判为健康；保留隐藏窗口保护及 5 秒注入宽限，旧 generation 不得污染新状态。
+- 注入产物必须从本地分片重组；上游新增的请求状态条模块尚未引入，不能宣称整条状态条修复已移植。
+- 请求日志、避震/重试、逐模型参数和会话新架构尚待适配；不得整体覆盖本地代理或设置结构，也不得把一般容量错误当作账号额度耗尽。
+- 原有官方认证隔离、同对话切换、顺序调度、旧子代理跟随、官方图片直通、模型别名及插件保留契约继续有效。上游外部 Agent 协作功能不能代替原生旧子代理跟随。
+- 耗时检查与交付统一交给后台 `scripts/release.ps1`；下方历史合并命令仅作参考，不能绕过当前 AGENTS.md 的后台发布流程。
+
 ---
 
 ## 1. 聚合供应商与模型路由（最大分叉）
@@ -28,6 +45,8 @@
 ---
 
 ## 2. 认证与会话隔离
+
+官方体验增加默认关闭的“旧子代理跟随父对话账号”选项（`followParentAccount`）。开启或关闭后须重启 Codex；启用时保持根 `openai` 和 live 登录，仅将官方传输接入本地代理。`official_child_routing.rs` 只读原生父子关系，令旧官方子代理的后续 Responses/compact 请求跟随根对话当前来源；账号/模型/关系不明确则拒绝，不创建副本、不改写子线程、不重放正在执行的请求。固定官方账号的内置图片同样跟随；第三方子代理不参与。默认关闭时保留原先固定账号隔离行为。合并后须同时覆盖默认隔离和显式跟随、跨聊天标识拒绝、原生登录不变、关闭后恢复官方传输，详见认证状态机文档。
 
 非官方供应商的 API key 写入 `experimental_bearer_token` 而非 `auth.json`，
 切换供应商时不覆写官方 ChatGPT/Codex 登录态。
@@ -55,7 +74,9 @@ Microsoft Store 更新可能在 Codex++ launcher 仍运行时关闭原窗口，�
 
 **Codex++ 自身不得开机自启动桌面端。** `CodexPlusPlusWatcher.lnk`（启动目录）与 `CodexPlusPlusWatcher`（`HKCU\...\CurrentVersion\Run`）都会在登录时以 `--debug-port` 拉起 launcher 进而启动 Codex。用户要求关闭自启动时，除了移除这两个入口，还要写 `~/.codex-session-delete/watcher.disabled`，否则 `install_watcher` 会再次安装。
 
-**只有直连官方账号的 route provider 可以用 ChatGPT 账号鉴权。** `ensure_official_experience_config_in_home` 为每个路由来源写 `[model_providers.<provider_id>]`；`requires_openai_auth` 必须**仅对 `OfficialExperienceSourceKind::DirectOfficial` 为 true**。一旦聚合（`codex_plus_aggregate_*`）、CLIProxyAPI（`codex_plus_cli_*`）等非官方通道也被写成 `requires_openai_auth = true`，Codex 会把会话当作 ChatGPT 账号会话并按账号限制模型名，用户选中 `Chat ECNU:ecnu-reasoner`、`deepseek:*` 等条目时会直接报 `The 'X' model is not supported when using Codex with a ChatGPT account.`（该文案不在本地任何二进制里，来自账号校验链）。非官方通道改为 `requires_openai_auth = false` + `experimental_bearer_token = NO_AUTH_PROXY_BEARER_TOKEN`；协议代理不校验 routes 请求的 bearer，官方上游凭据由代理自己从登录存档解析（`resolve_official_chatgpt_auth`）。
+**所有带路由前缀的本地 provider 都使用本地传输鉴权。** `ensure_official_experience_config_in_home` 为直连官方账号 2、聚合、CLIProxyAPI 和第三方来源写 `[model_providers.<provider_id>]`，统一设置 `requires_openai_auth = false`、`experimental_bearer_token = NO_AUTH_PROXY_BEARER_TOKEN`。路由 slug 带账号或供应商前缀，若声明 `requires_openai_auth = true`，Codex 会用当前 ChatGPT 登录先校验该 slug，账号 2 的 `codex_plus_official_*:gpt-*` 也会被拒绝为 `The 'X' model is not supported when using Codex with a ChatGPT account.`。直连官方账号 2 的实际凭据由本地代理按已验证的 provider 和模型路由从该账号登录存档读取，转发前将 slug 还原成官方模型名；主官方裸模型仍走 `openai` 原生链路。
+
+**已加载会话换来源必须先卸载再恢复。** 当前 app-server 的 `thread/settings/update` 只更新模型名，`turn/start` 中的 `modelProvider` 不会替换已加载会话的 provider；对已保存的会话，发送前用 `thread/unsubscribe` 卸载，再以目标 `model + modelProvider + reasoningEffort` 调用 `thread/resume`，核对响应的 provider 后才发 `turn/start`。新会话首回合尚无 rollout，必须从 `thread/start` 响应确认 provider；无法确认时关闭式拒绝，不能把账号 2 或第三方模型发给主官方账号。
 
 **同步流程不得改写用户在目录内的模型选择。** `ensure_official_experience_config_in_home` 只应把**目录外的未知模型**回退为官方默认模型；目录内出现的 `routing_slug`（官方账号别名、CLIProxyAPI、聚合、`供应商:模型`）都是合法选择，必须原样保留，否则用户选了第三方模型会在下一次配置同步时被静默改回官方模型。
 

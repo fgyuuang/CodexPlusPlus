@@ -18,7 +18,7 @@ type RateLimitRuntime = {
 async function rateLimitUnlockRuntime(quotaResume = true, documentValue: unknown = {}) {
   const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
   const start = renderer.indexOf("  const codexRateLimitUnlockMaxTrackedRequests = ");
-  const end = renderer.indexOf("\n  // Recent Codex builds send app-server requests", start);
+  const end = renderer.indexOf("\n  // The desktop app sends conversation requests", start);
   assert.ok(start >= 0 && end > start, "rate limit unlock block not found");
   const source = renderer.slice(start, end);
   const diagnostics: Diagnostics = [];

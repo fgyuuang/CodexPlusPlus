@@ -58,6 +58,20 @@
 - 改动隔离 + opt-in，不破坏现有 per-profile 单值行为
 - 不做需求外的操作
 
+## 拓展接口约定
+
+`window.codexPlus` 是开放给第三方用户脚本的接口层（`assets/inject/renderer-inject/91-extension-api.js`）。
+改动这里要遵守：
+
+- **已发布的类名与 `codexPlus.constants` 不再更名**，新增用新名字。第三方脚本按字面量依赖它们。
+- **路由默认不开放**。`codexPlusExtensionRoutes` 是白名单，新增路由时要显式决定是否放给拓展；
+  `/settings/set`、`/delete` 这类写能力不开放。契约测试会守住这条。
+- **注册表持久、DOM 瞬态**。消费方不能缓存 DOM 引用，每次重建都要从注册中心读数据。
+  见 `01-registry.js` 顶部的生命周期说明。
+- **扫描调度**：拓展插入的节点必须带 `data-codex-plus-ext` 属性，否则会触发自喂扫描循环
+  （issue #1960）。选择器按「有归属/无归属」两档登记，不要按脚本逐个登记，会耗尽配额。
+- 改分片后必须跑 `node scripts/assemble-renderer-inject.mjs` 重新组装产物。
+
 ## 测试约定
 
 - 沿用上游 `#[test]` + tempfile 风格
@@ -80,65 +94,28 @@
 
 ## 发布编译
 
-Manager 是 Tauri 应用，前端资源来自 `apps/codex-plus-manager/dist/`。只运行
-`cargo build --workspace --release` 不会可靠地执行 Vite 构建，可能把旧 `dist`
-嵌入新的 Manager 可执行文件，表现为后端命令已更新但页面仍是旧版。
+**默认将耗时检查、编译、等待和产物核对交给后台脚本，不占用对话轮询。** Agent 专注代码修改、必要的针对性验证和分片组装；代码准备好后启动一次任务即可交接，并准确报告“已启动，尚未完成”。只修改脚本/文档不必构建产品 Release。
 
-涉及 Manager 前端改动时必须先单独刷新 `dist`，再编译 Rust 工作区。不要使用
-`npm run build` 代替下面的两阶段流程：该脚本还会执行完整 `tauri build`，耗时更长，
-并可能生成当前验收不需要的安装包。
+~~~powershell
+# 默认交付到 bin/；涉及前端改动时必须提供本次功能的独特文本或标记
+pwsh -NoProfile -File .\scripts\release.ps1 -Action Start -ExpectedUiText '本次功能的独特文本'
 
-```powershell
-# 1. 生成最新前端资源
-Set-Location -LiteralPath "apps\codex-plus-manager"
-npm run vite:build
+# 需要更新已授权的现有安装目录时显式指定
+pwsh -NoProfile -File .\scripts\release.ps1 -Action Start -ExpectedUiText '本次功能的独特文本' -DeployTo 'D:\pro\Codex++'
 
-# 2. 确认 dist 时间戳已更新，并按本次功能选择一个独特的新界面文本进行检查
-Get-Item -LiteralPath "dist\index.html" | Select-Object FullName, LastWriteTime, Length
-$bundle = Get-ChildItem -LiteralPath "dist\assets" -Filter "index-*.js" -File |
-  Sort-Object LastWriteTime -Descending |
-  Select-Object -First 1
-$bundleText = [System.IO.File]::ReadAllText($bundle.FullName, [System.Text.Encoding]::UTF8)
-if (-not $bundleText.Contains("本次新增的独特界面文本")) {
-  throw "最新前端改动未进入 dist，禁止继续发布编译。"
-}
+# 需要进度时读取一次，不要循环调用工具等待
+pwsh -NoProfile -File .\scripts\release.ps1 -Action Status
+~~~
 
-# 3. 回到仓库根目录并编译；Release 优化可能需要 10-20 分钟
-Set-Location -LiteralPath "..\.."
-cargo build --workspace --release
+任务由独立、隐藏的 PowerShell 进程执行；不依赖当前聊天轮次。**禁止在对话里用 sleep/write_stdin 持续等 Release，禁止重复启动构建。** 已有任务运行时保留原任务，失败后根据日志修复再启动；状态 queued/running 不代表发布成功。
 
-# 4. 仅在所有 cargo/rustc/tauri 子进程结束且产物时间戳已刷新后复制到 bin/
-Copy-Item -LiteralPath "target\release\codex-plus-plus-manager.exe" -Destination "bin\" -Force
-Copy-Item -LiteralPath "target\release\codex-plus-plus.exe" -Destination "bin\" -Force
-Copy-Item -LiteralPath "target\release\codex-plus-mobile-relay.exe" -Destination "bin\" -Force
+脚本负责完整 Rust/TS 检查与回归、先 Vite 后 Rust Release、源码与文件集 SHA-256、dist 文本/时间戳、编译进程结束检查、三个产物备份/复制/最终哈希、运行进程路径及最终摘要。源码或 dist 在构建期间变化会阻止交付；默认只交付到 bin，指定 -DeployTo 才更新运行目录。不安装依赖、不重启用户应用、不自动提交或推送。
 
-# 5. 验证 target/release 与 bin 哈希逐一一致
-$artifacts = @(
-  "codex-plus-plus-manager.exe",
-  "codex-plus-plus.exe",
-  "codex-plus-mobile-relay.exe"
-)
-foreach ($name in $artifacts) {
-  $releaseHash = (Get-FileHash -LiteralPath (Join-Path "target\release" $name) -Algorithm SHA256).Hash
-  $binHash = (Get-FileHash -LiteralPath (Join-Path "bin" $name) -Algorithm SHA256).Hash
-  if ($releaseHash -ne $binHash) { throw "SHA-256 mismatch: $name" }
-  Write-Output "$name  $binHash"
-}
-```
+Manager 是 Tauri 应用，必须使用最新 dist；不得绕过脚本单独 cargo build 并复制旧前端，也不要使用会额外打包安装程序的 npm run build。发布任务使用项目已有 Vite CLI，等价 npm run vite:build。前端文本验证失败、Manager 早于 dist、测试失败或哈希不一致均不得发布。
 
-Windows 下命令超时不代表构建已经停止；`node`、`tauri`、`cargo` 或 `rustc` 子进程
-可能仍在后台运行。超时后先用 `Get-CimInstance Win32_Process` 检查相关进程，等待原构建
-结束，禁止直接启动第二份重复构建。最终至少确认以下证据：
+任务记录在 output/release-jobs/<任务编号>/。只有 status.json 的 state=succeeded 才可报告检查及交付成功；failed/interrupted 保留证据，不得冒充已更新。运行中的旧进程不会因文件替换自动加载新代码，用户自行安排重启及界面验收。完整用法与恢复边界见 [docs/release-workflow.md](docs/release-workflow.md)。
 
-- 新界面文本已进入最新 `dist/assets/index-*.js`。
-- Release 可执行文件的 `LastWriteTime` 已晚于前端构建时间，且 SHA-256 相比旧产物改变。
-- `target/release` 与 `bin` 中对应文件的 SHA-256 完全一致。
-- 从 `bin` 复制或移动到其他目录的旧副本不会自动更新；验收时必须确认实际启动路径，
-  并完全退出旧 Manager 后再启动新产物。
-
-`bin/` 已被 `.gitignore` 排除，不纳入版本控制。
-
-Release 配置已在 `Cargo.toml` 中启用 `strip = true`、`lto = "fat"`、`codegen-units = 1`、`panic = "abort"`。
+Release 优化仍使用 Cargo.toml 的 strip/lto/codegen-units/panic 设置，无需为减少对话等待而降低优化等级。
 
 ## 空间管理
 
@@ -152,44 +129,11 @@ Remove-Item -LiteralPath "target\debug" -Recurse -Force
 
 ## 验收流程
 
-提交前依次完成以下步骤，确认无误后由用户确认：
+Agent 完成代码改动与针对性验证后，检查 git status、任务差异及生成文件，不处理任务外既有变更。完整检查与交付通过上述后台发布任务执行，不再前台手动跑一遍相同的 workspace 测试和 Release。
 
-```powershell
-# 1. 检查未提交文件范围
-git status --short
+交接时提供任务编号及状态文件路径，说明“后台运行，尚未验收”；不因耗时继续轮询。需要确认结果时单次调用 Status，核对 state、失败步骤、产物哈希、备份目录及实际运行路径。后台失败只修复对应问题，禁止重复并行构建。
 
-# 2. Rust 检查
-cargo fmt --all -- --check
-cargo check --workspace
-
-# 3. 关键回归测试（单线程避免 Windows 共享冲突）
-cargo test -p codex-plus-core --tests -- --test-threads=1
-cargo test -p codex-plus-data --tests -- --test-threads=1
-cargo test -p codex-plus-manager --lib -- --test-threads=1
-
-# 4. TypeScript 检查与前端测试
-Push-Location -LiteralPath "apps\codex-plus-manager"
-.\node_modules\.bin\tsc --noEmit -p tsconfig.json
-node --test "src/*.test.ts"
-Pop-Location
-
-# 5. 生产构建（前端改动必须先刷新 dist，详见“发布编译”）
-Push-Location -LiteralPath "apps\codex-plus-manager"
-npm run vite:build
-Pop-Location
-cargo build --workspace --release
-
-# 6. 复制到 bin/
-Copy-Item -LiteralPath "target\release\codex-plus-plus-manager.exe" -Destination "bin\" -Force
-Copy-Item -LiteralPath "target\release\codex-plus-plus.exe" -Destination "bin\" -Force
-Copy-Item -LiteralPath "target\release\codex-plus-mobile-relay.exe" -Destination "bin\" -Force
-
-# 7. 出示 SHA-256 供验收确认
-Get-ChildItem -LiteralPath "bin" -Filter "codex*" | ForEach-Object {
-  $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
-  Write-Output "$($_.Name)  $hash"
-}
-```
+提交/推送前必须已有成功任务的检查和交付证据，再由用户确认实际启动新版及界面行为。不得把“启动后台任务”作为测试或发布已完成的证据。
 
 用户确认无误后执行：
 

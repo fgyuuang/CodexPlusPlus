@@ -148,6 +148,7 @@ pub async fn refresh_account(
     ensure!(!account_id.is_empty(), "官方账号 ID 不能为空");
     let store = OfficialAccountStore::default();
     let mut auth = store.get_auth_json(account_id)?;
+    let mut observed = store.get(account_id)?;
     let parsed = parse_official_auth(&auth)?;
     let client_version = discover_client_version(settings).await;
     let previous = load_cache()
@@ -169,6 +170,7 @@ pub async fn refresh_account(
             .await
             .with_context(|| "官方模型目录请求返回 401，刷新令牌失败")
             .and_then(|_| store.get_auth_json(account_id))?;
+        observed = store.get(account_id)?;
         let parsed = parse_official_auth(&auth)?;
         response = request_catalog(
             &auth,
@@ -210,6 +212,7 @@ pub async fn refresh_account(
         }
     };
 
+    store.mark_authenticated(&auth, &observed)?;
     let mut cache = load_cache().unwrap_or_default();
     cache.version = CACHE_VERSION;
     cache.accounts.insert(account_id.to_string(), snapshot);

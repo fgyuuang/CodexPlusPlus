@@ -1,7 +1,47 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
+import ts from "typescript";
 
 import { resolveProviderName, tomlSectionStringValue } from "./provider-name.ts";
+
+// 执行实际编辑器 helper，避免只测名称解析器而遗漏写回时的覆盖。
+function editorRuntime() {
+  const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const names = new Set([
+    "setCodexProviderStringKey", "ensureCodexProviderDefaults", "setTomlSectionBoolKey",
+    "setTomlSectionStringKey", "setTomlSectionRawKey", "tomlSectionName", "tomlString",
+    "ensureTrailingNewline", "joinTomlSections", "rootTomlStringValue", "tomlStringAssignmentValue",
+    "setRootTomlStringKey", "setRootTomlLine", "removeRootTomlKey", "splitTomlRootAndTables",
+  ]);
+  const functions = ast.statements.filter((node) => ts.isFunctionDeclaration(node) && names.has(node.name?.text || ""));
+  const code = functions.map((node) => node.getText(ast)).join("\n");
+  const context = vm.createContext({ resolveProviderName });
+  vm.runInContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  return context;
+}
+
+test("editing provider URL preserves its custom label and requested auth policy", () => {
+  const editor = editorRuntime();
+  const original = 'model_provider = "custom"\n[model_providers.custom]\nname = "My relay"\nbase_url = "https://old.invalid/v1"\n';
+  for (const requiresOpenAiAuth of [false, true]) {
+    const updated = editor.setCodexProviderStringKey(original, "base_url", "https://new.invalid/v1", { requiresOpenAiAuth });
+    assert.equal(tomlSectionStringValue(updated, "model_providers.custom", "name"), "My relay");
+    assert.equal(tomlSectionStringValue(updated, "model_providers.custom", "base_url"), "https://new.invalid/v1");
+    assert.match(updated, new RegExp(`requires_openai_auth = ${requiresOpenAiAuth}`));
+  }
+});
+
+test("editor fills missing or blank names while retaining local default auth isolation", () => {
+  const editor = editorRuntime();
+  for (const name of ["", 'name = "   "\n']) {
+    const updated = editor.ensureCodexProviderDefaults(`[model_providers.custom]\n${name}`, "custom");
+    assert.equal(tomlSectionStringValue(updated, "model_providers.custom", "name"), "custom");
+    assert.match(updated, /requires_openai_auth = false/);
+  }
+});
 
 // issue #1886：用户把 name 改成 OpenAi，保存/重启后不能被改回 custom
 test("keeps a user-customized provider name", () => {

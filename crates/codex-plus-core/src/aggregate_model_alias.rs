@@ -828,9 +828,10 @@ pub fn normalize_requested_model_name(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cliproxy_direct_api_aliases, cliproxy_general_api_aliases,
-        integration_is_cliproxy_official, integration_is_excluded_from_aggregate,
-        normalize_requested_model_name, provider_display_name,
+        cliproxy_direct_api_aliases_from_parts, cliproxy_general_api_aliases_for_slugs,
+        cliproxy_official_api_aliases_for_slugs, integration_is_cliproxy_official,
+        integration_is_excluded_from_aggregate, normalize_requested_model_name,
+        provider_display_name,
     };
     use crate::settings::RelayProfile;
 
@@ -872,6 +873,8 @@ mod tests {
 
     #[test]
     fn cliproxy_general_aliases_keep_non_official_models_and_yield_to_special_official_channel() {
+        // 路由优先级使用明确的目录夹具，不依赖本机账号实时可见模型。
+        let official_models = vec!["gpt-5.5".to_string()];
         let profiles = vec![
             RelayProfile {
                 id: "managed-cliproxy".to_string(),
@@ -890,20 +893,24 @@ mod tests {
         ];
 
         assert_eq!(
-            cliproxy_general_api_aliases(&profiles, true)
+            cliproxy_general_api_aliases_for_slugs(&profiles, true, &official_models)
                 .into_iter()
                 .map(|alias| alias.alias)
                 .collect::<Vec<_>>(),
             ["CLIProxyAPI:gemini-2.5-pro"]
         );
         assert_eq!(
-            cliproxy_general_api_aliases(&profiles[..1], false)
+            cliproxy_general_api_aliases_for_slugs(&profiles[..1], false, &official_models)
                 .into_iter()
                 .map(|alias| alias.alias)
                 .collect::<Vec<_>>(),
             ["CLIProxyAPI:gpt-5.5", "CLIProxyAPI:gemini-2.5-pro"]
         );
-        let aliases = cliproxy_direct_api_aliases(&profiles);
+        let aliases = cliproxy_direct_api_aliases_from_parts(
+            &profiles,
+            cliproxy_official_api_aliases_for_slugs(&profiles, &official_models),
+            &official_models,
+        );
         assert_eq!(
             aliases
                 .iter()

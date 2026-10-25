@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
@@ -23,6 +24,61 @@ static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
 const BRIDGE_HEALTH_FAILURE_THRESHOLD: u8 = 2;
 const BRIDGE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 const BRIDGE_WATCHDOG_MAX_CDP_BACKOFF: Duration = Duration::from_secs(60);
+
+/// 重注入退避状态，供新版健康检查路径使用。
+#[derive(Debug, Default)]
+struct BridgeReinjectBackoff {
+    consecutive_attempts: u32,
+    next_allowed_at: Option<std::time::Instant>,
+    healthy_since: Option<std::time::Instant>,
+}
+
+fn reinject_backoff_delay(consecutive_attempts: u32) -> std::time::Duration {
+    let factor = 1u64
+        .checked_shl(consecutive_attempts.min(u64::BITS - 1))
+        .unwrap_or(u64::MAX);
+    std::time::Duration::from_secs(
+        BRIDGE_REINJECT_BACKOFF_BASE_SECS
+            .saturating_mul(factor)
+            .min(BRIDGE_REINJECT_BACKOFF_CAP_SECS),
+    )
+}
+
+const BRIDGE_REINJECT_BACKOFF_BASE_SECS: u64 = 10;
+const BRIDGE_REINJECT_BACKOFF_CAP_SECS: u64 = 300;
+const BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS: u64 = 60;
+
+impl BridgeReinjectBackoff {
+    fn ready(&self, now: std::time::Instant) -> bool {
+        self.next_allowed_at.is_none_or(|deadline| now >= deadline)
+    }
+
+    fn record_attempt(&mut self, now: std::time::Instant) {
+        let delay = reinject_backoff_delay(self.consecutive_attempts);
+        self.next_allowed_at = Some(now + delay);
+        self.consecutive_attempts = self.consecutive_attempts.saturating_add(1);
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_attempts = 0;
+        self.next_allowed_at = None;
+        self.healthy_since = None;
+    }
+
+    fn observe_healthy(&mut self, now: std::time::Instant) {
+        let since = *self.healthy_since.get_or_insert(now);
+        if now.saturating_duration_since(since)
+            >= std::time::Duration::from_secs(BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS)
+        {
+            self.reset();
+        }
+    }
+
+    fn observe_unhealthy(&mut self) {
+        self.healthy_since = None;
+    }
+}
+
 const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 5_000;
 const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 
@@ -30,8 +86,11 @@ const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 /// 不能像普通 helper 端口那样临时换一个空闲的，否则 Codex CLI 会连到没人监听的地址。
 /// 而管理器的「重启」是先强杀旧 launcher 再拉新的，旧 helper 交还监听要一小会儿；
 /// 过去这里一次 bind 失败就整个启动中止，用户侧就是重启必失败、直接双击 exe 反而正常（issue #1933）。
-/// 所以固定端口下给前任一个让位的窗口，只对「端口被占用」重试。
+/// 所以固定端口下给前任一个让位的窗口。端口被占用，以及 Windows 在旧进程
+/// 退出瞬间暂时返回的 10013，都放在这一段里重试。窗口结束仍是 10013，
+/// 才当成端口被系统永久保留。
 const HELPER_BIND_RETRY_TIMEOUT_MS: u64 = 6_000;
+const PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS: u64 = 10_000;
 const HELPER_BIND_RETRY_INTERVAL_MS: u64 = 200;
 
 /// Initial bridge injection gets one bounded retry window. The watchdog takes
@@ -151,6 +210,7 @@ impl LaunchHandle {
         if self.helper_started {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
+        self.hooks.stop_native_browser_compatibility().await;
         result
     }
 }
@@ -165,6 +225,8 @@ pub trait LaunchHooks: Send + Sync {
     fn select_debug_port(&self, requested: u16) -> u16;
     fn select_helper_port(&self, requested: u16) -> u16;
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
+    async fn start_native_browser_compatibility(&self, _settings: &BackendSettings) {}
+    async fn stop_native_browser_compatibility(&self) {}
     fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -321,11 +383,75 @@ fn error_is_address_in_use(error: &anyhow::Error) -> bool {
     })
 }
 
-/// 端口被占用时按 `interval_ms` 重试启动 helper，直到成功或超过 `timeout_ms`。
+/// 判断错误链里是不是「端口被系统禁止绑定」（issue #2189）。
+/// Windows 上 Hyper-V/WSL 会在开机时把动态端口范围（49152-65535）里的一段段端口
+/// 划进排除区间，落在区间里的端口 bind 报 os error 10013（PermissionDenied），
+/// 和「被进程占用」不是一回事。真正被排除区间划走时重试不会成功，
+/// 但重启瞬间旧套接字未放开也会暂时返回同一个错误，所以只有固定端口会在
+/// 有限窗口内重试，窗口结束后仍失败才给出对症指引。
+fn error_is_bind_forbidden(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(crate::ports::port_bind_forbidden)
+    })
+}
+
+/// 把 helper 端口 bind 失败翻译成用户能照着处理的提示。
+///
+/// 过去只有「端口被占用」会追加中文说明（issue #1933 的重试逻辑），
+/// Windows 保留端口区间（os error 10013）直接裸抛英文 bind 报错，
+/// 用户既看不懂也不知道为什么混入 Responses key 之后就再也起不来。
+fn describe_helper_bind_failure(
+    error: anyhow::Error,
+    helper_port: u16,
+    protocol_proxy_enabled: bool,
+    bind_retry_timeout_ms: u64,
+) -> anyhow::Error {
+    if protocol_proxy_enabled && error_is_address_in_use(&error) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "helper.bind_gave_up_on_busy_port",
+            serde_json::json!({
+                "helper_port": helper_port,
+                "waited_ms": bind_retry_timeout_ms,
+            }),
+        );
+        return error.context(format!(
+            "协议代理端口 {helper_port} 被其他进程占用，等待 {} 秒后仍未释放。\
+             该端口写在 config.toml 的 base_url 里，不能自动改用其他端口；\
+             请退出仍在运行的 Codex++ 或占用该端口的程序后重试。",
+            bind_retry_timeout_ms / 1000
+        ));
+    }
+    if error_is_bind_forbidden(&error) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "helper.bind_forbidden_port",
+            serde_json::json!({ "helper_port": helper_port }),
+        );
+        if cfg!(windows) {
+            return error.context(format!(
+                "helper 端口 {helper_port} 被 Windows 保留，无法绑定\
+                 （os error 10013，常见于 Hyper-V/WSL 开机划走的动态端口排除区间）。\
+                 请以管理员运行 netsh interface ipv4 show excludedportrange protocol=tcp \
+                 确认该端口是否在排除区间内，重启电脑通常可重新分配；\
+                 协议代理模式下也可以设置环境变量 CODEX_PLUS_PROTOCOL_PROXY_PORT \
+                 换一个端口后重试。"
+            ));
+        }
+        return error.context(format!(
+            "helper 端口 {helper_port} 绑定被系统拒绝，请检查端口占用与权限。"
+        ));
+    }
+    error
+}
+
+/// 按 `interval_ms` 重试启动 helper，直到成功或超过 `timeout_ms`。
+/// 端口被占用会重试；`retry_forbidden` 为真时，暂时的 10013 也放在同一段等待里。
 async fn start_helper_waiting_for_busy_port<F, Fut>(
     mut start: F,
     timeout_ms: u64,
     interval_ms: u64,
+    retry_forbidden: bool,
 ) -> anyhow::Result<()>
 where
     F: FnMut() -> Fut,
@@ -350,7 +476,9 @@ where
             }
             Err(error) => error,
         };
-        if !error_is_address_in_use(&error) || waited_ms >= timeout_ms {
+        let retryable =
+            error_is_address_in_use(&error) || (retry_forbidden && error_is_bind_forbidden(&error));
+        if !retryable || waited_ms >= timeout_ms {
             return Err(error);
         }
         tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
@@ -359,10 +487,54 @@ where
 }
 
 fn helper_bind_retry_timeout_ms(protocol_proxy_enabled: bool, is_macos: bool) -> u64 {
-    if protocol_proxy_enabled || is_macos {
+    if protocol_proxy_enabled {
+        PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS
+    } else if is_macos {
         HELPER_BIND_RETRY_TIMEOUT_MS
     } else {
         0
+    }
+}
+
+pub fn protocol_proxy_bind_retry_timeout_ms() -> u64 {
+    PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS
+}
+
+pub fn helper_bind_retry_interval_ms() -> u64 {
+    HELPER_BIND_RETRY_INTERVAL_MS
+}
+
+/// 这次启动如果必须占用写进 `config.toml` 的协议代理端口，返回那个端口。
+/// 不需要协议代理时返回 `None`，调用方不应去等一个用不到的端口。
+pub fn required_fixed_helper_port(settings: &BackendSettings) -> Option<u16> {
+    let enabled =
+        relay_protocol_proxy_enabled(settings) || remote_control_provider_proxy_enabled(settings);
+    enabled.then(crate::protocol_proxy::protocol_proxy_port)
+}
+
+/// 在拉起新 launcher 之前确认固定端口已经能绑定。
+/// `probe` 成功表示端口已释放；占用和暂时的 10013 都继续等，其它错误立即返回。
+pub fn wait_for_fixed_helper_port(
+    port: u16,
+    timeout_ms: u64,
+    interval_ms: u64,
+    mut probe: impl FnMut(u16) -> std::io::Result<()>,
+    mut sleep: impl FnMut(u64),
+) -> anyhow::Result<()> {
+    let mut waited_ms = 0u64;
+    loop {
+        match probe(port) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let error = anyhow::Error::from(error);
+                let retryable = error_is_address_in_use(&error) || error_is_bind_forbidden(&error);
+                if !retryable || waited_ms >= timeout_ms {
+                    return Err(describe_helper_bind_failure(error, port, true, timeout_ms));
+                }
+                sleep(interval_ms);
+                waited_ms = waited_ms.saturating_add(interval_ms);
+            }
+        }
     }
 }
 
@@ -384,8 +556,10 @@ where
     let mut keep_launched_on_error = false;
 
     let result: anyhow::Result<LaunchHandle> = async {
+        hooks.start_native_browser_compatibility(&settings).await;
         let home = crate::relay_config::default_codex_home_dir();
         hooks.cleanup_unsupported_config()?;
+        crate::relay_config::ensure_windows_sandbox_usable_for_current_user(&home)?;
         if settings.provider_sync_enabled {
             crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
             hooks.run_provider_sync().await?;
@@ -438,10 +612,31 @@ where
                 );
             }
         }
-        let protocol_proxy_enabled = helper_port_requires_fixed_binding(&settings);
+
+        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
+            || remote_control_provider_proxy_enabled(&settings);
+        // issue #2264：重启链路上的模型漂移修复。launcher 不重放完整 apply（那会
+        // 覆盖 Codex 在 UI 选择后回写的 live 值），只在 live config 的 model 仍是
+        // 工具写入的隐式默认且有未归档目标任务时，对齐到目标任务模型。
+        if settings.relay_profiles_enabled {
+            let profile = settings.active_relay_profile();
+            if profile.relay_mode != crate::settings::RelayMode::Official {
+                if let Err(error) =
+                    crate::relay_config::align_live_config_model_with_goal_thread(&home, &profile)
+                {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.goal_thread_model_align_failed",
+                        serde_json::json!({
+                            "message": error.to_string(),
+                        }),
+                    );
+                }
+            }
+        }
+
         if protocol_proxy_enabled {
             hooks.ensure_active_protocol_proxy_config(&settings).await?;
-            helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
+            helper_port = crate::protocol_proxy::protocol_proxy_port();
         }
         hooks.prepare_codex_launch(debug_port).await?;
         if settings.enhancements_enabled || protocol_proxy_enabled {
@@ -452,25 +647,16 @@ where
                 || hooks.start_helper(helper_port),
                 bind_retry_timeout_ms,
                 HELPER_BIND_RETRY_INTERVAL_MS,
+                protocol_proxy_enabled,
             )
             .await
             .map_err(|error| {
-                if protocol_proxy_enabled && error_is_address_in_use(&error) {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "helper.bind_gave_up_on_busy_port",
-                        serde_json::json!({
-                            "helper_port": helper_port,
-                            "waited_ms": bind_retry_timeout_ms,
-                        }),
-                    );
-                    return error.context(format!(
-                        "协议代理端口 {helper_port} 被其他进程占用，等待 {} 秒后仍未释放。\
-                         该端口写在 config.toml 的 base_url 里，不能自动改用其他端口；\
-                         请退出仍在运行的 Codex++ 或占用该端口的程序后重试。",
-                        bind_retry_timeout_ms / 1000
-                    ));
-                }
-                error
+                describe_helper_bind_failure(
+                    error,
+                    helper_port,
+                    protocol_proxy_enabled,
+                    bind_retry_timeout_ms,
+                )
             })?;
             helper_started = true;
         }
@@ -537,6 +723,7 @@ where
     match result {
         Ok(handle) => Ok(handle),
         Err(error) => {
+            hooks.stop_native_browser_compatibility().await;
             if helper_started {
                 hooks.shutdown_helper(helper_port).await;
             }
@@ -552,6 +739,10 @@ where
             Err(error)
         }
     }
+}
+
+fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
+    settings.active_relay_uses_protocol_proxy()
 }
 
 fn remote_control_provider_proxy_enabled(settings: &BackendSettings) -> bool {
@@ -917,23 +1108,47 @@ impl LaunchHooks for DefaultLaunchHooks {
                 else {
                     unreachable!();
                 };
-                let process_id = activate_packaged_app(app_user_model_id, arguments).await?;
-                apply_codexplusplus_window_icon_after_launch(process_id);
-                if let Some(inspector_port) = native_menu_inspector_port {
-                    start_native_menu_localizer(inspector_port);
+                match activate_packaged_app(app_user_model_id, arguments).await {
+                    Ok(process_id) => {
+                        apply_codexplusplus_window_icon_after_launch(process_id);
+                        if let Some(inspector_port) = native_menu_inspector_port {
+                            start_native_menu_localizer(inspector_port);
+                        }
+                        return Ok(match activation {
+                            CodexLaunch::PackagedActivation {
+                                app_user_model_id,
+                                arguments,
+                                ..
+                            } => CodexLaunch::PackagedActivation {
+                                app_user_model_id,
+                                arguments,
+                                process_id: Some(process_id),
+                            },
+                            CodexLaunch::Process { .. } => unreachable!(),
+                        });
+                    }
+                    Err(error) => {
+                        // AUMID 激活失败（例如清单 Application Id 变化）时回退到
+                        // 直接执行应用，避免整份配置无法启动。
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.packaged_activation_fallback",
+                            serde_json::json!({
+                                "app_user_model_id": app_user_model_id,
+                                "app_dir": app_dir,
+                                "error": error.to_string()
+                            }),
+                        );
+                        // 提权进程激活打包应用必然失败，按路径启动的进程会因缺少
+                        // 包身份立即退出、注入也必然失败；此时必须如实失败并给出
+                        // 指引，而不是静默回退导致 latest-status.json 误报 running
+                        // （issue #2351）。
+                        if let Some(reason) = packaged_activation_fallback_block_reason(
+                            crate::windows_integration::current_process_is_elevated(),
+                        ) {
+                            anyhow::bail!("{reason}（激活错误：{error}）");
+                        }
+                    }
                 }
-                return Ok(match activation {
-                    CodexLaunch::PackagedActivation {
-                        app_user_model_id,
-                        arguments,
-                        ..
-                    } => CodexLaunch::PackagedActivation {
-                        app_user_model_id,
-                        arguments,
-                        process_id: Some(process_id),
-                    },
-                    CodexLaunch::Process { .. } => unreachable!(),
-                });
             }
         }
 
@@ -1034,8 +1249,11 @@ impl LaunchHooks for DefaultLaunchHooks {
             let pet_cursor_task = tokio::spawn(run_pet_real_mouse_cursor_driver(debug_port));
             let mut observed_browser_id: Option<String> = None;
             let mut bridge_health_failures = 0u8;
+            let mut bridge_reinject_backoff = BridgeReinjectBackoff::default();
+
             let mut cdp_unavailable_streak = 0u32;
             let mut next_probe_delay = Duration::ZERO;
+
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
@@ -1090,6 +1308,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                                 identity_changed,
                                 bridge_reinjector.clone(),
                                 &mut bridge_health_failures,
+                                &mut bridge_reinject_backoff,
                             ),
                         );
                         record_pet_overlay_sync_result(debug_port, helper_port, pet_result);
@@ -1141,19 +1360,12 @@ impl LaunchHooks for DefaultLaunchHooks {
                 }
             }
         }
-        let mut empty_streak = 0u32;
-        loop {
-            let has_codex_process = !crate::watcher::find_codex_processes().is_empty();
-            let cdp_available = should_probe_launcher_cdp(cfg!(windows), has_codex_process)
-                && crate::cdp::endpoint_available(debug_port);
-            if !launcher_target_alive(has_codex_process, cdp_available) {
-                empty_streak = empty_streak.saturating_add(1);
-                if empty_streak >= 3 {
-                    break;
-                }
-            } else {
-                empty_streak = 0;
-            }
+        // Another Codex process must not keep this launcher holding the native
+        // browser monitor. Directly owned processes and this debug port can.
+        while owned_launcher_target_alive(
+            launcher_owned_process_alive(launch, debug_port),
+            crate::cdp::endpoint_available(debug_port),
+        ) {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
         Ok(())
@@ -1234,6 +1446,12 @@ async fn handle_helper_connection(
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path);
     let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
+    let request_beta_features =
+        header_value_from_headers(&request_headers, "x-codex-beta-features");
+    let request_session_id = header_value_from_headers(&request_headers, "session-id");
+    let request_thread_id = header_value_from_headers(&request_headers, "thread-id");
+    let request_opencode_session =
+        header_value_from_headers(&request_headers, "x-opencode-session");
     let request_content_type = header_value_from_headers(&request_headers, "content-type");
     let request_content_encoding = header_value_from_headers(&request_headers, "content-encoding");
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
@@ -1306,6 +1524,11 @@ async fn handle_helper_connection(
             &request_body,
             operation,
             request_user_agent.as_deref(),
+            crate::protocol_proxy::ProxySessionHeaders {
+                session_id: request_session_id.as_deref(),
+                thread_id: request_thread_id.as_deref(),
+                opencode_session: request_opencode_session.as_deref(),
+            },
             method,
             path,
             remote_addr_text,
@@ -1345,6 +1568,12 @@ async fn handle_helper_connection(
             &mut stream,
             &request_body,
             request_user_agent.as_deref(),
+            request_beta_features.as_deref(),
+            crate::protocol_proxy::ProxySessionHeaders {
+                session_id: request_session_id.as_deref(),
+                thread_id: request_thread_id.as_deref(),
+                opencode_session: request_opencode_session.as_deref(),
+            },
             method,
             path,
             remote_addr_text,
@@ -1506,15 +1735,17 @@ async fn handle_official_images_proxy_connection(
     request_body: &str,
     operation: crate::protocol_proxy::ImageProxyOperation,
     request_user_agent: Option<&str>,
+    session_headers: crate::protocol_proxy::ProxySessionHeaders<'_>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
-    let upstream = match crate::protocol_proxy::open_images_proxy_request_for_path(
+    let upstream = match crate::protocol_proxy::open_images_proxy_request_for_path_with_session(
         request_body,
         operation,
         request_user_agent,
         path,
+        session_headers,
     )
     .await
     {
@@ -1715,11 +1946,11 @@ async fn handle_models_proxy_connection(
                 &body,
             )
             .await?;
-            log_helper_response(
+            log_helper_proxy_failure(
                 "helper.models_proxy_failed",
                 method,
                 path,
-                "502 Bad Gateway",
+                &error.to_string(),
                 remote_addr_text,
             );
             stream.shutdown().await?;
@@ -1757,11 +1988,14 @@ async fn handle_protocol_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
     request_user_agent: Option<&str>,
+    request_beta_features: Option<&str>,
+    session_headers: crate::protocol_proxy::ProxySessionHeaders<'_>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
+
     let request_is_stream = request_json
         .as_ref()
         .and_then(|request| request.get("stream"))
@@ -1770,10 +2004,12 @@ async fn handle_protocol_proxy_connection(
     let mut capacity_retry_round = 0u8;
     let mut capacity_retry_notice_sequence = None;
     let upstream = loop {
-        let upstream = match crate::protocol_proxy::open_responses_proxy_request_with_capacity_retries_for_path(
+        let upstream = match crate::protocol_proxy::open_responses_proxy_request_with_capacity_retries_for_path_and_session_headers(
             request_body,
             request_user_agent,
             path,
+            request_beta_features,
+            session_headers,
             )
             .await
             {
@@ -1784,21 +2020,21 @@ async fn handle_protocol_proxy_connection(
                     }
                     if request_is_stream {
                         let error_text = error.to_string();
-                        let body = crate::protocol_proxy::responses_error_from_upstream(
+                        let body = crate::protocol_proxy::responses_stream_failure_from_upstream(
+                            request_json.as_ref(),
                             502,
                             "text/plain; charset=utf-8",
                             error_text.as_bytes(),
                         );
-                        let body = serde_json::to_vec(&body)?;
                         write_http_response(
                             stream,
-                            "502 Bad Gateway",
-                            "application/json; charset=utf-8",
+                            "200 OK",
+                            "text/event-stream; charset=utf-8",
                             &body,
                         )
                         .await?;
                         log_helper_response(
-                            "helper.protocol_proxy_upstream_unavailable",
+                            "helper.protocol_proxy_stream_failed",
                             method,
                             path,
                             "502 Bad Gateway",
@@ -1855,13 +2091,38 @@ async fn handle_protocol_proxy_connection(
         let capacity_retry_max_attempts = upstream.capacity_retry_max_attempts;
         let upstream_content_type = upstream.content_type.clone();
         let mut upstream_body = upstream.prefetched_chunk;
-        upstream_body.extend_from_slice(
-            &crate::protocol_proxy::read_upstream_body_with_timeout(
-                upstream.response,
-                crate::protocol_proxy::upstream_body_timeout(),
-            )
-            .await?,
-        );
+        let error_body = crate::protocol_proxy::read_upstream_body_with_timeout(
+            upstream.response,
+            crate::protocol_proxy::upstream_body_timeout(),
+        )
+        .await;
+        match error_body {
+            Ok(body) => upstream_body.extend_from_slice(&body),
+            Err(error) if request_is_stream => {
+                let failed = crate::protocol_proxy::responses_stream_failure_events(
+                    request_json.as_ref(),
+                    format!("Upstream error body unavailable: {error}"),
+                    Some("stream_error".to_string()),
+                );
+                write_http_response(
+                    stream,
+                    "200 OK",
+                    "text/event-stream; charset=utf-8",
+                    &failed,
+                )
+                .await?;
+                log_helper_response(
+                    "helper.protocol_proxy_stream_failed",
+                    method,
+                    path,
+                    &status,
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         let is_capacity = capacity_retry_enabled
             && crate::protocol_proxy::is_selected_model_capacity_error(&upstream_body);
 
@@ -1905,15 +2166,16 @@ async fn handle_protocol_proxy_connection(
         }
 
         if request_is_stream {
-            let body = crate::protocol_proxy::responses_error_from_upstream(
+            let body = crate::protocol_proxy::responses_stream_failure_from_upstream(
+                request_json.as_ref(),
                 upstream.status_code,
                 &upstream_content_type,
                 &upstream_body,
             );
-            let body = serde_json::to_vec(&body)?;
-            write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
+            write_http_response(stream, "200 OK", "text/event-stream; charset=utf-8", &body)
+                .await?;
             log_helper_response(
-                "helper.protocol_proxy_upstream_error",
+                "helper.protocol_proxy_stream_failed",
                 method,
                 path,
                 &status,
@@ -1941,7 +2203,70 @@ async fn handle_protocol_proxy_connection(
     };
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
+        if upstream.compaction {
+            // v2 远程压缩：无论上游协议都重组为恰好一个 compaction 输出项，
+            // 压缩无增量展示诉求，收齐上游文本后一次性下发。
+            // SSE 事件可能跨网络 chunk 拆开，converter 内部按事件边界缓冲。
+            let mut converter = crate::protocol_proxy::CompactionSseConverter::new(
+                request_json
+                    .as_ref()
+                    .and_then(|request| request.get("model"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            );
+            if upstream.wire_api != crate::protocol_proxy::UpstreamWireApi::Responses {
+                converter = converter.with_chat_upstream();
+            }
+            converter.push_upstream_bytes(&upstream.prefetched_chunk);
+            let mut bytes_stream = Box::pin(upstream.response.bytes_stream());
+            loop {
+                match crate::protocol_proxy::next_stream_chunk_with_timeout(
+                    bytes_stream.as_mut(),
+                    crate::protocol_proxy::upstream_stream_idle_timeout(),
+                )
+                .await
+                {
+                    Ok(Some(Ok(bytes))) => converter.push_upstream_bytes(&bytes),
+                    Ok(Some(Err(error))) => {
+                        converter.fail(format!("Stream error: {error}"), None);
+                        break;
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        converter.fail(
+                            "Compaction stream idle timeout".to_string(),
+                            Some("stream_idle_timeout".to_string()),
+                        );
+                        break;
+                    }
+                }
+            }
+            if !converter.has_upstream_terminal() {
+                converter.fail(
+                    "Compaction stream ended before a terminal event".to_string(),
+                    Some("incomplete_stream".to_string()),
+                );
+            }
+            let payload = converter.finish();
+            let mut terminal = crate::protocol_proxy::ResponsesSseTerminalTracker::default();
+            terminal.observe(&payload);
+            stream.write_all(&payload).await?;
+            log_helper_response(
+                if terminal.has_failed() {
+                    "helper.protocol_proxy_stream_failed"
+                } else {
+                    "helper.protocol_proxy_compaction_ok"
+                },
+                method,
+                path,
+                "200 OK",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+            let scheduled_account_id = upstream.scheduled_account_id.clone();
             let prefetched_chunk = upstream.prefetched_chunk;
             let mut bytes_stream = Box::pin(upstream.response.bytes_stream());
             let mut terminal = crate::protocol_proxy::ResponsesSseTerminalTracker::default();
@@ -2006,6 +2331,14 @@ async fn handle_protocol_proxy_connection(
                     stream.write_all(&failed).await?;
                     stream_failed = true;
                 }
+            }
+            stream_failed |= terminal.has_failed();
+            if let (Some(account_id), Some(until)) = (scheduled_account_id, terminal.quota_reset) {
+                crate::official_account_schedule::mark_exhausted(&account_id, until);
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.official_schedule_quota_exhausted",
+                    serde_json::json!({"sourceId": account_id, "resetsAt": until, "phase": "stream_terminal"}),
+                );
             }
             log_helper_response(
                 if stream_failed {
@@ -2109,6 +2442,27 @@ async fn handle_protocol_proxy_connection(
         crate::protocol_proxy::upstream_body_timeout(),
     )
     .await?;
+    if upstream.compaction {
+        let body = crate::protocol_proxy::wrap_non_stream_response_as_compaction(
+            &upstream_body,
+            request_json
+                .as_ref()
+                .and_then(|request| request.get("model"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        )?;
+        write_http_response(stream, "200 OK", "text/event-stream; charset=utf-8", &body).await?;
+        log_helper_response(
+            "helper.protocol_proxy_compaction_ok",
+            method,
+            path,
+            "200 OK",
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         write_http_response(
             stream,
@@ -2178,11 +2532,11 @@ async fn handle_audio_transcriptions_proxy_connection(
                 &body,
             )
             .await?;
-            log_helper_response(
+            log_helper_proxy_failure(
                 "helper.audio_transcriptions_proxy_failed",
                 method,
                 path,
-                "502 Bad Gateway",
+                &error.to_string(),
                 remote_addr_text,
             );
             stream.shutdown().await?;
@@ -2207,6 +2561,78 @@ async fn handle_audio_transcriptions_proxy_connection(
             "helper.audio_transcriptions_proxy_ok"
         } else {
             "helper.audio_transcriptions_proxy_upstream_error"
+        },
+        method,
+        path,
+        &status,
+        remote_addr_text,
+    );
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn handle_image_proxy_connection(
+    stream: &mut tokio::net::TcpStream,
+    request_body: &[u8],
+    request_content_type: Option<&str>,
+    request_user_agent: Option<&str>,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    let upstream = if crate::protocol_proxy::is_image_generations_proxy_path(path) {
+        crate::protocol_proxy::open_image_generations_proxy_request(
+            request_body,
+            request_user_agent,
+        )
+        .await
+    } else {
+        crate::protocol_proxy::open_image_edits_proxy_request(
+            request_body,
+            request_content_type.unwrap_or_default(),
+            request_user_agent,
+        )
+        .await
+    };
+    let upstream = match upstream {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            log_helper_proxy_failure(
+                "helper.image_proxy_failed",
+                method,
+                path,
+                &error.to_string(),
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let status = upstream.response.status().to_string();
+    let is_success = upstream.response.status().is_success();
+    let content_type = if upstream.content_type.is_empty() {
+        "application/json; charset=utf-8".to_string()
+    } else {
+        upstream.content_type.clone()
+    };
+    let body = upstream.response.bytes().await?.to_vec();
+    write_http_response(stream, &status, &content_type, &body).await?;
+    log_helper_response(
+        if is_success {
+            "helper.image_proxy_ok"
+        } else {
+            "helper.image_proxy_upstream_error"
         },
         method,
         path,
@@ -2243,11 +2669,11 @@ async fn handle_chat_completions_proxy_connection(
                 &body,
             )
             .await?;
-            log_helper_response(
+            log_helper_proxy_failure(
                 "helper.chat_completions_proxy_failed",
                 method,
                 path,
-                "502 Bad Gateway",
+                &error.to_string(),
                 remote_addr_text,
             );
             stream.shutdown().await?;
@@ -2380,6 +2806,32 @@ fn log_helper_response(
             "method": method,
             "path": path,
             "status": status,
+            "remote_addr": remote_addr_text
+        }),
+    );
+}
+
+/// 代理失败（502）专用日志：在通用字段之外带上**失败原因**。
+///
+/// 这些分支把 error 写进了响应体，旧实现却只记 method/path/status，于是
+/// 客户端只看到「unexpected status 502 Bad Gateway: Unknown error」，
+/// 日志里也查不到为什么（issue #2385）。原因必须落进日志，否则
+/// 「上游不可达 / 没配可用中转 / 请求体解析失败」这几种完全不同的故障
+/// 在现场长得一模一样。
+fn log_helper_proxy_failure(
+    event: &str,
+    method: &str,
+    path: &str,
+    error: &str,
+    remote_addr_text: Option<String>,
+) {
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        event,
+        serde_json::json!({
+            "method": method,
+            "path": path,
+            "status": "502 Bad Gateway",
+            "error": error,
             "remote_addr": remote_addr_text
         }),
     );
@@ -2946,8 +3398,16 @@ pub fn build_packaged_activation_with_native_menu_inspector(
 pub async fn check_and_reinject_bridge(debug_port: u16, helper_port: u16) -> bool {
     // This one-shot entry point preserves its historical immediate-repair behavior.
     let mut health_failures = BRIDGE_HEALTH_FAILURE_THRESHOLD.saturating_sub(1);
-    check_and_reinject_bridge_inner(debug_port, helper_port, false, None, &mut health_failures)
-        .await
+    let mut backoff = BridgeReinjectBackoff::default();
+    check_and_reinject_bridge_inner(
+        debug_port,
+        helper_port,
+        false,
+        None,
+        &mut health_failures,
+        &mut backoff,
+    )
+    .await
 }
 
 pub fn browser_identity_changed(previous: Option<&str>, current: &str) -> bool {
@@ -2980,6 +3440,26 @@ fn should_probe_launcher_cdp(is_windows: bool, has_codex_process: bool) -> bool 
     is_windows && !has_codex_process
 }
 
+fn owned_launcher_target_alive(owned_process_alive: bool, debug_port_open: bool) -> bool {
+    owned_process_alive || debug_port_open
+}
+
+#[cfg(target_os = "macos")]
+fn launcher_owned_process_alive(launch: &CodexLaunch, debug_port: u16) -> bool {
+    matches!(
+        launch,
+        CodexLaunch::Process {
+            wait_strategy: ProcessWaitStrategy::ExternalWaitCommand,
+            ..
+        }
+    ) && !crate::watcher::find_macos_codex_processes_for_debug_port(debug_port).is_empty()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launcher_owned_process_alive(_launch: &CodexLaunch, _debug_port: u16) -> bool {
+    false
+}
+
 fn should_reinject_after_health_result(
     healthy: Option<bool>,
     browser_identity_changed: bool,
@@ -3007,6 +3487,7 @@ async fn check_and_reinject_bridge_inner(
     browser_identity_changed: bool,
     bridge_reinjector: Option<BridgeReinjector>,
     health_failures: &mut u8,
+    backoff: &mut BridgeReinjectBackoff,
 ) -> bool {
     let healthy = if browser_identity_changed {
         Some(false)
@@ -3030,9 +3511,36 @@ async fn check_and_reinject_bridge_inner(
             }
         }
     };
+    match healthy {
+        // 持续健康一段时间才清掉退避（见 BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS）；
+        // 探测不确定时不改变退避状态。失效计数由 should_reinject_* 统一管理。
+        Some(true) => backoff.observe_healthy(std::time::Instant::now()),
+        None => {}
+        Some(false) => backoff.observe_unhealthy(),
+    }
     if !should_reinject_after_health_result(healthy, browser_identity_changed, health_failures) {
         return false;
     }
+    if browser_identity_changed {
+        // 应用实例更换：旧退避针对的是旧页面，新页面需要立即注入。
+        backoff.reset();
+    }
+    let now = std::time::Instant::now();
+    if !backoff.ready(now) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "bridge.reinject_backoff_skipped",
+            serde_json::json!({
+                "debug_port": debug_port,
+                "helper_port": helper_port,
+                "consecutive_reinjections": backoff.consecutive_attempts,
+                "next_reinject_allowed_in_ms": backoff
+                    .next_allowed_at
+                    .map(|deadline| deadline.saturating_duration_since(now).as_millis() as u64),
+            }),
+        );
+        return false;
+    }
+    backoff.record_attempt(now);
 
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "bridge.reinject_start",
@@ -3565,6 +4073,7 @@ fn launch_status(
         debug_port: Some(debug_port),
         helper_port: Some(helper_port),
         codex_app: Some(app_dir.to_string_lossy().to_string()),
+        aumid: crate::app_paths::packaged_app_user_model_id(app_dir),
     }
 }
 
@@ -3614,6 +4123,29 @@ pub async fn activate_packaged_app(
     _arguments: &str,
 ) -> anyhow::Result<u32> {
     anyhow::bail!("Packaged app activation is only supported on Windows")
+}
+
+/// 提权运行时禁止「AUMID 激活失败 → 按路径直接启动」回退的原因；
+/// 非提权返回 None 以保留回退（兜底清单 Application Id 变化等场景）。
+///
+/// 提权进程无法激活 MSIX 打包应用，按路径启动的进程会因缺少包身份
+/// （APPMODEL_ERROR_NO_PACKAGE）立即退出，注入也必然失败；此时必须如实失败
+/// 并给出指引，而不是静默回退导致 latest-status.json 误报 running（issue #2351）。
+///
+/// 不加 `#[cfg(windows)]`：调用点在 `if cfg!(windows)` 的运行时分支里，
+/// 全平台都要编译到这个函数（纯逻辑，无平台依赖）。
+fn packaged_activation_fallback_block_reason(is_elevated: bool) -> Option<&'static str> {
+    if is_elevated {
+        Some(
+            "Codex 打包应用激活失败，且 Codex++ 当前以管理员（提权）身份运行：\
+             Windows 不允许提权进程激活 MSIX 打包应用，按路径启动的进程会因缺少\
+             包身份立即退出。请取消可执行文件「属性 → 兼容性 → 以管理员身份运行\
+             此程序」的勾选（或清除 AppCompatFlags\\Layers 中的 RUNASADMIN 标记），\
+             然后以普通权限重新启动 Codex++",
+        )
+    } else {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -3673,6 +4205,22 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    // 提权分支依赖 issue #2351 的手动复现步骤验收（勾选兼容性「以管理员身份运行」
+    // 后应得到指引错误）。这里不断言当前进程的提权状态：GitHub 的 Windows runner
+    // 本身就以提权令牌运行，断言「CI shell 非提权」必然失败。
+    #[test]
+    fn elevated_activation_failure_blocks_path_fallback_with_guidance() {
+        let reason = packaged_activation_fallback_block_reason(true)
+            .expect("elevated activation failure must block the path fallback");
+        assert!(reason.contains("管理员"));
+        assert!(reason.contains("以普通权限"));
+    }
+
+    #[test]
+    fn unelevated_activation_failure_keeps_path_fallback() {
+        assert!(packaged_activation_fallback_block_reason(false).is_none());
+    }
+
     fn counted_reinjector(calls: Arc<AtomicUsize>) -> BridgeReinjector {
         Arc::new(move || {
             let calls = calls.clone();
@@ -3684,15 +4232,14 @@ mod tests {
     }
 
     #[test]
-    fn launcher_stays_alive_while_injected_cdp_endpoint_is_available() {
-        assert!(launcher_target_alive(false, true));
+    fn owned_launcher_exit_follows_its_debug_port_not_other_codex_processes() {
+        assert!(owned_launcher_target_alive(false, true));
+        assert!(!owned_launcher_target_alive(false, false));
     }
 
     #[test]
-    fn launcher_only_probes_cdp_for_unrecognized_windows_processes() {
-        assert!(should_probe_launcher_cdp(true, false));
-        assert!(!should_probe_launcher_cdp(true, true));
-        assert!(!should_probe_launcher_cdp(false, false));
+    fn owned_launcher_waits_for_its_codex_process_when_cdp_is_unavailable() {
+        assert!(owned_launcher_target_alive(true, false));
     }
 
     #[test]
@@ -3732,16 +4279,202 @@ mod tests {
     }
 
     #[test]
+    fn reinject_backoff_delay_doubles_and_caps() {
+        assert_eq!(
+            reinject_backoff_delay(0),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            reinject_backoff_delay(1),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            reinject_backoff_delay(2),
+            std::time::Duration::from_secs(40)
+        );
+        assert_eq!(
+            reinject_backoff_delay(4),
+            std::time::Duration::from_secs(160)
+        );
+        assert_eq!(
+            reinject_backoff_delay(5),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(
+            reinject_backoff_delay(32),
+            std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn reinject_backoff_blocks_until_deadline_and_resets_on_recovery() {
+        let now = std::time::Instant::now();
+        let mut backoff = BridgeReinjectBackoff::default();
+        assert!(backoff.ready(now), "首次重注入应立即允许");
+
+        backoff.record_attempt(now);
+        assert_eq!(backoff.consecutive_attempts, 1);
+        assert!(!backoff.ready(now), "重注入后应进入退避窗口");
+        assert!(backoff.ready(now + reinject_backoff_delay(0)));
+
+        backoff.record_attempt(now + reinject_backoff_delay(0));
+        assert_eq!(backoff.consecutive_attempts, 2);
+        assert!(!backoff.ready(now + reinject_backoff_delay(0)));
+        assert!(backoff.ready(now + reinject_backoff_delay(0) + reinject_backoff_delay(1)));
+
+        backoff.reset();
+        assert_eq!(backoff.consecutive_attempts, 0);
+        assert!(backoff.ready(now), "健康恢复后应立即允许重注入");
+    }
+
+    #[test]
+    fn reinject_backoff_resets_only_after_sustained_health() {
+        let now = std::time::Instant::now();
+        let reset_after = std::time::Duration::from_secs(BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS);
+        let mut backoff = BridgeReinjectBackoff::default();
+
+        backoff.record_attempt(now);
+        backoff.observe_healthy(now + std::time::Duration::from_secs(1));
+        assert_eq!(
+            backoff.consecutive_attempts, 1,
+            "注入后立刻健康不应清零退避，否则退避永远停在第一档"
+        );
+
+        backoff.observe_healthy(now + std::time::Duration::from_secs(30));
+        assert_eq!(backoff.consecutive_attempts, 1, "未满阈值不应清零");
+
+        // 中途出现一次不健康，重新计时。
+        backoff.observe_unhealthy();
+        let restart = now + std::time::Duration::from_secs(40);
+        backoff.observe_healthy(restart);
+        backoff.observe_healthy(now + std::time::Duration::from_secs(1) + reset_after);
+        assert_eq!(
+            backoff.consecutive_attempts, 1,
+            "不健康之后必须从新起点重新计时"
+        );
+
+        backoff.observe_healthy(restart + reset_after);
+        assert_eq!(backoff.consecutive_attempts, 0, "持续健康满阈值后应清零");
+        assert!(backoff.healthy_since.is_none());
+        assert!(backoff.ready(restart + reset_after));
+    }
+
+    #[test]
     fn helper_bind_retry_covers_fixed_proxy_ports_and_macos_restarts() {
         assert_eq!(
             helper_bind_retry_timeout_ms(true, false),
-            HELPER_BIND_RETRY_TIMEOUT_MS
+            PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS
         );
         assert_eq!(
             helper_bind_retry_timeout_ms(false, true),
             HELPER_BIND_RETRY_TIMEOUT_MS
         );
         assert_eq!(helper_bind_retry_timeout_ms(false, false), 0);
+        assert_eq!(
+            helper_bind_retry_timeout_ms(true, true),
+            PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn fixed_helper_port_is_required_only_when_protocol_proxy_is_used() {
+        assert_eq!(
+            required_fixed_helper_port(&BackendSettings::default()),
+            None
+        );
+
+        let official_mix = BackendSettings {
+            active_relay_id: "official-mix".to_string(),
+            relay_profiles: vec![crate::settings::RelayProfile {
+                id: "official-mix".to_string(),
+                relay_mode: crate::settings::RelayMode::Official,
+                official_mix_api_key: true,
+                protocol: crate::settings::RelayProtocol::Responses,
+                ..crate::settings::RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+        assert_eq!(
+            required_fixed_helper_port(&official_mix),
+            Some(crate::protocol_proxy::protocol_proxy_port())
+        );
+    }
+
+    #[test]
+    fn fixed_port_wait_retries_transient_forbidden_and_stops_on_other_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("diagnostic.log");
+        crate::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path));
+        struct RestoreLog;
+        impl Drop for RestoreLog {
+            fn drop(&mut self) {
+                crate::diagnostic_log::set_diagnostic_log_path_for_tests(None);
+            }
+        }
+        let _restore = RestoreLog;
+
+        let forbidden_attempts = std::cell::Cell::new(0u32);
+        let sleeps = std::cell::Cell::new(0u32);
+        wait_for_fixed_helper_port(
+            57321,
+            400,
+            200,
+            |_| {
+                let attempt = forbidden_attempts.get();
+                forbidden_attempts.set(attempt + 1);
+                if attempt < 2 {
+                    Err(std::io::Error::from_raw_os_error(10013))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(forbidden_attempts.get(), 3);
+        assert_eq!(sleeps.get(), 2);
+
+        let probes = std::cell::Cell::new(0u32);
+        let other_sleeps = std::cell::Cell::new(0u32);
+        let error = wait_for_fixed_helper_port(
+            57321,
+            10_000,
+            200,
+            |_| {
+                probes.set(probes.get() + 1);
+                Err(std::io::Error::other("simulated unrelated failure"))
+            },
+            |_| other_sleeps.set(other_sleeps.get() + 1),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(probes.get(), 1);
+        assert_eq!(other_sleeps.get(), 0);
+        assert!(message.contains("simulated unrelated failure"), "{message}");
+        assert!(!message.contains("被其他进程占用"), "{message}");
+        assert!(!message.contains("被 Windows 保留"), "{message}");
+
+        let permanent_probes = std::cell::Cell::new(0u32);
+        let permanent_sleeps = std::cell::Cell::new(0u32);
+        let error = wait_for_fixed_helper_port(
+            57321,
+            400,
+            200,
+            |_| {
+                permanent_probes.set(permanent_probes.get() + 1);
+                Err(std::io::Error::from_raw_os_error(10013))
+            },
+            |_| permanent_sleeps.set(permanent_sleeps.get() + 1),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(permanent_probes.get(), 3);
+        assert_eq!(permanent_sleeps.get(), 2);
+        assert!(message.contains("os error 10013"), "{message}");
+        assert!(!message.contains("被其他进程占用"), "{message}");
+        if cfg!(windows) {
+            assert!(message.contains("被 Windows 保留"), "{message}");
+        }
     }
 
     #[tokio::test]
@@ -4116,7 +4849,7 @@ mod tests {
         });
         let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
         let headers = format!(
-            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nSeSsIoN-Id: conversation-123\r\nTHREAD-ID: thread-123\r\nX-OpenCode-Session: opencode-123\r\nCookie: private-cookie\r\nX-Unrelated: private-value\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             compressed.len()
         );
         client.write_all(headers.as_bytes()).await.unwrap();
@@ -4133,6 +4866,11 @@ mod tests {
         assert!(upstream_headers.starts_with("post /v1/responses http/1.1"));
         assert!(upstream_headers.contains("authorization: bearer sk-upstream"));
         assert!(!upstream_headers.contains("chatgpt-secret"));
+        assert!(upstream_headers.contains("session-id: conversation-123"));
+        assert!(upstream_headers.contains("thread-id: thread-123"));
+        assert!(upstream_headers.contains("x-opencode-session: opencode-123"));
+        assert!(!upstream_headers.contains("private-cookie"));
+        assert!(!upstream_headers.contains("private-value"));
         let upstream_body: serde_json::Value =
             serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
         assert_eq!(upstream_body["model"], "gpt-5.6-sol");
@@ -4164,7 +4902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn helper_preserves_upstream_http_status_for_streaming_auth_error() {
+    async fn helper_returns_failed_sse_for_streaming_supplier_auth_error() {
         let _settings_guard = crate::paths::settings_path_test_guard();
         let temp = tempfile::tempdir().unwrap();
         let settings_path = temp.path().join("settings.json");
@@ -4216,11 +4954,34 @@ mod tests {
         let response = send_raw_helper_request(request.as_bytes()).await;
         let response = String::from_utf8_lossy(&response);
 
-        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("text/event-stream"));
         assert!(response.contains("invalid supplier key"));
-        assert!(!response.contains("event: response.failed"));
+        assert!(response.contains("event: response.failed"));
         upstream.await.unwrap();
         crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    #[tokio::test]
+    async fn helper_returns_failed_sse_when_streaming_route_is_unavailable() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous = crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        std::fs::write(&settings_path, b"{}").unwrap();
+        let body = br#"{"model":"missing-supplier:model","input":[],"stream":true}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = send_raw_helper_request(request.as_bytes()).await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("text/event-stream"));
+        assert!(response.contains("event: response.failed"));
+        assert!(!response.contains("event: response.completed"));
+        crate::paths::set_settings_path_for_tests(previous);
     }
 
     async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {

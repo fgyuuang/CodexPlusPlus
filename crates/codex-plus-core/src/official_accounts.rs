@@ -305,19 +305,158 @@ impl OfficialAccountStore {
         account_id: &str,
         force: bool,
     ) -> anyhow::Result<OfficialAccountSummary> {
+        // 自定义 store（测试、导入）不访问用户的真实登录文件。
+        let home = (self.metadata_path == crate::paths::default_official_accounts_path())
+            .then(crate::codex_home::default_codex_home_dir);
+        self.refresh_tokens_with(
+            account_id,
+            force,
+            home.as_deref(),
+            false,
+            |auth| async move { refresh_auth_json(&auth).await },
+        )
+        .await
+    }
+
+    async fn refresh_tokens_with<F, Fut>(
+        &self,
+        account_id: &str,
+        force: bool,
+        home: Option<&Path>,
+        codex_running: bool,
+        refresh: F,
+    ) -> anyhow::Result<OfficialAccountSummary>
+    where
+        F: FnOnce(Value) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Value>>,
+    {
+        let observed = self.get_auth_json(account_id)?;
+        // 跨 Manager/launcher 进程串行化；等待文件锁不能阻塞异步执行器。
+        let digest = Sha256::digest(account_id.trim().as_bytes());
+        let key: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let lock_path = self
+            .metadata_path
+            .with_extension(format!("refresh-{key}.lock"));
+        let _refresh_lock =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
+                let lock = OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)?;
+                lock.lock_exclusive()?;
+                Ok(lock)
+            })
+            .await??;
+        let live = match home.map(|home| fs::read(home.join("auth.json"))) {
+            Some(Ok(bytes)) => Some(serde_json::from_slice::<Value>(&bytes)?),
+            Some(Err(error)) if error.kind() == ErrorKind::NotFound => None,
+            Some(Err(error)) => return Err(error.into()),
+            None => None,
+        };
+        let live = live.filter(|auth| {
+            parse_official_auth(auth).is_ok_and(|parsed| parsed.id == account_id.trim())
+        });
+        if let Some(auth) = live.as_ref() {
+            let (_, _, decision) = self.merge_auth_json(auth.clone())?;
+            ensure!(
+                decision != OfficialAuthMergeDecision::Conflict,
+                "本机登录与账号库凭据存在冲突，请重新登录或确认放弃旧凭据"
+            );
+        }
         let current = self.get_auth_json(account_id)?;
         let parsed = parse_official_auth(&current)?;
-        if !force
+        // 等待期间别人已更新的有效令牌可直接复用，即便原调用要求强制刷新。
+        if (!force || current != observed)
             && parsed
                 .access_token_expires_at
                 .is_some_and(|expires| expires > now_ts() + 5 * 60)
         {
             return self.get(account_id);
         }
-        match refresh_auth_json(&current).await {
-            Ok(refreshed) => self.replace_auth_json(account_id, refreshed),
+        // 桌面端拥有当前 live 登录的轮换权，目录/代理刷新不可与它争用。
+        let desktop_running = || {
+            codex_running
+                || (self.metadata_path == crate::paths::default_official_accounts_path()
+                    && crate::watcher::codex_processes_running())
+        };
+        let desktop_owns_account = live.is_some()
+            || (self.metadata_path == crate::paths::default_official_accounts_path()
+                && crate::settings::SettingsStore::default()
+                    .load()?
+                    .active_official_account_id
+                    .trim()
+                    == account_id.trim());
+        if desktop_owns_account && desktop_running() {
+            // 临近过期仍可请求；真正过期或 401 强制刷新交给桌面端处理。
+            if (!force || current != observed)
+                && parsed
+                    .access_token_expires_at
+                    .is_some_and(|expires| expires > now_ts())
+            {
+                return self.get(account_id);
+            }
+            anyhow::bail!("Codex 正在运行，请等待桌面端刷新当前登录；未重复使用 refresh token");
+        }
+        match refresh(current.clone()).await {
+            Ok(refreshed) => {
+                ensure!(
+                    parse_official_auth(&refreshed)?.id == account_id.trim(),
+                    "刷新令牌返回了不同账号，未修改凭据"
+                );
+                let summary = self.with_lock(|| {
+                    let secrets = self.load_secrets_unlocked()?;
+                    ensure!(
+                        secrets.credentials.get(account_id.trim()) == Some(&current),
+                        "刷新期间账号凭据已变化，保留更新的登录，请重试"
+                    );
+                    self.upsert_auth_json_unlocked(refreshed.clone())
+                        .map(|(summary, _)| summary)
+                })?;
+                if let (Some(home), Some(live)) = (home, live) {
+                    let path = home.join("auth.json");
+                    let latest: Value = serde_json::from_slice(&fs::read(&path)?)?;
+                    ensure!(
+                        latest == live && !desktop_running(),
+                        "令牌已刷新，但本机登录或运行状态已变化，未覆盖 auth.json"
+                    );
+                    let backup = home
+                        .join("backups")
+                        .join(format!("official-refresh-{}", random_urlsafe(12)));
+                    fs::create_dir_all(&backup)?;
+                    fs::copy(&path, backup.join("auth.json"))?;
+                    crate::settings::atomic_write(&path, &serde_json::to_vec_pretty(&refreshed)?)?;
+                }
+                Ok(summary)
+            }
             Err(error) => {
-                let _ = self.mark_status(account_id, "needsReauth");
+                // 网络/目录错误不等于登录失效；也不能把并发重新登录标为失效。
+                let message = error.to_string();
+                if message.contains("HTTP 400") || message.contains("HTTP 401") {
+                    let _ = self.with_lock(|| {
+                        if self
+                            .load_secrets_unlocked()?
+                            .credentials
+                            .get(account_id.trim())
+                            == Some(&current)
+                        {
+                            let mut accounts = self.load_accounts_unlocked()?;
+                            if let Some(record) = accounts
+                                .accounts
+                                .iter_mut()
+                                .find(|record| record.summary.id == account_id.trim())
+                            {
+                                record.summary.status = "needsReauth".to_string();
+                                record.summary.updated_at = now_ts();
+                                self.save_state_unlocked(
+                                    &accounts,
+                                    &self.load_secrets_unlocked()?,
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    });
+                }
                 Err(error)
             }
         }
@@ -355,8 +494,12 @@ impl OfficialAccountStore {
             let _ = self.refresh_tokens(account_id, false).await?;
         }
         let auth = self.get_auth_json(account_id)?;
+        let observed = self.get(account_id)?;
         match fetch_usage(&auth).await {
-            Ok(usage) => self.update_usage(account_id, usage),
+            Ok(usage) => {
+                self.mark_authenticated(&auth, &observed)?;
+                self.update_usage(account_id, usage)
+            }
             Err(error) => {
                 let mut usage = current.usage.unwrap_or(OfficialUsageSnapshot {
                     fetched_at: now_ts(),
@@ -393,67 +536,100 @@ impl OfficialAccountStore {
     }
 
     pub fn upsert_auth_json(&self, auth: Value) -> anyhow::Result<(OfficialAccountSummary, bool)> {
+        self.with_lock(|| self.upsert_auth_json_unlocked(auth))
+    }
+
+    // 比较与写入必须使用同一把锁，不能让刷新或重新登录插入两者之间。
+    pub fn merge_auth_json(
+        &self,
+        auth: Value,
+    ) -> anyhow::Result<(OfficialAccountSummary, bool, OfficialAuthMergeDecision)> {
+        let auth = normalize_auth_json(auth)?;
         let parsed = parse_official_auth(&auth)?;
         self.with_lock(|| {
-            let mut accounts = self.load_accounts_unlocked()?;
-            let mut secrets = self.load_secrets_unlocked()?;
-            let now = now_ts();
-            let existing = accounts
-                .accounts
-                .iter_mut()
-                .find(|record| record.summary.id == parsed.id);
-            let created = existing.is_none();
-            let summary = if let Some(record) = existing {
-                record.summary.email = parsed.email.clone();
-                if record.summary.name.trim().is_empty() {
-                    record.summary.name = preferred_account_name(&parsed);
-                }
-                record.summary.chatgpt_account_id = parsed.chatgpt_account_id.clone();
-                record.summary.workspace_id = parsed.workspace_id.clone();
-                record.summary.plan_type = parsed.plan_type.clone();
-                record.summary.status = "ready".to_string();
-                record.summary.updated_at = now;
-                record.summary.last_refresh_at = Some(now);
-                record.identity = parsed_identity(&parsed);
-                record.summary.clone()
-            } else {
-                let sort = accounts
-                    .accounts
-                    .iter()
-                    .map(|record| record.summary.sort)
-                    .max()
-                    .unwrap_or(-1)
-                    + 1;
-                let summary = OfficialAccountSummary {
-                    id: parsed.id.clone(),
-                    name: preferred_account_name(&parsed),
-                    email: parsed.email.clone(),
-                    group: String::new(),
-                    tags: Vec::new(),
-                    sort,
-                    enabled: true,
-                    status: "ready".to_string(),
-                    chatgpt_account_id: parsed.chatgpt_account_id.clone(),
-                    workspace_id: parsed.workspace_id.clone(),
-                    plan_type: parsed.plan_type.clone(),
-                    created_at: now,
-                    updated_at: now,
-                    last_refresh_at: Some(now),
-                    last_used_at: None,
-                    usage: None,
-                };
-                accounts.accounts.push(OfficialAccountRecord {
-                    summary: summary.clone(),
-                    identity: parsed_identity(&parsed),
-                });
-                summary
+            let accounts = self.load_accounts_unlocked()?;
+            let secrets = self.load_secrets_unlocked()?;
+            let decision = match secrets.credentials.get(&parsed.id) {
+                Some(stored) => official_auth_merge_decision(stored, &auth)?,
+                None => OfficialAuthMergeDecision::UseCandidate,
             };
-            secrets
-                .credentials
-                .insert(parsed.id, normalize_auth_json(auth)?);
-            self.save_state_unlocked(&accounts, &secrets)?;
-            Ok((summary, created))
+            if decision != OfficialAuthMergeDecision::UseCandidate {
+                let summary = accounts
+                    .accounts
+                    .into_iter()
+                    .find(|record| record.summary.id == parsed.id)
+                    .context("官方账号不存在")?
+                    .summary;
+                return Ok((summary, false, decision));
+            }
+            let (summary, created) = self.upsert_auth_json_unlocked(auth)?;
+            Ok((summary, created, decision))
         })
+    }
+
+    fn upsert_auth_json_unlocked(
+        &self,
+        auth: Value,
+    ) -> anyhow::Result<(OfficialAccountSummary, bool)> {
+        let parsed = parse_official_auth(&auth)?;
+        let mut accounts = self.load_accounts_unlocked()?;
+        let mut secrets = self.load_secrets_unlocked()?;
+        let now = now_ts();
+        let existing = accounts
+            .accounts
+            .iter_mut()
+            .find(|record| record.summary.id == parsed.id);
+        let created = existing.is_none();
+        let summary = if let Some(record) = existing {
+            record.summary.email = parsed.email.clone();
+            if record.summary.name.trim().is_empty() {
+                record.summary.name = preferred_account_name(&parsed);
+            }
+            record.summary.chatgpt_account_id = parsed.chatgpt_account_id.clone();
+            record.summary.workspace_id = parsed.workspace_id.clone();
+            record.summary.plan_type = parsed.plan_type.clone();
+            record.summary.status = "ready".to_string();
+            record.summary.updated_at = now;
+            record.summary.last_refresh_at = Some(now);
+            record.identity = parsed_identity(&parsed);
+            record.summary.clone()
+        } else {
+            let sort = accounts
+                .accounts
+                .iter()
+                .map(|record| record.summary.sort)
+                .max()
+                .unwrap_or(-1)
+                + 1;
+            let summary = OfficialAccountSummary {
+                id: parsed.id.clone(),
+                name: preferred_account_name(&parsed),
+                email: parsed.email.clone(),
+                group: String::new(),
+                tags: Vec::new(),
+                sort,
+                enabled: true,
+                status: "ready".to_string(),
+                chatgpt_account_id: parsed.chatgpt_account_id.clone(),
+                workspace_id: parsed.workspace_id.clone(),
+                plan_type: parsed.plan_type.clone(),
+                created_at: now,
+                updated_at: now,
+                last_refresh_at: Some(now),
+                last_used_at: None,
+                usage: None,
+            };
+            accounts.accounts.push(OfficialAccountRecord {
+                summary: summary.clone(),
+                identity: parsed_identity(&parsed),
+            });
+            summary
+        };
+        secrets
+            .credentials
+            .insert(parsed.id, normalize_auth_json(auth)?);
+        self.save_state_unlocked(&accounts, &secrets)?;
+        Ok((summary, created))
     }
 
     pub fn update(
@@ -540,6 +716,29 @@ impl OfficialAccountStore {
             let secrets = self.load_secrets_unlocked()?;
             self.save_state_unlocked(&accounts, &secrets)?;
             Ok(summary)
+        })
+    }
+
+    /// 只由真实官方请求成功确认登录；旧凭据和缓存不能清除失效状态。
+    pub(crate) fn mark_authenticated(
+        &self,
+        auth: &Value,
+        observed: &OfficialAccountSummary,
+    ) -> anyhow::Result<()> {
+        let parsed = parse_official_auth(auth)?;
+        ensure!(parsed.id == observed.id, "认证身份与目标账号不一致");
+        self.with_lock(|| {
+            let mut accounts = self.load_accounts_unlocked()?;
+            let secrets = self.load_secrets_unlocked()?;
+            if let Some(record) = accounts.accounts.iter_mut().find(|record| {
+                record.summary == *observed && record.summary.status == "needsReauth"
+            }) && secrets.credentials.get(&observed.id) == Some(auth)
+            {
+                record.summary.status = "ready".to_string();
+                record.summary.updated_at = now_ts();
+                self.save_state_unlocked(&accounts, &secrets)?;
+            }
+            Ok(())
         })
     }
 
@@ -768,7 +967,7 @@ fn migrate_legacy_official_accounts_with_store(
         if parse_official_auth(&auth).is_err() {
             continue;
         }
-        let (summary, created) = store.upsert_auth_json(auth)?;
+        let (summary, created, _) = store.merge_auth_json(auth)?;
         imported += usize::from(created);
         imported_ids.insert(profile.id.clone(), summary.id);
     }
@@ -778,7 +977,7 @@ fn migrate_legacy_official_accounts_with_store(
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .filter(|auth| parse_official_auth(auth).is_ok());
     let live_account_id = if let Some(auth) = live_auth {
-        let (summary, created) = store.upsert_auth_json(auth)?;
+        let (summary, created, _) = store.merge_auth_json(auth)?;
         imported += usize::from(created);
         Some(summary.id)
     } else {
@@ -1756,6 +1955,53 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_success_repairs_stale_status_without_overwriting_concurrent_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = OfficialAccountStore::new(
+            temp.path().join("accounts.json"),
+            temp.path().join("secrets.json"),
+        );
+        let auth = sample_auth("user-1", "acct-1");
+        let (account, _) = store.upsert_auth_json(auth.clone()).unwrap();
+        store.mark_status(&account.id, "needsReauth").unwrap();
+        let observed = store.get(&account.id).unwrap();
+        // 迁移/回存同一凭据不证明认证成功。
+        store.merge_auth_json(auth.clone()).unwrap();
+        assert_eq!(store.get(&account.id).unwrap().status, "needsReauth");
+        store.mark_authenticated(&auth, &observed).unwrap();
+        assert_eq!(store.get(&account.id).unwrap().status, "ready");
+        assert_eq!(store.get_auth_json(&account.id).unwrap(), auth);
+
+        store.mark_status(&account.id, "needsReauth").unwrap();
+        let observed = store.get(&account.id).unwrap();
+        store
+            .update(
+                &account.id,
+                OfficialAccountPatch {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.mark_authenticated(&auth, &observed).unwrap();
+        assert_eq!(store.get(&account.id).unwrap().status, "needsReauth");
+
+        let mut newer = auth.clone();
+        newer["tokens"]["refresh_token"] = json!("new-refresh");
+        store.upsert_auth_json(newer.clone()).unwrap();
+        store.mark_status(&account.id, "needsReauth").unwrap();
+        let observed = store.get(&account.id).unwrap();
+        store.mark_authenticated(&auth, &observed).unwrap();
+        assert_eq!(store.get(&account.id).unwrap().status, "needsReauth");
+        assert_eq!(store.get_auth_json(&account.id).unwrap(), newer);
+        assert!(
+            store
+                .mark_authenticated(&sample_auth("user-2", "acct-2"), &observed)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn encrypted_export_rejects_wrong_password_and_merges_identity() {
         let source = tempfile::tempdir().unwrap();
         let source_store = OfficialAccountStore::new(
@@ -1840,5 +2086,345 @@ mod tests {
         .unwrap();
         assert!(!second.changed);
         assert_eq!(second.imported, 0);
+    }
+
+    #[test]
+    fn migration_does_not_overwrite_newer_stored_credentials_with_stale_live_auth() {
+        // 模拟真实故障：账号库持有较新的 refresh_token（桌面端已轮换过），
+        // 而本机 auth.json 是陈旧的旧 token。列表查询触发的 migration 不能把
+        // 账号库覆盖回旧值，否则旧 refresh_token 会被拿去刷新并触发
+        // "refresh token was already used"，账号被永久判定失效。
+        let temp = tempfile::tempdir().unwrap();
+        let store = OfficialAccountStore::new(
+            temp.path().join("accounts.json"),
+            temp.path().join("secrets.json"),
+        );
+        let codex_home = temp.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        // 账号库先写入较新的凭据。
+        let stored_newer = sample_auth_with_revision(
+            "user-1",
+            "acct-1",
+            2_000,
+            "refresh-new",
+            Some("2026-01-01T00:10:00Z"),
+        );
+        let (summary, _) = store.upsert_auth_json(stored_newer.clone()).unwrap();
+
+        // 本机 auth.json 是更旧的版本。
+        let stale_live = sample_auth_with_revision(
+            "user-1",
+            "acct-1",
+            1_000,
+            "refresh-old",
+            Some("2026-01-01T00:00:00Z"),
+        );
+        std::fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec(&stale_live).unwrap(),
+        )
+        .unwrap();
+
+        let mut settings = crate::settings::BackendSettings::default();
+        let result =
+            migrate_legacy_official_accounts_with_store(&mut settings, &codex_home, &store)
+                .unwrap();
+        assert_eq!(result.active_account_id, summary.id);
+
+        // 账号库必须仍然持有较新的 refresh_token。
+        let after = store.get_auth_json(&summary.id).unwrap();
+        assert_eq!(
+            auth_token(&after, "refresh_token").as_deref(),
+            Some("refresh-new")
+        );
+    }
+
+    fn test_store(temp: &tempfile::TempDir) -> OfficialAccountStore {
+        OfficialAccountStore::new(
+            temp.path().join("accounts.json"),
+            temp.path().join("secrets.json"),
+        )
+    }
+
+    #[test]
+    fn migration_keeps_newer_credentials_when_legacy_profile_is_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let newer = sample_auth_with_revision("user-1", "acct-1", 2000, "new", None);
+        let (summary, _) = store.upsert_auth_json(newer.clone()).unwrap();
+        let mut profile = crate::settings::RelayProfile::default();
+        profile.relay_mode = crate::settings::RelayMode::Official;
+        profile.auth_contents = serde_json::to_string(&sample_auth_with_revision(
+            "user-1", "acct-1", 1000, "old", None,
+        ))
+        .unwrap();
+        let mut settings = crate::settings::BackendSettings {
+            relay_profiles: vec![profile],
+            ..Default::default()
+        };
+        migrate_legacy_official_accounts_with_store(&mut settings, temp.path(), &store).unwrap();
+        assert_eq!(store.get_auth_json(&summary.id).unwrap(), newer);
+        assert!(settings.relay_profiles[0].auth_contents.is_empty());
+    }
+
+    #[test]
+    fn merge_keeps_conflicting_credentials_and_does_not_reset_reauth_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let stored = sample_auth_with_revision("user-1", "acct-1", 2000, "a", None);
+        let (summary, _) = store.upsert_auth_json(stored.clone()).unwrap();
+        store.mark_status(&summary.id, "needsReauth").unwrap();
+        let before = fs::read(&store.metadata_path).unwrap();
+        let conflicting = sample_auth_with_revision("user-1", "acct-1", 2000, "b", None);
+        assert_eq!(
+            store.merge_auth_json(conflicting).unwrap().2,
+            OfficialAuthMergeDecision::Conflict
+        );
+        assert_eq!(
+            store.merge_auth_json(stored.clone()).unwrap().2,
+            OfficialAuthMergeDecision::KeepStored
+        );
+        assert_eq!(fs::read(&store.metadata_path).unwrap(), before);
+        assert_eq!(store.get_auth_json(&summary.id).unwrap(), stored);
+    }
+
+    #[test]
+    fn concurrent_merges_always_keep_the_newest_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let (summary, _) = store
+            .upsert_auth_json(sample_auth_with_revision(
+                "user-1", "acct-1", 1000, "initial", None,
+            ))
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for revision in 1..=8 {
+                let store = &store;
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    store
+                        .merge_auth_json(sample_auth_with_revision(
+                            "user-1",
+                            "acct-1",
+                            1000 + revision,
+                            &format!("token-{revision}"),
+                            None,
+                        ))
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(
+            auth_token(&store.get_auth_json(&summary.id).unwrap(), "refresh_token").as_deref(),
+            Some("token-8")
+        );
+    }
+
+    #[tokio::test]
+    async fn running_desktop_owns_live_refresh_and_newer_live_token_is_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let old = sample_auth_with_revision("user-1", "acct-1", now_ts() - 1, "old", None);
+        let (summary, _) = store.upsert_auth_json(old.clone()).unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let result = store
+            .refresh_tokens_with(&summary.id, true, Some(temp.path()), true, |_| async {
+                panic!("运行中的桌面端凭据不得被轮换")
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(store.get(&summary.id).unwrap().status, "ready");
+        let newer = sample_auth_with_revision("user-1", "acct-1", now_ts() + 3600, "new", None);
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+        store
+            .refresh_tokens_with(&summary.id, true, Some(temp.path()), true, |_| async {
+                panic!("已由桌面端更新的令牌应直接复用")
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.get_auth_json(&summary.id).unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn offline_refresh_updates_live_auth_and_preserves_a_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let old = sample_auth_with_revision("user-1", "acct-1", now_ts() - 1, "old", None);
+        let new = sample_auth_with_revision("user-1", "acct-1", now_ts() + 3600, "new", None);
+        let (summary, _) = store.upsert_auth_json(old.clone()).unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        store
+            .refresh_tokens_with(&summary.id, false, Some(temp.path()), false, |_| async {
+                Ok(new.clone())
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.get_auth_json(&summary.id).unwrap(), new);
+        let live: Value =
+            serde_json::from_slice(&fs::read(temp.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(live, new);
+        let backup_dir = fs::read_dir(temp.path().join("backups"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let backup: Value =
+            serde_json::from_slice(&fs::read(backup_dir.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(backup, old);
+    }
+
+    #[tokio::test]
+    async fn concurrent_forced_refreshes_rotate_only_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let (summary, _) = store
+            .upsert_auth_json(sample_auth_with_revision(
+                "user-1",
+                "acct-1",
+                now_ts() - 1,
+                "old",
+                None,
+            ))
+            .unwrap();
+        let entered = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let first = store.refresh_tokens_with(&summary.id, true, None, false, |_| async {
+            entered.notify_one();
+            release.notified().await;
+            Ok(sample_auth_with_revision(
+                "user-1",
+                "acct-1",
+                now_ts() + 3600,
+                "new",
+                None,
+            ))
+        });
+        let second = async {
+            entered.notified().await;
+            release.notify_one();
+            store
+                .refresh_tokens_with(&summary.id, true, None, false, |_| async {
+                    panic!("等待中的强制刷新不能再次轮换同一个令牌")
+                })
+                .await
+        };
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .unwrap();
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(
+            auth_token(&store.get_auth_json(&summary.id).unwrap(), "refresh_token").as_deref(),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_cannot_overwrite_a_login_completed_during_the_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let (summary, _) = store
+            .upsert_auth_json(sample_auth_with_revision(
+                "user-1",
+                "acct-1",
+                now_ts() - 1,
+                "old",
+                None,
+            ))
+            .unwrap();
+        let login = sample_auth_with_revision("user-1", "acct-1", now_ts() + 7200, "login", None);
+        let result = store
+            .refresh_tokens_with(&summary.id, true, None, false, |_| async {
+                store.upsert_auth_json(login.clone()).unwrap();
+                Ok(sample_auth_with_revision(
+                    "user-1",
+                    "acct-1",
+                    now_ts() + 3600,
+                    "rotated",
+                    None,
+                ))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(store.get_auth_json(&summary.id).unwrap(), login);
+    }
+
+    #[tokio::test]
+    async fn running_desktop_can_use_a_token_near_expiry_without_rotating_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let auth = sample_auth_with_revision("user-1", "acct-1", now_ts() + 60, "live", None);
+        let (summary, _) = store.upsert_auth_json(auth.clone()).unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec(&auth).unwrap(),
+        )
+        .unwrap();
+        store
+            .refresh_tokens_with(&summary.id, false, Some(temp.path()), true, |_| async {
+                panic!("临近过期的 live token 仍应交给桌面端轮换")
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.get_auth_json(&summary.id).unwrap(), auth);
+    }
+
+    #[tokio::test]
+    async fn transient_refresh_error_does_not_require_reauthentication() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let auth = sample_auth_with_revision("user-1", "acct-1", now_ts() - 1, "old", None);
+        let (summary, _) = store.upsert_auth_json(auth.clone()).unwrap();
+        let result = store
+            .refresh_tokens_with(&summary.id, false, None, false, |_| async {
+                anyhow::bail!("连接 refresh token 接口失败")
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(store.get(&summary.id).unwrap().status, "ready");
+        assert_eq!(store.get_auth_json(&summary.id).unwrap(), auth);
+    }
+
+    #[tokio::test]
+    async fn oauth_failure_does_not_mark_a_concurrent_new_login_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp);
+        let (summary, _) = store
+            .upsert_auth_json(sample_auth_with_revision(
+                "user-1",
+                "acct-1",
+                now_ts() - 1,
+                "old",
+                None,
+            ))
+            .unwrap();
+        let login = sample_auth_with_revision("user-1", "acct-1", now_ts() + 3600, "login", None);
+        let result = store
+            .refresh_tokens_with(&summary.id, false, None, false, |_| async {
+                store.upsert_auth_json(login.clone()).unwrap();
+                anyhow::bail!("刷新官方令牌失败（HTTP 400）：refresh token was already used")
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(store.get(&summary.id).unwrap().status, "ready");
+        assert_eq!(store.get_auth_json(&summary.id).unwrap(), login);
     }
 }

@@ -18,10 +18,10 @@ use zip::ZipArchive;
 
 use crate::commands::CommandResult;
 
-const RELEASE_VERSION: &str = "v7.2.103";
-const RELEASE_FILE: &str = "CLIProxyAPI_7.2.103_windows_amd64.zip";
+const RELEASE_VERSION: &str = "v8.0.30";
+const RELEASE_FILE: &str = "CLIProxyAPI_8.0.30_windows_amd64.zip";
 const RELEASE_BASE_URL: &str =
-    "https://github.com/router-for-me/CLIProxyAPI/releases/download/v7.2.103";
+    "https://github.com/router-for-me/CLIProxyAPI/releases/download/v8.0.30";
 const INSTALL_ROOT: &str = r"D:\pro\CLIProxyAPI";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8317;

@@ -22,6 +22,16 @@ pub const OFFICIAL_CHATGPT_CODEX_IMAGE_GENERATIONS_URL: &str =
     "https://chatgpt.com/backend-api/codex/images/generations";
 pub const OFFICIAL_CHATGPT_CODEX_IMAGE_EDITS_URL: &str =
     "https://chatgpt.com/backend-api/codex/images/edits";
+
+/// 协议代理实际生效端口，默认 DEFAULT_PROTOCOL_PROXY_PORT。
+pub fn protocol_proxy_port() -> u16 {
+    std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+}
+
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,6 +39,7 @@ const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_BODY_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_COOLDOWN_RETRIES: usize = 3;
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -86,6 +97,72 @@ impl Default for CapacityRetryNoticeState {
 
 static CAPACITY_RETRY_NOTICE: OnceLock<Mutex<CapacityRetryNoticeState>> = OnceLock::new();
 
+fn should_retry_after_cooldown(retries: usize) -> bool {
+    retries < MAX_COOLDOWN_RETRIES
+}
+
+/// codex v2 远程压缩请求在 input 末尾携带的控制 item（openai/codex compact_remote_v2）。
+const COMPACTION_TRIGGER_TYPE: &str = "compaction_trigger";
+/// codex 期望响应里恰好包含一个的压缩结果 item，`encrypted_content` 只透传不校验。
+const COMPACTION_OUTPUT_TYPE: &str = "compaction";
+/// 本地代理生成摘要时注入的 user 指令（对齐 openai/codex prompts/templates/compact/prompt.md）。
+const COMPACTION_SUMMARY_INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work.";
+/// 历史回放时 `compaction` item 展开成的文本前缀（对齐 codex SUMMARY_PREFIX 语义）。
+const COMPACTION_REPLAY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. Here is the summary produced by the other language model:\n";
+
+/// 判断 Responses 请求体是否为 codex v2 远程压缩请求：
+/// input 末尾（允许中间有尾随的空壳 item）存在 `compaction_trigger`。
+pub fn request_has_compaction_trigger(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .rev()
+                .find(|item| item.get("type").and_then(Value::as_str).is_some())
+                .map(|item| {
+                    item.get("type").and_then(Value::as_str) == Some(COMPACTION_TRIGGER_TYPE)
+                })
+        })
+        .unwrap_or(false)
+}
+
+/// 从请求 input 中剥离 `compaction_trigger` 控制项，返回去掉后的请求体。
+/// codex 只把它放在 input 末尾，其余位置的按未知类型忽略。
+fn strip_compaction_trigger(mut body: Value) -> Value {
+    if let Some(items) = body
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .filter(|items| !items.is_empty())
+    {
+        while items
+            .last()
+            .and_then(|item| item.get("type").and_then(Value::as_str))
+            == Some(COMPACTION_TRIGGER_TYPE)
+        {
+            items.pop();
+        }
+    }
+    body
+}
+
+/// 把压缩摘要请求改写成上游能理解的普通生成请求：
+/// - input 末尾注入 user 摘要指令；
+/// - tools/parallel_tool_calls 清空，避免摘要阶段触发工具调用。
+fn rewrite_request_for_compaction(mut body: Value) -> Value {
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": COMPACTION_SUMMARY_INSTRUCTION }]
+        }));
+    }
+    body["tools"] = json!([]);
+    body["tool_choice"] = json!("none");
+    body["parallel_tool_calls"] = json!(false);
+    body
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatReasoningStyle {
     Default,
@@ -123,6 +200,8 @@ enum CodexCustomToolKind {
     Raw,
     ApplyPatch,
     BuiltIn,
+    /// Codex 的 tool_search 工具（MCP 延迟加载检索，execution: client）。
+    ToolSearch,
 }
 
 impl Default for CodexCustomToolKind {
@@ -157,6 +236,11 @@ impl CodexToolContext {
         self.custom_tools.contains_key(upstream_name)
     }
 
+    fn is_tool_search_proxy(&self, upstream_name: &str) -> bool {
+        self.custom_tools.get(upstream_name).map(|spec| spec.kind)
+            == Some(CodexCustomToolKind::ToolSearch)
+    }
+
     fn original_custom_tool_name(&self, upstream_name: &str) -> String {
         self.custom_tools
             .get(upstream_name)
@@ -182,6 +266,13 @@ pub fn local_responses_proxy_base_url(port: u16) -> String {
 }
 
 pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
+    responses_to_chat_completions_with_options(body, false)
+}
+
+pub fn responses_to_chat_completions_with_options(
+    body: Value,
+    standard: bool,
+) -> anyhow::Result<Value> {
     let mut result = json!({});
 
     if let Some(model) = body.get("model") {
@@ -199,7 +290,11 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
     if let Some(input) = body.get("input") {
         append_responses_input(input, &mut messages);
     }
+    // 必须在 enforce_tool_call_pairing 之前：配对一旦被错误摘除就无法恢复。
+    relocate_interleaved_non_tool_messages(&mut messages);
     enforce_tool_call_pairing(&mut messages);
+    // 配对判定之后仍有无主 tool 消息（上游会直接 400），降级成 user 保住内容。
+    degrade_unpaired_tool_messages(&mut messages);
     // 必须在 enforce_tool_call_pairing 之后：它依赖 tool 消息的连续性，
     // 而这一步会往中间插入 user 消息。
     relocate_tool_output_images(&mut messages);
@@ -237,16 +332,29 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
         result["stream_options"] = stream_options;
     }
 
-    apply_chat_reasoning_options(&mut result, &body, model);
+    apply_chat_reasoning_options(&mut result, &body, model, standard);
 
-    let tool_context = build_codex_tool_context(body.get("tools"));
+    let mut tool_context = build_codex_tool_context(body.get("tools"));
+    // Codex 客户端把 tool_search 命中的 MCP 命名空间挂在历史里的 tool_search_output
+    // item 上，却不会把它们提升进下一轮请求的 tools 数组。这里补上这一跳：先登记进
+    // tool context（模型调用回来时才能还原 namespace），再用既有 namespace 链路展开
+    // 成 mcp__<server>__<tool>，否则上游只看到命名空间外壳，调不到内层工具。
+    let harvested_namespaces = collect_tool_search_output_namespaces(&body);
+    for namespace_tool in &harvested_namespaces {
+        add_namespace_tools_to_context(&mut tool_context, namespace_tool);
+    }
     let mut has_chat_tools = false;
+    let mut converted = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let converted = responses_tools_to_chat_tools(tools, &tool_context);
-        if !converted.is_empty() {
-            has_chat_tools = true;
-            result["tools"] = json!(converted);
-        }
+        converted = responses_tools_to_chat_tools(tools, &tool_context);
+    }
+    for namespace_tool in &harvested_namespaces {
+        converted.extend(namespace_tool_to_chat_tools(namespace_tool, &tool_context));
+    }
+    dedup_chat_tools_by_name(&mut converted);
+    if !converted.is_empty() {
+        has_chat_tools = true;
+        result["tools"] = json!(converted);
     }
 
     if has_chat_tools {
@@ -281,7 +389,12 @@ pub fn chat_completion_to_response_with_request(
     body: Value,
     original_request: &Value,
 ) -> anyhow::Result<Value> {
-    let context = build_codex_tool_context(original_request.get("tools"));
+    let mut context = build_codex_tool_context(original_request.get("tools"));
+    // 反向同样要认领 tool_search_output 里的命名空间，否则模型调用
+    // mcp__<server>__<tool> 回来时查不到 namespace，还原不成 Responses item。
+    for namespace_tool in &collect_tool_search_output_namespaces(original_request) {
+        add_namespace_tools_to_context(&mut context, namespace_tool);
+    }
     chat_completion_to_response_with_context(body, &context, Some(original_request))
 }
 
@@ -343,16 +456,78 @@ pub struct UpstreamProxyResponse {
     pub content_type: String,
     pub is_stream: bool,
     pub wire_api: UpstreamWireApi,
-    /// 底层请求命中容量错误，调用方应在代理内重新发起请求。
+    /// 底层流命中容量错误时，调用方应在读取 body 前重新请求。
     pub capacity_retryable: bool,
-    /// 当前 Responses 请求启用了容量错误改写。
+    /// 当前 Responses 请求是否启用容量错误重写。
     pub capacity_retry_enabled: bool,
-    /// 用于在读取到非流式上游错误体后继续执行容量重试计数的请求指纹。
+    /// 用于容量重试去重的请求指纹。
     pub capacity_retry_key: Option<u64>,
     pub capacity_retry_max_attempts: u8,
-    /// 已读取但尚未转发的流首段，用于容量错误探测后继续转发正常流。
+    /// 已预读但未消费的响应字节。
     pub prefetched_chunk: Vec<u8>,
+    /// 上游是 Chat Completions 的合成摘要，或 Responses 压缩请求，需要重组为 compaction。
+    pub compaction: bool,
+
     pub response: reqwest::Response,
+    pub scheduled_account_id: Option<String>,
+    pub(crate) _channel_permit: Option<crate::channel_protection::ChannelPermit>,
+}
+
+/// 客户端会话头白名单；可选官方跟随模式必须经本地原生父子关系验证后选路。
+#[derive(Clone, Copy, Default)]
+pub struct ProxySessionHeaders<'a> {
+    pub session_id: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
+    pub opencode_session: Option<&'a str>,
+}
+
+impl ProxySessionHeaders<'_> {
+    fn following_provider(
+        self,
+        settings: &crate::settings::BackendSettings,
+        provider: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if !settings.official_experience.enabled
+            || !settings.official_experience.follow_parent_account
+            || !crate::official_child_routing::official_provider(provider)
+        {
+            return Ok(None);
+        }
+        crate::official_child_routing::inherited_provider(
+            &crate::codex_home::default_codex_home_dir(),
+            self.thread_id,
+            self.session_id,
+        )
+    }
+
+    fn apply(
+        self,
+        mut request: reqwest::RequestBuilder,
+        relay: Option<&crate::settings::RelayProfile>,
+    ) -> reqwest::RequestBuilder {
+        for (name, value) in [
+            ("session-id", self.session_id),
+            ("thread-id", self.thread_id),
+            ("x-opencode-session", self.opencode_session),
+        ] {
+            if relay.is_some_and(|relay| {
+                relay
+                    .custom_headers
+                    .iter()
+                    .any(|header| header.key.trim().eq_ignore_ascii_case(name))
+            }) {
+                continue;
+            }
+            if let Some(value) = value
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && value.len() <= 1024)
+                .and_then(|value| reqwest::header::HeaderValue::from_str(value).ok())
+            {
+                request = request.header(name, value);
+            }
+        }
+        request
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -522,6 +697,38 @@ pub async fn open_responses_proxy_request_with_capacity_retries_for_path(
     original_user_agent: Option<&str>,
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_with_capacity_retries_for_path_and_beta(
+        body,
+        original_user_agent,
+        request_path,
+        None,
+    )
+    .await
+}
+
+pub async fn open_responses_proxy_request_with_capacity_retries_for_path_and_beta(
+    body: &str,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+    beta_features: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_with_capacity_retries_for_path_and_session_headers(
+        body,
+        original_user_agent,
+        request_path,
+        beta_features,
+        ProxySessionHeaders::default(),
+    )
+    .await
+}
+
+pub async fn open_responses_proxy_request_with_capacity_retries_for_path_and_session_headers(
+    body: &str,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     open_responses_proxy_request_with_settings_and_capacity_retries_and_user_agent(
         body,
@@ -529,6 +736,8 @@ pub async fn open_responses_proxy_request_with_capacity_retries_for_path(
         original_user_agent,
         request_path,
         OFFICIAL_CHATGPT_CODEX_RESPONSES_URL,
+        beta_features,
+        session_headers,
     )
     .await
 }
@@ -544,6 +753,8 @@ pub async fn open_responses_proxy_request_with_settings_and_capacity_retries(
         None,
         "/responses",
         OFFICIAL_CHATGPT_CODEX_RESPONSES_URL,
+        None,
+        ProxySessionHeaders::default(),
     )
     .await
 }
@@ -560,6 +771,8 @@ pub async fn open_responses_proxy_request_with_settings_and_capacity_retries_and
         None,
         "/responses",
         official_endpoint,
+        None,
+        ProxySessionHeaders::default(),
     )
     .await
 }
@@ -570,6 +783,8 @@ async fn open_responses_proxy_request_with_settings_and_capacity_retries_and_use
     original_user_agent: Option<&str>,
     request_path: &str,
     official_endpoint: &str,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut retry_attempt = 0u8;
     let mut notice_sequence = None;
@@ -581,6 +796,8 @@ async fn open_responses_proxy_request_with_settings_and_capacity_retries_and_use
                 original_user_agent,
                 request_path,
                 official_endpoint,
+                beta_features,
+                session_headers,
             )
             .await
             {
@@ -626,6 +843,8 @@ async fn open_responses_proxy_request_with_settings_and_capacity_retries_and_use
                 original_user_agent,
                 request_path,
                 official_endpoint,
+                beta_features,
+                session_headers,
             )
             .await;
         }
@@ -822,6 +1041,389 @@ pub struct ChatSseToResponsesConverter {
     failed: bool,
 }
 
+/// codex v2 远程压缩的响应包装器：把上游摘要文本（无论 Responses 还是
+/// Chat 上游、流式还是非流式）封装成「恰好一个 `compaction` 输出项」的
+/// Responses SSE 流。输出项通过 output_item.done 显式交付给客户端，
+/// 不能只放进 response.completed.response.output。
+pub struct CompactionSseConverter {
+    response_id: String,
+    compaction_id: String,
+    model: String,
+    summary: String,
+    final_summary: Option<String>,
+    failed: Option<(String, Option<String>)>,
+    /// 跨网络 chunk 攒 SSE 事件的缓冲（见 push_upstream_bytes）。
+    sse_buffer: String,
+    sse_utf8_remainder: Vec<u8>,
+    responses_wire: bool,
+    upstream_terminal: bool,
+}
+
+impl CompactionSseConverter {
+    pub fn new(model: &str) -> Self {
+        Self {
+            response_id: format!("resp_compact_{}", chrono_now_millis()),
+            compaction_id: format!("cmp_{}", uuid::Uuid::new_v4().simple()),
+            model: model.to_string(),
+            summary: String::new(),
+            final_summary: None,
+            failed: None,
+            sse_buffer: String::new(),
+            sse_utf8_remainder: Vec::new(),
+            responses_wire: true,
+            upstream_terminal: false,
+        }
+    }
+
+    /// 标记上游是 Chat Completions（SSE chunk 的增量在 `choices[].delta.content`）。
+    /// Responses 上游默认，增量在 `response.output_text.delta` 事件里。
+    pub fn with_chat_upstream(mut self) -> Self {
+        self.responses_wire = false;
+        self
+    }
+
+    /// 追加上游输出的一块文本内容（非流式路径直接喂完整摘要）。
+    pub fn push_summary_text(&mut self, text: &str) {
+        self.summary.push_str(text);
+    }
+
+    /// 当前已收集的原始摘要文本（剥 think 之前），供空摘要判定。
+    pub fn summary_text(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn has_upstream_terminal(&self) -> bool {
+        self.upstream_terminal
+    }
+
+    /// 喂入上游流式响应的一个网络 chunk。SSE 事件可能被 TCP 拆开，
+    /// 内部按 `\n\n` 边界缓冲；残缺块留在缓冲区等下一个 chunk。
+    pub fn push_upstream_bytes(&mut self, bytes: &[u8]) {
+        append_utf8_safe(&mut self.sse_buffer, &mut self.sse_utf8_remainder, bytes);
+        while let Some(block) = take_sse_block(&mut self.sse_buffer) {
+            if block.trim().is_empty() {
+                continue;
+            }
+            self.handle_upstream_sse_block(&block);
+        }
+    }
+
+    fn handle_upstream_sse_block(&mut self, block: &str) {
+        let mut event_name = "";
+        let mut data_parts: Vec<&str> = Vec::new();
+        for line in block.lines() {
+            if let Some(event) = strip_sse_field(line, "event") {
+                event_name = event.trim();
+            }
+            if let Some(data) = strip_sse_field(line, "data") {
+                data_parts.push(data);
+            }
+        }
+        if data_parts.is_empty() {
+            return;
+        }
+        let data = data_parts.join("\n");
+        if data.trim() == "[DONE]" {
+            self.upstream_terminal = true;
+            return;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(&data) else {
+            return;
+        };
+        let event_type = chunk
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or(event_name);
+        self.upstream_terminal |= is_terminal_responses_event(event_type)
+            || chunk
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(|choices| {
+                    choices.iter().any(|choice| {
+                        choice
+                            .get("finish_reason")
+                            .is_some_and(|reason| !reason.is_null())
+                    })
+                });
+        if matches!(
+            event_type,
+            "response.failed" | "response.incomplete" | "error"
+        ) || chunk.get("error").is_some_and(|error| !error.is_null())
+        {
+            let error = chunk
+                .pointer("/response/error")
+                .or_else(|| chunk.get("error"));
+            self.fail(
+                error
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Compaction upstream stream failed or was incomplete")
+                    .to_string(),
+                error
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            );
+            return;
+        }
+        if self.responses_wire {
+            match event_type {
+                // Responses 流优先读取正文增量，排除携带同名 delta 字段的推理事件。
+                "response.output_text.delta" => {
+                    if let Some(delta) = chunk.get("delta").and_then(Value::as_str) {
+                        self.summary.push_str(delta);
+                    }
+                }
+                // 部分兼容实现不发送 delta，只在完成事件里携带完整正文。
+                "response.output_text.done" => {
+                    self.capture_final_summary(chunk.get("text"));
+                }
+                "response.content_part.done" => {
+                    self.capture_final_summary(chunk.pointer("/part/text"));
+                }
+                "response.output_item.done" => {
+                    let text = chunk
+                        .get("item")
+                        .map(extract_summary_text_from_response_item)
+                        .unwrap_or_default();
+                    self.capture_final_summary(Some(&json!(text)));
+                }
+                "response.completed" => {
+                    let text = chunk
+                        .get("response")
+                        .map(extract_summary_text_from_responses)
+                        .unwrap_or_default();
+                    self.capture_final_summary(Some(&json!(text)));
+                }
+                _ => {}
+            }
+        } else if let Some(choice) = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        {
+            if let Some(content) = choice
+                .get("delta")
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str)
+            {
+                self.summary.push_str(content);
+            }
+            self.capture_final_summary(
+                choice
+                    .get("message")
+                    .and_then(|message| message.get("content")),
+            );
+        }
+    }
+
+    fn capture_final_summary(&mut self, text: Option<&Value>) {
+        let Some(text) = text
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        else {
+            return;
+        };
+        self.final_summary = Some(text.to_string());
+    }
+
+    pub fn fail(&mut self, message: String, error_type: Option<String>) -> Vec<u8> {
+        self.failed = Some((message, error_type));
+        Vec::new()
+    }
+
+    /// 收尾：产出完整的 compaction 响应 SSE。
+    /// 链式推理上游（DeepSeek thinking 等）会把推理过程以 `<think>` 块
+    /// 混进正文，这里统一剥掉首部完整 think 块，只保留真正的摘要答案；
+    /// think 块未闭合（上游截断）时整个丢弃——剩下的只有推理残片。
+    pub fn finish(mut self) -> Vec<u8> {
+        if let Some(final_summary) = self.final_summary.take() {
+            self.summary = final_summary;
+        }
+        if let Some((_reasoning, answer)) = split_leading_think_block(&self.summary) {
+            self.summary = answer;
+        } else if self.summary.trim_start().starts_with(THINK_OPEN_TAG) {
+            self.summary = String::new();
+        }
+        self.summary = self.summary.trim().to_string();
+        // 剥掉 think 块后为空（上游空输出、纯推理文本、截断导致块未闭合），
+        // 一律按失败返回，避免向 codex 交付 `completed + 空 encrypted_content`
+        // 的空 checkpoint 静默清空会话。
+        if self.failed.is_none() && self.summary.is_empty() {
+            self.failed = Some((
+                "上游返回了空摘要，无法完成压缩".to_string(),
+                Some("compaction_empty_summary".to_string()),
+            ));
+        }
+        let mut output = String::new();
+        let mut response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": chrono_now_millis() / 1000,
+            "status": "in_progress",
+            "model": self.model,
+            "output": [],
+            "usage": default_responses_usage()
+        });
+        push_sse(
+            &mut output,
+            "response.created",
+            json!({"type": "response.created", "sequence_number": 0, "response": response}),
+        );
+        if let Some((message, error_type)) = self.failed {
+            response["status"] = json!("failed");
+            response["error"] = json!({
+                "code": error_type.unwrap_or_else(|| "compaction_failed".to_string()),
+                "message": message
+            });
+            push_sse(
+                &mut output,
+                "response.failed",
+                json!({"type": "response.failed", "sequence_number": 1, "response": response}),
+            );
+            output.push_str("data: [DONE]\n\n");
+            return output.into_bytes();
+        }
+        let compaction_item = json!({
+            "id": self.compaction_id,
+            "type": COMPACTION_OUTPUT_TYPE,
+            "encrypted_content": self.summary
+        });
+        for (sequence_number, event_type) in [
+            (1, "response.output_item.added"),
+            (2, "response.output_item.done"),
+        ] {
+            push_sse(
+                &mut output,
+                event_type,
+                json!({
+                    "type": event_type,
+                    "sequence_number": sequence_number,
+                    "output_index": 0,
+                    "item": compaction_item
+                }),
+            );
+        }
+        response["status"] = json!("completed");
+        response["output"] = json!([compaction_item]);
+        push_sse(
+            &mut output,
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": response
+            }),
+        );
+        output.push_str("data: [DONE]\n\n");
+        output.into_bytes()
+    }
+}
+
+fn chrono_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 非流式压缩响应包装：从上游 JSON 响应里提取 assistant 文本并封装成
+/// 恰好一个 `compaction` 输出项的 Responses 响应。
+pub fn wrap_non_stream_response_as_compaction(
+    upstream_body: &[u8],
+    model: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let upstream_json: Value = serde_json::from_slice(upstream_body)?;
+    let mut converter = CompactionSseConverter::new(model);
+    if let Some(error) = upstream_json.get("error").filter(|value| !value.is_null()) {
+        converter.fail(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("compaction upstream error")
+                .to_string(),
+            None,
+        );
+        return Ok(converter.finish());
+    }
+    let responses_text = extract_summary_text_from_responses(&upstream_json);
+    let text = if responses_text.is_empty() {
+        extract_summary_text_from_chat(&upstream_json)
+    } else {
+        responses_text
+    };
+    if text.is_empty() {
+        converter.fail(
+            "上游返回了空摘要，无法完成压缩".to_string(),
+            Some("compaction_empty_summary".to_string()),
+        );
+        return Ok(converter.finish());
+    }
+    converter.push_summary_text(&text);
+    Ok(converter.finish())
+}
+
+/// 从 Responses JSON 响应（`output[].content[].text`）提取 assistant 文本。
+fn extract_summary_text_from_responses(response: &Value) -> String {
+    let Some(items) = response.get("output").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        let text = extract_summary_text_from_response_item(item);
+        if !text.is_empty() {
+            texts.push(text);
+        }
+    }
+    texts.join("\n")
+}
+
+fn extract_summary_text_from_response_item(item: &Value) -> String {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(COMPACTION_OUTPUT_TYPE) => item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 从 Chat Completions JSON 响应提取 assistant 文本。
+fn extract_summary_text_from_chat(response: &Value) -> String {
+    response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 历史回放：把 codex 历史里的 `compaction` item 展开成明文 user 消息。
+/// codex 下游请求会把上次压缩结果作为 `{"type":"compaction","encrypted_content":"..."}`
+/// 放进 input，第三方模型看不懂该类型，必须转成文本。
+fn expand_compaction_item(item: &Value) -> Option<Value> {
+    let summary = item.get("encrypted_content").and_then(Value::as_str)?;
+    let mut text = COMPACTION_REPLAY_PREFIX.to_string();
+    text.push_str(summary);
+    Some(json!({
+        "role": "user",
+        "content": text
+    }))
+}
+
 impl Default for ChatSseToResponsesConverter {
     fn default() -> Self {
         Self {
@@ -865,7 +1467,14 @@ impl ChatSseToResponsesConverter {
 
         let mut output = String::new();
         if !self.failed {
-            self.state.finalize_into(&mut output);
+            if self.state.completed || self.state.finish_reason.is_some() {
+                self.state.finalize_into(&mut output);
+            } else {
+                return self.fail(
+                    "Upstream stream ended before a terminal Chat Completions event".to_string(),
+                    Some("incomplete_stream".to_string()),
+                );
+            }
         }
         output.into_bytes()
     }
@@ -920,6 +1529,8 @@ pub struct ResponsesSseTerminalTracker {
     buffer: String,
     utf8_remainder: Vec<u8>,
     terminal: bool,
+    failed: bool,
+    pub quota_reset: Option<i64>,
 }
 
 impl ResponsesSseTerminalTracker {
@@ -955,7 +1566,17 @@ impl ResponsesSseTerminalTracker {
         self.terminal
     }
 
+    pub fn has_failed(&self) -> bool {
+        self.failed
+    }
+
     fn observe_block(&mut self, block: &str) {
+        self.quota_reset = self.quota_reset.or_else(|| {
+            crate::official_account_schedule::quota_error_reset(
+                block.as_bytes(),
+                chrono::Utc::now().timestamp(),
+            )
+        });
         let mut event_name = None;
         let mut data_parts = Vec::new();
         for line in block.lines() {
@@ -968,6 +1589,7 @@ impl ResponsesSseTerminalTracker {
         }
         if event_name.is_some_and(is_terminal_responses_event) {
             self.terminal = true;
+            self.failed = event_name != Some("response.completed");
             return;
         }
         let data = data_parts.join("\n");
@@ -982,6 +1604,7 @@ impl ResponsesSseTerminalTracker {
                 .is_some_and(is_terminal_responses_event)
         {
             self.terminal = true;
+            self.failed = value.get("type").and_then(Value::as_str) != Some("response.completed");
         }
     }
 }
@@ -1125,9 +1748,41 @@ pub async fn open_images_proxy_request_for_path(
     original_user_agent: Option<&str>,
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_images_proxy_request_for_path_with_session(
+        body,
+        operation,
+        original_user_agent,
+        request_path,
+        ProxySessionHeaders::default(),
+    )
+    .await
+}
+
+pub async fn open_images_proxy_request_for_path_with_session(
+    body: &str,
+    operation: ImageProxyOperation,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+    session_headers: ProxySessionHeaders<'_>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let provider_id = crate::official_experience::route_provider_id_from_path(request_path);
     if let Some(provider_id) = provider_id.as_deref() {
+        if settings.official_experience.enabled
+            && settings.official_experience.follow_parent_account
+            && crate::official_child_routing::official_provider(provider_id)
+        {
+            return open_following_official_images_request(
+                body,
+                settings,
+                operation,
+                operation.official_endpoint(),
+                original_user_agent,
+                provider_id,
+                session_headers,
+            )
+            .await;
+        }
         if provider_id == crate::official_experience::PRIMARY_OFFICIAL_PROVIDER_ID {
             anyhow::bail!("主官方图片请求必须使用官方客户端原生链路")
         }
@@ -1148,8 +1803,58 @@ pub async fn open_images_proxy_request_for_path(
         operation,
         operation.official_endpoint(),
         original_user_agent,
+        None,
     )
     .await
+}
+
+async fn open_following_official_images_request(
+    body: &str,
+    settings: crate::settings::BackendSettings,
+    operation: ImageProxyOperation,
+    endpoint: &str,
+    original_user_agent: Option<&str>,
+    provider_id: &str,
+    session_headers: ProxySessionHeaders<'_>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let inherited = session_headers.following_provider(&settings, provider_id)?;
+    let provider_id = inherited.as_deref().unwrap_or(provider_id);
+    let request: Value = serde_json::from_str(body)?;
+    anyhow::ensure!(
+        request.get("model").and_then(Value::as_str) == Some("gpt-image-2"),
+        "官方内置图片跟随只接受 gpt-image-2"
+    );
+    let account_id = if provider_id == "openai" {
+        settings.active_official_account_id.clone()
+    } else {
+        crate::official_accounts::OfficialAccountStore::default()
+            .list()?
+            .into_iter()
+            .find(|account| {
+                crate::official_experience::direct_official_provider_id(&account.id) == provider_id
+            })
+            .context("图片来源不是固定官方账号；调度图片请求不自动换号")?
+            .id
+    };
+    let auth = resolve_stored_official_account_auth(&account_id).await?;
+    let response = open_official_images_proxy_request_with_settings_and_endpoint_and_user_agent(
+        body,
+        settings,
+        operation,
+        endpoint,
+        original_user_agent,
+        Some(auth),
+    )
+    .await?;
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.child_official_image_dispatch",
+        json!({
+            "sourceId": account_id, "providerId": provider_id, "operation": operation.name(),
+            "threadId": session_headers.thread_id, "sessionId": session_headers.session_id,
+            "phase": "response_headers", "statusCode": response.status_code, "willFailover": false,
+        }),
+    );
+    Ok(response)
 }
 
 async fn open_source_images_proxy_request(
@@ -1171,9 +1876,15 @@ async fn open_source_images_proxy_request(
         .context("图片请求缺少模型，无法验证来源归属")?
         .to_string();
     let descriptors = crate::official_experience::model_route_descriptors(settings);
+    let historical_model = crate::official_experience::descriptor_for_provider_and_model(
+        settings,
+        provider_id,
+        &routing_slug,
+    );
     let matching_model = descriptors
         .iter()
-        .find(|descriptor| descriptor.routing_slug.eq_ignore_ascii_case(&routing_slug));
+        .find(|descriptor| descriptor.routing_slug.eq_ignore_ascii_case(&routing_slug))
+        .or(historical_model.as_ref());
     if let Some(descriptor) = matching_model
         && descriptor.source_kind != crate::settings::OfficialExperienceSourceKind::MainOfficial
         && !descriptor.provider_id.eq_ignore_ascii_case(provider_id)
@@ -1197,7 +1908,17 @@ async fn open_source_images_proxy_request(
         }
         let mut upstream_json = request_json;
         upstream_json["model"] = Value::String(descriptor.upstream_model.clone());
-        let auth = resolve_stored_official_account_auth(&descriptor.source_id).await?;
+        let source_id = if descriptor.provider_id == crate::official_account_schedule::PROVIDER_ID {
+            crate::official_account_schedule::select_account(
+                settings,
+                &descriptor.upstream_model,
+                &std::collections::HashSet::new(),
+            )?
+            .id
+        } else {
+            descriptor.source_id.clone()
+        };
+        let auth = resolve_stored_official_account_auth(&source_id).await?;
         let client =
             crate::http_client::proxied_client(&effective_user_agent("", original_user_agent))?;
         let upstream = send_upstream_request_with_header_timeout(
@@ -1221,7 +1942,7 @@ async fn open_source_images_proxy_request(
             .to_string();
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.direct_official_image_response",
-            json!({"sourceId": descriptor.source_id, "operation": operation.name(), "statusCode": status_code}),
+            json!({"sourceId": source_id, "operation": operation.name(), "statusCode": status_code}),
         );
         return Ok(UpstreamProxyResponse {
             status_code,
@@ -1236,7 +1957,10 @@ async fn open_source_images_proxy_request(
             capacity_retry_key: None,
             capacity_retry_max_attempts: 0,
             prefetched_chunk: Vec::new(),
+            compaction: false,
             response: upstream,
+            scheduled_account_id: None,
+            _channel_permit: None,
         });
     }
     let relay = crate::official_experience::source_profile_for_descriptor(settings, &descriptor)
@@ -1343,7 +2067,10 @@ async fn open_source_images_proxy_request(
         capacity_retry_key: None,
         capacity_retry_max_attempts: 0,
         prefetched_chunk: Vec::new(),
+        compaction: false,
         response: upstream,
+        scheduled_account_id: None,
+        _channel_permit: None,
     })
 }
 
@@ -1360,6 +2087,7 @@ pub async fn open_official_images_proxy_request_with_settings_and_endpoint(
         operation,
         official_endpoint,
         None,
+        None,
     )
     .await
 }
@@ -1370,12 +2098,16 @@ async fn open_official_images_proxy_request_with_settings_and_endpoint_and_user_
     operation: ImageProxyOperation,
     official_endpoint: &str,
     original_user_agent: Option<&str>,
+    auth_override: Option<OfficialChatGptAuth>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    if !settings.official_login_mixed_mode {
+    if !settings.official_login_mixed_mode && auth_override.is_none() {
         anyhow::bail!("官方图像代理仅在官方登录混合模式下启用");
     }
     let request_json: Value = serde_json::from_str(body).context("官方图像请求必须是 JSON")?;
-    let auth = resolve_official_chatgpt_auth(&settings)?;
+    let auth = match auth_override {
+        Some(auth) => auth,
+        None => resolve_official_chatgpt_auth(&settings)?,
+    };
     let configured_user_agent = settings
         .official_login_relay_profile()
         .map(|profile| profile.user_agent.as_str())
@@ -1434,7 +2166,10 @@ async fn open_official_images_proxy_request_with_settings_and_endpoint_and_user_
         capacity_retry_key: None,
         capacity_retry_max_attempts: 0,
         prefetched_chunk: Vec::new(),
+        compaction: false,
         response: upstream,
+        scheduled_account_id: None,
+        _channel_permit: None,
     })
 }
 
@@ -1471,12 +2206,25 @@ pub async fn open_responses_proxy_request_for_path(
     original_user_agent: Option<&str>,
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_for_path_with_beta(body, original_user_agent, request_path, None)
+        .await
+}
+
+/// 只转发客户端声明的 beta 能力，不转发客户端鉴权。
+pub async fn open_responses_proxy_request_for_path_with_beta(
+    body: &str,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+    beta_features: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
         settings,
         original_user_agent,
         request_path,
+        beta_features,
+        ProxySessionHeaders::default(),
     )
     .await
 }
@@ -1485,8 +2233,15 @@ pub async fn open_responses_proxy_request_with_settings(
     body: &str,
     settings: crate::settings::BackendSettings,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    open_responses_proxy_request_with_settings_and_user_agent(body, settings, None, "/responses")
-        .await
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        None,
+        "/responses",
+        None,
+        ProxySessionHeaders::default(),
+    )
+    .await
 }
 
 pub async fn open_responses_proxy_request_with_settings_for_path(
@@ -1494,8 +2249,32 @@ pub async fn open_responses_proxy_request_with_settings_for_path(
     settings: crate::settings::BackendSettings,
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    open_responses_proxy_request_with_settings_and_user_agent(body, settings, None, request_path)
-        .await
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        None,
+        request_path,
+        None,
+        ProxySessionHeaders::default(),
+    )
+    .await
+}
+
+pub async fn open_responses_proxy_request_with_settings_for_path_and_beta(
+    body: &str,
+    settings: crate::settings::BackendSettings,
+    request_path: &str,
+    beta_features: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        None,
+        request_path,
+        beta_features,
+        ProxySessionHeaders::default(),
+    )
+    .await
 }
 
 #[doc(hidden)]
@@ -1510,6 +2289,8 @@ pub async fn open_responses_proxy_request_with_settings_and_official_endpoint(
         None,
         "/responses",
         official_endpoint,
+        None,
+        ProxySessionHeaders::default(),
     )
     .await
 }
@@ -1519,6 +2300,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     settings: crate::settings::BackendSettings,
     original_user_agent: Option<&str>,
     request_path: &str,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     open_responses_proxy_request_with_settings_and_user_agent_and_official_endpoint(
         body,
@@ -1526,6 +2309,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         original_user_agent,
         request_path,
         OFFICIAL_CHATGPT_CODEX_RESPONSES_URL,
+        beta_features,
+        session_headers,
     )
     .await
 }
@@ -1536,6 +2321,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
     original_user_agent: Option<&str>,
     request_path: &str,
     official_endpoint: &str,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
     let codex_app_tools_filter =
@@ -1558,13 +2345,36 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let source_model = request_json
+    let mut source_model = request_json
         .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("")
         .to_string();
-    let route_provider_id = crate::official_experience::route_provider_id_from_path(request_path);
+    let mut route_provider_id =
+        crate::official_experience::route_provider_id_from_path(request_path);
+    if let Some(original) = route_provider_id.as_deref()
+        && let Some(inherited) = session_headers.following_provider(&settings, original)?
+    {
+        // 仅剥离旧实例自己的官方别名；不能借跟随规则接纳其他账号/供应商别名。
+        if let Some((prefix, bare)) = source_model.split_once(':') {
+            anyhow::ensure!(
+                prefix == original,
+                "旧子代理模型别名与原来源不一致，停止账号跟随"
+            );
+            source_model = bare.to_string();
+            request_json["model"] = json!(source_model);
+        }
+        if inherited != original {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.child_account_follow",
+                json!({
+                    "from": original, "to": inherited, "threadId": session_headers.thread_id, "sessionId": session_headers.session_id,
+                }),
+            );
+        }
+        route_provider_id = Some(inherited);
+    }
     let official_endpoint_for_path = if is_responses_compact_proxy_path(request_path) {
         format!("{}/compact", official_endpoint.trim_end_matches('/'))
     } else {
@@ -1572,7 +2382,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
     };
     let route_descriptor = match route_provider_id.as_deref() {
         Some(crate::official_experience::PRIMARY_OFFICIAL_PROVIDER_ID) => {
-            anyhow::bail!("主官方模型不得经过 Codex++ 本地协议代理")
+            anyhow::ensure!(
+                settings.official_experience.enabled
+                    && settings.official_experience.follow_parent_account,
+                "主官方模型不得经过 Codex++ 本地协议代理"
+            );
+            let mut descriptor = crate::official_experience::descriptor_for_provider_and_model(
+                &settings,
+                "openai",
+                &source_model,
+            )
+            .context("主官方模型不在可信目录；停止请求")?;
+            descriptor.source_id = settings.active_official_account_id.clone();
+            descriptor.source_kind = crate::settings::OfficialExperienceSourceKind::DirectOfficial;
+            Some(descriptor)
         }
         Some(crate::official_experience::LEGACY_CUSTOM_PROVIDER_ID) | None => None,
         Some(provider_id) => {
@@ -1646,20 +2469,47 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
     if let Some(descriptor) = route_descriptor.as_ref()
         && descriptor.source_kind == crate::settings::OfficialExperienceSourceKind::DirectOfficial
     {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.direct_official_request",
-            json!({"sourceId": descriptor.source_id, "operation": "responses", "providerId": descriptor.provider_id}),
-        );
+        if descriptor.provider_id == crate::official_account_schedule::PROVIDER_ID {
+            return open_scheduled_official_request(
+                &settings,
+                request_json,
+                is_stream,
+                original_user_agent,
+                &official_endpoint_for_path,
+                session_headers,
+            )
+            .await;
+        }
         let auth = resolve_stored_official_account_auth(&descriptor.source_id).await?;
-        return open_official_chatgpt_responses_request(
+        let response = open_official_chatgpt_responses_request(
             &settings,
             request_json,
             is_stream,
             original_user_agent,
             &official_endpoint_for_path,
             Some(auth),
+            session_headers,
         )
-        .await;
+        .await?;
+        // 已验证凭据身份且收到响应头；此事件不表示流已成功完成。
+        let audit_uuid = |value: Option<&str>| {
+            value.and_then(|id| {
+                uuid::Uuid::parse_str(id.trim())
+                    .ok()
+                    .map(|id| id.to_string())
+            })
+        };
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.direct_official_dispatch",
+            json!({
+                "sourceId": descriptor.source_id, "providerId": descriptor.provider_id,
+                "upstreamModel": descriptor.upstream_model,
+                "operation": if is_responses_compact_proxy_path(request_path) { "responses/compact" } else { "responses" },
+                "threadId": audit_uuid(session_headers.thread_id), "sessionId": audit_uuid(session_headers.session_id),
+                "phase": "response_headers", "statusCode": response.status_code, "willFailover": false,
+            }),
+        );
+        return Ok(response);
     }
     if let Some(route) = &model_route
         && route.upstream_model != source_model
@@ -1695,6 +2545,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
                     original_user_agent,
                     &official_endpoint_for_path,
                     None,
+                    session_headers,
                 )
                 .await;
             }
@@ -1735,48 +2586,54 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
         Some(relay.id.as_str())
     );
     let relay_count = relays.len();
-    for (attempt, relay) in relays.into_iter().enumerate() {
-        validate_upstream(&relay)?;
-        let model_override = aggregate_upstream_model_override(&settings, &relay, requested_model);
-        let (endpoint, upstream_body, wire_api) = upstream_request_parts(
-            &relay,
-            request_json.clone(),
-            request_path,
-            model_override.as_deref(),
-        )
-        .await?;
-        let has_more_candidates = attempt + 1 < relay_count;
-        let header_timeout = response_header_timeout(is_stream);
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.upstream_request",
-            json!({
-                "relayId": relay.id,
-                "relayName": relay.name,
-                "endpoint": endpoint,
-                "wireApi": wire_api,
-                "stream": is_stream,
-                "attempt": attempt + 1,
-                "candidateCount": relay_count,
-                "headerTimeoutSeconds": header_timeout.as_secs(),
-                "modelRoute": model_route.as_ref().map(|route| json!({
-                    "sourceRelayId": route.source_relay_id,
-                    "sourceModel": route.source_model,
-                    "targetRelayId": route.relay.id,
-                    "upstreamModel": route.upstream_model
-                })),
-                "routeDescriptor": route_descriptor.as_ref().map(|descriptor| json!({
-                    "providerId": descriptor.provider_id,
-                    "sourceKind": descriptor.source_kind,
-                    "sourceId": descriptor.source_id,
-                    "routingSlug": descriptor.routing_slug,
-                    "upstreamModel": descriptor.upstream_model,
-                    "capabilitySlug": descriptor.capability_slug,
-                    "failoverPolicy": descriptor.failover_policy
-                }))
-            }),
-        );
-        let mut upstream = match send_upstream_request_for_responses(
-            upstream_request_builder(
+    let mut cooldown_retries = 0_usize;
+    'request: loop {
+        for (attempt, relay) in relays.iter().cloned().enumerate() {
+            validate_upstream(&relay)?;
+            validate_upstream(&relay)?;
+            let channel_key = crate::channel_protection::key_for_relay(&relay);
+            let channel_permit = crate::channel_protection::acquire(&channel_key, &relay).await;
+            let model_override =
+                aggregate_upstream_model_override(&settings, &relay, requested_model);
+            let (endpoint, upstream_body, wire_api, compaction) = upstream_request_parts(
+                &relay,
+                request_json.clone(),
+                request_path,
+                model_override.as_deref(),
+            )
+            .await?;
+            let is_compaction_request = compaction;
+            let has_more_candidates = attempt + 1 < relay_count;
+            let header_timeout = response_header_timeout(is_stream);
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.upstream_request",
+                json!({
+                    "relayId": relay.id,
+                    "relayName": relay.name,
+                    "endpoint": endpoint,
+                    "wireApi": wire_api,
+                    "stream": is_stream,
+                    "attempt": attempt + 1,
+                    "candidateCount": relay_count,
+                    "headerTimeoutSeconds": header_timeout.as_secs(),
+                    "modelRoute": model_route.as_ref().map(|route| json!({
+                        "sourceRelayId": route.source_relay_id,
+                        "sourceModel": route.source_model,
+                        "targetRelayId": route.relay.id,
+                        "upstreamModel": route.upstream_model
+                    })),
+                    "routeDescriptor": route_descriptor.as_ref().map(|descriptor| json!({
+                        "providerId": descriptor.provider_id,
+                        "sourceKind": descriptor.source_kind,
+                        "sourceId": descriptor.source_id,
+                        "routingSlug": descriptor.routing_slug,
+                        "upstreamModel": descriptor.upstream_model,
+                        "capabilitySlug": descriptor.capability_slug,
+                        "failoverPolicy": descriptor.failover_policy
+                    }))
+                }),
+            );
+            let mut builder = upstream_request_builder(
                 crate::http_client::proxied_client(&effective_user_agent(
                     &relay.user_agent,
                     original_user_agent,
@@ -1785,138 +2642,28 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
                 &relay,
                 is_stream,
                 &upstream_body,
-            ),
-            is_stream,
-        )
-        .await
-        {
-            Ok(upstream) => upstream,
-            Err(error) => {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "protocol_proxy.upstream_request_failed",
-                    json!({
-                        "relayId": relay.id,
-                        "relayName": relay.name,
-                        "endpoint": endpoint,
-                        "wireApi": wire_api,
-                        "stream": is_stream,
-                        "attempt": attempt + 1,
-                        "candidateCount": relay_count,
-                        "headerTimeoutSeconds": header_timeout.as_secs(),
-                        "willFailover": has_more_candidates,
-                        "error": error.to_string()
-                    }),
-                );
-                if track_aggregate_rotation {
-                    crate::relay_rotation::record_relay_request_failure(&settings);
+            );
+            builder = session_headers.apply(builder, Some(&relay));
+            if wire_api == UpstreamWireApi::Responses {
+                if let Some(value) = beta_features.filter(|value| !value.is_empty()) {
+                    builder = builder.header("x-codex-beta-features", value);
                 }
-                if has_more_candidates {
-                    continue;
-                }
-                return Err(error).with_context(|| {
-                    format!(
-                        "供应商「{}」请求上游失败，endpoint: {}",
-                        relay.name, endpoint
-                    )
-                });
             }
-        };
-        let status_code = upstream.status().as_u16();
-        let content_type = upstream
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let mut prefetched_chunk = Vec::new();
-        if settings.codex_app_capacity_retry && (200..300).contains(&status_code) && is_stream {
-            match probe_stream_start_for_capacity_error(&mut upstream).await {
-                Ok(StreamCapacityProbe::CapacityError(capacity_error_chunk)) => {
-                    let capacity_retry_attempt = capacity_retry_key.and_then(|key| {
-                        next_capacity_retry_attempt(
-                            key,
-                            settings.codex_app_capacity_retry_max_attempts,
-                        )
-                    });
-                    if capacity_retry_attempt.is_none() {
-                        let _ = crate::diagnostic_log::append_diagnostic_log(
-                            "protocol_proxy.upstream_stream_capacity_passthrough",
-                            json!({
-                                "relayId": relay.id,
-                                "relayName": relay.name,
-                                "endpoint": endpoint,
-                                "wireApi": wire_api,
-                                "stream": true,
-                                "statusCode": status_code,
-                                "attempt": attempt + 1,
-                                "candidateCount": relay_count,
-                                "maxAttempts": settings.codex_app_capacity_retry_max_attempts,
-                                "reason": "selected_model_at_capacity"
-                            }),
-                        );
-                        return Ok(UpstreamProxyResponse {
-                            status_code,
-                            content_type,
-                            is_stream: true,
-                            wire_api,
-                            capacity_retryable: false,
-                            capacity_retry_enabled: true,
-                            capacity_retry_key,
-                            capacity_retry_max_attempts: settings
-                                .codex_app_capacity_retry_max_attempts,
-                            prefetched_chunk: capacity_error_chunk,
-                            response: upstream,
-                        });
-                    }
-                    let capacity_retry_attempt = capacity_retry_attempt.unwrap_or_default();
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "protocol_proxy.upstream_stream_capacity_rewritten",
-                        json!({
-                            "relayId": relay.id,
-                            "relayName": relay.name,
-                            "endpoint": endpoint,
-                            "wireApi": wire_api,
-                            "stream": true,
-                            "statusCode": status_code,
-                            "attempt": attempt + 1,
-                            "candidateCount": relay_count,
-                            "capacityRetryAttempt": capacity_retry_attempt,
-                            "capacityRetryMaxAttempts": settings.codex_app_capacity_retry_max_attempts,
-                            "willFailover": false,
-                            "reason": "selected_model_at_capacity"
-                        }),
-                    );
-                    if track_aggregate_rotation {
-                        crate::relay_rotation::record_relay_request_event(
-                            &settings,
-                            RotationEvent::Failure,
-                        );
-                    }
-                    return Ok(UpstreamProxyResponse {
-                        status_code: 503,
-                        content_type: "application/json; charset=utf-8".to_string(),
-                        is_stream: false,
-                        wire_api,
-                        capacity_retryable: true,
-                        capacity_retry_enabled: true,
-                        capacity_retry_key,
-                        capacity_retry_max_attempts: settings.codex_app_capacity_retry_max_attempts,
-                        prefetched_chunk: Vec::new(),
-                        response: upstream,
-                    });
-                }
-                Ok(StreamCapacityProbe::Prefetched(chunk)) => prefetched_chunk = chunk,
+            let mut upstream = match send_upstream_request_for_responses(builder, is_stream).await {
+                Ok(upstream) => upstream,
                 Err(error) => {
+                    drop(channel_permit);
                     let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "protocol_proxy.upstream_stream_probe_failed",
+                        "protocol_proxy.upstream_request_failed",
                         json!({
                             "relayId": relay.id,
                             "relayName": relay.name,
                             "endpoint": endpoint,
                             "wireApi": wire_api,
-                            "stream": true,
+                            "stream": is_stream,
                             "attempt": attempt + 1,
                             "candidateCount": relay_count,
+                            "headerTimeoutSeconds": header_timeout.as_secs(),
                             "willFailover": has_more_candidates,
                             "error": error.to_string()
                         }),
@@ -1927,70 +2674,226 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
                     if has_more_candidates {
                         continue;
                     }
-                    return Err(error).context("读取上游流首段失败");
+                    return Err(error).with_context(|| {
+                        format!(
+                            "供应商「{}」请求上游失败，endpoint: {}",
+                            relay.name, endpoint
+                        )
+                    });
+                }
+            };
+            let status_code = upstream.status().as_u16();
+
+            let content_type = upstream
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let mut prefetched_chunk = Vec::new();
+            if settings.codex_app_capacity_retry && (200..300).contains(&status_code) && is_stream {
+                match probe_stream_start_for_capacity_error(&mut upstream).await {
+                    Ok(StreamCapacityProbe::CapacityError(capacity_error_chunk)) => {
+                        let capacity_retry_attempt = capacity_retry_key.and_then(|key| {
+                            next_capacity_retry_attempt(
+                                key,
+                                settings.codex_app_capacity_retry_max_attempts,
+                            )
+                        });
+                        if capacity_retry_attempt.is_none() {
+                            let _ = crate::diagnostic_log::append_diagnostic_log(
+                                "protocol_proxy.upstream_stream_capacity_passthrough",
+                                json!({
+                                    "relayId": relay.id,
+                                    "relayName": relay.name,
+                                    "endpoint": endpoint,
+                                    "wireApi": wire_api,
+                                    "stream": true,
+                                    "statusCode": status_code,
+                                    "attempt": attempt + 1,
+                                    "candidateCount": relay_count,
+                                    "maxAttempts": settings.codex_app_capacity_retry_max_attempts,
+                                    "reason": "selected_model_at_capacity"
+                                }),
+                            );
+                            return Ok(UpstreamProxyResponse {
+                                status_code,
+                                content_type,
+                                is_stream: true,
+                                wire_api,
+                                capacity_retryable: false,
+                                capacity_retry_enabled: true,
+                                capacity_retry_key,
+                                capacity_retry_max_attempts: settings
+                                    .codex_app_capacity_retry_max_attempts,
+                                prefetched_chunk: capacity_error_chunk,
+                                compaction: is_compaction_request,
+                                response: upstream,
+                                scheduled_account_id: None,
+                                _channel_permit: Some(channel_permit),
+                            });
+                        }
+                        let capacity_retry_attempt = capacity_retry_attempt.unwrap_or_default();
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "protocol_proxy.upstream_stream_capacity_rewritten",
+                            json!({
+                                "relayId": relay.id,
+                                "relayName": relay.name,
+                                "endpoint": endpoint,
+                                "wireApi": wire_api,
+                                "stream": true,
+                                "statusCode": status_code,
+                                "attempt": attempt + 1,
+                                "candidateCount": relay_count,
+                                "capacityRetryAttempt": capacity_retry_attempt,
+                                "capacityRetryMaxAttempts": settings.codex_app_capacity_retry_max_attempts,
+                                "willFailover": false,
+                                "reason": "selected_model_at_capacity"
+                            }),
+                        );
+                        if track_aggregate_rotation {
+                            crate::relay_rotation::record_relay_request_event(
+                                &settings,
+                                RotationEvent::Failure,
+                            );
+                        }
+                        return Ok(UpstreamProxyResponse {
+                            status_code: 503,
+                            content_type: "application/json; charset=utf-8".to_string(),
+                            is_stream: false,
+                            wire_api,
+                            capacity_retryable: true,
+                            capacity_retry_enabled: true,
+                            capacity_retry_key,
+                            capacity_retry_max_attempts: settings
+                                .codex_app_capacity_retry_max_attempts,
+                            prefetched_chunk: Vec::new(),
+                            compaction: is_compaction_request,
+                            response: upstream,
+                            scheduled_account_id: None,
+                            _channel_permit: Some(channel_permit),
+                        });
+                    }
+                    Ok(StreamCapacityProbe::Prefetched(chunk)) => prefetched_chunk = chunk,
+                    Err(error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "protocol_proxy.upstream_stream_probe_failed",
+                            json!({
+                                "relayId": relay.id,
+                                "relayName": relay.name,
+                                "endpoint": endpoint,
+                                "wireApi": wire_api,
+                                "stream": true,
+                                "attempt": attempt + 1,
+                                "candidateCount": relay_count,
+                                "willFailover": has_more_candidates,
+                                "error": error.to_string()
+                            }),
+                        );
+                        if track_aggregate_rotation {
+                            crate::relay_rotation::record_relay_request_failure(&settings);
+                        }
+                        if has_more_candidates {
+                            continue;
+                        }
+                        return Err(error).context("读取上游流首段失败");
+                    }
                 }
             }
-        }
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.upstream_response",
-            json!({
-                "relayId": relay.id,
-                "relayName": relay.name,
-                "endpoint": endpoint,
-                "wireApi": wire_api,
-                "stream": is_stream,
-                "statusCode": status_code,
-                "attempt": attempt + 1,
-                "candidateCount": relay_count,
-                "headerTimeoutSeconds": header_timeout.as_secs(),
-                "willFailover": has_more_candidates && !(200..300).contains(&status_code)
-            }),
-        );
-        if track_aggregate_rotation {
-            crate::relay_rotation::record_relay_request_event(
-                &settings,
-                if (200..300).contains(&status_code) {
-                    RotationEvent::Success
-                } else {
-                    RotationEvent::Failure
-                },
+            let retry_after = crate::channel_protection::retry_after_duration(upstream.headers());
+
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.upstream_response",
+                json!({
+                    "relayId": relay.id,
+                    "relayName": relay.name,
+                    "endpoint": endpoint,
+                    "wireApi": wire_api,
+                    "stream": is_stream,
+                    "statusCode": status_code,
+                    "attempt": attempt + 1,
+                    "candidateCount": relay_count,
+                    "headerTimeoutSeconds": header_timeout.as_secs(),
+                    "willFailover": has_more_candidates && !(200..300).contains(&status_code)
+                }),
+            );
+            if track_aggregate_rotation {
+                crate::relay_rotation::record_relay_request_event(
+                    &settings,
+                    if (200..300).contains(&status_code) {
+                        RotationEvent::Success
+                    } else {
+                        RotationEvent::Failure
+                    },
+                );
+            }
+            if (200..300).contains(&status_code) || !has_more_candidates {
+                if (200..300).contains(&status_code)
+                    && let Some(key) = capacity_retry_key
+                {
+                    reset_capacity_retry_attempts(key);
+                }
+                if !(200..300).contains(&status_code) {
+                    let cooldown_started = crate::channel_protection::mark_failure(
+                        &channel_key,
+                        &relay,
+                        status_code,
+                        retry_after,
+                    )
+                    .await;
+                    if cooldown_started && should_retry_after_cooldown(cooldown_retries) {
+                        cooldown_retries = cooldown_retries.saturating_add(1);
+                        drop(channel_permit);
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "protocol_proxy.channel_cooldown_retry",
+                            json!({
+                                "relayId": relay.id,
+                                "relayName": relay.name,
+                                "statusCode": status_code,
+                                "retryAfterSeconds": retry_after.map(|value| value.as_secs()),
+                                "retry": cooldown_retries
+                            }),
+                        );
+                        continue 'request;
+                    }
+                }
+                return Ok(UpstreamProxyResponse {
+                    status_code,
+                    is_stream: is_stream || content_type.contains("text/event-stream"),
+                    content_type,
+                    wire_api,
+                    capacity_retryable: false,
+                    capacity_retry_enabled: settings.codex_app_capacity_retry,
+                    capacity_retry_key,
+                    capacity_retry_max_attempts: settings.codex_app_capacity_retry_max_attempts,
+                    prefetched_chunk,
+                    compaction: is_compaction_request,
+
+                    response: upstream,
+                    scheduled_account_id: None,
+                    _channel_permit: Some(channel_permit),
+                });
+            }
+            crate::channel_protection::mark_failure(&channel_key, &relay, status_code, retry_after)
+                .await;
+            drop(channel_permit);
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.upstream_failover",
+                json!({
+                    "relayId": relay.id,
+                    "relayName": relay.name,
+                    "endpoint": endpoint,
+                    "wireApi": wire_api,
+                    "stream": is_stream,
+                    "statusCode": status_code,
+                    "attempt": attempt + 1,
+                    "candidateCount": relay_count,
+                    "headerTimeoutSeconds": header_timeout.as_secs()
+                }),
             );
         }
-        if (200..300).contains(&status_code) || !has_more_candidates {
-            if (200..300).contains(&status_code)
-                && let Some(key) = capacity_retry_key
-            {
-                reset_capacity_retry_attempts(key);
-            }
-            return Ok(UpstreamProxyResponse {
-                status_code,
-                is_stream: is_stream || content_type.contains("text/event-stream"),
-                content_type,
-                wire_api,
-                capacity_retryable: false,
-                capacity_retry_enabled: settings.codex_app_capacity_retry,
-                capacity_retry_key,
-                capacity_retry_max_attempts: settings.codex_app_capacity_retry_max_attempts,
-                prefetched_chunk,
-                response: upstream,
-            });
-        }
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.upstream_failover",
-            json!({
-                "relayId": relay.id,
-                "relayName": relay.name,
-                "endpoint": endpoint,
-                "wireApi": wire_api,
-                "stream": is_stream,
-                "statusCode": status_code,
-                "attempt": attempt + 1,
-                "candidateCount": relay_count,
-                "headerTimeoutSeconds": header_timeout.as_secs()
-            }),
-        );
+        anyhow::bail!("未找到可用的聚合供应商成员")
     }
-    anyhow::bail!("未找到可用的聚合供应商成员")
 }
 
 fn select_model_route(
@@ -2117,6 +3020,524 @@ mod direct_official_auth_tests {
     }
 
     #[tokio::test]
+    async fn direct_official_dispatch_preserves_selected_account_and_session_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        struct Restore {
+            accounts: Option<(std::path::PathBuf, std::path::PathBuf)>,
+            catalog: Option<std::path::PathBuf>,
+            settings: Option<std::path::PathBuf>,
+            home: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::paths::set_official_account_paths_for_tests(self.accounts.take());
+                crate::paths::set_official_model_catalog_path_for_tests(self.catalog.take());
+                crate::paths::set_settings_path_for_tests(self.settings.take());
+                crate::diagnostic_log::set_diagnostic_log_path_for_tests(None);
+                unsafe {
+                    match self.home.take() {
+                        Some(home) => std::env::set_var("CODEX_HOME", home),
+                        None => std::env::remove_var("CODEX_HOME"),
+                    }
+                }
+            }
+        }
+        let paths = (
+            temp.path().join("accounts.json"),
+            temp.path().join("secrets.json"),
+        );
+        assert!(paths.0.starts_with(temp.path()) && paths.1.starts_with(temp.path()));
+        let catalog_path = temp.path().join("catalog.json");
+        let _restore = Restore {
+            accounts: crate::paths::set_official_account_paths_for_tests(Some(paths.clone())),
+            catalog: crate::paths::set_official_model_catalog_path_for_tests(Some(
+                catalog_path.clone(),
+            )),
+            settings: crate::paths::set_settings_path_for_tests(Some(
+                temp.path().join("settings.json"),
+            )),
+            home: std::env::var_os("CODEX_HOME"),
+        };
+        unsafe {
+            std::env::set_var("CODEX_HOME", temp.path());
+        }
+        let log_path = temp.path().join("audit.jsonl");
+        crate::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
+        let store = crate::official_accounts::OfficialAccountStore::default();
+        let first_auth = auth("first", "chatgpt-1");
+        let second_auth = auth("second", "chatgpt-2");
+        let (first, _) = store.upsert_auth_json(first_auth.clone()).unwrap();
+        let (second, _) = store.upsert_auth_json(second_auth.clone()).unwrap();
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.official_experience.enabled = true;
+        settings.active_official_account_id = first.id.clone();
+        settings.official_experience.primary_official_account_id = first.id.clone();
+        std::fs::write(&catalog_path, serde_json::to_vec(&json!({"version":1,"accounts":{
+            &first.id:{"accountId":first.id,"fetchedAt":1,"clientVersion":"test","models":[{"slug":"gpt-6.1-sol","visibility":"list"}]},
+            &second.id:{"accountId":second.id,"fetchedAt":1,"clientVersion":"test","models":[{"slug":"gpt-6.1-sol","visibility":"list"}]}
+        }})).unwrap()).unwrap();
+        let thread = "01a11443-b035-7e73-bb3e-be5e9ecd30a7";
+        let session = "01a11ace-65f5-7913-a794-56db911459f9";
+        let headers = ProxySessionHeaders {
+            thread_id: Some(thread),
+            session_id: Some(session),
+            opencode_session: Some("opencode-123"),
+        };
+        let graph = rusqlite::Connection::open(temp.path().join("state_5.sqlite")).unwrap();
+        graph.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,source TEXT,model_provider TEXT); CREATE TABLE thread_spawn_edges(parent_thread_id TEXT,child_thread_id TEXT);").unwrap();
+        graph
+            .execute("INSERT INTO threads VALUES(?1,'cli','openai')", [session])
+            .unwrap();
+        graph
+            .execute(
+                "INSERT INTO threads VALUES(?1,'subagent','openai')",
+                [thread],
+            )
+            .unwrap();
+        graph
+            .execute(
+                "INSERT INTO thread_spawn_edges VALUES(?1,?2)",
+                [session, thread],
+            )
+            .unwrap();
+        let first_provider = crate::official_experience::direct_official_provider_id(&first.id);
+        let second_provider = crate::official_experience::direct_official_provider_id(&second.id);
+        for (selected, selected_auth, live_auth, operation, incoming, follow) in [
+            (
+                &first,
+                &first_auth,
+                &second_auth,
+                "responses",
+                first_provider.as_str(),
+                false,
+            ),
+            (
+                &second,
+                &second_auth,
+                &first_auth,
+                "responses/compact",
+                second_provider.as_str(),
+                false,
+            ),
+            (
+                &second,
+                &second_auth,
+                &first_auth,
+                "responses",
+                "openai",
+                true,
+            ),
+            (
+                &second,
+                &second_auth,
+                &first_auth,
+                "responses/compact",
+                first_provider.as_str(),
+                true,
+            ),
+            (
+                &first,
+                &first_auth,
+                &first_auth,
+                "responses",
+                second_provider.as_str(),
+                true,
+            ),
+            (
+                &second,
+                &second_auth,
+                &first_auth,
+                "images/generations",
+                "openai",
+                true,
+            ),
+            (
+                &second,
+                &second_auth,
+                &first_auth,
+                "images/edits",
+                first_provider.as_str(),
+                true,
+            ),
+        ] {
+            settings.official_experience.follow_parent_account = follow;
+            let provider = if follow && selected.id == first.id {
+                "openai".to_string()
+            } else {
+                crate::official_experience::direct_official_provider_id(&selected.id)
+            };
+            graph
+                .execute(
+                    "UPDATE threads SET model_provider=?1 WHERE id=?2",
+                    [&provider, session],
+                )
+                .unwrap();
+            std::fs::write(
+                temp.path().join("auth.json"),
+                serde_json::to_vec(live_auth).unwrap(),
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0_u8; 4096];
+                    let count = stream.read(&mut bytes).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let path = format!("/v1/routes/{incoming}/{operation}");
+            let model = if follow && incoming != "openai" {
+                format!("{incoming}:gpt-6.1-sol")
+            } else {
+                "gpt-6.1-sol".to_string()
+            };
+            let body = json!({"model":model,"input":[],"stream":false}).to_string();
+            let image = operation.starts_with("images/");
+            let result = if image {
+                open_following_official_images_request(
+                    r#"{"model":"gpt-image-2","prompt":"local fixture"}"#,
+                    settings.clone(),
+                    if operation.ends_with("edits") {
+                        ImageProxyOperation::Edit
+                    } else {
+                        ImageProxyOperation::Generate
+                    },
+                    &endpoint,
+                    None,
+                    incoming,
+                    headers,
+                )
+                .await
+                .unwrap()
+            } else {
+                open_responses_proxy_request_with_settings_and_user_agent_and_official_endpoint(
+                    &body,
+                    settings.clone(),
+                    None,
+                    &path,
+                    &endpoint,
+                    None,
+                    headers,
+                )
+                .await
+                .unwrap()
+            };
+            assert_eq!(result.status_code, 200);
+            let request = server.await.unwrap();
+            let expected_token = selected_auth["tokens"]["access_token"].as_str().unwrap();
+            assert!(request.contains(&format!("authorization: Bearer {expected_token}")));
+            assert!(
+                request.contains(&format!(
+                    "ChatGPT-Account-Id: {}",
+                    selected_auth["tokens"]["account_id"].as_str().unwrap()
+                )) || request.contains(&format!(
+                    "chatgpt-account-id: {}",
+                    selected_auth["tokens"]["account_id"].as_str().unwrap()
+                ))
+            );
+            if !image {
+                assert!(
+                    request.contains(&format!("session-id: {session}"))
+                        && request.contains(&format!("thread-id: {thread}"))
+                        && request.contains("x-opencode-session: opencode-123")
+                );
+                assert!(request.contains(if operation.ends_with("compact") {
+                    "POST /responses/compact "
+                } else {
+                    "POST /responses "
+                }));
+                let events = std::fs::read_to_string(&log_path).unwrap();
+                let dispatch: Value = events
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .filter(|event| event["event"] == "protocol_proxy.direct_official_dispatch")
+                    .last()
+                    .unwrap();
+                assert_eq!(dispatch["detail"]["sourceId"], selected.id);
+                assert_eq!(dispatch["detail"]["providerId"], provider);
+                assert_eq!(dispatch["detail"]["threadId"], thread);
+                assert_eq!(dispatch["detail"]["upstreamModel"], "gpt-6.1-sol");
+                assert!(!events.contains(expected_token));
+                assert!(request.contains("\"model\":\"gpt-6.1-sol\""));
+            } else {
+                assert!(request.contains("\"model\":\"gpt-image-2\""));
+                let events = std::fs::read_to_string(&log_path).unwrap();
+                assert!(!events.contains("local fixture") && !events.contains(expected_token));
+            }
+            assert_eq!(
+                graph
+                    .query_row(
+                        "SELECT model_provider FROM threads WHERE id=?1",
+                        [thread],
+                        |r| r.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                "openai"
+            );
+        }
+
+        settings.official_experience.follow_parent_account = false;
+        settings.official_experience.account_schedule_enabled = true;
+        settings.official_experience.account_schedule_order =
+            vec![second.id.clone(), first.id.clone()];
+        let schedule_provider = crate::official_account_schedule::PROVIDER_ID;
+        // 启动登录账号1、首选推理账号2：写目录和 provider 不能修改 live auth。
+        std::fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec(&first_auth).unwrap(),
+        )
+        .unwrap();
+        let auth_before_schedule = std::fs::read(temp.path().join("auth.json")).unwrap();
+        crate::relay_config::ensure_official_experience_config_in_home(temp.path(), &settings)
+            .unwrap();
+        let config: toml::Table = std::fs::read_to_string(temp.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(config["model_provider"].as_str(), Some("openai"));
+        assert!(
+            config["model_providers"][schedule_provider]["base_url"]
+                .as_str()
+                .unwrap()
+                .ends_with(schedule_provider)
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("auth.json")).unwrap(),
+            auth_before_schedule
+        );
+        assert_eq!(settings.active_official_account_id, first.id);
+        assert_eq!(
+            settings.official_experience.primary_official_account_id,
+            first.id
+        );
+        // Parent and child requests retain the same provider even when the wire model is bare.
+        for model in [
+            "gpt-6.1-sol".to_string(),
+            format!("{schedule_provider}:gpt-6.1-sol"),
+        ] {
+            assert!(
+                crate::official_experience::descriptor_for_provider_and_model(
+                    &settings,
+                    schedule_provider,
+                    &model
+                )
+                .is_some()
+            );
+        }
+        for (status, payload, expected_requests) in [
+            (429, r#"{"error":{"type":"usage_limit_reached"}}"#, 2),
+            (429, r#"{"error":{"code":"rate_limit_exceeded"}}"#, 1),
+            (401, r#"{"error":{"code":"invalid_api_key"}}"#, 1),
+            (500, r#"{"error":{"code":"server_error"}}"#, 1),
+            (
+                200,
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"usage_limit_reached\"}}}\n\n",
+                2,
+            ),
+            (
+                200,
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\ndata: {\"error\":{\"type\":\"usage_limit_reached\"}}\n\n",
+                1,
+            ),
+        ] {
+            crate::official_account_schedule::mark_exhausted(&second.id, 0);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for index in 0..expected_requests {
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buf = [0u8; 4096];
+                        let size = stream.read(&mut buf).await.unwrap();
+                        assert!(size > 0);
+                        request.extend_from_slice(&buf[..size]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head =
+                                String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                            let length: usize = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length: "))
+                                .unwrap()
+                                .parse()
+                                .unwrap();
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    requests.push(String::from_utf8(request).unwrap());
+                    let (status, body) = if index == 0 {
+                        (status, payload)
+                    } else {
+                        (200, "data: {\"type\":\"response.completed\"}\n\n")
+                    };
+                    let content_type = if status == 200 {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(reply.as_bytes()).await.unwrap();
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err()
+                );
+                requests
+            });
+            let result =
+                open_responses_proxy_request_with_settings_and_user_agent_and_official_endpoint(
+                    r#"{"model":"gpt-6.1-sol","input":[],"stream":true}"#,
+                    settings.clone(),
+                    None,
+                    &format!("/v1/routes/{schedule_provider}/responses"),
+                    &endpoint,
+                    None,
+                    headers,
+                )
+                .await
+                .unwrap();
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), expected_requests);
+            for (index, request) in requests.iter().enumerate() {
+                let selected_auth = if index == 0 {
+                    &second_auth
+                } else {
+                    &first_auth
+                };
+                let token = selected_auth["tokens"]["access_token"].as_str().unwrap();
+                assert!(request.contains(&format!("authorization: Bearer {token}")));
+                assert!(request.to_ascii_lowercase().contains(&format!(
+                    "chatgpt-account-id: {}",
+                    selected_auth["tokens"]["account_id"].as_str().unwrap()
+                )));
+                assert!(request.contains(&format!("thread-id: {thread}")));
+            }
+            assert_eq!(
+                result.scheduled_account_id.as_deref(),
+                Some(if expected_requests == 2 {
+                    first.id.as_str()
+                } else {
+                    second.id.as_str()
+                })
+            );
+        }
+        // A known exhausted 5h window skips account2 before any network call.
+        assert_eq!(
+            std::fs::read(temp.path().join("auth.json")).unwrap(),
+            auth_before_schedule,
+            "调度换号不能改写启动登录身份"
+        );
+        let usage = crate::official_accounts::parse_usage_snapshot(
+            &json!({"rate_limit":{"primary_window":{
+                "used_percent":100,"limit_window_seconds":18000,"reset_at":chrono::Utc::now().timestamp()+300
+            }}}),
+        );
+        store.update_usage(&second.id, usage).unwrap();
+        assert_eq!(
+            crate::official_account_schedule::select_account(
+                &settings,
+                "gpt-6.1-sol",
+                &std::collections::HashSet::new()
+            )
+            .unwrap()
+            .id,
+            first.id
+        );
+        let mut disabled = settings.clone();
+        disabled.official_experience.account_schedule_enabled = false;
+        assert!(
+            crate::official_account_schedule::select_account(
+                &disabled,
+                "gpt-6.1-sol",
+                &std::collections::HashSet::new()
+            )
+            .is_err()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let before = std::fs::read_to_string(&log_path).unwrap();
+        for (provider, model) in [
+            ("codex_plus_official_missing".to_string(), "gpt-6.1-sol"),
+            (
+                crate::official_experience::direct_official_provider_id(&second.id),
+                "gpt-unknown",
+            ),
+        ] {
+            assert!(
+                open_responses_proxy_request_with_settings_and_user_agent_and_official_endpoint(
+                    &json!({"model":model}).to_string(),
+                    settings.clone(),
+                    None,
+                    &format!("/v1/routes/{provider}/responses"),
+                    &endpoint,
+                    None,
+                    headers
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(before, std::fs::read_to_string(&log_path).unwrap());
+    }
+
+    #[test]
+    fn client_session_header_values_are_bounded_and_cannot_inject_headers() {
+        let client = reqwest::Client::new();
+        let oversized = "x".repeat(1025);
+        let request = ProxySessionHeaders {
+            session_id: Some("ok\r\nauthorization: stolen"),
+            thread_id: Some(&oversized),
+            opencode_session: Some("  safe  "),
+        }
+        .apply(client.get("http://localhost"), None)
+        .build()
+        .unwrap();
+        assert!(
+            !request.headers().contains_key("session-id")
+                && !request.headers().contains_key("thread-id")
+                && !request.headers().contains_key("authorization")
+        );
+        assert_eq!(request.headers()["x-opencode-session"], "safe");
+    }
+
+    #[tokio::test]
     async fn explicit_account_route_reads_only_its_own_credentials() {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::official_accounts::OfficialAccountStore::new(
@@ -2189,6 +3610,117 @@ fn resolve_official_chatgpt_auth(
     }
 }
 
+/// 只在响应尚未交付客户端、且官方明确报告额度耗尽时重试下一个账号。
+async fn open_scheduled_official_request(
+    settings: &crate::settings::BackendSettings,
+    request_json: Value,
+    is_stream: bool,
+    original_user_agent: Option<&str>,
+    endpoint: &str,
+    session_headers: ProxySessionHeaders<'_>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut attempted = std::collections::HashSet::new();
+    loop {
+        let account =
+            crate::official_account_schedule::select_account(settings, model, &attempted)?;
+        attempted.insert(account.id.clone());
+        // 推理等级仍须被目标账号自己的目录支持，不能静默降级或换号。
+        if let Some(effort) = request_json
+            .pointer("/reasoning/effort")
+            .and_then(Value::as_str)
+        {
+            let entries = crate::official_model_catalog::cached_official_model_entries_for_account(
+                &account.id,
+            )
+            .unwrap_or_default();
+            if let Some(levels) = entries
+                .iter()
+                .find(|e| e.get("slug").and_then(Value::as_str) == Some(model))
+                .and_then(|e| e.get("supported_reasoning_levels"))
+                .and_then(Value::as_array)
+            {
+                anyhow::ensure!(
+                    levels
+                        .iter()
+                        .any(|v| v.get("effort").and_then(Value::as_str) == Some(effort)),
+                    "顺序调度目标账号不支持请求的推理等级：{effort}"
+                );
+            }
+        }
+        let auth = resolve_stored_official_account_auth(&account.id).await?;
+        let mut response = open_official_chatgpt_responses_request(
+            settings,
+            request_json.clone(),
+            is_stream,
+            original_user_agent,
+            endpoint,
+            Some(auth),
+            session_headers,
+        )
+        .await?;
+        let now = chrono::Utc::now().timestamp();
+        // 非流式拒绝和首段 SSE 额度错误可以安全重试；首段以外的输出不缓冲、不重放。
+        if response.status_code == 429 || (response.is_success() && response.is_stream) {
+            let limit = if response.status_code == 429 {
+                64 * 1024
+            } else {
+                16 * 1024
+            };
+            while response.prefetched_chunk.len() < limit {
+                if response.is_success()
+                    && (response.prefetched_chunk.windows(2).any(|w| w == b"\n\n")
+                        || response
+                            .prefetched_chunk
+                            .windows(4)
+                            .any(|w| w == b"\r\n\r\n"))
+                {
+                    break;
+                }
+                match tokio::time::timeout(
+                    upstream_stream_idle_timeout(),
+                    response.response.chunk(),
+                )
+                .await
+                {
+                    Ok(Ok(Some(chunk))) => response.prefetched_chunk.extend_from_slice(&chunk),
+                    Ok(Ok(None)) => break,
+                    Ok(Err(error)) => return Err(error).context("读取顺序调度响应失败"),
+                    Err(_) => anyhow::bail!("读取顺序调度响应超时"),
+                }
+            }
+            if let Some(until) =
+                crate::official_account_schedule::quota_error_reset(&response.prefetched_chunk, now)
+            {
+                crate::official_account_schedule::mark_exhausted(&account.id, until);
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.official_schedule_quota_exhausted",
+                    json!({"sourceId": account.id, "providerId": crate::official_account_schedule::PROVIDER_ID,
+                        "resetsAt": until, "attempt": attempted.len(), "phase": "before_output"}),
+                );
+                continue;
+            }
+        }
+        let audit_uuid = |value: Option<&str>| {
+            value
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .map(|id| id.to_string())
+        };
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.direct_official_dispatch",
+            json!({"sourceId": account.id, "providerId": crate::official_account_schedule::PROVIDER_ID,
+                "upstreamModel": model, "threadId": audit_uuid(session_headers.thread_id),
+                "sessionId": audit_uuid(session_headers.session_id), "phase": "response_headers",
+                "statusCode": response.status_code, "attempt": attempted.len(), "willFailover": false}),
+        );
+        response.scheduled_account_id = Some(account.id);
+        return Ok(response);
+    }
+}
+
 async fn open_official_chatgpt_responses_request(
     settings: &crate::settings::BackendSettings,
     mut request_json: Value,
@@ -2196,6 +3728,7 @@ async fn open_official_chatgpt_responses_request(
     original_user_agent: Option<&str>,
     official_endpoint: &str,
     auth_override: Option<OfficialChatGptAuth>,
+    session_headers: ProxySessionHeaders<'_>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     normalize_responses_input_items(&mut request_json);
     normalize_responses_item_ids(&mut request_json);
@@ -2220,6 +3753,7 @@ async fn open_official_chatgpt_responses_request(
         .header("ChatGPT-Account-Id", &auth.account_id)
         .header("originator", "codex_cli_rs")
         .header(reqwest::header::CONTENT_TYPE, "application/json");
+    builder = session_headers.apply(builder, None);
     if is_stream {
         builder = builder
             .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -2275,7 +3809,10 @@ async fn open_official_chatgpt_responses_request(
                         capacity_retry_key,
                         capacity_retry_max_attempts: settings.codex_app_capacity_retry_max_attempts,
                         prefetched_chunk: capacity_error_chunk,
+                        compaction: false,
                         response: upstream,
+                        scheduled_account_id: None,
+                        _channel_permit: None,
                     });
                 }
                 let capacity_retry_attempt = capacity_retry_attempt.unwrap_or_default();
@@ -2303,7 +3840,10 @@ async fn open_official_chatgpt_responses_request(
                     capacity_retry_key,
                     capacity_retry_max_attempts: settings.codex_app_capacity_retry_max_attempts,
                     prefetched_chunk: Vec::new(),
+                    compaction: false,
                     response: upstream,
+                    scheduled_account_id: None,
+                    _channel_permit: None,
                 });
             }
             Ok(StreamCapacityProbe::Prefetched(chunk)) => prefetched_chunk = chunk,
@@ -2346,7 +3886,10 @@ async fn open_official_chatgpt_responses_request(
         capacity_retry_key,
         capacity_retry_max_attempts: settings.codex_app_capacity_retry_max_attempts,
         prefetched_chunk,
+        compaction: false,
         response: upstream,
+        scheduled_account_id: None,
+        _channel_permit: None,
     })
 }
 
@@ -2455,7 +3998,11 @@ pub async fn open_models_proxy_request(
         capacity_retry_key: None,
         capacity_retry_max_attempts: 0,
         prefetched_chunk: Vec::new(),
+        compaction: false,
+
         response: upstream,
+        scheduled_account_id: None,
+        _channel_permit: None,
     })
 }
 
@@ -2509,7 +4056,11 @@ pub async fn open_audio_transcriptions_proxy_request(
         capacity_retry_key: None,
         capacity_retry_max_attempts: 0,
         prefetched_chunk: Vec::new(),
+        compaction: false,
+
         response: upstream,
+        scheduled_account_id: None,
+        _channel_permit: None,
     })
 }
 
@@ -2645,7 +4196,11 @@ async fn open_image_proxy_request(
         capacity_retry_key: None,
         capacity_retry_max_attempts: 0,
         prefetched_chunk: Vec::new(),
+        compaction: false,
+
         response: upstream,
+        scheduled_account_id: None,
+        _channel_permit: None,
     })
 }
 
@@ -2918,45 +4473,82 @@ pub async fn open_chat_completions_proxy_request(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let client = crate::http_client::proxied_client(&effective_user_agent(
-        &relay.user_agent,
-        original_user_agent,
-    ))?;
-    let mut builder = client
+    let channel_key = crate::channel_protection::key_for_relay(&relay);
+    let mut cooldown_retries = 0_usize;
+    loop {
+        let channel_permit = crate::channel_protection::acquire(&channel_key, &relay).await;
+        let mut request = crate::http_client::proxied_client(&effective_user_agent(
+            &relay.user_agent,
+            original_user_agent,
+        ))?
         .post(chat_completions_url(&relay.base_url))
         .header(reqwest::header::CONTENT_TYPE, "application/json");
-    if is_stream {
-        builder = builder
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(reqwest::header::CACHE_CONTROL, "no-cache");
-    }
-    let upstream = send_upstream_request_for_responses(
-        with_relay_auth(builder.json(&request_json), &relay),
-        is_stream,
-    )
-    .await?;
-    let status_code = upstream.status().as_u16();
-    let content_type = upstream
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        if is_stream {
+            request = request
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .header(reqwest::header::CACHE_CONTROL, "no-cache");
+        }
+        let upstream = match with_relay_auth(request.json(&request_json), &relay)
+            .send()
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                drop(channel_permit);
+                return Err(error.into());
+            }
+        };
+        let status_code = upstream.status().as_u16();
+        let retry_after = crate::channel_protection::retry_after_duration(upstream.headers());
+        if !(200..300).contains(&status_code) {
+            let cooldown_started = crate::channel_protection::mark_failure(
+                &channel_key,
+                &relay,
+                status_code,
+                retry_after,
+            )
+            .await;
+            if cooldown_started && should_retry_after_cooldown(cooldown_retries) {
+                cooldown_retries = cooldown_retries.saturating_add(1);
+                drop(channel_permit);
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.channel_cooldown_retry",
+                    json!({
+                        "relayId": relay.id,
+                        "relayName": relay.name,
+                        "statusCode": status_code,
+                        "retryAfterSeconds": retry_after.map(|value| value.as_secs()),
+                        "retry": cooldown_retries
+                    }),
+                );
+                continue;
+            }
+        }
+        let content_type = upstream
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
 
-    Ok(UpstreamProxyResponse {
-        status_code,
-        is_stream: is_stream || content_type.contains("text/event-stream"),
-        content_type,
-        wire_api: UpstreamWireApi::ChatCompletions,
-        capacity_retryable: false,
-        capacity_retry_enabled: settings.codex_app_capacity_retry,
-        capacity_retry_key: settings
-            .codex_app_capacity_retry
-            .then(|| capacity_retry_request_key(&request_json)),
-        capacity_retry_max_attempts: settings.codex_app_capacity_retry_max_attempts,
-        prefetched_chunk: Vec::new(),
-        response: upstream,
-    })
+        return Ok(UpstreamProxyResponse {
+            status_code,
+            is_stream: is_stream || content_type.contains("text/event-stream"),
+            content_type,
+            wire_api: UpstreamWireApi::ChatCompletions,
+            capacity_retryable: false,
+            capacity_retry_enabled: settings.codex_app_capacity_retry,
+            capacity_retry_key: settings
+                .codex_app_capacity_retry
+                .then(|| capacity_retry_request_key(&request_json)),
+            capacity_retry_max_attempts: settings.codex_app_capacity_retry_max_attempts,
+            prefetched_chunk: Vec::new(),
+            compaction: false,
+            response: upstream,
+            scheduled_account_id: None,
+            _channel_permit: Some(channel_permit),
+        });
+    }
 }
 
 async fn upstream_request_parts(
@@ -2964,10 +4556,14 @@ async fn upstream_request_parts(
     mut request_json: Value,
     request_path: &str,
     model_override: Option<&str>,
-) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
-    let compact = is_responses_compact_proxy_path(request_path);
-    if compact && relay.protocol == RelayProtocol::ChatCompletions {
-        anyhow::bail!("Chat Completions 协议暂不支持 Responses compact 请求");
+) -> anyhow::Result<(String, Value, UpstreamWireApi, bool)> {
+    let compact = is_responses_compact_proxy_path(request_path)
+        || request_has_compaction_trigger(&request_json);
+    let is_v2_compaction = compact && request_has_compaction_trigger(&request_json);
+    // 原生 Responses 状态必须来自上游，不能以普通摘要冒充加密状态。
+    let synthetic_compaction = compact && relay.protocol == RelayProtocol::ChatCompletions;
+    if synthetic_compaction {
+        request_json = rewrite_request_for_compaction(strip_compaction_trigger(request_json));
     }
     if let Some(model) = model_override
         .map(str::trim)
@@ -2977,7 +4573,10 @@ async fn upstream_request_parts(
     }
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
-        RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
+        RelayProtocol::ChatCompletions => responses_to_chat_completions_with_options(
+            request_json,
+            relay.standard_openai_protocol,
+        )?,
     };
     rewrite_model_for_relay(&mut body, relay);
     if relay.protocol == RelayProtocol::Responses {
@@ -3045,12 +4644,17 @@ async fn upstream_request_parts(
     };
     Ok((
         match relay.protocol {
-            RelayProtocol::Responses if compact => responses_compact_url(&relay.base_url),
+            // v2 压缩请求走普通 /responses 端点（compaction_trigger 在 input 里）；
+            // 显式 legacy compact 保留原端点。
+            RelayProtocol::Responses if compact && !is_v2_compaction => {
+                responses_compact_url(&relay.base_url)
+            }
             RelayProtocol::Responses => responses_url(&relay.base_url),
             RelayProtocol::ChatCompletions => chat_completions_url(&relay.base_url),
         },
         body,
         wire_api,
+        synthetic_compaction,
     ))
 }
 
@@ -3110,11 +4714,8 @@ fn with_relay_auth(
     request: reqwest::RequestBuilder,
     relay: &crate::settings::RelayProfile,
 ) -> reqwest::RequestBuilder {
-    if relay.uses_no_auth() {
-        request
-    } else {
-        request.bearer_auth(relay.api_key.trim())
-    }
+    // 认证（API Key / 无认证）+ 供应商自定义请求头，统一在 relay_headers 里决定优先级。
+    crate::relay_headers::apply(request, relay)
 }
 
 fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
@@ -3198,6 +4799,7 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
             body: serde_json::to_vec(&error)?,
         });
     };
+    let is_compaction = upstream.compaction;
     let upstream_content_type = upstream.content_type.clone();
     let is_stream = upstream.is_stream;
     let wire_api = upstream.wire_api;
@@ -3205,6 +4807,32 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     upstream_body.extend_from_slice(
         &read_upstream_body_with_timeout(upstream.response, upstream_body_timeout()).await?,
     );
+
+    if is_compaction {
+        // v2 压缩：无论上游协议/是否流式，都重组为单个 compaction 输出项。
+        let model = request_json
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !is_stream {
+            return Ok(ProxyHttpResponse {
+                status: "200 OK".to_string(),
+                content_type: "text/event-stream; charset=utf-8".to_string(),
+                body: wrap_non_stream_response_as_compaction(&upstream_body, model)?,
+            });
+        }
+        let mut converter = CompactionSseConverter::new(model);
+        if wire_api != UpstreamWireApi::Responses {
+            converter = converter.with_chat_upstream();
+        }
+        // 整包已收齐，直接喂给有状态 SSE 解析器（与 launcher 逐 chunk 路径同逻辑）。
+        converter.push_upstream_bytes(&upstream_body);
+        return Ok(ProxyHttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            body: converter.finish(),
+        });
+    }
 
     if wire_api == UpstreamWireApi::Responses {
         return Ok(ProxyHttpResponse {
@@ -3339,8 +4967,7 @@ fn is_local_protocol_proxy_base_url(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
         return false;
     };
-    if !url.scheme().eq_ignore_ascii_case("http") || url.port() != Some(DEFAULT_PROTOCOL_PROXY_PORT)
-    {
+    if !url.scheme().eq_ignore_ascii_case("http") || url.port() != Some(protocol_proxy_port()) {
         return false;
     }
     matches!(
@@ -3549,9 +5176,14 @@ impl ChatSseState {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let mut tool_context = build_codex_tool_context(original_request.get("tools"));
+        for namespace_tool in &collect_tool_search_output_namespaces(original_request) {
+            add_namespace_tools_to_context(&mut tool_context, namespace_tool);
+        }
         Self {
             model,
-            tool_context: build_codex_tool_context(original_request.get("tools")),
+            tool_context,
+
             original_request: Some(original_request.clone()),
             ..Self::default()
         }
@@ -4310,6 +5942,7 @@ fn truncate_error_preview(input: &str) -> String {
 const RESPONSES_ITEM_ID_PREFIXES: &[(&str, &str)] = &[
     ("message", "msg_"),
     ("reasoning", "rs_"),
+    ("compaction", "cmp_"),
     ("function_call", "fc_"),
     ("function_call_output", "fco_"),
     ("custom_tool_call", "ctc_"),
@@ -4362,9 +5995,10 @@ fn normalize_responses_item_id(item: &mut Value) {
     // 剥掉 id 上现有的前缀再换新的。取**最长**匹配：`fc_` 是 `fco_` 的前缀，
     // 先撞上短的会把 `fco_call_a` 剥成 `call_a` 再换成 `fc_call_a`，
     // 把 function_call_output 错改成 function_call。
-    // `item_` 是历史版本 Codex++ 自己造的前缀；`resp_` 来自历史版本把 message
-    // item 命名成 `{response_id}_msg`（#1431 / #1781），都要一并剥掉。
-    let suffix = ["item_", "resp_"]
+    // `item_` 是历史版本 Codex++ 自己造的前缀；`cp_` 来自压缩项错误使用
+    // `cp_{response_id}` 的版本；`resp_` 来自历史版本把 message item 命名成
+    // `{response_id}_msg`（#1431 / #1781），都要一并剥掉。
+    let suffix = ["item_", "cp_", "resp_"]
         .into_iter()
         .chain(RESPONSES_ITEM_ID_PREFIXES.iter().map(|(_, known)| *known))
         .filter_map(|known| id.strip_prefix(known).map(|rest| (known.len(), rest)))
@@ -4497,6 +6131,48 @@ fn append_responses_item(
                 }
             }));
         }
+        Some("tool_search_call") => {
+            // Codex 的 tool_search 是客户端执行的代理工具，历史回放时按
+            // function tool_call 形态映射进 chat 消息流。
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if call_id.is_empty() {
+                return;
+            }
+            seen_tool_call_ids.insert(call_id.to_string());
+            pending_tool_calls.push(json!({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "arguments": responses_arguments_to_chat(
+                        item.get("arguments").unwrap_or(&json!({}))
+                    )
+                }
+            }));
+        }
+        Some("tool_search_output") => {
+            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+            if call_id.is_empty() {
+                return;
+            }
+            let output = item.get("tools").unwrap_or(&Value::Null);
+            if !seen_tool_call_ids.contains(call_id) {
+                flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
+                flush_reasoning(messages, pending_reasoning);
+                messages.push(orphan_tool_output_message(call_id, output));
+                return;
+            }
+            flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": tool_output_content(output)
+            }));
+        }
         Some("custom_tool_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
@@ -4571,6 +6247,18 @@ fn append_responses_item(
                 }
             }
         }
+        Some(COMPACTION_OUTPUT_TYPE) => {
+            // codex 历史回放：上次压缩的结果以 `compaction` item 形式出现在 input
+            // 里，`encrypted_content` 是我们生成的明文摘要，展开成 user 消息喂给上游。
+            flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
+            flush_reasoning(messages, pending_reasoning);
+            if let Some(message) = expand_compaction_item(item) {
+                messages.push(message);
+            }
+        }
+        Some(COMPACTION_TRIGGER_TYPE) => {
+            // 控制项不进上游历史；正常请求不该出现，出现即忽略。
+        }
         _ => {
             flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
             if let Some(content) = item.get("content") {
@@ -4623,6 +6311,114 @@ fn orphan_tool_output_message(call_id: &str, output: &Value) -> Value {
 ///
 /// 这里把没有配对 output 的 tool_call 从消息里摘掉，降级成文本保留在历史中，
 /// 避免丢失「模型曾试图调用某工具」这一信息。
+/// 把插在「连续 tool 结果」之间的非 tool 消息整体搬到该 tool 区之后
+/// （issue #2275 / #2257）。
+///
+/// 上游 codex 会把 `<image_resize_notice>` 这类提示以 developer（映射成 system）
+/// 或 user 消息的形式插在两条 tool 结果之间，形成夹心结构：
+/// `assistant(tool_calls=[a,b]) → tool(a) → developer → tool(b)`。
+/// `enforce_tool_call_pairing` 用 `take_while` 只收集「role 连续为 tool」的后续消息，
+/// 数到夹心就停，于是 followers 只有 1 条、`b` 被误判 orphaned 并从 `tool_calls`
+/// 摘掉，但 `b` 的 tool 消息还留在原地 —— 这正是「role 'tool' 无前置 tool_calls」
+/// 与「No tool output found for tool call」的来源。
+///
+/// 这里在配对判定**之前**把夹心消息移到 tool 区之后，使 tool 结果重新连续。
+/// system 形态的夹心会被后续的 `collapse_system_messages_to_head` 带到头部（合法），
+/// user 形态的则留在 tool 区之后（同样合法）。
+fn relocate_interleaved_non_tool_messages(messages: &mut Vec<Value>) {
+    let mut index = 0;
+    while index < messages.len() {
+        let Some(tool_calls) = messages[index].get("tool_calls").and_then(Value::as_array) else {
+            index += 1;
+            continue;
+        };
+        let mut unanswered: BTreeSet<String> = tool_calls
+            .iter()
+            .filter_map(|tool_call| tool_call.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        if unanswered.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // 从本条 assistant 往后扫，收集本轮的所有 tool 结果与夹在其中的非 tool 消息，
+        // 直到 tool_call 集合配齐、撞上下一条 assistant（新轮次，不能越界）、或到底。
+        let mut tool_messages: Vec<Value> = Vec::new();
+        let mut interleaved: Vec<Value> = Vec::new();
+        let mut scan = index + 1;
+        while scan < messages.len() {
+            let role = messages[scan].get("role").and_then(Value::as_str);
+            if role == Some("assistant") {
+                break;
+            }
+            if role == Some("tool") {
+                if let Some(id) = messages[scan].get("tool_call_id").and_then(Value::as_str) {
+                    unanswered.remove(id);
+                }
+                tool_messages.push(messages[scan].clone());
+            } else if !tool_messages.is_empty() {
+                // 只有已经收到过 tool 结果之后的夹心才值得搬：
+                // 本条 assistant 尚未收到任何结果时，中间的消息是正常历史，不是夹心。
+                interleaved.push(messages[scan].clone());
+            }
+            scan += 1;
+            if unanswered.is_empty() {
+                break;
+            }
+        }
+
+        if interleaved.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // 重建这段区间：tool 结果。配齐时）在前、夹心消息在后。
+        let rebuilt: Vec<Value> = tool_messages.into_iter().chain(interleaved).collect();
+        let rebuilt_len = rebuilt.len();
+        messages.splice(index + 1..scan, rebuilt);
+        // 跳过刚重建的区间，避免在搬动过的消息上重复扫描导致死循环。
+        index += 1 + rebuilt_len;
+    }
+}
+
+/// 把没有前置 `tool_calls` 的 tool 消息降级成 user（issue #2275 / #2257 的防线）。
+///
+/// `enforce_tool_call_pairing` 目前只清理 assistant 侧（把 orphaned 的 tool_call
+/// 从 `tool_calls` 摘掉），被摘掉的那些 tool 消息本身仍留在原位，上游会直接
+/// 400「No tool output found for tool call」。这里把它们降级成 user，保住内容
+/// 且不再触发协议错误。
+fn degrade_unpaired_tool_messages(messages: &mut [Value]) {
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    for message in messages.iter() {
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in tool_calls {
+                if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                    known.insert(id.to_string());
+                }
+            }
+        }
+    }
+
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let paired = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| known.contains(id));
+        if paired {
+            continue;
+        }
+        let content = message.get("content").cloned().unwrap_or(Value::Null);
+        *message = json!({
+            "role": "user",
+            "content": content
+        });
+    }
+}
+
 fn enforce_tool_call_pairing(messages: &mut [Value]) {
     let mut index = 0;
     while index < messages.len() {
@@ -4897,6 +6693,19 @@ fn flush_tool_calls(
     if let Some(last) = messages.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some("assistant") {
             merge_tool_calls_into_message(last, std::mem::take(pending_tool_calls));
+            // 合并路径同样要消费 pending_reasoning（issue #2210）。
+            // 触发时序：reasoning item → 不带 tool_calls 的 assistant 文本消息
+            // （pending_tool_calls 为空，reasoning 被附加到该文本消息并 take）→
+            // function_call。此时最后一条已是 assistant，走本分支提前 return，
+            // 若这里不追加，随后的 reasoning 就随函数返回被静默丢弃；
+            // 而 ensure_tool_call_reasoning_content 只补 content 与
+            // reasoning_content 同时为空的占位，content 非空时补不上。
+            if !pending_reasoning.is_empty() {
+                append_reasoning_to_assistant_message(
+                    last,
+                    &std::mem::take(pending_reasoning).join("\n"),
+                );
+            }
             return;
         }
     }
@@ -5159,6 +6968,25 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                 }
             }
             "namespace" => add_namespace_tools_to_context(&mut context, tool),
+            // Codex 的 tool_search（MCP 延迟加载检索）是客户端执行的代理工具：
+            // 转发层把它当作 custom 代理工具登记，模型调用回来时还原成
+            // tool_search_call item，检索本身仍由 Codex 客户端执行。
+            "tool_search" => {
+                let name = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("tool_search");
+                context.custom_tools.insert(
+                    name.to_string(),
+                    CodexCustomToolSpec {
+                        openai_name: name.to_string(),
+                        kind: CodexCustomToolKind::ToolSearch,
+                        proxy_action: None,
+                    },
+                );
+                context.has_custom_tools = true;
+            }
             "web_search" | "local_shell" | "computer_use" => {
                 let name = tool
                     .get("name")
@@ -5258,6 +7086,28 @@ fn responses_tools_to_chat_tools(tools: &[Value], context: &CodexToolContext) ->
                 }
             }
             "namespace" => converted.extend(namespace_tool_to_chat_tools(tool, context)),
+            // tool_search 透传为 chat 的 function 工具，名字保持 tool_search，
+            // 检索由 Codex 客户端执行（execution: client），转发层只做搬运。
+            "tool_search" => {
+                let name = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("tool_search");
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let parameters = tool.get("parameters").cloned().unwrap_or_else(|| json!({}));
+                converted.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters
+                    }
+                }));
+            }
             _ => {}
         }
     }
@@ -5387,7 +7237,9 @@ fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
         .as_object()
         .is_some_and(|object| object.len() == 1 && object.contains_key("$ref"));
     if !is_bare_ref {
-        if normalized.get("type").is_none() {
+        // `type: null` 与缺失等价：严格供应商（如 deepseek）会以
+        // `got 'type: null'` 拒绝整个请求（issue #2247）。
+        if normalized.get("type").is_none_or(Value::is_null) {
             normalized["type"] = json!("object");
         }
         if normalized.get("properties").is_none() {
@@ -5397,7 +7249,202 @@ fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
             normalized["required"] = json!([]);
         }
     }
-    inline_ref_siblings(&normalized)
+    let normalized = inline_ref_siblings(&normalized);
+    // 必须先内联再摊平：合并分支时 $defs 已摊开才拿得到真实属性（issue #2367）。
+    flatten_top_level_combinators(normalized)
+}
+
+/// JSON Schema 的顶层组合器（`oneOf` / `anyOf` / `allOf`）。
+const SCHEMA_COMBINATOR_KEYS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+/// 摊平工具 schema **顶层**的组合器（issue #2367）。
+///
+/// zod-to-json-schema 会生成形如
+/// `{type:"object", properties:{}, oneOf:[{$ref:"#/$defs/__schema0"},…], $defs:{…}}`
+/// 的 schema。部分上游（Anthropic 系）拒绝顶层 `oneOf`，直接整轮 400、模型完全不可用。
+/// 全仓原本对 `oneOf` 零处理。
+///
+/// 策略（保守优先，绝不让整轮失败）：
+/// 1. 顶层有组合器时，逐分支归一化后再摊平；
+/// 2. `properties` 取各分支并集，同名属性都是 object 时递归合并其 properties；
+///    `required` 取交集（只有所有分支都要求才算必须）；
+/// 3. 剥掉组合器键，补回 `type:"object"`；
+/// 4. 无法摊平（分支不是对象、合并后 properties 为空）时把各分支塞进一个带
+///    description 的私有字段，保住信息且 schema 仍合法；
+/// 5. 结果仍不是合法对象 schema 时原样返回——宁可交给上游判断，也不静默丢掉工具。
+fn flatten_top_level_combinators(schema: Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema;
+    };
+    let Some((key, branches)) = SCHEMA_COMBINATOR_KEYS.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_array)
+            .map(|a| (*key, a))
+    }) else {
+        return schema;
+    };
+    if branches.is_empty() {
+        return schema;
+    }
+
+    // 分支常是裸 `$ref`（`{ "$ref": "#/$defs/__schema0" }`），它自己不带 `$defs`，
+    // 所以必须拿**父级**的 $defs 来解析——只对分支单独调 inline_ref_siblings
+    // 永远解析不出来（实测：分支落进降级路径，properties 为空）。
+    let defs = object.get("$defs").and_then(Value::as_object);
+
+    let mut properties = Map::new();
+    let mut required: Option<BTreeSet<String>> = None;
+    let mut flattenable = true;
+
+    for branch in branches {
+        let normalized = match resolve_local_definition(
+            branch
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(local_definition_name)
+                .unwrap_or(""),
+            defs,
+            &mut Vec::new(),
+        ) {
+            // 分支是裸 $ref：用父级 $defs 解析出真实 schema。
+            Ok(Some(resolved)) if branch.as_object().is_some_and(|o| o.len() == 1) => {
+                normalize_schema_value(&resolved, defs, &mut Vec::new()).unwrap_or(resolved)
+            }
+            _ => inline_ref_siblings(branch),
+        };
+        let Some(branch_object) = normalized.as_object() else {
+            flattenable = false;
+            break;
+        };
+        let branch_properties = branch_object.get("properties").and_then(Value::as_object);
+        let branch_required: BTreeSet<String> = branch_object
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 分支没有 properties 时（例如 type:"string"）无法并入对象 schema。
+        if branch_properties.is_none() && !branch_required.is_empty() {
+            flattenable = false;
+            break;
+        }
+        for (name, value) in branch_properties.into_iter().flatten() {
+            merge_schema_property(&mut properties, name, value);
+        }
+        required = Some(match required {
+            None => branch_required,
+            Some(current) => current.intersection(&branch_required).cloned().collect(),
+        });
+    }
+
+    if !flattenable || properties.is_empty() {
+        // 降级：把分支原样塞进一个带说明的字段，schema 依然合法。
+        let mut fallback = object.clone();
+        fallback.insert("type".to_string(), json!("object"));
+        fallback.insert("properties".to_string(), json!({}));
+        let mut description: Vec<String> = Vec::new();
+        for branch in branches {
+            if let Some(text) = branch.get("description").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    description.push(text.trim().to_string());
+                }
+            }
+        }
+        fallback.insert(
+            "x-merged-combinator".to_string(),
+            json!({
+                "kind": key,
+                "branches": branches,
+                "description": description.join("\n")
+            }),
+        );
+        for combinator in SCHEMA_COMBINATOR_KEYS {
+            fallback.remove(combinator);
+        }
+        return Value::Object(fallback);
+    }
+
+    let mut flattened = object.clone();
+    for combinator in SCHEMA_COMBINATOR_KEYS {
+        flattened.remove(combinator);
+    }
+    flattened.insert("type".to_string(), json!("object"));
+    flattened.insert("properties".to_string(), Value::Object(properties));
+    flattened.insert(
+        "required".to_string(),
+        json!(required.unwrap_or_default().into_iter().collect::<Vec<_>>()),
+    );
+    Value::Object(flattened)
+}
+
+/// 把分支属性并入目标 properties；同名且两侧都是 object schema 时递归合并
+/// （properties 并集、required 取交集），否则保留先到的一方（非破坏性）。
+fn merge_schema_property(properties: &mut Map<String, Value>, name: &str, value: &Value) {
+    let Some(existing) = properties.get_mut(name) else {
+        properties.insert(name.to_string(), value.clone());
+        return;
+    };
+    let (Some(left), Some(right)) = (existing.as_object(), value.as_object()) else {
+        return;
+    };
+    if left.get("properties").is_none() || right.get("properties").is_none() {
+        return;
+    }
+    let mut merged = left.clone();
+    let mut merged_properties = left
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (child_name, child_value) in right
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        merge_schema_property(&mut merged_properties, child_name, child_value);
+    }
+    merged.insert("properties".to_string(), Value::Object(merged_properties));
+
+    let left_required: BTreeSet<String> = left
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let right_required: BTreeSet<String> = right
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    merged.insert(
+        "required".to_string(),
+        json!(
+            left_required
+                .intersection(&right_required)
+                .cloned()
+                .collect::<Vec<_>>()
+        ),
+    );
+    *existing = Value::Object(merged);
 }
 
 fn inline_ref_siblings(root: &Value) -> Value {
@@ -5452,6 +7499,10 @@ fn normalize_schema_object(
 
     let mut normalized = Map::new();
     for (key, value) in object {
+        // JSON Schema 的 type 必须是字符串，null 恒非法，剥掉等价于未声明。
+        if key == "type" && value.is_null() {
+            continue;
+        }
         normalized.insert(key.clone(), normalize_schema_value(value, defs, resolving)?);
     }
     Ok(Value::Object(normalized))
@@ -5586,6 +7637,58 @@ fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
             "parameters": parameters
         }
     })
+}
+
+/// 从历史里的 tool_search_output item 收集 Codex 客户端检索命中的命名空间工具。
+///
+/// 条目形如 `{ type: "namespace", name, description, tools: [...] }`，必须走
+/// `add_namespace_tools_to_context` + `namespace_tool_to_chat_tools` 展开成
+/// `mcp__<server>__<tool>`。只取 namespace 名字的话上游只能看到外壳，
+/// 调不到内层工具，反向转换也还原不出 namespace 字段。
+fn collect_tool_search_output_namespaces(body: &Value) -> Vec<Value> {
+    let mut collected: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return collected;
+    };
+
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("tool_search_output") {
+            continue;
+        }
+        let Some(tools) = item.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        for tool in tools {
+            let Some(name) = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if seen.insert(name.to_string()) {
+                collected.push(tool.clone());
+            }
+        }
+    }
+
+    collected
+}
+
+/// chat tools 按函数名去重，保留首次出现。
+fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    tools.retain(|tool| {
+        match tool
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+        {
+            Some(name) => seen.insert(name.to_string()),
+            None => true,
+        }
+    });
 }
 
 fn patch_proxy_description(description: &str, action: &str, default_description: &str) -> String {
@@ -5931,6 +8034,20 @@ fn tool_call_added_item(
     tool_context: &CodexToolContext,
 ) -> Value {
     if tool_context.is_custom_tool_proxy(&state.name) {
+        if tool_context.is_tool_search_proxy(&state.name) {
+            return json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": tool_call_item_id(&state.call_id, &state.name, tool_context),
+                    "type": "tool_search_call",
+                    "status": "in_progress",
+                    "call_id": state.call_id,
+                    "execution": "client",
+                    "arguments": {}
+                }
+            });
+        }
         return json!({
             "type": "response.output_item.added",
             "output_index": output_index,
@@ -5970,7 +8087,19 @@ fn push_tool_call_delta_sse(
     delta: &str,
     tool_context: &CodexToolContext,
 ) {
-    if tool_context.is_custom_tool_proxy(&state.name) {
+    if tool_context.is_tool_search_proxy(&state.name) {
+        // tool_search 走 function 参数流，客户端按 tool_search_call.arguments 聚合。
+        push_sse(
+            output,
+            "response.function_call_arguments.delta",
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": state.item_id,
+                "output_index": output_index,
+                "delta": delta
+            }),
+        );
+    } else if tool_context.is_custom_tool_proxy(&state.name) {
         let _ = delta;
     } else {
         push_sse(
@@ -5992,6 +8121,19 @@ fn push_tool_call_done_sse(
     output_index: u32,
     tool_context: &CodexToolContext,
 ) {
+    if tool_context.is_tool_search_proxy(&state.name) {
+        push_sse(
+            output,
+            "response.function_call_arguments.done",
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": state.item_id,
+                "output_index": output_index,
+                "arguments": state.arguments
+            }),
+        );
+        return;
+    }
     if tool_context.is_custom_tool_proxy(&state.name) {
         push_sse(
             output,
@@ -6033,6 +8175,19 @@ fn response_tool_call_item(
     tool_context: &CodexToolContext,
 ) -> Value {
     if tool_context.is_custom_tool_proxy(name) {
+        if tool_context.is_tool_search_proxy(name) {
+            // 官方客户端的 tool_search handler 只接受 tool_search_call item，
+            // function_call 形态会被拒绝，因此必须还原成专属 item 类型；
+            // arguments 转发层原样搬运（对象字符串双向保真）。
+            return json!({
+                "id": format!("tsc_{call_id}"),
+                "type": "tool_search_call",
+                "status": "completed",
+                "call_id": call_id,
+                "execution": "client",
+                "arguments": responses_arguments_to_chat_parse(arguments)
+            });
+        }
         return json!({
             "id": tool_call_item_id(call_id, name, tool_context),
             "type": "custom_tool_call",
@@ -6059,6 +8214,10 @@ fn response_tool_call_item(
 
 fn tool_call_item_id(call_id: &str, name: &str, tool_context: &CodexToolContext) -> String {
     let prefix = if tool_context.is_custom_tool_proxy(name) {
+        if tool_context.is_tool_search_proxy(name) {
+            // 官方客户端给 tool_search_call 分配的 item id 前缀（见 codex id_prefix）。
+            return format!("tsc_{call_id}");
+        }
         "ctc_"
     } else {
         "fc_"
@@ -6839,6 +8998,16 @@ fn responses_arguments_to_chat(value: &Value) -> String {
     }
 }
 
+/// 把 chat 侧的 arguments 字符串解析回 JSON Value，供需要对象形态参数的
+/// item（如 tool_search_call）使用；解析失败时退回空对象，避免构造非法 item。
+fn responses_arguments_to_chat_parse(arguments: &str) -> Value {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+    serde_json::from_str(trimmed).unwrap_or_else(|_| json!({}))
+}
+
 fn normalize_chat_tool_arguments_string(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -6893,16 +9062,24 @@ fn canonical_json_string(value: &Value) -> String {
     }
 }
 
-fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str) {
+fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str, standard: bool) {
     let Some(reasoning_enabled) = reasoning_requested(body) else {
         return;
     };
-    let style = infer_chat_reasoning_style(model);
+    let style = if standard {
+        ChatReasoningStyle::Default
+    } else {
+        infer_chat_reasoning_style(model)
+    };
 
     match style {
         ChatReasoningStyle::Thinking => {
             result["thinking"] = json!({
-                "type": if reasoning_enabled { "enabled" } else { "disabled" }
+                "type": if reasoning_enabled {
+                    kimi_thinking_enabled_type(model)
+                } else {
+                    "disabled"
+                }
             });
         }
         ChatReasoningStyle::EnableThinking => {
@@ -7042,7 +9219,15 @@ fn map_chat_reasoning_effort(effort: &str, style: ChatReasoningStyle) -> Option<
 /// 仍只发 thinking 开关。
 fn is_kimi_coding_model(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    model.starts_with("k3") || model.contains("for-coding")
+    model.starts_with("k3") || model.contains("kimi-k3") || model.contains("for-coding")
+}
+
+fn kimi_thinking_enabled_type(model: &str) -> &'static str {
+    if is_kimi_coding_model(model) {
+        "adaptive"
+    } else {
+        "enabled"
+    }
 }
 
 fn supports_reasoning_effort(model: &str) -> bool {
@@ -7063,4 +9248,77 @@ fn is_openai_o_series(model: &str) -> bool {
             .as_bytes()
             .get(1)
             .is_some_and(|byte| byte.is_ascii_digit())
+}
+
+/// 供应商自定义请求头必须真正写进发往上游的请求（issue #1685）。
+#[cfg(test)]
+mod relay_custom_header_tests {
+    use super::*;
+    use crate::settings::{RelayHeaderKeyValue, RelayMode, RelayProfile};
+
+    fn header(key: &str, value: &str) -> RelayHeaderKeyValue {
+        RelayHeaderKeyValue {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn relay_with(headers: Vec<RelayHeaderKeyValue>) -> RelayProfile {
+        RelayProfile {
+            relay_mode: RelayMode::PureApi,
+            api_key: "sk-upstream".to_string(),
+            custom_headers: headers,
+            ..RelayProfile::default()
+        }
+    }
+
+    fn build_upstream_request(relay: &RelayProfile) -> reqwest::Request {
+        upstream_request_builder(
+            reqwest::Client::new(),
+            "http://upstream.example/v1/responses",
+            relay,
+            false,
+            &serde_json::json!({ "model": "m" }),
+        )
+        .build()
+        .unwrap()
+    }
+
+    #[test]
+    fn upstream_request_carries_custom_headers() {
+        let request = build_upstream_request(&relay_with(vec![header("X-Tenant", "acme")]));
+        assert_eq!(request.headers().get("x-tenant").unwrap(), "acme");
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer sk-upstream"
+        );
+    }
+
+    /// 代理路径与测试连接、模型列表一致：显式 Authorization 优先于 API Key。
+    #[test]
+    fn upstream_request_prefers_custom_authorization() {
+        let request = build_upstream_request(&relay_with(vec![header(
+            "Authorization",
+            "Bearer explicit",
+        )]));
+        assert_eq!(request.headers().get_all("authorization").iter().count(), 1);
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer explicit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod channel_cooldown_retry_tests {
+    use super::*;
+
+    #[test]
+    fn cooldown_allows_three_automatic_retries_only() {
+        assert!(should_retry_after_cooldown(0));
+        assert!(should_retry_after_cooldown(1));
+        assert!(should_retry_after_cooldown(2));
+        assert!(!should_retry_after_cooldown(3));
+        assert!(!should_retry_after_cooldown(usize::MAX));
+    }
 }

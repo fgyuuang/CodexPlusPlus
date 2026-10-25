@@ -19,6 +19,7 @@ struct LauncherHooks {
     data: Arc<LauncherDataService>,
     runtime: Arc<LauncherRuntimeService>,
     bridge_context: Arc<Mutex<Option<BridgeContext>>>,
+    browser_monitor: Arc<Mutex<Option<codex_plus_core::native_browser::BrowserMonitor>>>,
 }
 
 impl Default for LauncherHooks {
@@ -31,6 +32,7 @@ impl Default for LauncherHooks {
                 default_user_script_manager(),
             )),
             bridge_context: Arc::new(Mutex::new(None)),
+            browser_monitor: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -67,6 +69,7 @@ async fn main() -> Result<()> {
                 codex_app: options
                     .app_dir
                     .map(|path| path.to_string_lossy().to_string()),
+                aumid: None,
             });
         }
         return Err(error);
@@ -82,6 +85,7 @@ async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOpti
         hooks.shutdown_helper(options.helper_port).await;
         return Ok(());
     }
+    ensure_weixin_manager_started();
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
         let helper_port = activate_existing_codex_app(&options).await?;
         options.status_store.save_latest(&LaunchStatus {
@@ -93,6 +97,7 @@ async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOpti
             codex_app: options
                 .app_dir
                 .map(|path| path.to_string_lossy().to_string()),
+            aumid: None,
         })?;
         return Ok(());
     };
@@ -101,8 +106,57 @@ async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOpti
     });
     let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
-    handle.wait_for_codex_exit().await?;
+    run_periodic_until_exit(
+        handle.wait_for_codex_exit(),
+        std::time::Duration::from_secs(30 * 60),
+        || repair_session_index_automatically(true),
+    )
+    .await?;
     Ok(())
+}
+
+// 退出时不再安排下一次检查；已开始的数据库事务先完成，避免脱离启动器生命周期。
+async fn run_periodic_until_exit<F, T, C, W>(
+    exit: F,
+    interval: std::time::Duration,
+    mut check: C,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+    C: FnMut() -> W,
+    W: std::future::Future<Output = ()>,
+{
+    tokio::pin!(exit);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut exit => return result,
+            _ = tokio::time::sleep(interval) => check().await,
+        }
+    }
+}
+
+async fn repair_session_index_automatically(check_setting: bool) {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        if check_setting
+            && !codex_plus_core::settings::SettingsStore::default()
+                .load()?
+                .provider_sync_enabled
+        {
+            return Ok(());
+        }
+        codex_plus_data::repair_session_index(None)?;
+        Ok(())
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    if let Err(error) = result {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.session_index_repair.failed",
+            json!({ "message": error.to_string() }),
+        );
+    }
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -110,6 +164,45 @@ fn current_timestamp_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn ensure_weixin_manager_started() {
+    let result = (|| -> anyhow::Result<()> {
+        let settings = codex_plus_core::settings::SettingsStore::default().load()?;
+        if should_start_weixin_manager(
+            settings.weixin_connect_enabled,
+            &settings.weixin_connect_token,
+        ) {
+            codex_plus_core::install::spawn_companion(
+                codex_plus_core::install::MANAGER_BINARY,
+                ["--background"],
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.weixin_manager_start_failed",
+            serde_json::json!({ "error": error.to_string() }),
+        );
+    }
+}
+
+fn should_start_weixin_manager(enabled: bool, token: &str) -> bool {
+    enabled && !token.trim().is_empty()
+}
+
+#[cfg(test)]
+mod weixin_startup_tests {
+    use super::should_start_weixin_manager;
+
+    #[test]
+    fn only_enabled_and_authenticated_connections_start_manager() {
+        assert!(should_start_weixin_manager(true, "test-token"));
+        assert!(!should_start_weixin_manager(false, "test-token"));
+        assert!(!should_start_weixin_manager(true, ""));
+        assert!(!should_start_weixin_manager(true, "   "));
+    }
 }
 
 fn acquire_single_instance_guard(
@@ -443,7 +536,7 @@ async fn notify_manager_when_update_available() -> anyhow::Result<bool> {
 fn open_manager_with_update_prompt() -> anyhow::Result<()> {
     codex_plus_core::install::spawn_companion(
         codex_plus_core::install::MANAGER_BINARY,
-        ["--show-update"],
+        ["--show-update", "--background"],
     )
     .map(|_| ())
     .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))
@@ -508,6 +601,32 @@ impl LaunchHooks for LauncherHooks {
         self.core.load_settings().await
     }
 
+    async fn start_native_browser_compatibility(
+        &self,
+        settings: &codex_plus_core::settings::BackendSettings,
+    ) {
+        let monitor = codex_plus_core::native_browser::start_monitor(
+            settings.enhancements_enabled
+                && settings.codex_app_native_browser_require_identification,
+        )
+        .await;
+        *self
+            .browser_monitor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = monitor;
+    }
+
+    async fn stop_native_browser_compatibility(&self) {
+        let monitor = self
+            .browser_monitor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(monitor) = monitor {
+            monitor.stop().await;
+        }
+    }
+
     fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
         self.core.cleanup_unsupported_config()
     }
@@ -515,7 +634,8 @@ impl LaunchHooks for LauncherHooks {
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
         let settings = SettingsStore::default().load().unwrap_or_default();
         if settings.official_experience.enabled {
-            // 新任务按模型显式保存稳定 provider；启动时不得把共享历史批量改写。
+            // 官方全体验模型按会话/模型路由动态决定 provider，启动时不能把官方历史会话批量写回固定 provider。
+            repair_session_index_automatically(false).await;
             return Ok(());
         }
         let target_provider = codex_plus_data::provider_sync_target_for_settings(&settings);
@@ -524,7 +644,9 @@ impl LaunchHooks for LauncherHooks {
         })
         .await
         .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"))?;
-        require_completed_provider_sync(&result.status, &result.message)
+        require_completed_provider_sync(&result.status, &result.message)?;
+        repair_session_index_automatically(false).await;
+        Ok(())
     }
 
     fn has_pending_remote_control_session_recoveries(&self) -> bool {
@@ -1024,13 +1146,40 @@ impl BridgeRuntimeService for LauncherRuntimeService {
         self.user_scripts.inventory()
     }
 
+    async fn load_user_scripts(&self) -> anyhow::Result<Value> {
+        let websocket_url = self
+            .websocket_url
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Codex 页面尚未连接"))?;
+        codex_plus_core::user_scripts::load_scripts_at(&websocket_url, &self.user_scripts).await
+    }
+
     async fn reload_user_scripts(&self) -> anyhow::Result<Value> {
-        let bundle = self.user_scripts.build_enabled_bundle()?;
-        let websocket_url = self.websocket_url.lock().unwrap().clone();
-        if let Some(websocket_url) = websocket_url.filter(|_| !bundle.trim().is_empty()) {
-            codex_plus_core::bridge::evaluate_script(&websocket_url, &bundle).await?;
+        let websocket_url = self
+            .websocket_url
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Codex 页面尚未连接"))?;
+        codex_plus_core::user_scripts::reload_scripts_at(&websocket_url, &self.user_scripts).await
+    }
+
+    async fn script_market_list(&self) -> anyhow::Result<Value> {
+        codex_plus_core::script_market::list_market_scripts(&self.user_scripts).await
+    }
+
+    async fn script_market_install(&self, payload: Value) -> anyhow::Result<Value> {
+        let id = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if id.is_empty() {
+            anyhow::bail!("脚本 id 不能为空");
         }
-        self.user_scripts.inventory()
+        codex_plus_core::script_market::install_market_script_by_id(&self.user_scripts, id).await
     }
 
     async fn open_devtools(&self) -> anyhow::Result<Value> {
@@ -1193,15 +1342,10 @@ async fn try_inject_with_context(
         .load()
         .unwrap_or_default();
     let script = codex_plus_core::assets::injection_script_with_settings(helper_port, &settings);
-    let user_bundle = runtime
-        .user_scripts
-        .build_enabled_bundle()
-        .unwrap_or_default();
-    let new_document_scripts = if user_bundle.is_empty() {
-        vec![script]
-    } else {
-        vec![script, user_bundle]
-    };
+    let new_document_scripts = vec![
+        script,
+        codex_plus_core::user_scripts::BOOTSTRAP_SCRIPT.to_string(),
+    ];
     codex_plus_core::bridge::install_bridge(
         websocket_url,
         codex_plus_core::bridge::BRIDGE_BINDING_NAME,
@@ -1280,6 +1424,36 @@ fn default_user_scripts_config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_index_monitor_does_not_start_after_exit() {
+        let checks = std::cell::Cell::new(0);
+        let result = run_periodic_until_exit(async { 42 }, std::time::Duration::ZERO, || {
+            checks.set(checks.get() + 1);
+            std::future::ready(())
+        })
+        .await;
+        assert_eq!(result, 42);
+        assert_eq!(checks.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_index_monitor_finishes_current_check_before_exit() {
+        let (done, exit) = tokio::sync::oneshot::channel::<()>();
+        let mut done = Some(done);
+        let finished = std::cell::Cell::new(false);
+        run_periodic_until_exit(exit, std::time::Duration::from_millis(1), || {
+            done.take().expect("only one check").send(()).unwrap();
+            let finished = &finished;
+            async move {
+                tokio::task::yield_now().await;
+                finished.set(true);
+            }
+        })
+        .await
+        .unwrap();
+        assert!(finished.get());
+    }
 
     #[test]
     fn parse_launch_options_accepts_manager_forwarded_ports_and_app_path() {
@@ -1516,6 +1690,7 @@ mod tests {
                 ),
             )),
             bridge_context: Arc::new(Mutex::new(None)),
+            browser_monitor: Arc::new(Mutex::new(None)),
         };
 
         hooks.bridge_context(9229, &test_dir).await.unwrap();

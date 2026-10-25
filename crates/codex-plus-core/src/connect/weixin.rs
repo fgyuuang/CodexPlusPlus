@@ -67,6 +67,85 @@ pub struct WeixinUpdates {
     pub longpolling_timeout_ms: u64,
 }
 
+/// Stable classification for errors returned by the iLink long-poll request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeixinLongPollErrorKind {
+    /// The credentials were rejected by HTTP authentication.
+    AuthenticationRejected,
+    /// The request can be retried after the caller's backoff delay.
+    Retryable,
+    /// The request or response is invalid and retrying unchanged input will not help.
+    Terminal,
+    /// The sync cursor was rejected and must be reset before polling again.
+    CursorRejected,
+}
+
+#[derive(Debug)]
+struct WeixinLongPollHttpError {
+    status: u16,
+}
+
+impl std::fmt::Display for WeixinLongPollHttpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "微信长轮询请求失败：HTTP {}", self.status)
+    }
+}
+
+impl std::error::Error for WeixinLongPollHttpError {}
+
+#[derive(Debug)]
+struct WeixinLongPollApiError {
+    ret: i64,
+    errcode: i64,
+    errmsg: String,
+}
+
+impl std::fmt::Display for WeixinLongPollApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "微信长轮询被拒绝：ret={} errcode={} {}",
+            self.ret, self.errcode, self.errmsg
+        )
+    }
+}
+
+impl std::error::Error for WeixinLongPollApiError {}
+
+/// Classify an error from [`WeixinClient::get_updates`] without parsing its
+/// display text. The typed HTTP and iLink errors survive `anyhow::Context`,
+/// while request and response-body errors retain their `reqwest::Error` source.
+pub fn classify_weixin_long_poll_error(error: &anyhow::Error) -> WeixinLongPollErrorKind {
+    for cause in error.chain() {
+        if let Some(api_error) = cause.downcast_ref::<WeixinLongPollApiError>() {
+            if api_error.ret == -14 || api_error.errcode == -14 {
+                return WeixinLongPollErrorKind::CursorRejected;
+            }
+            return WeixinLongPollErrorKind::Terminal;
+        }
+
+        if let Some(http_error) = cause.downcast_ref::<WeixinLongPollHttpError>() {
+            return match http_error.status {
+                401 | 403 => WeixinLongPollErrorKind::AuthenticationRejected,
+                408 | 429 | 500..=599 => WeixinLongPollErrorKind::Retryable,
+                400..=499 => WeixinLongPollErrorKind::Terminal,
+                _ => WeixinLongPollErrorKind::Terminal,
+            };
+        }
+
+        if let Some(request_error) = cause.downcast_ref::<reqwest::Error>()
+            && (request_error.is_timeout()
+                || request_error.is_connect()
+                || request_error.is_request()
+                || request_error.is_body())
+        {
+            return WeixinLongPollErrorKind::Retryable;
+        }
+    }
+
+    WeixinLongPollErrorKind::Terminal
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WeixinMessage {
     #[serde(default)]
@@ -218,47 +297,55 @@ impl WeixinClient {
         get_updates_buf: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<WeixinUpdates> {
+        let timeout_ms = timeout_ms.clamp(1_000, 60_000);
+        self.get_updates_with_request_timeout(
+            get_updates_buf,
+            Duration::from_millis(timeout_ms + 5_000),
+        )
+        .await
+    }
+
+    async fn get_updates_with_request_timeout(
+        &self,
+        get_updates_buf: &str,
+        request_timeout: Duration,
+    ) -> anyhow::Result<WeixinUpdates> {
         let request_body = json!({
             "get_updates_buf": get_updates_buf,
             "base_info": { "channel_version": CHANNEL_VERSION }
         });
-        let timeout_ms = timeout_ms.clamp(1_000, 60_000);
         let response = self
             .client
             .post(self.endpoint("ilink/bot/getupdates")?)
             .headers(self.auth_headers()?)
             .json(&request_body)
-            .timeout(Duration::from_millis(timeout_ms + 5_000))
+            .timeout(request_timeout)
             .send()
             .await;
         let response = match response {
             Ok(response) => response,
             Err(error) if error.is_timeout() => {
-                return Ok(WeixinUpdates {
-                    ret: 0,
-                    errcode: 0,
-                    errmsg: String::new(),
-                    messages: Vec::new(),
-                    get_updates_buf: get_updates_buf.to_string(),
-                    longpolling_timeout_ms: timeout_ms,
-                });
+                return Err(error).context("微信长轮询客户端等待超时");
             }
             Err(error) => return Err(error).context("微信长轮询请求失败"),
         };
         let (http_status, bytes) =
             read_response_limited(response, MAX_API_RESPONSE_BYTES, "微信长轮询").await?;
         if !http_status.is_success() {
-            bail!("微信长轮询请求失败：HTTP {http_status}");
+            return Err(WeixinLongPollHttpError {
+                status: http_status.as_u16(),
+            }
+            .into());
         }
         let updates: WeixinUpdates =
             serde_json::from_slice(&bytes).context("微信长轮询响应格式无效")?;
         if updates.ret != 0 || updates.errcode != 0 {
-            bail!(
-                "微信长轮询被拒绝：ret={} errcode={} {}",
-                updates.ret,
-                updates.errcode,
-                updates.errmsg
-            );
+            return Err(WeixinLongPollApiError {
+                ret: updates.ret,
+                errcode: updates.errcode,
+                errmsg: updates.errmsg,
+            }
+            .into());
         }
         Ok(updates)
     }
@@ -455,7 +542,7 @@ impl WeixinClient {
         if context_token.trim().is_empty() {
             bail!("微信回复缺少 context_token");
         }
-        for chunk in chunk_text(text, MAX_REPLY_CHARS) {
+        for chunk in split_reply_text(text) {
             self.send_text(to_user_id, &chunk, context_token).await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -738,6 +825,10 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
         .collect()
 }
 
+pub fn split_reply_text(text: &str) -> Vec<String> {
+    chunk_text(text, MAX_REPLY_CHARS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +881,68 @@ mod tests {
     }
 
     #[test]
+    fn classifies_long_poll_http_and_api_errors() {
+        let classify_http = |status| {
+            classify_weixin_long_poll_error(&anyhow::Error::new(WeixinLongPollHttpError { status }))
+        };
+        assert_eq!(
+            classify_http(401),
+            WeixinLongPollErrorKind::AuthenticationRejected
+        );
+        assert_eq!(
+            classify_http(403),
+            WeixinLongPollErrorKind::AuthenticationRejected
+        );
+        for status in [408, 429, 500, 503, 599] {
+            assert_eq!(
+                classify_http(status),
+                WeixinLongPollErrorKind::Retryable,
+                "HTTP {status} should be retryable"
+            );
+        }
+        for status in [400, 404, 422] {
+            assert_eq!(
+                classify_http(status),
+                WeixinLongPollErrorKind::Terminal,
+                "HTTP {status} should be terminal"
+            );
+        }
+
+        let cursor_error = anyhow::Error::new(WeixinLongPollApiError {
+            ret: 0,
+            errcode: -14,
+            errmsg: "session timeout".to_string(),
+        });
+        assert_eq!(
+            classify_weixin_long_poll_error(&cursor_error),
+            WeixinLongPollErrorKind::CursorRejected
+        );
+        let cursor_ret_error = anyhow::Error::new(WeixinLongPollApiError {
+            ret: -14,
+            errcode: 0,
+            errmsg: "session timeout".to_string(),
+        });
+        assert_eq!(
+            classify_weixin_long_poll_error(&cursor_ret_error),
+            WeixinLongPollErrorKind::CursorRejected
+        );
+
+        let api_error = anyhow::Error::new(WeixinLongPollApiError {
+            ret: -2,
+            errcode: 0,
+            errmsg: "invalid request".to_string(),
+        });
+        assert_eq!(
+            classify_weixin_long_poll_error(&api_error),
+            WeixinLongPollErrorKind::Terminal
+        );
+        assert_eq!(
+            classify_weixin_long_poll_error(&anyhow::anyhow!("unclassified failure")),
+            WeixinLongPollErrorKind::Terminal
+        );
+    }
+
+    #[test]
     fn renders_qr_as_svg_without_remote_service() {
         let svg = render_qr_svg("https://example.test/login").unwrap();
         assert!(svg.starts_with("<?xml"));
@@ -806,5 +959,49 @@ mod tests {
         assert_eq!(bytes, b"private image data");
         assert!(checked_cdn_url("https://evil.example/media").is_err());
         assert!(checked_cdn_url("http://novac2c.cdn.weixin.qq.com/media").is_err());
+    }
+
+    #[tokio::test]
+    async fn long_poll_timeout_is_reported_as_an_error_instead_of_a_healthy_empty_poll() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ilink/bot/getupdates"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_json(json!({"ret": 0, "errcode": 0, "msgs": []})),
+            )
+            .mount(&server)
+            .await;
+        let client = WeixinClient::new(&server.uri(), "test-token", "").unwrap();
+
+        let error = client
+            .get_updates_with_request_timeout("cursor", Duration::from_millis(10))
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("长轮询客户端等待超时"));
+        assert_eq!(
+            classify_weixin_long_poll_error(&error),
+            WeixinLongPollErrorKind::Retryable
+        );
+    }
+
+    #[tokio::test]
+    async fn classifies_connection_errors_as_retryable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = WeixinClient::new(&format!("http://{address}"), "test-token", "").unwrap();
+        let error = client
+            .get_updates_with_request_timeout("cursor", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            classify_weixin_long_poll_error(&error),
+            WeixinLongPollErrorKind::Retryable
+        );
     }
 }

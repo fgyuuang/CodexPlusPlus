@@ -1229,6 +1229,25 @@ body {
   min-width: 0;
 }
 
+.official-account-schedule, .official-account-usage, .official-usage-window {
+  display: grid;
+  gap: 6px;
+}
+.official-account-schedule {
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  padding: 12px;
+  margin: 12px 0;
+}
+.official-account-schedule-order { display: flex; flex-wrap: wrap; gap: 12px; }
+.official-account-schedule p, .official-account-schedule small, .official-account-usage small {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+.official-usage-window { max-width: 520px; padding-top: 5px; }
+.official-usage-window > div { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.official-usage-window progress { width: 100%; height: 7px; accent-color: hsl(var(--primary)); }
+
 .official-account-title,
 .official-account-meta,
 .official-account-actions {
@@ -1512,6 +1531,14 @@ body {
   background: hsl(var(--shell-bg));
 }
 
+.relay-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .relay-detail-body {
   flex: 1;
   min-height: 0;
@@ -1570,6 +1597,14 @@ body {
 .relay-file-head div {
   display: grid;
   gap: 3px;
+  min-width: 0;
+}
+
+.relay-editor-heading {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
 }
 
@@ -2132,6 +2167,65 @@ body {
   background: hsl(var(--surface-raised) / 0.45);
   padding: 14px;
 }
+
+/* 渠道保护默认折叠：details 复用 .relay-config-section 的外观，
+   summary 直接当区块标题用。 */
+details.relay-config-section > summary.relay-config-section-head {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.relay-config-section > summary.relay-config-section-head::-webkit-details-marker {
+  display: none;
+}
+
+details.relay-config-section > summary.relay-config-section-head::after {
+  content: "\25BE";
+  flex-shrink: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  transition: transform var(--motion-fast) var(--motion-ease);
+}
+
+details.relay-config-section[open] > summary.relay-config-section-head::after {
+  transform: rotate(180deg);
+}
+
+/* 通用配置默认折叠为一行文字：summary 复用 .relay-file-head 的排版，
+   展开后才显示提取按钮与编辑器。 */
+details.relay-common-config-panel > summary.relay-common-config-summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.relay-common-config-panel > summary.relay-common-config-summary::-webkit-details-marker {
+  display: none;
+}
+
+details.relay-common-config-panel > summary.relay-common-config-summary::after {
+  content: "\25BE";
+  flex-shrink: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  transition: transform var(--motion-fast) var(--motion-ease);
+}
+
+details.relay-common-config-panel[open] > summary.relay-common-config-summary::after {
+  transform: rotate(180deg);
+}
+
+/* 折叠态必须显式隐藏：Chrome 现在用 `::details-content` 的 visibility 实现
+   折叠，给子元素设 display/grid 会让它继续占位（实测 details 高 81px、
+   内容仍撑到 285px 并溢出）。展开时才用 grid 排布。 */
+details.relay-common-config-panel:not([open]) > .relay-common-config-body {
+  display: none;
+}
+
+details.relay-common-config-panel[open] > .relay-common-config-body {
+  display: grid;
+  gap: 12px;
+}
+
 
 .relay-config-section-head {
   display: flex;
@@ -3394,6 +3488,16 @@ body {
   margin-bottom: 0;
 }
 
+.switch-row.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.switch-row.is-disabled:hover {
+  border-color: hsl(var(--border));
+  background: hsl(var(--background));
+}
+
 .zed-remote-settings {
   display: grid;
   grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
@@ -4644,6 +4748,31 @@ input[type="range"]:disabled {
   opacity: 0.5;
 }
 
+/* cb3c7fa7 改版时误删了这两条：JSX 一直在用 .inline-check，但样式没了，
+   复选框退化成浏览器原生小方块（13×13），与同页 .switch-row 的开关形态
+   不一致。恢复为带描边的 40px 行内控件。 */
+.inline-check {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--surface-raised));
+  padding: 0 12px;
+  color: hsl(var(--foreground));
+  font-size: 13px;
+  font-weight: 650;
+  transition:
+    border-color var(--motion-fast) var(--motion-ease),
+    background-color var(--motion-fast) var(--motion-ease);
+}
+
+.inline-check input {
+  width: 16px;
+  height: 16px;
+}
+
 .check-row {
   display: flex;
   align-items: center;
@@ -5716,7 +5845,7 @@ input[type="range"]:disabled {
 
 .relay-model-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1.6fr) minmax(130px, 0.7fr) minmax(110px, 0.6fr) minmax(180px, 1fr) 40px 40px;
+  grid-template-columns: 32px minmax(220px, 1.6fr) minmax(130px, 0.7fr) minmax(110px, 0.6fr) minmax(180px, 1fr) 40px 40px;
   align-items: center;
   gap: 8px;
   min-height: var(--relay-control-height);
@@ -5778,9 +5907,45 @@ input[type="range"]:disabled {
   gap: 8px;
 }
 
+.relay-model-drag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: grab;
+  touch-action: none;
+}
+
+.relay-model-drag:hover,
+.relay-model-drag:focus-visible {
+  border-color: hsl(var(--border));
+  background: hsl(var(--surface-raised));
+  color: hsl(var(--foreground));
+}
+
+.relay-model-drag:active {
+  cursor: grabbing;
+}
+
+.relay-model-drag svg {
+  pointer-events: none;
+
+}
+
 .relay-model-entry {
   display: grid;
   gap: 8px;
+}
+
+.relay-model-entry.dragging {
+  position: relative;
+  z-index: 1;
+  opacity: 0.82;
 }
 
 .relay-model-import-workbench {
@@ -5815,6 +5980,42 @@ input[type="range"]:disabled {
   background: hsl(var(--warning) / 0.12);
 }
 
+.relay-model-source-badge {
+  flex-shrink: 0;
+  border-radius: 9999px;
+  padding: 1px 7px;
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: nowrap;
+  border: 1px solid hsl(var(--muted-foreground) / 0.55);
+  color: hsl(var(--muted-foreground));
+  background: hsl(var(--surface-sunken));
+}
+
+.relay-model-source-builtin {
+  color: hsl(var(--success-foreground, var(--foreground)));
+  border-color: hsl(var(--success, 160 84% 39%) / 0.9);
+}
+
+.relay-model-source-custom {
+  color: hsl(var(--primary-foreground, var(--foreground)));
+  border-color: hsl(var(--primary) / 0.9);
+}
+
+.relay-model-source-fallback {
+  color: hsl(var(--muted-foreground));
+}
+
+/* 行内导入按钮的元数据状态色：命中=绿、自定义=蓝、回退=默认无色 */
+.relay-model-import-button.relay-model-import-builtin {
+  border: 1px solid hsl(var(--success, 160 84% 39%) / 0.9);
+}
+
+.relay-model-import-button.relay-model-import-custom {
+  border: 1px solid hsl(var(--primary) / 0.9);
+}
+
+
 .relay-model-metadata-import-actions {
   display: flex;
   align-items: center;
@@ -5822,15 +6023,22 @@ input[type="range"]:disabled {
   gap: 12px;
 }
 
+/* 徽标与 slug 同行横排（c00177e 的既定设计）；c8ed14b 整文件覆盖时曾回退成
+   grid 单列导致竖排。flex-wrap 允许窄窗口下徽标整体折行而不挤压 slug。 */
 .relay-model-import-copy {
-  display: grid;
-  gap: 3px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   min-width: 0;
 }
 
-.relay-model-import-copy span {
-  color: hsl(var(--muted-foreground));
-  font-size: 12px;
+/* 省略号只作用于 slug 本身（strong）；不能再用 span 通配——那会把徽标的
+   10px 字号和三色 tone 覆盖成 muted 灰。 */
+.relay-model-import-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .relay-model-metadata-import-flow {
@@ -7136,7 +7344,34 @@ select {
   grid-column: 1 / -1;
 }
 
+.relay-field-custom-headers {
+  grid-column: 1 / -1;
+}
+
 @media (max-width: 860px) {
+.relay-custom-headers {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.relay-custom-header-row {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
+}
+
+.relay-custom-headers-actions {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+}
+
+.relay-custom-headers-error {
+  color: hsl(var(--destructive));
+}
+
   .relay-advanced-fields,
   .relay-api-fields,
   .relay-vlm-section {
@@ -8756,6 +8991,43 @@ select {
 .settings-content .settings-block {
   border-top: 1px solid hsl(var(--border));
   padding-top: 14px;
+}
+
+.settings-content .check-row > span {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-content .check-row > span small {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.channel-status-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.channel-status-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 24px;
+}
+
+.channel-status-chip {
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+  cursor: pointer;
+  font: inherit;
+  padding: 3px 8px;
+}
+
+.channel-status-chip:hover {
+  border-color: hsl(var(--primary));
 }
 
 .settings-content .stepwise-settings-block {

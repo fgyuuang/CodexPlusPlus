@@ -26,6 +26,7 @@ pnpm-lock.yaml
 pnpm-workspace.yaml
 
 # project-specific
+/temp/
 .trae/
 plan.md
 plan_v2.md
@@ -34,3 +35,18 @@ plan_v2.md
 .codex-merge/
 .codex-tmp-gh/
 .codex-upstream/
+
+# agent temporary artifacts
+.zcode/
+.tmp-commit-msg.txt
+.tmp-*.cjs
+assets/example.json
+issue*-repro.md
+stepfun-*-stall-bugreport.md
+
+# ZCode CLI local workspace artifacts
+.zcodeignore
+
+# agent/CLI temporary directories outside .zcode/
+.zcodetmp/
+
