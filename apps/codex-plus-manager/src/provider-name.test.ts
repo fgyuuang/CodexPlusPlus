@@ -4,13 +4,14 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
 
-import { resolveProviderName, tomlSectionStringValue } from "./provider-name.ts";
+import { providerAvatarText, resolveProviderName, tomlSectionStringValue } from "./provider-name.ts";
 
 // 执行实际编辑器 helper，避免只测名称解析器而遗漏写回时的覆盖。
 function editorRuntime() {
   const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
   const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const names = new Set([
+    "tomlStructureMask", "tomlQuotedValue", "tomlDottedKeyPath", "tomlKeyPathName", "codexProviderSectionName", "tomlKeyAssignment", "tomlInlineComment",
     "setCodexProviderStringKey", "ensureCodexProviderDefaults", "setTomlSectionBoolKey",
     "setTomlSectionStringKey", "setTomlSectionRawKey", "tomlSectionName", "tomlString",
     "ensureTrailingNewline", "joinTomlSections", "rootTomlStringValue", "tomlStringAssignmentValue",
@@ -100,4 +101,22 @@ test("handles single quotes and escaped characters", () => {
 name = 'My \\'Relay\\''
 `;
   assert.equal(resolveProviderName(contents, "custom"), "My 'Relay'");
+});
+
+test("provider avatar prefers two characters of different kinds", () => {
+  const cases: Array<[string, string]> = [
+    ["哈基米 国模 kimi", "哈K"],
+    ["供应商 4", "供4"],
+    ["a 哥国模", "A哥"],
+    ["聚合供应商 1", "聚1"],
+    ["哈基米 国模", "哈国"],
+    ["Max JOJO Code（ccswitch）", "MJ"],
+    ["DeepSeek", "DS"],
+    ["jojocodemax", "JO"],
+    ["智谱", "智谱"],
+    ["x", "X"],
+    ["  ", "供"],
+    ["!!!", "供"],
+  ];
+  for (const [name, expected] of cases) assert.equal(providerAvatarText(name), expected, name);
 });

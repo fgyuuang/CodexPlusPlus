@@ -346,6 +346,8 @@ fn plain_path(path: &Path) -> Result<()> {
 // Open root-first with OPEN_REPARSE_POINT so no checked parent can become a junction.
 fn pin_parents(path: &Path) -> Result<Vec<File>> {
     plain_path(path)?;
+    // 非 Windows 上下面这段 cfg 块整段编译掉，guards 从不被 push。
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut guards = Vec::new();
     #[cfg(windows)]
     {
@@ -1474,7 +1476,7 @@ mod tests {
     /// 这里 canonicalize 到真实路径，既保留被校验路径的生产语义，又让测试可跨平台运行。
     /// Windows 的 junction 重定向（如被重定向的 TEMP）不在此 helper 的处理范围内，
     /// 那属于 `plain_path` 自身需要收紧的地方。
-    fn temp_root(temp: &tempfile::TempDir) -> PathBuf {
+    pub(super) fn temp_root(temp: &tempfile::TempDir) -> PathBuf {
         let canonical = temp
             .path()
             .canonicalize()

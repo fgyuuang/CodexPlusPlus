@@ -1,5 +1,6 @@
 [package]
 name = "codex-plus-manager"
+default-run = "codex-plus-plus-manager"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,14 +14,20 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "codex-plus-plus-manager"
 path = "src/main.rs"
 
+[[bin]]
+name = "codex-plus-legacy-shim"
+path = "src/legacy_shim.rs"
+
 [dependencies]
 anyhow.workspace = true
 async-trait = "0.1"
 base64.workspace = true
 codex-plus-core = { path = "../../../crates/codex-plus-core" }
 codex-plus-data = { path = "../../../crates/codex-plus-data" }
+codex-plus-launcher = { path = "../../codex-plus-launcher" }
 directories.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"
@@ -43,5 +50,4 @@ windows = { version = "0.58", features = [
 tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
-rusqlite.workspace = true
 tempfile.workspace = true

@@ -5,7 +5,8 @@
 ## 项目概述
 
 本仓库是 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 fork。
-当前版本 v1.2.56，本地分支 `codex/Manage-multiple-official-accounts`。
+当前整合版本 v2.0.0（正式 tag `d2fb3a6e`），本地分支 `codex/Manage-multiple-official-accounts`。
+本轮整合与验收边界见 `docs/reports/2026-10-29-v2.0.0-local-integration.md`。
 
 本地扩展了聚合供应商路由与模型别名、认证与会话隔离、插件市场保留等功能，
 详见 `docs/local-features.md` —— 每次上游合并后必须逐条确认回归。
@@ -94,6 +95,8 @@
 
 ## 发布编译
 
+日常开发先按 `docs/development-workflow.md` 使用前端热更新、按 crate 检查和定向测试；不要为每个小改动重复完整发布。定向验证不代替最终发布门禁，开发进程不得与发布任务同时编译或修改 dist。
+
 **默认将耗时检查、编译、等待和产物核对交给后台脚本，不占用对话轮询。** Agent 专注代码修改、必要的针对性验证和分片组装；代码准备好后启动一次任务即可交接，并准确报告“已启动，尚未完成”。只修改脚本/文档不必构建产品 Release。
 
 ~~~powershell
@@ -119,13 +122,14 @@ Release 优化仍使用 Cargo.toml 的 strip/lto/codegen-units/panic 设置，�
 
 ## 空间管理
 
-`target/debug` 易积累到 50 GB+，建议定期清理：
+`target/debug` 包含可复用的依赖、测试程序和增量缓存，并非全部无用。开发期间保留；空间不足或阶段性交付后，再核对路径、确认无编译进程并预览清理：
 
 ```powershell
-cargo clean          # 清除所有编译缓存
-# 或只清 debug 保留 release
-Remove-Item -LiteralPath "target\debug" -Recurse -Force
+cargo clean --profile dev --dry-run
+cargo clean --profile dev   # 只清 debug，保留 release；下次开发检查需要重建
 ```
+
+不默认执行无参数 `cargo clean`，不自动清理 bin、dist、原生库下载缓存、发布证据、安装目录或合并备份。2026-10-29 实测清理 88.3 GiB 逻辑文件，磁盘实际回收 81.03 GiB。降低开发符号体积的可选办法见开发文档；不得顺带降低 Release 优化设置。
 
 ## 验收流程
 
@@ -140,14 +144,15 @@ Agent 完成代码改动与针对性验证后，检查 git status、任务差异
 ```powershell
 git add --update
 git commit -m "合并描述"
-git push -u fork codex/fix-plugin-marketplace-persistence
+# 仅在用户另行要求推送时执行，使用当前实际分支
+git push -u fork HEAD
 ```
 
 ## 与上游同步
 
 - `origin` = https://github.com/BigPizzaV3/CodexPlusPlus（fetch）
 - `fork` = https://github.com/fgyuuang/CodexPlusPlus.git（push）
-- 工作分支：`codex/fix-plugin-marketplace-persistence`
-- 合并策略：`git merge --no-commit --no-ff origin/main`，不以 rebase 方式处理，保留完整本地提交历史
+- 工作分支：`codex/Manage-multiple-official-accounts`（执行前用 `git branch --show-current` 核对）
+- 合并策略：`git merge --no-commit --no-ff <已审计的上游提交或正式 tag>`，不以 rebase 方式处理，保留完整本地提交历史；本轮目标为 `v2.0.0`，不自动追入其后的 origin/main
 - 合并后逐文件核对 `docs/local-features.md` 中标记的模块并运行回归测试
 - 上游若修改登录、`model_provider`、启动顺序、会话索引或 SQLite schema，必须人工确认 `docs/provider-auth-session-switching.md` 的状态机仍成立

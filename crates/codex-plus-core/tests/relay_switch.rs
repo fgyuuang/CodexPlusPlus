@@ -3,7 +3,7 @@ use codex_plus_core::relay_switch::{
 };
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    LaunchMode, RelayMode, RelayProfile, RelaySessionProvider, SettingsStore,
+    RelayMode, RelayProfile, RelaySessionProvider, SettingsStore,
 };
 
 #[test]
@@ -35,6 +35,7 @@ base_url = "https://a.example/v1"
     )
     .unwrap();
     let next = BackendSettings {
+        settings_revision: store.load().unwrap().settings_revision,
         active_relay_id: "b".to_string(),
         relay_profiles: vec![
             pure_profile("a", "https://a.example/v1", "sk-a"),
@@ -125,7 +126,7 @@ base_url = "https://b.example/v1"
         ..BackendSettings::default()
     };
 
-    let error = switch_relay_profile_in_home(&store, &home, next, "a")
+    let error = switch_current_relay_profile(&store, &home, next, "a")
         .expect_err("missing api key should fail post-write status check");
 
     assert!(
@@ -183,7 +184,7 @@ base_url = "https://edited-a.example/v1"
     let original = BackendSettings {
         active_relay_id: "a".to_string(),
         relay_profiles: vec![
-            pure_profile("a", "https://a.example/v1", "sk-a"),
+            pure_profile("a", "https://edited-a.example/v1", "sk-a"),
             pure_profile("b", "https://b.example/v1", "sk-b"),
         ],
         ..BackendSettings::default()
@@ -195,7 +196,7 @@ base_url = "https://edited-a.example/v1"
         ..BackendSettings::default()
     };
 
-    switch_relay_profile_in_home(&store, &home, next, "a").unwrap();
+    switch_current_relay_profile(&store, &home, next, "a").unwrap();
 
     let stored = store.load().unwrap();
     let previous = stored
@@ -219,7 +220,12 @@ base_url = "https://edited-a.example/v1"
     assert!(previous.context_window.is_empty());
     assert!(previous.auto_compact_limit.is_empty());
     assert_eq!(stored.active_relay_id, "b");
-    assert_eq!(stored.launch_mode, LaunchMode::Patch);
+    assert!(
+        serde_json::to_value(&stored)
+            .unwrap()
+            .get("launchMode")
+            .is_none()
+    );
     let live: toml::Value = std::fs::read_to_string(home.join("config.toml"))
         .unwrap()
         .parse()
@@ -272,7 +278,7 @@ experimental_bearer_token = "codex-plus-aggregate"
     let next = BackendSettings {
         active_relay_id: "b".to_string(),
         relay_profiles: original.relay_profiles.clone(),
-        ..BackendSettings::default()
+        ..store.load().unwrap()
     };
 
     switch_relay_profile_in_home(&store, &home, next, "a").unwrap();
@@ -333,7 +339,7 @@ experimental_bearer_token = "sk-b"
     let next = BackendSettings {
         active_relay_id: "b".to_string(),
         relay_profiles: original.relay_profiles.clone(),
-        ..BackendSettings::default()
+        ..store.load().unwrap()
     };
 
     switch_relay_profile_in_home(&store, &home, next, "a").unwrap();
@@ -383,6 +389,7 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
             id: "agg".to_string(),
             name: "聚合供应商 1".to_string(),
             session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
             strategy: AggregateRelayStrategy::Failover,
             model_mappings_enabled: true,
             members: vec![AggregateRelayMember {
@@ -391,12 +398,14 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
             }],
             model_mappings: Vec::new(),
             routes: Vec::new(),
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()
     };
 
-    let result = switch_relay_profile_in_home(&store, &home, next, "api").unwrap();
+    let result = switch_current_relay_profile(&store, &home, next, "api").unwrap();
     let live = std::fs::read_to_string(home.join("config.toml")).unwrap();
 
     assert!(result.configured);
@@ -405,7 +414,7 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
 }
 
 #[test]
-fn official_login_mixed_mode_restores_official_auth_before_aggregate_api_override() {
+fn mixed_aggregate_target_preserves_auth_until_explicit_login_restore() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex");
     std::fs::create_dir(&home).unwrap();
@@ -448,12 +457,23 @@ fn official_login_mixed_mode_restores_official_auth_before_aggregate_api_overrid
             }],
             model_mappings: Vec::new(),
             routes: Vec::new(),
+            model_aggregation_enabled: false,
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()
     };
 
-    let result = switch_relay_profile_in_home(&store, &home, next, "official").unwrap();
+    let before_auth = std::fs::read(home.join("auth.json")).ok();
+    let ordinary = switch_relay_profile_in_home(&store, &home, next, "official").unwrap();
+    assert_eq!(
+        std::fs::read(home.join("auth.json")).ok(),
+        before_auth,
+        "选择API/聚合请求目标或兼容登录字段不授权改写启动登录"
+    );
+    let result =
+        switch_official_account_in_home(&store, &home, ordinary.settings, official_auth).unwrap();
     let live_config = std::fs::read_to_string(home.join("config.toml")).unwrap();
     let live_auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
 
@@ -484,7 +504,7 @@ fn official_login_mixed_mode_restores_official_auth_before_aggregate_api_overrid
 }
 
 #[test]
-fn official_login_mixed_mode_applies_single_provider_after_official_auth() {
+fn mixed_single_target_preserves_absent_auth_until_explicit_login_restore() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex");
     std::fs::create_dir(&home).unwrap();
@@ -506,7 +526,20 @@ fn official_login_mixed_mode_applies_single_provider_after_official_auth() {
         ..BackendSettings::default()
     };
 
-    switch_relay_profile_in_home(&store, &home, next, "official").unwrap();
+    let before_auth = std::fs::read(home.join("auth.json")).ok();
+    let ordinary = switch_relay_profile_in_home(&store, &home, next, "official").unwrap();
+    assert_eq!(
+        std::fs::read(home.join("auth.json")).ok(),
+        before_auth,
+        "选择API/聚合请求目标或兼容登录字段不授权改写启动登录"
+    );
+    switch_official_account_in_home(
+        &store,
+        &home,
+        ordinary.settings,
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official-account"}}"#,
+    )
+    .unwrap();
     let live_config = std::fs::read_to_string(home.join("config.toml")).unwrap();
     let live_auth: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
@@ -519,7 +552,7 @@ fn official_login_mixed_mode_applies_single_provider_after_official_auth() {
 }
 
 #[test]
-fn official_login_mixed_mode_can_switch_selected_official_account() {
+fn mixed_login_account_change_requires_explicit_authentication_api() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex");
     std::fs::create_dir(&home).unwrap();
@@ -545,6 +578,7 @@ fn official_login_mixed_mode_can_switch_selected_official_account() {
             .to_string(),
         ..RelayProfile::default()
     };
+    let selected_auth = account_b.auth_contents.clone();
     let next = BackendSettings {
         active_relay_id: "official-a".to_string(),
         relay_profiles: vec![account_a, account_b],
@@ -553,7 +587,14 @@ fn official_login_mixed_mode_can_switch_selected_official_account() {
         ..BackendSettings::default()
     };
 
-    switch_relay_profile_in_home(&store, &home, next, "official-a").unwrap();
+    let before_auth = std::fs::read(home.join("auth.json")).ok();
+    let ordinary = switch_relay_profile_in_home(&store, &home, next, "official-a").unwrap();
+    assert_eq!(
+        std::fs::read(home.join("auth.json")).ok(),
+        before_auth,
+        "选择API/聚合请求目标或兼容登录字段不授权改写启动登录"
+    );
+    switch_official_account_in_home(&store, &home, ordinary.settings, &selected_auth).unwrap();
     let live_auth: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
 
@@ -671,7 +712,7 @@ goals = true
         ..BackendSettings::default()
     };
 
-    let result = switch_relay_profile_in_home(&store, &home, next, "official").unwrap();
+    let result = switch_current_relay_profile(&store, &home, next, "official").unwrap();
     let returned = result
         .settings
         .relay_profiles
@@ -719,7 +760,7 @@ fn switch_captures_safe_app_state_before_writing_provider_config() {
         ..BackendSettings::default()
     };
 
-    switch_relay_profile_in_home(&store, &home, next, "a").unwrap();
+    switch_current_relay_profile(&store, &home, next, "a").unwrap();
 
     let snapshot: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(
@@ -762,14 +803,12 @@ fn switch_from_aggregate_preserves_profile_and_live_auth() {
         ..BackendSettings::default()
     };
     store.save(&original).unwrap();
-    switch_relay_profile_in_home(
-        &store,
-        &home,
-        aggregate_target_settings(api.clone(), aggregate.clone()),
-        "api",
-    )
-    .unwrap();
-    switch_relay_profile_in_home(&store, &home, original, "agg").unwrap();
+    let mut aggregate_target = aggregate_target_settings(api.clone(), aggregate.clone());
+    aggregate_target.settings_revision = store.load().unwrap().settings_revision;
+    switch_relay_profile_in_home(&store, &home, aggregate_target, "api").unwrap();
+    let mut restored = original;
+    restored.settings_revision = store.load().unwrap().settings_revision;
+    switch_relay_profile_in_home(&store, &home, restored, "agg").unwrap();
     let saved = store.load().unwrap();
     assert!(
         saved
@@ -845,6 +884,7 @@ fn official_oauth_survives_aggregate_round_trip() {
             id: "agg".to_string(),
             name: "聚合".to_string(),
             session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
             strategy: AggregateRelayStrategy::Failover,
             members: vec![AggregateRelayMember {
                 relay_id: "api".to_string(),
@@ -853,6 +893,8 @@ fn official_oauth_survives_aggregate_round_trip() {
             routes: Vec::new(),
             model_mappings_enabled: true,
             model_mappings: Vec::new(),
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()
@@ -860,7 +902,7 @@ fn official_oauth_survives_aggregate_round_trip() {
     store.save(&round_trip_settings("official")).unwrap();
 
     // 官方 → 聚合
-    switch_relay_profile_in_home(&store, &home, round_trip_settings("agg"), "official").unwrap();
+    switch_current_relay_profile(&store, &home, round_trip_settings("agg"), "official").unwrap();
     let after_switch: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
     assert_eq!(
@@ -879,7 +921,7 @@ fn official_oauth_survives_aggregate_round_trip() {
     );
 
     // 聚合 → 官方
-    switch_relay_profile_in_home(&store, &home, round_trip_settings("official"), "agg").unwrap();
+    switch_current_relay_profile(&store, &home, round_trip_settings("official"), "agg").unwrap();
     let final_auth: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
     assert_eq!(
@@ -922,6 +964,7 @@ fn aggregate_target_settings(api: RelayProfile, aggregate: RelayProfile) -> Back
             id: "agg".to_string(),
             name: "聚合供应商".to_string(),
             session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
             strategy: AggregateRelayStrategy::Failover,
             members: vec![AggregateRelayMember {
                 relay_id: "api".to_string(),
@@ -930,6 +973,8 @@ fn aggregate_target_settings(api: RelayProfile, aggregate: RelayProfile) -> Back
             routes: Vec::new(),
             model_mappings_enabled: true,
             model_mappings: Vec::new(),
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()
@@ -953,7 +998,7 @@ fn switch_api_to_aggregate_with(
         ..BackendSettings::default()
     };
     store.save(&original)?;
-    switch_relay_profile_in_home(
+    switch_current_relay_profile(
         &store,
         home,
         aggregate_target_settings(api, aggregate),
@@ -1060,7 +1105,7 @@ base_url = "https://a.example/v1"
         let previous = settings.active_relay_id.clone();
         settings.active_relay_id = if cycle % 2 == 0 { "b" } else { "a" }.to_string();
         let result =
-            switch_relay_profile_in_home(&store, &home, settings.clone(), &previous).unwrap();
+            switch_current_relay_profile(&store, &home, settings.clone(), &previous).unwrap();
         settings = result.settings;
     }
 
@@ -1078,4 +1123,215 @@ base_url = "https://a.example/v1"
     );
     // 切换链路本身未被破坏：live config 仍是最后一个激活供应商（a）的合法配置
     assert!(final_config.contains(r#"base_url = "https://a.example/v1""#));
+}
+
+/// 回归（issue #1888）：上一个供应商已不在配置列表里时，错误里必须带上它的 id，
+/// 用户才知道是哪一个没了（否则只看到「回填当前供应商配置失败」这一句无从下手）。
+#[test]
+fn switch_reports_previous_profile_id_when_it_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    store
+        .save(&BackendSettings {
+            active_relay_id: "a".to_string(),
+            relay_profiles: vec![pure_profile("a", "https://a.example/v1", "sk-a")],
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    // 目标设置里只剩 b，上一个活跃的 a 已被删掉。
+    let next = BackendSettings {
+        active_relay_id: "b".to_string(),
+        relay_profiles: vec![
+            pure_profile("a", "https://a.example/v1", "sk-a"),
+            pure_profile("b", "https://b.example/v1", "sk-b"),
+        ],
+        ..BackendSettings::default()
+    };
+
+    let error = switch_current_relay_profile(&store, &home, next, "deleted-id")
+        .expect_err("上一个供应商不存在时必须中止切换");
+    let message = error.to_string();
+
+    assert!(
+        message.contains("deleted-id"),
+        "错误信息要带上缺失的供应商 id，实际：{message}"
+    );
+    assert!(
+        message.contains("已不在配置列表中"),
+        "错误信息要说明原因，实际：{message}"
+    );
+    // 中止切换后不能覆盖用户的磁盘配置。
+    assert_eq!(store.load().unwrap().active_relay_id, "a");
+    assert!(!home.join("config.toml").exists());
+}
+
+/// 回归：列表页按分页过滤后提交的子集设置（只带当前分页的聚合、成员供应商全丢）
+/// 不能丢配置，也不能因成员不在请求里而拒绝切换。
+#[test]
+fn switch_restores_profiles_filtered_out_of_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let home = temp.path().join("codex");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let aggregate_profile = RelayProfile {
+        id: "agg".to_string(),
+        name: "聚合".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    };
+    let original = BackendSettings {
+        active_relay_id: "deepseek".to_string(),
+        relay_profiles: vec![
+            pure_profile("deepseek", "https://deepseek.example/v1", "sk-deepseek"),
+            pure_profile("openai", "https://openai.example/v1", "sk-openai"),
+            aggregate_profile.clone(),
+        ],
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: "agg".to_string(),
+            name: "聚合".to_string(),
+            session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: true,
+            strategy: AggregateRelayStrategy::Failover,
+            members: vec![
+                AggregateRelayMember {
+                    relay_id: "deepseek".to_string(),
+                    weight: 1,
+                },
+                AggregateRelayMember {
+                    relay_id: "openai".to_string(),
+                    weight: 1,
+                },
+            ],
+            routes: Vec::new(),
+            default_relay_id: "deepseek".to_string(),
+            sync_default_member_login: false,
+            model_mappings_enabled: true,
+            model_mappings: Vec::new(),
+        }],
+        ..BackendSettings::default()
+    };
+    store.save(&original).unwrap();
+
+    let filtered = BackendSettings {
+        active_relay_id: "agg".to_string(),
+        relay_profiles: vec![aggregate_profile],
+        ..BackendSettings::default()
+    };
+    let result = switch_current_relay_profile(&store, &home, filtered, "deepseek").unwrap();
+    assert_eq!(result.settings.active_relay_id, "agg");
+
+    let saved = store.load().unwrap();
+    let ids: Vec<String> = saved
+        .relay_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect();
+    assert!(ids.contains(&"deepseek".to_string()), "{ids:?}");
+    assert!(ids.contains(&"openai".to_string()), "{ids:?}");
+    assert_eq!(
+        saved.aggregate_relay_profiles.len(),
+        1,
+        "聚合成员配置不能被过滤请求吞掉"
+    );
+    assert_eq!(
+        saved.aggregate_relay_profiles[0].default_relay_id, "deepseek",
+        "默认供应商配置要跟着聚合一起回填"
+    );
+}
+
+// 这些测试验证切换、回填和回滚；请求携带当前版本，避免先被并发保护拒绝。
+fn switch_current_relay_profile(
+    store: &SettingsStore,
+    home: &std::path::Path,
+    mut settings: BackendSettings,
+    previous_active_relay_id: &str,
+) -> anyhow::Result<codex_plus_core::relay_switch::RelaySwitchResult> {
+    settings.settings_revision = store.revision()?;
+    switch_relay_profile_in_home(store, home, settings, previous_active_relay_id)
+}
+
+/// issue #2601：live auth.json 是 Codex 自己写的 API Key 登录态
+/// （`auth_mode = "apikey"`），当前供应商是内置的「默认中转」（官方登录、非混合）。
+/// 切换前回填过去会把这份 API Key 认证原样吸进官方快照，随后存储校验判为
+/// 「不支持的官方认证存档格式」，整次切换失败、config.toml 不再写入。
+#[test]
+fn switch_from_default_official_ignores_live_api_key_auth() {
+    for saved_auth in [
+        String::new(),
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#.to_string(),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-test"}"#,
+        )
+        .unwrap();
+        let log_path = temp.path().join("diagnostic.log");
+        codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let official = RelayProfile {
+            auth_contents: saved_auth.clone(),
+            ..RelayProfile::default()
+        };
+        let pure = pure_profile("deepseek", "https://api.deepseek.example/v1", "sk-deepseek");
+        let original = BackendSettings {
+            active_relay_id: "default".to_string(),
+            relay_profiles: vec![official.clone(), pure.clone()],
+            ..BackendSettings::default()
+        };
+        store.save(&original).unwrap();
+        let next = BackendSettings {
+            active_relay_id: "deepseek".to_string(),
+            relay_profiles: vec![official, pure],
+            ..BackendSettings::default()
+        };
+
+        let result = switch_current_relay_profile(&store, &home, next, "default");
+        codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(None);
+        let result = result
+            .unwrap_or_else(|error| panic!("切换不应失败（saved_auth={saved_auth}）：{error:#}"));
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("relay_backfill.official_auth.kept_snapshot") && !log.contains("sk-test"),
+            "应记一条不含密钥的诊断日志：{log}"
+        );
+
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(
+            config.contains("https://api.deepseek.example/v1"),
+            "目标供应商应写入 config.toml：{config}"
+        );
+        let stored = store.load().unwrap();
+        assert_eq!(stored.active_relay_id, "deepseek");
+        for settings in [&result.settings, &stored] {
+            let default = settings
+                .relay_profiles
+                .iter()
+                .find(|profile| profile.id == "default")
+                .unwrap();
+            assert!(
+                !default.auth_contents.contains("sk-test")
+                    && !default.auth_contents.contains("apikey"),
+                "官方快照不应吸收 live 的 API Key 身份：{}",
+                default.auth_contents
+            );
+            if !saved_auth.is_empty() {
+                assert!(
+                    default.auth_contents.contains("\"access_token\""),
+                    "原有官方登录快照应保留：{}",
+                    default.auth_contents
+                );
+            }
+        }
+    }
 }

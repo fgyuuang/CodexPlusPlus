@@ -109,6 +109,48 @@ function Assert-NoCompiler {
     $active = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('cargo.exe', 'rustc.exe', 'link.exe', 'tauri.exe') })
     if ($active.Count) { throw 'Another compiler is still active. Refusing a concurrent build/delivery; inspect processes first.' }
 }
+function Get-RuntimeDependencySnapshot {
+    $manifest = [IO.File]::ReadAllText((Join-Path $repoRoot 'Cargo.toml'), [Text.Encoding]::UTF8)
+    # 只处理当前显式启用的共享语音库；绝不把 target/release 中任意 DLL 打包。
+    if ($manifest -notmatch '(?m)^sherpa-onnx\s*=\s*\{[^\r\n]*features\s*=\s*\[[^\r\n]*"shared"') { return @() }
+    $lockText = [IO.File]::ReadAllText((Join-Path $repoRoot 'Cargo.lock'), [Text.Encoding]::UTF8)
+    if ($lockText -notmatch '(?ms)^\[\[package\]\]\s*name\s*=\s*"sherpa-onnx-sys"\s*version\s*=\s*"([^"\r\n]+)"') {
+        throw 'Shared sherpa-onnx is enabled but its locked native-library version cannot be determined.'
+    }
+    $version = $Matches[1]
+    if ($version -notmatch '^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$') { throw 'Invalid sherpa-onnx native-library version.' }
+    $releaseDirectory = Join-Path $repoRoot 'target/release'
+    $cacheDirectory = Join-Path $repoRoot 'target/sherpa-onnx-prebuilt'
+    $candidates = if ($env:SHERPA_ONNX_LIB_DIR) {
+        @([IO.Path]::GetFullPath($env:SHERPA_ONNX_LIB_DIR))
+    } elseif (Test-Path -LiteralPath $cacheDirectory -PathType Container) {
+        @(Get-ChildItem -LiteralPath $cacheDirectory -Directory -Filter "sherpa-onnx-v$version-win-*-shared-MT-Release-lib" |
+            Sort-Object Name | ForEach-Object { Join-Path $_.FullName 'lib' })
+    } else { @() }
+    $required = @('sherpa-onnx-c-api.dll', 'onnxruntime.dll')
+    foreach ($directory in $candidates) {
+        Assert-PlainPath $directory
+        if (-not (Test-Path -LiteralPath $directory -PathType Container)) { continue }
+        $libraries = @(Get-ChildItem -LiteralPath $directory -File -Filter '*.dll' | Sort-Object Name)
+        if (-not $libraries.Count) { continue }
+        if (@($required | Where-Object { $_ -notin $libraries.Name }).Count) { continue }
+        $snapshot = @()
+        $matchesRelease = $true
+        foreach ($library in $libraries) {
+            if ($library.Name -notmatch '^[A-Za-z0-9_.-]+\.dll$' -or $library.Name -match '^(?:api-ms-|ext-ms-|kernel32\.|kernelbase\.|ntdll\.|ucrtbase\.|vcruntime\d|msvcp\d|msvcr\d)') {
+                throw "Refusing a Windows/system runtime DLL in the sherpa-onnx dependency bundle: $($library.Name)"
+            }
+            Assert-PlainPath $library.FullName
+            $built = Join-Path $releaseDirectory $library.Name
+            if (-not (Test-Path -LiteralPath $built -PathType Leaf) -or $library.Length -eq 0) { $matchesRelease = $false; break }
+            $hash = (Get-FileHash -LiteralPath $library.FullName -Algorithm SHA256).Hash
+            if ((Get-FileHash -LiteralPath $built -Algorithm SHA256).Hash -ne $hash) { $matchesRelease = $false; break }
+            $snapshot += @{ name=$library.Name; sha256=$hash; source=$library.FullName; version=$version }
+        }
+        if ($matchesRelease) { return $snapshot }
+    }
+    throw 'Required shared sherpa-onnx runtime DLLs are missing or do not match the versioned native build bundle; refusing delivery.'
+}
 function Publish-Artifacts {
     $targets = @(@{ path=(Join-Path $repoRoot 'bin'); backup=(Join-Path $jobDirectory 'backup-bin') })
     if ($request.deployTo) { $targets += @{ path=$request.deployTo; backup=(Join-Path $request.deployTo "backups/release-$($request.id)") } }
@@ -246,7 +288,7 @@ try {
             Invoke-Step 'rust-check' $request.cargo @('check', '--workspace', '-j', "$($request.jobs)")
             foreach ($package in @('codex-plus-core', 'codex-plus-data', 'codex-plus-manager')) {
                 $selection = if ($package -eq 'codex-plus-manager') { '--lib' } else { '--tests' }
-                Invoke-Step "test-$package" $request.cargo @('test', '-p', $package, $selection, '-j', "$($request.jobs)", '--', '--test-threads=1')
+                Invoke-Step "test-$package" $request.cargo @('test', '-p', $package, $selection, '--no-fail-fast', '-j', "$($request.jobs)", '--', '--test-threads=1')
             }
             $frontend = Join-Path $repoRoot 'apps/codex-plus-manager'
             Invoke-Step 'typescript' $request.node @('node_modules/typescript/bin/tsc', '--noEmit', '-p', 'tsconfig.json') $frontend
@@ -267,7 +309,9 @@ try {
             Invoke-Step 'release' $request.cargo @('build', '--workspace', '--release', '-j', "$($request.jobs)")
             Assert-NoCompiler
             Assert-Inputs
-            foreach ($name in $names) {
+            $script:state['runtimeDependencies'] = @(Get-RuntimeDependencySnapshot)
+            $artifactNames = @($names) + @($script:state.runtimeDependencies | ForEach-Object { $_.name })
+            foreach ($name in $artifactNames) {
                 $artifact = Get-Item -LiteralPath (Join-Path $repoRoot "target/release/$name")
                 if ($artifact.Length -eq 0) { throw "Empty release artifact: $name" }
                 if ($name -eq $names[0] -and $artifact.LastWriteTimeUtc -lt $index.LastWriteTimeUtc) { throw 'Manager predates generated frontend; refusing delivery.' }

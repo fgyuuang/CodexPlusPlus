@@ -205,6 +205,9 @@ fn selected_aggregate_exposes_only_members_and_rejects_stale_bindings() {
             }],
             model_mappings: Vec::new(),
             routes: Vec::new(),
+            model_aggregation_enabled: false,
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
         });
     settings.active_relay_id = "selected-aggregate".to_string();
     settings.active_aggregate_relay_id = "selected-aggregate".to_string();
@@ -349,8 +352,19 @@ fn migration_keeps_root_official_and_preserves_user_context() {
     let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
     assert_eq!(doc["model_provider"].as_str(), Some("openai"));
     assert_eq!(doc["model"].as_str(), Some(official_slug.as_str()));
-    assert!(doc.get("openai_base_url").is_none());
-    assert!(doc["model_providers"]["openai"].get("base_url").is_none());
+    assert_eq!(
+        doc["openai_base_url"].as_str(),
+        Some("http://127.0.0.1:57321/v1/routes/openai"),
+        "官方体验必须接管旧子代理的原生 openai 通道，即使旧设置关闭跟随",
+    );
+    // `openai` 是 Codex 保留的内置 provider ID，本地代理入口的残留表必须整表删除，
+    // 否则新客户端会以 “reserved built-in provider IDs” 拒绝加载配置。
+    assert!(
+        doc.get("model_providers")
+            .and_then(toml_edit::Item::as_table)
+            .and_then(|providers| providers.get("openai"))
+            .is_none()
+    );
     assert_eq!(doc["mcp_servers"]["demo"]["command"].as_str(), Some("demo"));
     assert_eq!(
         doc["model_providers"][relay_provider_id("vendor-a").as_str()]["base_url"].as_str(),
@@ -586,6 +600,9 @@ async fn aggregate_deepseek_alias_uses_selected_member_and_never_fails_over() {
         ],
         model_mappings: Vec::new(),
         routes: Vec::new(),
+        model_aggregation_enabled: false,
+        default_relay_id: String::new(),
+        sync_default_member_login: false,
     }];
     settings.active_relay_id = aggregate_id.to_string();
     settings.active_aggregate_relay_id = aggregate_id.to_string();

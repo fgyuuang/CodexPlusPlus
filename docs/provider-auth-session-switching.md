@@ -2,12 +2,18 @@
 
 本文记录 CodexPlusPlus fork 的认证、请求路由和本地会话归属规则。这三类状态必须独立维护，不能再通过同一个 API Key 或 provider 字段互相覆盖。
 
+## v2.0.0 网关边界
+
+网关模式与下文直连/本地混合模式并存，只有显式接入才改 Agent 的受管配置。网关自己的 ChatGPT 登录独立保存和刷新，不能复制到 Codex live auth 或与本地账号库共用刷新令牌。普通启用、重写、模型/来源切换、断开必须保留 live auth 原字节（包括不存在）。旧借用记录无法证明当前归属时停止，不删除双方凭据或按 account_id 认领同 Team 用户。
+
+网关已选定唯一上游时，通过 ForcedRelay 直接执行该供应商的协议转换，不再次经过直连 profile 选择器；旧本地账号专用路由仍按身份验证。Codex 内置官方图片只允许明确官方来源，失败不转第三方；无模型/来源不明确时拒绝。网关支持的自动通用生图不能覆盖这条本地契约。
+
 ## 状态边界
 
 | 状态 | 文件/字段 | 责任 |
 |---|---|---|
 | 官方账号库 | `official-accounts.json`、`official-account-secrets.json` | 元数据与凭据分离；Windows 凭据使用当前用户 DPAPI 保护，非 Windows 文件限制为当前用户可读。 |
-| 活动官方账号 | `activeOfficialAccountId`、`~/.codex/auth.json` | 账号库保存多个登录，活动账号的凭据原子写入 Codex live auth。 |
+| 活动官方账号 | `activeOfficialAccountId`、`~/.codex/auth.json` | 账号库保存多个登录；只有显式切换或恢复登录才原子写入 live auth，迁移和请求目标切换不写。 |
 | 当前请求路由 | `~/.codex/config.toml` 的 `model_provider` | 纯官方默认使用 `openai`；聚合和独立 API 使用虚拟 provider `custom`。 |
 | API 供应商密钥 | `[model_providers.custom].experimental_bearer_token` | 仅供第三方或聚合路由请求使用，不写入 `auth.json`。 |
 | 官方登录混合模式 | `officialLoginMixedMode`、`activeOfficialAccountId` | 活动官方账号作为认证源；第三方或聚合 profile 仍作为请求目标。`officialLoginRelayId` 仅用于旧配置迁移兼容。 |
@@ -25,12 +31,14 @@
 | 聚合供应商 | 是 | `custom` | `custom` |
 | 独立 API | 是 | `custom` | `custom` |
 | 官方混入 API | 是 | `custom` | `custom` |
-| 官方登录混合 + 独立 API | 先恢复所选官方账号 | `custom`，`requires_openai_auth = true` | `custom` |
-| 官方登录混合 + 聚合供应商 | 先恢复所选官方账号 | `custom`，`requires_openai_auth = true` | `custom` |
+| 官方登录混合 + 独立 API | 保留当前登录；显式选择时恢复 | `custom`，`requires_openai_auth = true` | `custom` |
+| 官方登录混合 + 聚合供应商 | 保留当前登录；显式选择时恢复 | `custom`，`requires_openai_auth = true` | `custom` |
 
-官方登录混合模式的执行顺序固定为：
+普通供应商、模型或请求来源切换保持 live `auth.json` 全部原字节，包括文件不存在的状态。账号列表的“切换/恢复登录”经专门认证 API 显式传入已验证凭据；当前活动账号也可显式恢复登录，避免迁移后的账号库选择与 live 登录不一致。旧 `officialLoginRelayId` 只用于迁移，不授权普通来源切换重写旧登录快照。
 
-1. 从 `activeOfficialAccountId` 指向的加密账号库恢复 ChatGPT 登录态；旧版官方 profile 的有效 `authContents` 首次加载时迁入账号库。
+官方登录混合模式的执行顺序为：
+
+1. 用户显式选择切换或恢复登录时，从所选加密账号库恢复 ChatGPT 登录；普通来源切换跳过此写入。旧版有效 `authContents` 的首次迁移仅保存到账号库。
 2. 写入当前选中的独立 API 或聚合供应商配置，由 `experimental_bearer_token` 覆盖实际请求认证。
 3. 官方 API 不写入 `AggregateRelayProfile.members`，也不参与失败切换、轮转或权重计算。
 4. 官方原生模型保持原名；聚合替换项使用半角字符，例如 `gpt-5.4(供应商1|供应商2:真实模型)`。
@@ -51,11 +59,15 @@
 
 ### 子代理与切换来源
 
+2026-10-28 迁移规则：官方体验启用时，当前对话全部新旧及嵌套子代理的后续请求统一使用根对话当前来源，其他独立对话不变。`followParentAccount` 只兼容旧数据，false 或缺失不能关闭统一策略，界面不再显示旧开关。下文涉及默认关闭、需重新创建旧子代理的历史说明不再适用于新版。根级 `openai_base_url` 接入受管代理，不写保留的 `[model_providers.openai]`，不改线程 ID、历史或权限，不重放已发请求；原生进程仍须重启一次加载入口。
+
+原生标题、描述、环境建议和临时 fork 可以没有持久化记录。仅身份缺失时，通过已登记 CDP 的受信页面向同一 local app-server 固定调用 `thread/read(includeTurns:false)`，返回身份、来源及父谱系的最小元数据；不读取正文、不创建模型回合。总超时 6 秒。未知 UUID、伪造来源、跨对话、多父或循环关系均拒绝；普通新线程写库竞态同样必须有原生内存证明。普通持久化 fork 保持独立，仅临时 fork 的 forkedFromId 用作辅助任务谱系。
+
 Codex 子代理创建时继承父回合的 provider；账号专用 provider 必须保留到子请求，即使子代理使用官方裸模型名。Renderer 的恢复记忆必须同时保存 model/provider，不能把账号专用 provider + 裸模型改写为 `openai`，也不能在后续无模型的回合中丢失账号来源。明确选择主官方来源时仍允许切到 `openai`。
 
-已经创建的子代理是独立线程，原生 provider 不随父聊天切换。默认关闭跟随时，向旧子代理继续发任务仍使用其自身来源；可停止后重新创建，或启用下面的官方账号跟随。`openai` 是启动登录入口，不是固定账号 ID 的别名。不能声称父聊天切换成功意味着已经迁移全部后台代理。
+已经创建的子代理保持独立原生线程 ID，但其后续官方请求在本地代理中按根对话当前来源分派。无需复制或逐个重新创建。`openai` 是启动登录入口，不是固定账号 ID 的别名；已经发出的请求不会被中断或重放。
 
-Manager 的“旧子代理跟随父对话账号”（`officialExperience.followParentAccount`）默认关闭，启用/关闭后须重启 Codex。启用期间，根 `model_provider` 和 `auth.json` 保持不变；仅将官方 `openai` 的 Responses 传输接到本地受管代理，使此前加载的官方子线程也能在下一次启动后接受路由校验。不得覆盖用户自定义的 openai 端点或认证。关闭后移除这段受管 base URL，恢复原生官方传输。
+官方体验启用期间，根 `model_provider` 和 `auth.json` 保持不变；仅将官方 `openai` 的 Responses 传输接到本地受管代理，使此前加载的官方子线程也能在加载新版入口后接受路由校验。不得覆盖用户自定义的 openai 端点或认证。退出官方体验才撤销相应受管入口，旧字段不能单独关闭父子族统一策略。
 
 每次官方请求均只读原生 `thread_spawn_edges` 和 `threads`，沿父子关系找到根对话当前 provider；只对真实子线程应用跟随，根对话和其他聊天保持来源。子线程 ID、模型、推理等级、工具状态和历史不改写，旧 provider 别名只在验证原来源后还原为基础模型，再用目标账号自己的目录和凭据校验。关系缺失/有环/多父/标识跨对话、账号不可用或模型不存在时停止请求，不回落到账号1。第三方子代理不参与官方账号跟随。请求已发出时不终止、不重放，下次请求才采用新来源。
 

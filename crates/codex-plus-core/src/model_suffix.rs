@@ -20,6 +20,29 @@ pub struct ModelCatalogEntry {
     pub auto_compact_percent: Option<u32>,
 }
 
+/// 剥掉合法窗口后缀，保留模型 ID 的大小写。
+pub(crate) fn normalize_model_key(raw: &str) -> String {
+    parse_model_suffix(raw).0
+}
+
+/// 优先精确匹配，再剥后缀，最后按大小写不敏感匹配历史键。
+/// BTreeMap 保证同名大小写变体的回退结果稳定。
+pub(crate) fn lookup_model_map<'a, T>(
+    map: &'a std::collections::BTreeMap<String, T>,
+    model: &str,
+) -> Option<&'a T> {
+    if let Some(value) = map.get(model) {
+        return Some(value);
+    }
+    let slug = normalize_model_key(model);
+    if let Some(value) = map.get(&slug) {
+        return Some(value);
+    }
+    map.iter()
+        .find(|(key, _)| normalize_model_key(key).eq_ignore_ascii_case(&slug))
+        .map(|(_, value)| value)
+}
+
 /// 解析单个模型条目的后缀，返回 (slug, 可选窗口)。
 /// 括号内非合法窗口 token 时，整串作为 slug 且 window=None（不剥离括号）。
 pub fn parse_model_suffix(raw: &str) -> (String, Option<u64>) {
@@ -117,6 +140,14 @@ pub fn collect_catalog_entries(
     current_model: &str,
 ) -> Vec<ModelCatalogEntry> {
     // 先解析 model_list，保留顺序并去重；后缀已从 model_list 剥离，窗口来自 model_windows map。
+    let windows = model_windows
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let auto_compacts = model_auto_compact
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
     let mut seen = HashSet::new();
     let mut list_entries: Vec<ModelCatalogEntry> = Vec::new();
     for raw in model_list
@@ -132,13 +163,10 @@ pub fn collect_catalog_entries(
             continue;
         }
         let suffix_window = suffix_window.or_else(|| {
-            model_windows
-                .get(&slug)
-                .and_then(|token| parse_window_token(token))
+            lookup_model_map(&windows, &slug).and_then(|token| parse_window_token(token))
         });
-        let auto_compact_percent = model_auto_compact
-            .get(&slug)
-            .and_then(|token| parse_compact_percent(token));
+        let auto_compact_percent =
+            lookup_model_map(&auto_compacts, &slug).and_then(|token| parse_compact_percent(token));
         list_entries.push(ModelCatalogEntry {
             display_name: slug.clone(),
             slug,
@@ -154,12 +182,9 @@ pub fn collect_catalog_entries(
         let (slug, suffix_window) = parse_model_suffix(current_model);
         if !slug.is_empty() {
             let suffix_window = suffix_window.or_else(|| {
-                model_windows
-                    .get(&slug)
-                    .and_then(|token| parse_window_token(token))
+                lookup_model_map(&windows, &slug).and_then(|token| parse_window_token(token))
             });
-            let auto_compact_percent = model_auto_compact
-                .get(&slug)
+            let auto_compact_percent = lookup_model_map(&auto_compacts, &slug)
                 .and_then(|token| parse_compact_percent(token));
             entries.push(ModelCatalogEntry {
                 display_name: slug.clone(),
@@ -322,17 +347,41 @@ pub fn requires_bundled_metadata_catalog(slug: &str) -> bool {
 }
 
 pub fn model_ui_metadata(slug: &str) -> Option<Value> {
-    let resolved = resolve_builtin_metadata(slug)?;
-    let metadata = resolved.entry;
-    let normalized_slug = resolved.slug;
+    model_ui_metadata_with_override(slug, None)
+}
 
+/// UI 与请求拦截读取同一份供应商模型能力；用户明确声明优先于内置默认。
+pub fn model_ui_metadata_with_override(slug: &str, user_override: Option<&Value>) -> Option<Value> {
+    let resolved = resolve_builtin_metadata(slug);
+    let has_builtin = resolved.is_some();
+    let user_override = user_override.and_then(Value::as_object);
+    if resolved.is_none() && user_override.is_none() {
+        return None;
+    }
+    let normalized_slug = resolved
+        .as_ref()
+        .map(|entry| entry.slug.clone())
+        .unwrap_or_else(|| normalized_model_slug(slug));
+    let mut metadata = resolved
+        .map(|entry| entry.entry)
+        .unwrap_or_else(|| json!({}));
+    if let Some(user) = user_override
+        && let Some(model) = metadata.as_object_mut()
+    {
+        for (key, value) in user {
+            if key != "codex_plus_fast_support" {
+                model.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let fast_mode = user_override.and_then(|user| user.get("codex_plus_fast_support"));
+    apply_model_fast_support(&mut metadata, fast_mode);
     let levels = metadata
         .get("supported_reasoning_levels")
         .or_else(|| metadata.get("supportedReasoningLevels"))
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(|level| {
             let effort = level
                 .get("effort")
@@ -352,18 +401,11 @@ pub fn model_ui_metadata(slug: &str) -> Option<Value> {
             }))
         })
         .collect::<Vec<_>>();
-    let display_name = metadata
-        .get("display_name")
-        .or_else(|| metadata.get("displayName"))
-        .and_then(Value::as_str)
-        .unwrap_or(slug);
-    Some(json!({
+    let mut ui = json!({
         "displayName": if normalized_slug.eq_ignore_ascii_case(slug.trim()) {
-            display_name
-        } else {
-            slug
-        },
-
+            metadata.get("display_name").or_else(|| metadata.get("displayName"))
+                .and_then(Value::as_str).unwrap_or(slug)
+        } else { slug },
         "description": metadata
             .get("description")
             .and_then(Value::as_str)
@@ -384,7 +426,132 @@ pub fn model_ui_metadata(slug: &str) -> Option<Value> {
             .or_else(|| metadata.get("serviceTiers"))
             .cloned()
             .unwrap_or_else(|| json!([]))
-    }))
+    });
+    // 供应商分组身份（模型聚合在 catalog 条目上写的 `codex_plus_group` /
+    // `codex_plus_group_id`）：这份 UI 元数据是白名单结构，不在这里显式转发就流不到
+    // 前端。只在值是非空字符串时写——单供应商直连的目录没有这两个键，因此不会凭空
+    // 多出一个空分组；空串同样忽略，避免前端渲染出无名表头。
+    for key in ["codex_plus_group", "codex_plus_group_id"] {
+        if let Some(value) = metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            ui[key] = json!(value);
+        }
+    }
+    // `codex_plus_default` 标的是"这个模型属于默认成员"，用于在选择器里给默认供应商
+    // 那一组打标志。只有显式 true 才转发，缺键/false 都不写，保持既有响应形态不变。
+    if metadata.get("codex_plus_default").and_then(Value::as_bool) == Some(true) {
+        ui["codex_plus_default"] = json!(true);
+    }
+    // 网关写的收藏标记：选择器里在这一行后面画星标。同样只有显式 true 才转发。
+    if metadata.get("codex_plus_favorite").and_then(Value::as_bool) == Some(true) {
+        ui["codex_plus_favorite"] = json!(true);
+    }
+    // 注入侧与原生目录使用同一份窗口信息。
+    for (source, camel, snake) in [
+        ("context_window", "contextWindow", "context_window"),
+        (
+            "max_context_window",
+            "maxContextWindow",
+            "max_context_window",
+        ),
+    ] {
+        if let Some(window) = metadata.get(source) {
+            ui[camel] = window.clone();
+            ui[snake] = window.clone();
+        }
+    }
+    if !has_builtin {
+        // 单独声明 Fast 不能替原生描述符制造名称、描述或推理默认档。
+        for (ui_field, source_field) in [
+            ("displayName", "display_name"),
+            ("description", "description"),
+            ("defaultReasoningEffort", "default_reasoning_level"),
+        ] {
+            if metadata.get(source_field).and_then(Value::as_str).is_none() {
+                ui.as_object_mut().unwrap().remove(ui_field);
+            }
+        }
+    }
+    // 内置空数组不代表用户禁用；只有用户 JSON 中明确的数组才覆盖硬名单。
+    // 此标记仅属于 /model-catalog 的 UI 响应，不写入原生 models.json。
+    if let Some(user) = user_override {
+        let declaration = match fast_mode.and_then(Value::as_str) {
+            Some("supported") => Some(true),
+            Some("unsupported") => Some(false),
+            _ => user
+                .get("service_tiers")
+                .and_then(Value::as_array)
+                .map(|tiers| {
+                    tiers
+                        .iter()
+                        .any(|tier| model_speed_tier_is(tier, "priority"))
+                })
+                .or_else(|| {
+                    user.get("additional_speed_tiers")
+                        .and_then(Value::as_array)
+                        .map(|tiers| tiers.iter().any(|tier| model_speed_tier_is(tier, "fast")))
+                }),
+        };
+        if let Some(supported) = declaration {
+            ui["prioritySupportOverride"] = json!(supported);
+        }
+    }
+    Some(ui)
+}
+
+fn model_speed_tier_is(tier: &Value, expected: &str) -> bool {
+    tier.as_str()
+        .or_else(|| tier.get("id").and_then(Value::as_str))
+        .is_some_and(|id| id.trim().eq_ignore_ascii_case(expected))
+}
+
+/// 生成原生 catalog 和 UI 元数据共用解释；私有声明不进入 Codex 的模型 schema。
+pub(crate) fn apply_model_fast_support(model: &mut Value, declaration: Option<&Value>) {
+    let supported = match declaration.and_then(Value::as_str) {
+        Some("supported") => true,
+        Some("unsupported") => false,
+        _ => return,
+    };
+    for (field, tier, added) in [
+        (
+            "service_tiers",
+            "priority",
+            json!({"id":"priority", "name":"Fast", "description":"Priority processing declared for this provider."}),
+        ),
+        ("additional_speed_tiers", "fast", json!("fast")),
+    ] {
+        let mut values = model
+            .get(field)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if supported {
+            if field == "service_tiers" {
+                for value in values
+                    .iter_mut()
+                    .filter(|value| model_speed_tier_is(value, tier))
+                {
+                    let mut entry = value.as_object().cloned().unwrap_or_default();
+                    for key in ["id", "name", "description"] {
+                        if entry.get(key).is_none_or(|value| !value.is_string()) {
+                            entry.insert(key.to_string(), added[key].clone());
+                        }
+                    }
+                    *value = Value::Object(entry);
+                }
+            }
+            if !values.iter().any(|value| model_speed_tier_is(value, tier)) {
+                values.push(added);
+            }
+        } else {
+            values.retain(|value| !model_speed_tier_is(value, tier));
+        }
+        model[field] = json!(values);
+    }
 }
 
 /// 外接模型默认先尝试 Codex 原生 Code Mode。显式非空模式仍由模型元数据决定。
@@ -546,6 +713,10 @@ pub fn builtin_model_metadata_index() -> Vec<Value> {
                 .get("context_window")
                 .or_else(|| entry.get("max_context_window")),
             "auto_compact_token_limit": entry.get("auto_compact_token_limit"),
+            // 模型列表「思考等级」列的初值：内置声明直接展示（用户覆盖写进
+            // 自己的 model_metadata，不经这里）。
+            "supported_reasoning_levels": entry.get("supported_reasoning_levels"),
+            "default_reasoning_level": entry.get("default_reasoning_level"),
         }));
     };
     for slug in candidate_slugs {
@@ -558,7 +729,7 @@ pub fn builtin_model_metadata_index() -> Vec<Value> {
 
 /// 构建 codex model_catalog_json 内容。
 ///
-/// 采用 cc-switch 的 template-clone 思路：取 codex 自带 bundled entry 做模板，
+/// 采用 template-clone 思路：取 codex 自带 bundled entry 做模板，
 /// 再覆盖 slug / display_name / description / context_window / max_context_window /
 /// effective_context_window_percent / priority / auto_compact_token_limit 等字段。
 /// 无后缀条目用 fallback_window；fallback 也无时回落 272000（codex 默认）。
@@ -673,6 +844,14 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
                     .cloned()
                     .unwrap_or_else(|| json!(""));
                 model["base_instructions"] = mirrored;
+            }
+            // 新上游模板允许此可选能力为 null；本地发布契约要求明确 boolean。
+            // 未声明能力时保守关闭，保留模板明确声明的 true/false。
+            if !model
+                .get("supports_parallel_tool_calls")
+                .is_some_and(Value::is_boolean)
+            {
+                model["supports_parallel_tool_calls"] = json!(false);
             }
             model["availability_nux"] = Value::Null;
             model["upgrade"] = Value::Null;
@@ -939,4 +1118,37 @@ fn with_catalog_metadata_models<T>(catalog_json: &'static str, f: impl FnOnce(&[
             .unwrap_or_default()
     });
     f(entries)
+}
+
+#[cfg(test)]
+mod generated_catalog_contract_tests {
+    use super::*;
+
+    #[test]
+    fn generated_catalog_has_valid_parallel_capability_without_inventing_support() {
+        let entries = collect_catalog_entries(
+            "unknown-fixture-model",
+            &HashMap::new(),
+            &HashMap::new(),
+            "",
+        );
+        for declared in [
+            None,
+            Some(Value::Null),
+            Some(json!(false)),
+            Some(json!(true)),
+        ] {
+            let mut template = json!({"base_instructions": "fixture instructions"});
+            if let Some(value) = &declared {
+                template["supports_parallel_tool_calls"] = value.clone();
+            }
+            let catalog = build_model_catalog_json_with_template(&entries, None, Some(&template));
+            crate::relay_config::validate_managed_model_catalog(&catalog).unwrap();
+            let parsed: Value = serde_json::from_str(&catalog).unwrap();
+            assert_eq!(
+                parsed["models"][0]["supports_parallel_tool_calls"],
+                json!(declared.and_then(|value| value.as_bool()).unwrap_or(false))
+            );
+        }
+    }
 }

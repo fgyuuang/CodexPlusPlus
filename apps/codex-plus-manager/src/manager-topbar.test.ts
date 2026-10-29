@@ -15,17 +15,15 @@ function collect(value: unknown, accept: (node: AstNode) => boolean): AstNode[] 
   ];
 }
 
-function isTopbarRestart(node: AstNode): boolean {
+function isRestart(node: AstNode): boolean {
   if (node.type !== "CallExpression") return false;
   const callee = node.callee as AstNode;
-  const object = callee?.object as AstNode;
-  const property = callee?.property as AstNode;
-  const args = node.arguments as AstNode[];
-  return callee?.type === "MemberExpression" && object?.name === "actions"
-    && property?.name === "restart" && args[0]?.value === "topbar";
+  return callee?.type === "MemberExpression"
+    && (callee.object as AstNode)?.name === "actions"
+    && (callee.property as AstNode)?.name === "restart";
 }
 
-test("Manager 顶部重启控件必须位于实际渲染树中", async () => {
+test("Manager 重启操作属于实际命令菜单，顶部页面操作挂载点保留", async () => {
   const source = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
   const tree = parse(source, { sourceType: "module", plugins: ["typescript", "jsx"] });
   const topbars = collect(tree, (node) => {
@@ -36,7 +34,17 @@ test("Manager 顶部重启控件必须位于实际渲染树中", async () => {
       && (attr.value as AstNode)?.value === "topbar-actions");
   });
   assert.equal(topbars.length, 1);
-  assert.equal(collect(topbars[0], isTopbarRestart).length, 1,
-    "重启调用必须属于顶部工具栏，不能成为异步操作中的未使用 JSX");
-  assert.equal(collect(tree, isTopbarRestart).length, 1);
+  assert.ok(collect(topbars[0], (node) => node.type === "JSXAttribute"
+    && (node.name as AstNode)?.name === "data-topbar-actions").length === 1);
+  const actions = collect(tree, (node) => node.type === "ObjectExpression"
+    && (node.properties as AstNode[]).some((property) =>
+      (property.key as AstNode)?.name === "id" && (property.value as AstNode)?.value === "action:codex"));
+  assert.equal(actions.length, 1);
+  assert.equal(collect(actions[0], isRestart).length, 1);
+  const palettes = collect(tree, (node) => node.type === "JSXOpeningElement"
+    && (node.name as AstNode)?.name === "CommandPalette");
+  assert.equal(palettes.length, 1);
+  assert.ok((palettes[0].attributes as AstNode[]).some((attribute) =>
+    (attribute.name as AstNode)?.name === "commands"
+    && ((attribute.value as AstNode)?.expression as AstNode)?.name === "paletteCommands"));
 });

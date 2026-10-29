@@ -211,7 +211,7 @@ fn model_route_descriptors_with_store(
     settings: &BackendSettings,
     store: &crate::official_accounts::OfficialAccountStore,
 ) -> Vec<ModelRouteDescriptor> {
-    if !settings.official_experience.enabled {
+    if !settings.official_experience_active() {
         return Vec::new();
     }
     let trusted =
@@ -297,27 +297,24 @@ fn model_route_descriptors_with_store(
                     .map(|entries| (a, entries))
             })
             .collect::<Vec<_>>();
-        if catalogs.len() == accounts.len()
-            && let Some((first, entries)) = catalogs.first()
-        {
-            let common = entries
+        let mut scheduled = HashSet::new();
+        // 发布各账号可用模型的并集；实际分派仍逐账号验证目录和额度。
+        for (account, entries) in &catalogs {
+            let available = entries
                 .iter()
+                .filter(|entry| crate::official_account_schedule::eligible_model_entry(entry))
                 .filter_map(|e| e.get("slug").and_then(Value::as_str))
-                .filter(|slug| {
-                    catalogs.iter().all(|(_, entries)| {
-                        entries.iter().any(|e| {
-                            e.get("slug")
-                                .and_then(Value::as_str)
-                                .is_some_and(|s| s.eq_ignore_ascii_case(slug))
-                                && crate::official_account_schedule::eligible_model_entry(e)
-                        })
-                    })
-                })
                 .map(str::to_ascii_lowercase)
                 .collect();
-            for mut route in
-                direct_official_descriptors_for_account(&first.id, "官方顺序调度", entries, &common)
-            {
+            for mut route in direct_official_descriptors_for_account(
+                &account.id,
+                "官方顺序调度",
+                entries,
+                &available,
+            ) {
+                if !scheduled.insert(route.upstream_model.to_ascii_lowercase()) {
+                    continue;
+                }
                 route.provider_id = crate::official_account_schedule::PROVIDER_ID.to_string();
                 route.routing_slug = format!("{}:{}", route.provider_id, route.upstream_model);
                 descriptors.push(route);

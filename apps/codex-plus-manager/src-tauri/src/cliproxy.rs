@@ -1178,7 +1178,7 @@ fn sync_existing_official_profile_with(
     let changed = profile != settings.relay_profiles[profile_index];
     if changed {
         settings.relay_profiles[profile_index] = profile;
-        store.save(&settings)?;
+        settings.settings_revision = store.save_versioned(&settings)?;
     }
 
     Ok(Some(CliproxyOfficialProfileSync {
@@ -2068,7 +2068,7 @@ mod tests {
                 .all(|profile| !is_official_managed_profile(profile))
         );
 
-        let mut settings = BackendSettings::default();
+        let mut settings = store.load().unwrap();
         settings.relay_profiles = vec![codex_plus_core::settings::RelayProfile {
             id: OFFICIAL_PROFILE_ID.to_string(),
             name: "CLIProxyAPI 官方 Codex API".to_string(),
@@ -2091,6 +2091,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(added.changed);
+        assert_eq!(
+            added.settings.settings_revision,
+            store.load().unwrap().settings_revision
+        );
         assert_eq!(added.model_count, 2);
         let managed = added
             .settings
@@ -2106,6 +2110,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(removed.changed);
+        assert_eq!(
+            removed.settings.settings_revision,
+            store.load().unwrap().settings_revision
+        );
         assert_eq!(removed.model_count, 1);
         let managed = removed
             .settings

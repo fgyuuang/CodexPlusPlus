@@ -27,10 +27,20 @@ function New-Fixture($Mode) {
     foreach ($path in @('Cargo.toml', 'Cargo.lock', 'crates/core/lib.rs', 'scripts/assemble-renderer-inject.mjs', 'apps/codex-plus-manager/src/a.test.ts')) {
         Write-Text (Join-Path $root $path) 'fixture source'
     }
+    if ($Mode -like 'sherpa-*') {
+        Write-Text (Join-Path $root 'Cargo.toml') 'sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }'
+        Write-Text (Join-Path $root 'Cargo.lock') "[[package]]`nname = `"sherpa-onnx-sys`"`nversion = `"1.13.8`"`n"
+    }
     Write-Text (Join-Path $root 'mode.txt') $Mode
     foreach ($name in $names) {
         Write-Text (Join-Path $root "bin/$name") 'old artifact'
         Write-Text (Join-Path $root "runtime with spaces/$name") 'old artifact'
+    }
+    if ($Mode -like 'sherpa-*') {
+        foreach ($name in @('sherpa-onnx-c-api.dll', 'onnxruntime.dll')) {
+            Write-Text (Join-Path $root "bin/$name") 'old runtime library'
+            Write-Text (Join-Path $root "runtime with spaces/$name") 'old runtime library'
+        }
     }
     Write-Text (Join-Path $root 'tools/node.ps1') @'
 $root = Split-Path -Parent $PSScriptRoot
@@ -54,6 +64,18 @@ if ($args -contains '--release') {
     [IO.Directory]::CreateDirectory($release) | Out-Null
     foreach ($name in @('codex-plus-plus-manager.exe', 'codex-plus-plus.exe', 'codex-plus-mobile-relay.exe')) {
         [IO.File]::WriteAllText((Join-Path $release $name), "new $name")
+    }
+    $mode = Get-Content -LiteralPath (Join-Path $root 'mode.txt') -Raw
+    if ($mode -like 'sherpa-*') {
+        $libraryDirectory = Join-Path $root 'target/sherpa-onnx-prebuilt/sherpa-onnx-v1.13.8-win-x64-shared-MT-Release-lib/lib'
+        [IO.Directory]::CreateDirectory($libraryDirectory) | Out-Null
+        foreach ($name in @('sherpa-onnx-c-api.dll', 'onnxruntime.dll')) {
+            [IO.File]::WriteAllText((Join-Path $libraryDirectory $name), "new $name")
+            if ($mode -eq 'sherpa-missing' -and $name -eq 'onnxruntime.dll') { continue }
+            [IO.File]::WriteAllText((Join-Path $release $name), "new $name")
+        }
+        [IO.File]::WriteAllText((Join-Path $release 'unrelated.dll'), 'must not be distributed')
+        if ($mode -eq 'sherpa-mismatch') { [IO.File]::WriteAllText((Join-Path $release 'onnxruntime.dll'), 'different library') }
     }
     if ((Get-Content -LiteralPath (Join-Path $root 'mode.txt') -Raw) -eq 'stale-manager') {
         [IO.File]::SetLastWriteTimeUtc((Join-Path $release 'codex-plus-plus-manager.exe'), [datetime]::UtcNow.AddDays(-1))
@@ -105,6 +127,36 @@ $result = Read-StatusFile $task
 Assert ($result.state -eq 'succeeded' -and $result.delivery.Count -eq 3) 'Default delivery must only publish three bin artifacts.'
 foreach ($name in $names) { Assert ((Get-Content -LiteralPath (Join-Path $fixture.runtime $name) -Raw) -eq 'old artifact') 'Default must not change runtime files.' }
 Write-Output 'PASS default bin-only delivery preserves runtime'
+
+$fixture = New-Fixture 'sherpa-success'
+$task = Start-Fixture $fixture
+Wait-Until { (Read-StatusFile $task).state -in @('succeeded', 'failed') } 'shared runtime delivery'
+$result = Read-StatusFile $task
+Assert ($result.state -eq 'succeeded' -and $result.artifacts.Count -eq 5 -and $result.delivery.Count -eq 10) 'Shared speech runtime must accompany the three executables.'
+Assert ($result.runtimeDependencies.Count -eq 2) 'Native runtime sources must be recorded.'
+foreach ($item in $result.delivery) {
+    Assert ((Get-FileHash -LiteralPath $item.path).Hash -eq $item.sha256) 'Runtime and executable delivery hashes must match.'
+    Assert (Test-Path -LiteralPath $item.backup -PathType Leaf) 'Old DLLs must be backed up.'
+}
+foreach ($directory in @('bin', 'runtime with spaces')) {
+    Assert (-not (Test-Path -LiteralPath (Join-Path $fixture.root "$directory/unrelated.dll"))) 'Do not distribute arbitrary DLLs from target/release.'
+}
+Write-Output 'PASS shared speech runtime provenance, backup, delivery and hashes'
+
+foreach ($mode in @('sherpa-missing', 'sherpa-mismatch')) {
+    $fixture = New-Fixture $mode
+    $task = Start-Fixture $fixture
+    Wait-Until { (Read-StatusFile $task).state -in @('succeeded', 'failed') } $mode
+    $result = Read-StatusFile $task
+    Assert ($result.state -eq 'failed' -and $result.error -match 'runtime DLLs are missing or do not match') "$mode must stop delivery."
+    Assert-OldArtifacts $fixture
+    foreach ($directory in @('bin', 'runtime with spaces')) {
+        foreach ($name in @('sherpa-onnx-c-api.dll', 'onnxruntime.dll')) {
+            Assert ((Get-Content -LiteralPath (Join-Path $fixture.root "$directory/$name") -Raw) -eq 'old runtime library') 'Failed runtime validation must preserve old DLLs.'
+        }
+    }
+    Write-Output "PASS $mode fails before executable or DLL delivery"
+}
 
 foreach ($mode in @('cargo-failure', 'source-change', 'dist-change', 'stale-manager', 'ui-missing')) {
     $fixture = New-Fixture $mode

@@ -1,4 +1,6 @@
   function installCodexPlusNavigationEntries() {
+    document.getElementById(codexPlusRailPluginMarketId)?.remove();
+    document.getElementById(codexPlusSidebarPluginMarketId)?.remove();
     if (installCodexPlusRailNavigation()) {
       detachCodexPlusSidebarNavigation();
       return;
@@ -9,9 +11,10 @@
 
   const codexPluginRemoteOnlyMarketplaceKinds = new Set(["created-by-me-remote", "shared-with-me"]);
 
-  function pluginMarketplaceRequestProfile(params) {
-    const marketplaceKinds = Array.isArray(params?.marketplaceKinds)
-      ? Array.from(new Set(params.marketplaceKinds.map((kind) => restorePluginMarketplaceName(kind))))
+  function pluginMarketplaceRequestProfile(params, hostId) {
+    const requestParams = params?.params && typeof params.params === "object" ? params.params : params;
+    const marketplaceKinds = Array.isArray(requestParams?.marketplaceKinds)
+      ? Array.from(new Set(requestParams.marketplaceKinds.map((kind) => restorePluginMarketplaceName(kind))))
       : [];
     const hasRemoteOnlyKind = marketplaceKinds.some((kind) => codexPluginRemoteOnlyMarketplaceKinds.has(kind));
     const hasLocalKind = marketplaceKinds.includes("local");
@@ -21,6 +24,7 @@
     return {
       marketplaceKinds,
       remoteOnly: hasRemoteOnlyKind && !hasLocalKind && !hasOtherKind,
+      localHost: [hostId, params?.hostId, requestParams?.hostId].every((host) => host == null || host === "local"),
     };
   }
 
@@ -31,6 +35,7 @@
       return params;
     }
     const next = { ...params };
+    if (next.forceRefetch === true) clearPluginMarketplaceRemoteCatalogUnavailable();
     const requestProfile = pluginMarketplaceRequestProfile(next);
     const requestCwds = Array.isArray(next.cwds)
       ? next.cwds.filter((cwd) => typeof cwd === "string" && cwd.trim())
@@ -43,7 +48,7 @@
     const hadMarketplaceKinds = Object.prototype.hasOwnProperty.call(next, "marketplaceKinds");
     const broadCatalogRequest = codexPluginUsesBroadCatalogKinds()
       && (!hadMarketplaceKinds || next.marketplaceKinds == null);
-    const remoteCatalogUnavailable = window.__codexPluginMarketplaceRemoteCatalogUnavailable === true;
+    const remoteCatalogUnavailable = pluginMarketplaceRemoteCatalogUnavailable();
     if (broadCatalogRequest && !remoteCatalogUnavailable) {
       sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
         hadMarketplaceKinds,
@@ -264,4 +269,3 @@
     if (Array.isArray(filtered) && filtered.length >= sample.length) return false;
     return true;
   }
-

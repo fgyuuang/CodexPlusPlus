@@ -139,6 +139,37 @@ pub async fn refresh_active_account(force: bool) -> anyhow::Result<OfficialModel
     refresh_account(&account_id, &settings, force).await
 }
 
+/// 官方体验中的各账号都有独立权限目录；次账号失败不能中断其他账号刷新。
+pub async fn refresh_enabled_accounts(force: bool) -> anyhow::Result<OfficialModelCatalogStatus> {
+    let settings = SettingsStore::default().load()?;
+    let mut ids = Vec::new();
+    if !settings.active_official_account_id.trim().is_empty() {
+        ids.push(settings.active_official_account_id.clone());
+    }
+    if settings.official_experience.enabled {
+        for account in OfficialAccountStore::default().list()? {
+            if account.enabled && account.status == "ready" && !ids.contains(&account.id) {
+                ids.push(account.id);
+            }
+        }
+    }
+    ensure!(!ids.is_empty(), "没有可刷新目录的官方账号");
+    let mut errors = Vec::new();
+    for id in ids {
+        let error = match refresh_account(&id, &settings, force).await {
+            Ok(status) => status.error,
+            Err(error) => Some(sanitize_error(&error.to_string())),
+        };
+        if let Some(error) = error {
+            errors.push(format!("{id}: {error}"));
+        }
+    }
+    Ok(status_for_settings(
+        &settings,
+        (!errors.is_empty()).then(|| errors.join("; ")),
+    ))
+}
+
 pub async fn refresh_account(
     account_id: &str,
     settings: &BackendSettings,
@@ -146,6 +177,11 @@ pub async fn refresh_account(
 ) -> anyhow::Result<OfficialModelCatalogStatus> {
     let account_id = account_id.trim();
     ensure!(!account_id.is_empty(), "官方账号 ID 不能为空");
+    // 并发手动刷新与后台刷新不能相互覆盖整份账号缓存。
+    static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = REFRESH_LOCK.lock().await;
+    let mut account_settings = settings.clone();
+    account_settings.active_official_account_id = account_id.to_string();
     let store = OfficialAccountStore::default();
     let mut auth = store.get_auth_json(account_id)?;
     let mut observed = store.get(account_id)?;
@@ -208,7 +244,7 @@ pub async fn refresh_account(
                 }),
             );
             // 目录刷新是增强能力，回退结果仍然交给 Codex 使用。
-            return Ok(status_for_settings(settings, Some(safe_error)));
+            return Ok(status_for_settings(&account_settings, Some(safe_error)));
         }
     };
 
@@ -217,7 +253,7 @@ pub async fn refresh_account(
     cache.version = CACHE_VERSION;
     cache.accounts.insert(account_id.to_string(), snapshot);
     save_cache(&cache)?;
-    let status = status_for_settings(settings, None);
+    let status = status_for_settings(&account_settings, None);
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "official_model_catalog.refreshed",
         json!({
@@ -431,8 +467,27 @@ fn bundled_cli_catalog_sync(settings: &BackendSettings) -> Option<Vec<Value>> {
     None
 }
 
+// 目录与版本探测属于后台操作；仅重定向 stdio 仍会在 GUI 宿主下新建控制台。
+fn hidden_sync_cli_command(candidate: &Path) -> StdCommand {
+    let mut command = StdCommand::new(candidate);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    }
+    command
+}
+
+fn hidden_async_cli_command(candidate: &Path) -> Command {
+    let mut command = Command::new(candidate);
+    command.kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    command
+}
+
 fn run_bundled_catalog_command(candidate: &Path) -> Option<Vec<u8>> {
-    let mut child = StdCommand::new(candidate)
+    let mut child = hidden_sync_cli_command(candidate)
         .args(["debug", "models", "--bundled"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -843,7 +898,7 @@ async fn command_version(candidate: &Path) -> Option<String> {
     }
     let output = timeout(
         COMMAND_TIMEOUT,
-        Command::new(candidate)
+        hidden_async_cli_command(candidate)
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -865,7 +920,7 @@ fn command_version_sync(candidate: &Path) -> Option<String> {
     if let Some(version) = candidate_text.strip_prefix("__version__:") {
         return normalize_client_version(version);
     }
-    let mut child = StdCommand::new(candidate)
+    let mut child = hidden_sync_cli_command(candidate)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -983,6 +1038,211 @@ mod tests {
             vec!["gpt-6-astra", "gpt-7-internal", "gpt-6-fake"]
         );
         assert_eq!(visible_slugs(&entries), vec!["gpt-6-astra"]);
+    }
+
+    #[test]
+    fn all_accounts_refresh_publishes_new_models_and_schedule_union_without_cross_account_grants() {
+        use base64::Engine;
+        use std::io::{Read, Write};
+        let _guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        struct Restore {
+            settings: Option<PathBuf>,
+            accounts: Option<(PathBuf, PathBuf)>,
+            catalog: Option<PathBuf>,
+            endpoint: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::paths::set_settings_path_for_tests(self.settings.take());
+                crate::paths::set_official_account_paths_for_tests(self.accounts.take());
+                crate::paths::set_official_model_catalog_path_for_tests(self.catalog.take());
+                unsafe {
+                    if let Some(value) = self.endpoint.take() {
+                        std::env::set_var("CODEX_PLUS_OFFICIAL_MODEL_CATALOG_URL", value);
+                    } else {
+                        std::env::remove_var("CODEX_PLUS_OFFICIAL_MODEL_CATALOG_URL");
+                    }
+                }
+            }
+        }
+        let _restore = Restore {
+            settings: crate::paths::set_settings_path_for_tests(Some(
+                temp.path().join("settings.json"),
+            )),
+            accounts: crate::paths::set_official_account_paths_for_tests(Some((
+                temp.path().join("accounts.json"),
+                temp.path().join("secrets.json"),
+            ))),
+            catalog: crate::paths::set_official_model_catalog_path_for_tests(Some(
+                temp.path().join("catalog.json"),
+            )),
+            endpoint: std::env::var_os("CODEX_PLUS_OFFICIAL_MODEL_CATALOG_URL"),
+        };
+        let store = OfficialAccountStore::default();
+        let mut ids = Vec::new();
+        for name in ["first", "second"] {
+            let jwt = |value: Value| {
+                format!(
+                    "e30.{}.sig",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(serde_json::to_vec(&value).unwrap())
+                )
+            };
+            let (account, _) = store.upsert_auth_json(json!({"auth_mode":"chatgpt", "tokens": {
+                "id_token": jwt(json!({"sub":name})),
+                "access_token":jwt(json!({"sub":name,"exp":4000000000_i64,"https://api.openai.com/auth":{"chatgpt_account_id":name}})),
+                "refresh_token":"test-refresh", "account_id":name
+            }})).unwrap();
+            ids.push(account.id);
+        }
+        let mut settings = BackendSettings::default();
+        settings.active_official_account_id = ids[0].clone();
+        settings.official_experience.enabled = true;
+        settings.official_experience.primary_official_account_id = ids[0].clone();
+        settings.official_experience.account_schedule_enabled = true;
+        settings.official_experience.account_schedule_order = vec![ids[1].clone(), ids[0].clone()];
+        SettingsStore::default().save(&settings).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        unsafe {
+            std::env::set_var(
+                "CODEX_PLUS_OFFICIAL_MODEL_CATALOG_URL",
+                format!("http://{}/models", listener.local_addr().unwrap()),
+            );
+        }
+        let server = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 2048];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(
+                    !request.contains("if-none-match"),
+                    "forced refresh must reach every account"
+                );
+                let second = request.contains("chatgpt-account-id: second");
+                let slug = if second {
+                    "new-secondary-model"
+                } else {
+                    "new-primary-model"
+                };
+                let failed = index == 3;
+                let body = if failed {
+                    "{}".to_string()
+                } else {
+                    json!({"models":[{"slug":slug,"visibility":"list","supported_in_api":true}]})
+                        .to_string()
+                };
+                write!(socket, "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", if failed { "503 Unavailable" } else { "200 OK" }, body.len(), body).unwrap();
+            }
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let status = runtime.block_on(refresh_enabled_accounts(true)).unwrap();
+        assert!(status.error.is_none());
+        assert_eq!(status.visible_models, vec!["new-primary-model"]);
+        assert_eq!(
+            visible_slugs(&cached_official_model_entries_for_account(&ids[1]).unwrap()),
+            vec!["new-secondary-model"]
+        );
+        let routes = crate::official_experience::model_route_descriptors(&settings);
+        for slug in ["new-primary-model", "new-secondary-model"] {
+            assert!(routes.iter().any(|route| route.provider_id
+                == crate::official_account_schedule::PROVIDER_ID
+                && route.upstream_model == slug));
+        }
+        assert!(!routes.iter().any(|route| route.provider_id
+            == crate::official_experience::direct_official_provider_id(&ids[1])
+            && route.upstream_model == "new-primary-model"));
+        assert_eq!(
+            crate::official_account_schedule::select_account(
+                &settings,
+                "new-primary-model",
+                &HashSet::new()
+            )
+            .unwrap()
+            .id,
+            ids[0]
+        );
+        assert_eq!(
+            crate::official_account_schedule::select_account(
+                &settings,
+                "new-secondary-model",
+                &HashSet::new()
+            )
+            .unwrap()
+            .id,
+            ids[1]
+        );
+        assert!(
+            crate::official_account_schedule::select_account(
+                &settings,
+                "unknown-model",
+                &HashSet::new()
+            )
+            .is_err()
+        );
+        let status = runtime.block_on(refresh_enabled_accounts(true)).unwrap();
+        assert!(status.error.as_deref().unwrap().contains("HTTP 503"));
+        assert_eq!(
+            visible_slugs(&cached_official_model_entries_for_account(&ids[1]).unwrap()),
+            vec!["new-secondary-model"]
+        );
+        server.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn background_catalog_probes_do_not_allocate_windows_consoles() {
+        let system_root = std::env::var_os("SystemRoot").expect("Windows system root");
+        let shell =
+            PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let script = r#"Add-Type 'using System; using System.Runtime.InteropServices; public static class ConsoleProbe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); }'; [Console]::Write([ConsoleProbe]::GetConsoleWindow().ToInt64())"#;
+        let output = hidden_sync_cli_command(&shell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let output = runtime.block_on(async {
+            hidden_async_cli_command(&shell)
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .unwrap()
+        });
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
     }
 
     #[test]

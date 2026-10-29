@@ -964,6 +964,16 @@ fn apply_profile_with(
     profile.base_url = integration.api_base_url();
     profile.upstream_base_url = integration.api_base_url();
     profile.api_key = api_key.trim().to_string();
+    // normalize优先使用已选命名Key；同步更新该槽位，不能清空用户的其它Key或选择。
+    if let Some(selected_id) = profile.selected_api_key().map(|entry| entry.id.clone()) {
+        if let Some(selected) = profile
+            .api_keys
+            .iter_mut()
+            .find(|entry| entry.id == selected_id)
+        {
+            selected.api_key = profile.api_key.clone();
+        }
+    }
     profile.protocol = RelayProtocol::Responses;
     profile.relay_mode = RelayMode::PureApi;
     profile.official_mix_api_key = false;
@@ -986,7 +996,7 @@ fn apply_profile_with(
     if let Some(previous_id) = previous_id.filter(|id| id != MANAGED_PROFILE_ID) {
         rewrite_relay_references(&mut settings, &previous_id, MANAGED_PROFILE_ID);
     }
-    store.save(&settings)?;
+    settings.settings_revision = store.save_versioned(&settings)?;
     Ok(NewApiApplyPayload {
         settings,
         profile_id: MANAGED_PROFILE_ID.to_string(),
@@ -1450,6 +1460,81 @@ mod tests {
             .unwrap();
         assert_eq!(profile.model, "model-c");
         assert!(profile.config_contents.contains("sk-new"));
+        assert_eq!(profile.api_key, "sk-new");
+        assert_eq!(profile.selected_api_key().unwrap().api_key, "sk-new");
+        assert_eq!(
+            updated.settings.settings_revision,
+            store.load().unwrap().settings_revision
+        );
+    }
+
+    #[test]
+    fn apply_profile_refreshes_selected_named_key_without_replacing_other_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let integration = temp_integration(temp.path());
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        apply_profile_with(
+            NewApiApplyRequest {
+                model: "model-a".into(),
+                models: vec!["model-a".into()],
+            },
+            &integration,
+            "sk-original",
+            &store,
+        )
+        .unwrap();
+        let mut settings = store.load().unwrap();
+        let profile = settings
+            .relay_profiles
+            .iter_mut()
+            .find(|profile| is_managed_profile(profile))
+            .unwrap();
+        profile.api_keys = vec![
+            codex_plus_core::settings::RelayApiKey {
+                id: "spare".into(),
+                name: "保留备用".into(),
+                api_key: "sk-spare".into(),
+            },
+            codex_plus_core::settings::RelayApiKey {
+                id: "chosen".into(),
+                name: "用户选择".into(),
+                api_key: "sk-original".into(),
+            },
+        ];
+        profile.active_api_key_id = "chosen".into();
+        store.save(&settings).unwrap();
+
+        let applied = apply_profile_with(
+            NewApiApplyRequest {
+                model: "model-b".into(),
+                models: vec!["model-b".into()],
+            },
+            &integration,
+            "sk-refreshed",
+            &store,
+        )
+        .unwrap();
+        let persisted = store.load().unwrap();
+        assert_eq!(
+            applied.settings.settings_revision,
+            persisted.settings_revision
+        );
+        let profile = persisted
+            .relay_profiles
+            .iter()
+            .find(|profile| is_managed_profile(profile))
+            .unwrap();
+        assert_eq!(profile.active_api_key_id, "chosen");
+        assert_eq!(profile.api_keys.len(), 2);
+        assert_eq!(profile.api_keys[0].id, "spare");
+        assert_eq!(profile.api_keys[0].name, "保留备用");
+        assert_eq!(profile.api_keys[0].api_key, "sk-spare");
+        assert_eq!(profile.api_keys[1].id, "chosen");
+        assert_eq!(profile.api_keys[1].name, "用户选择");
+        assert_eq!(profile.selected_api_key().unwrap().api_key, "sk-refreshed");
+        assert_eq!(profile.api_key, "sk-refreshed");
+        assert!(profile.config_contents.contains("sk-refreshed"));
+        assert!(!profile.config_contents.contains("sk-original"));
     }
 
     #[test]
@@ -1494,6 +1579,9 @@ mod tests {
                 }],
             }],
             routes: Vec::new(),
+            model_aggregation_enabled: false,
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
         }];
         store.save(&settings).unwrap();
 

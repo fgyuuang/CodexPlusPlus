@@ -4,14 +4,20 @@
       const key = button.getAttribute("data-codex-plus-setting");
       const waitsForBackend = codexPlusBackendMappedSettings.has(key) && !codexPlusBackendSettingsLoaded;
       button.dataset.enabled = String(!!settings[key]);
+      button.setAttribute("aria-checked", button.dataset.enabled);
       button.dataset.pending = String(waitsForBackend);
       button.disabled = waitsForBackend || button.dataset.relayUnneeded === "true";
     });
     refreshConversationViewControls();
     refreshCodexServiceTierControls();
+    document.querySelectorAll("[data-codex-plus-typing-effect]").forEach((select) => {
+      select.value = ["rainbow", "fireworks", "stars"].includes(settings.typingEffect) ? settings.typingEffect : "off";
+      select.disabled = !codexPlusBackendSettingsLoaded || codexPlusBackendSettings.enhancementsEnabled === false;
+      if (typeof syncCodexPlusTypingEffectDropdown === "function") syncCodexPlusTypingEffectDropdown(select);
+    });
   }
 
-  let codexPlusBackendSettings = { providerSyncEnabled: false, enhancementsEnabled: true, launchMode: "patch", codexAppVersion: "" };
+  let codexPlusBackendSettings = { providerSyncEnabled: false, enhancementsEnabled: true, codexAppVersion: "" };
   let codexPlusBackendSettingsSeq = 0;
   const codexPluginLegacyEntryUnlockBeforeVersion = "26.601.2237";
   const codexPluginBridgeRequestUnlockFromVersion = "26.616.0";
@@ -75,25 +81,6 @@
   }
 
   let codexPlusBackendSettingsLoaded = false;
-  let codexServiceTierState = {
-    status: "loading",
-    serviceTier: null,
-    configServiceTier: null,
-    serviceTierSource: null,
-    message: "正在读取…",
-    fastTierValue: "priority",
-    controlMode: "inherit",
-    defaultMode: "inherit",
-    activeThreadId: "",
-    threadMode: "inherit",
-    effectiveServiceTier: null,
-    effectiveMode: "standard",
-    fastModelName: "",
-    fastSupported: false,
-  };
-  const codexDefaultServiceTierSetting = { key: "default-service-tier", default: null };
-  const codexServiceTierFallbackFastValue = "priority";
-  const codexServiceTierReadTimeoutMs = 5000;
   const codexServiceTierModulePromises = new Map();
   // namePart -> { at, attempts, error }，见 loadCodexAppModule 里的说明。
   // 挂在 window 上跨重注入保留：否则每次重注入都会清空失败记录，重新全量 fetch asset
@@ -191,6 +178,8 @@
 
   function codexAppAssetCandidateUrls() {
     return uniqueCodexAppAssetUrls([
+      // Fast 的 import map 让实际加载记录指向 Blob；定位原生类仍需要原资产 URL。
+      window.__codexPlusNativeFastCompiled === "v1" ? window.__codexPlusNativeFastModuleDiagnostics?.url : null,
       ...Array.from(document.scripts || []).map((script) => script.src),
       ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
       ...performance.getEntriesByType("resource").map((entry) => entry.name),
@@ -247,6 +236,22 @@
   // 实测空闲时 301 次请求/秒，主线程 TaskOtherDuration 占满一半 CPU，JS 堆每秒涨约 1MB，
   // Sentry 又给每个请求记一条 breadcrumb 并回同步一次 scope，把量再翻一倍推给 browser 进程。
   // 记住失败 + 冷却重试，让下游即便还在轮询也只会周期性地试一次。
+  // 「这个 asset 找不到」是可预期的、会随 Codex 版本变化的情形，
+  // 不是异常。用结构化标记而不是靠 message 字符串比对来区分：字符串比对让
+  // loadOptionalCodexAppModule 的「可选」语义只对精确复刻了那段 message 的调用方生效，
+  // 任何一个自己抛错或包了一层的调用方都会漏判，把可选依赖的缺失当成硬失败中断整条流程
+  // （issue #1316 的「未找到 Codex App asset: vscode-api-」就是这么冒到用户面前的）。
+  function codexAppAssetMissingError(namePart) {
+    const error = new Error(`未找到 Codex App asset: ${namePart}`);
+    error.code = "CODEX_PLUS_ASSET_MISSING";
+    error.assetNamePart = namePart;
+    return error;
+  }
+
+  function isCodexAppAssetMissingError(error) {
+    return !!error && (error.code === "CODEX_PLUS_ASSET_MISSING" || error.name === "CodexPlusAssetMissingError");
+  }
+
   async function loadCodexAppModule(namePart) {
     if (!codexServiceTierModulePromises.has(namePart)) {
       const failure = codexAppModuleFailures.get(namePart);
@@ -257,7 +262,7 @@
       }
       const promise = Promise.resolve().then(async () => {
         const url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
-        if (!url) throw new Error(`未找到 Codex App asset: ${namePart}`);
+        if (!url) throw codexAppAssetMissingError(namePart);
         return await import(url);
       }).then((module) => {
         // Codex 更新后 asset 可能又出现，成功时把失败记录清掉，冷却计数重新开始。
@@ -281,8 +286,9 @@
     try {
       return await loadCodexAppModule(namePart);
     } catch (error) {
-      const message = String(error?.message || error);
-      if (message.includes(`未找到 Codex App asset: ${namePart}`)) return null;
+      // 结构化标记优先；保留字符串兜底以便老缓存里的 Error 也能被认出来。
+      if (isCodexAppAssetMissingError(error)) return null;
+      if (String(error?.message || error).includes(`未找到 Codex App asset: ${namePart}`)) return null;
       throw error;
     }
   }
@@ -489,19 +495,53 @@
     return codexServiceTierModelFromValue(codexModelCatalog.model) || codexServiceTierModelFromValue(codexModelCatalog.default_model);
   }
 
+  // threadId -> 模型名。挂在 window 上跨重注入保留（重注入不该丢掉已知的线程模型）。
+  // 只在请求路径观测到模型时写入，用于让界面判定跟上线程当前模型（issue #1463）。
+  const codexServiceTierThreadModels = window.__codexPlusServiceTierThreadModels
+    || (window.__codexPlusServiceTierThreadModels = new Map());
+
+  // 线程中途换模型后，全局 catalog 的 model 字段往往还没更新，直接拿它判 Fast 可用性
+  // 会落后一拍。因此界面优先读「当前线程最近一次实际请求用的模型」，读不到才回落全局。
+  function codexServiceTierUiModelName(threadId = "") {
+    const key = typeof validThreadScrollSessionKey === "function"
+      ? validThreadScrollSessionKey(threadId)
+      : String(threadId || "");
+    if (key) {
+      const cached = codexServiceTierThreadModels.get(key);
+      if (cached) return cached;
+    }
+    return codexServiceTierCurrentModelName();
+  }
+
+  function codexServiceTierRememberThreadModel(threadId, modelName) {
+    const key = typeof validThreadScrollSessionKey === "function"
+      ? validThreadScrollSessionKey(threadId)
+      : String(threadId || "");
+    const model = codexServiceTierModelFromValue(modelName);
+    if (!key || !model) return;
+    codexServiceTierThreadModels.set(key, model);
+    // 简易上界，避免长会话里 Map 无限增长；Map 的插入序即写入序，删最旧的即可。
+    while (codexServiceTierThreadModels.size > 64) {
+      const oldest = codexServiceTierThreadModels.keys().next().value;
+      if (oldest === undefined) break;
+      codexServiceTierThreadModels.delete(oldest);
+    }
+  }
+
   function codexServiceTierModelForRequest(params, modelHint = "") {
     return codexServiceTierModelFromValue(params) || codexServiceTierModelFromValue(modelHint) || codexServiceTierCurrentModelName();
   }
 
   function codexServiceTierFastSupportedForModel(modelName) {
-    const normalized = String(modelName || "").trim();
-    if (!normalized) return false;
+    const normalized = normalizeCodexServiceTierModelName(modelName);
     try {
       const metadata = typeof codexPlusModelMetadata === "function" ? codexPlusModelMetadata(normalized) : null;
-      return codexCatalogModelSupportsFast(metadata);
-    } catch {
-      return false;
-    }
+      if (typeof metadata?.prioritySupportOverride === "boolean") return metadata.prioritySupportOverride;
+      if (typeof codexCatalogModelSupportsFast === "function") return codexCatalogModelSupportsFast(metadata);
+      return [metadata?.serviceTiers, metadata?.service_tiers, metadata?.additionalSpeedTiers, metadata?.additional_speed_tiers]
+        .some((tiers) => Array.isArray(tiers) && tiers.some((tier) => typeof tier === "string"
+          ? tier === "priority" || tier === "fast" : tier?.id === "priority"));
+    } catch { return false; }
   }
 
   function codexServiceTierFastUnsupportedMessage(modelName = codexServiceTierCurrentModelName()) {
@@ -526,6 +566,29 @@
       supported: codexServiceTierFastSupportedForModel(modelName),
     };
   }
+
+  let codexServiceTierState = {
+    status: "loading",
+    serviceTier: null,
+    configServiceTier: null,
+    serviceTierSource: null,
+    message: "正在读取…",
+    fastTierValue: "priority",
+    controlMode: "inherit",
+    defaultMode: "inherit",
+    activeThreadId: "",
+    threadMode: "inherit",
+    effectiveServiceTier: null,
+    effectiveMode: "standard",
+    fastModelName: "",
+    fastSupported: false,
+  };
+
+  const codexDefaultServiceTierSetting = { key: "default-service-tier", default: null };
+
+  const codexServiceTierFallbackFastValue = "priority";
+
+  const codexServiceTierReadTimeoutMs = 5000;
 
   function codexServiceTierInheritedValue() {
     if (codexServiceTierState.serviceTier != null) return codexServiceTierState.serviceTier;
@@ -561,4 +624,3 @@
   function codexServiceTierEffectiveMode(value) {
     return isFastServiceTierValue(value) ? "fast" : "standard";
   }
-

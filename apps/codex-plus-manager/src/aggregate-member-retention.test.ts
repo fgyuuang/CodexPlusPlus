@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import test from "node:test";
 import ts from "typescript";
+import { normalizeAggregateMembers, normalizeAggregateDefaultRelayId, isAggregateProfile, isOfficialLoginMemberProfile } from "./aggregate-members.ts";
 import { clampAggregateRoutePriority } from "./aggregate-routes.ts";
 
 const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
@@ -19,7 +20,7 @@ const compiled = ts.transpileModule(functions.join("\n"), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText;
 const context = vm.createContext({
-  clampAggregateRoutePriority,
+  clampAggregateRoutePriority, normalizeAggregateMembers, normalizeAggregateDefaultRelayId, isAggregateProfile, isOfficialLoginMemberProfile,
   aggregateStrategyOptions: [{ value: "failover" }],
   officialLoginModelList: () => [],
   inferAggregateModelList: (profile: any) => profile.modelList,
@@ -69,4 +70,20 @@ test("an empty known candidate set removes excluded references, while missing se
   assert.deepEqual(run("normalizeAggregateRelayProfile", aggregate, settings).aggregate.members, []);
   assert.deepEqual(run("normalizeAggregateRelayProfile", aggregate, null).aggregate.members,
     aggregate.aggregate.members);
+});
+
+
+test("legacy login-sync data survives aggregate normalization while its inactive control stays hidden", () => {
+  const editor = ast.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === "AggregateRelayProfileEditor");
+  assert.ok(editor);
+  const editorText = editor.getText(ast);
+  assert.doesNotMatch(editorText, /aggregate\.syncDefaultMemberLogin|aggregate-default-login-sync/);
+  assert.match(editorText, /设为默认/);
+  for (const syncDefaultMemberLogin of [false, true]) {
+    const aggregate = profile();
+    Object.assign(aggregate.aggregate, { syncDefaultMemberLogin, defaultRelayId: "a" });
+    const result = run("normalizeAggregateRelayProfile", aggregate, { relayProfiles: [api("a"), api("b"), aggregate] });
+    assert.equal(result.aggregate.syncDefaultMemberLogin, syncDefaultMemberLogin);
+    assert.equal(result.aggregate.defaultRelayId, "a");
+  }
 });
