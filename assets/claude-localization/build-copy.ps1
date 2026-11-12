@@ -23,34 +23,21 @@ function Get-Sha256Hex([string]$path) {
 }
 
 function Find-Ion([string]$root) {
+  # 新版 Claude 把本地界面打包成 ion-dist.asar（#2884）：词表注入与校验由 Codex++ 完成。
+  $packed = Test-Path -LiteralPath (Join-Path $root 'resources\ion-dist.asar') -PathType Leaf
   foreach ($candidate in @((Join-Path $root 'resources\ion-dist'), (Join-Path $root 'ion-dist'))) {
-    if (Test-Path (Join-Path $candidate 'index.html')) { return $candidate }
+    if (-not (Test-Path (Join-Path $candidate 'index.html'))) { continue }
+    # asar 旁边的 ion-dist 可能只是占位页（#2943）：assets 下没有脚本时交给 asar 分支。
+    $assets = Join-Path $candidate 'assets'
+    $hasUi = (Test-Path -LiteralPath $assets -PathType Container) -and (Get-ChildItem -LiteralPath $assets -Filter '*.js' -Recurse -File | Select-Object -First 1)
+    if ($hasUi -or -not $packed) { return $candidate }
   }
+  if ($packed) { return $null }
   throw "找不到 Claude 本地界面 ion-dist"
 }
 
-function Find-FuseBinary([string]$root) {
-  $wire = [Text.Encoding]::ASCII.GetBytes('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX')
-  $files = @(Get-ChildItem -LiteralPath $root -Filter '*.exe' -Recurse -File)
-  foreach ($file in $files) {
-    $bytes = [IO.File]::ReadAllBytes($file.FullName)
-    for ($i = 0; $i -le $bytes.Length - $wire.Length; $i++) {
-      $same = $true
-      for ($j = 0; $j -lt $wire.Length; $j++) { if ($bytes[$i + $j] -ne $wire[$j]) { $same = $false; break } }
-      if ($same) {
-        $count = $bytes[$i + $wire.Length + 1]
-        if ($count -ge 4) { return @{ Path = $file.FullName; Offset = $i + $wire.Length + 2; Count = $count } }
-      }
-    }
-  }
-  throw '找不到 Electron fuse，无法安全启动注入'
-}
-
-function Patch-Fuse([string]$root) {
-  $fuse = Find-FuseBinary $root
-  $bytes = [IO.File]::ReadAllBytes($fuse.Path)
-  if ($bytes[$fuse.Offset + 3] -ne 0x31) { $bytes[$fuse.Offset + 3] = 0x31; [IO.File]::WriteAllBytes($fuse.Path, $bytes) }
-}
+# Electron fuse（含 EnableNodeCliInspectArguments）由 Codex++ 在复制完成后改写并复核，
+# 逐字节扫描上百 MB 的 exe 在 PowerShell 里太慢；官方安装目录始终只读不改。
 
 function Copy-Catalogs([string]$ion) {
   foreach ($relative in @('zh-Hans.json', 'dynamic\zh-Hans.json', 'zh-Hans.overrides.json')) {
@@ -84,14 +71,17 @@ if ($args -contains '--check') {
   $sourceAsar = Join-Path $sourceRoot 'resources\app.asar'; $copyAsar = Join-Path $copyRoot 'resources\app.asar'
   if ((Get-Sha256Hex $sourceAsar) -ne (Get-Sha256Hex $copyAsar)) { throw 'app.asar 已被改动' }
   $ion = Find-Ion $copyRoot
-  if (-not (Test-Path (Join-Path $ion 'i18n\zh-Hans.json'))) { throw '中文词表缺失' }
+  if ($ion -and -not (Test-Path (Join-Path $ion 'i18n\zh-Hans.json'))) { throw '中文词表缺失' }
   Write-Output 'Windows Claude 副本、中文词表与 app.asar 一致性检查通过'; exit 0
 }
 
 if (Test-Path $copyRoot) { throw '构建目标必须是新的暂存目录' }
 New-Item -ItemType Directory -Force (Split-Path $copyRoot -Parent) | Out-Null
 $null = & robocopy.exe $sourceRoot $copyRoot /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
-if ($LASTEXITCODE -gt 7) { throw "复制 Windows Claude 副本失败，robocopy 退出码：$LASTEXITCODE" }
-Patch-Fuse $copyRoot
-Copy-Catalogs (Find-Ion $copyRoot)
+if ($LASTEXITCODE -gt 7) {
+  $hint = $(if ($sourceRoot -match '\\WindowsApps\\') { '；商店版（MSIX）Claude 位于受保护的 WindowsApps 目录，请用安装 Claude 的同一账户运行 Codex++，不要以管理员或其他用户身份运行' } else { '' })
+  throw "复制 Windows Claude 副本失败（robocopy 退出码：$LASTEXITCODE），可能没有读取 $sourceRoot 的权限或磁盘空间不足$hint"
+}
+$ion = Find-Ion $copyRoot
+if ($ion) { Copy-Catalogs $ion } else { Write-Output 'ion-dist.asar 由 Codex++ 处理' }
 Write-Output 'Windows Claude 副本已创建，官方 app.asar 未修改'

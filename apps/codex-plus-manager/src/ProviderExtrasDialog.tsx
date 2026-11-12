@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
 import { AppSelect } from "./AppSelect";
-import { maskAccountName, type GatewayPoolEntry, type ProviderPrice } from "./gateway-model";
+import { DIRECT_PROXY, isDirectProxy, maskAccountName, parseKeyLimit, proxyAddressError, type GatewayPoolEntry, type ProviderPrice } from "./gateway-model";
 import {
   EMPTY_PRICE_ROW,
   formatPrice,
@@ -86,12 +86,18 @@ export function ProviderExtrasDialog({
     return initial;
   });
   const [currency, setCurrency] = useState(() => Object.values(entry.modelPrices ?? {})[0]?.currency || entry.price?.currency || "USD");
-  const [proxy, setProxy] = useState(entry.proxy ?? "");
+  // 代理三种：沿用系统代理（留空）、单独代理（填地址）、不使用代理（直连，#2760）。
+  const [proxyMode, setProxyMode] = useState<"system" | "custom" | "direct">(
+    isDirectProxy(entry.proxy) ? "direct" : (entry.proxy ?? "").trim() ? "custom" : "system",
+  );
+  const [proxy, setProxy] = useState(isDirectProxy(entry.proxy) ? "" : entry.proxy ?? "");
   const [price, setPrice] = useState<PriceState>({ state: "idle" });
   const setRow = (model: string, patch: Partial<PriceRow>) => setRows((previous) => ({ ...previous, [model]: { ...(previous[model] ?? EMPTY_PRICE_ROW), ...patch } }));
-  const proxyError = proxy.trim() && !/^(https?|socks5h?):\/\/\S+$/i.test(proxy.trim())
-    ? t("代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）")
-    : "";
+  const proxyValue = proxyMode === "direct" ? DIRECT_PROXY : proxyMode === "custom" ? proxy.trim() : "";
+  const proxyAddressProblem = proxyMode === "custom" ? proxyAddressError(proxy) : null;
+  const proxyError = proxyAddressProblem
+    ? t(proxyAddressProblem)
+    : proxyMode === "custom" && !proxy.trim() ? t("请填写代理地址") : "";
 
   // Esc 栈：币种下拉开着时 Esc 只关下拉，不会把整个价格弹窗（和填了一半的价格）关掉。
   useEscapeLayer(true, onCancel);
@@ -131,7 +137,7 @@ export function ProviderExtrasDialog({
         onSubmit={(event) => {
           event.preventDefault();
           if (section === "proxy") {
-            if (!proxyError) onSave(entry.price ?? null, null, proxy.trim());
+            if (!proxyError) onSave(entry.price ?? null, null, proxyValue);
             return;
           }
           const perModel: Record<string, PriceRow> = { ...rows };
@@ -194,8 +200,27 @@ export function ProviderExtrasDialog({
           </section>
           ) : (
           <section className="pf-section">
-            <h4>{t("代理")}<small>{t("只这个供应商单独走的 HTTP 代理，留空沿用系统代理")}</small></h4>
-            <Input className="pf-mono" onChange={(event) => setProxy(event.currentTarget.value)} placeholder="http://127.0.0.1:7890" spellCheck={false} value={proxy} />
+            <h4>{t("代理")}<small>{t("这个供应商的请求怎么走代理")}</small></h4>
+            <div className="pf-seg" role="radiogroup" aria-label={t("代理")}>
+              {([
+                ["system", t("沿用系统代理")],
+                ["custom", t("单独代理")],
+                ["direct", t("不使用代理（直连）")],
+              ] as const).map(([mode, label]) => (
+                <button aria-checked={proxyMode === mode} data-active={proxyMode === mode} key={mode} onClick={() => setProxyMode(mode)} role="radio" type="button">
+                  {label}
+                </button>
+              ))}
+            </div>
+            {proxyMode === "custom" ? (
+              <Input autoFocus className="pf-mono" onChange={(event) => setProxy(event.currentTarget.value)} placeholder="http://127.0.0.1:7890" spellCheck={false} value={proxy} />
+            ) : (
+              <p className="pf-hint">
+                {proxyMode === "direct"
+                  ? t("不走系统代理和代理环境变量，直接连这个供应商；适合国内可直连的中转。")
+                  : t("跟随系统代理（以及代理环境变量）；没有设置系统代理时就是直连。")}
+              </p>
+            )}
           </section>
           )}
         </div>
@@ -204,6 +229,162 @@ export function ProviderExtrasDialog({
           <span className="pf-error">{section === "proxy" ? proxyError : ""}</span>
           <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
           <Button disabled={busy || (section === "proxy" && Boolean(proxyError))} size="sm" type="submit">{busy ? t("保存中") : t("保存")}</Button>
+        </footer>
+      </form>
+    </div>,
+    document.body,
+  );
+}
+
+/** 详情里「限速」一行的展示文字：没设上限时为空。 */
+export function keyLimitSummary(entry: GatewayPoolEntry): string {
+  const parts: string[] = [];
+  if (entry.keyRpm) parts.push(tf("每分钟 {0} 次", [entry.keyRpm]));
+  if (entry.keyConcurrency) parts.push(tf("同时 {0} 个", [entry.keyConcurrency]));
+  return parts.length ? tf("每个 Key · {0}", [parts.join(" · ")]) : "";
+}
+
+/** 供应商的主动限速（#1130 / #2726）：每个 Key 的 RPM / 并发上限，留空表示不限。 */
+export function ProviderLimitsDialog({
+  entry,
+  busy,
+  onSave,
+  onCancel,
+}: {
+  entry: GatewayPoolEntry;
+  busy: boolean;
+  onSave: (rpm: number | null, concurrency: number | null) => void;
+  onCancel: () => void;
+}) {
+  const [rpm, setRpm] = useState(entry.keyRpm ? String(entry.keyRpm) : "");
+  const [concurrency, setConcurrency] = useState(entry.keyConcurrency ? String(entry.keyConcurrency) : "");
+  const rpmValue = parseKeyLimit(rpm);
+  const concurrencyValue = parseKeyLimit(concurrency);
+  const invalid = Number.isNaN(rpmValue) || Number.isNaN(concurrencyValue);
+  useEscapeLayer(true, onCancel);
+
+  return createPortal(
+    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
+      <form
+        className="pf-modal pf-extras-modal"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!invalid) onSave(rpmValue, concurrencyValue);
+        }}
+      >
+        <header className="pf-head">
+          <Avatar baseUrl={entry.baseUrl} name={entry.name} />
+          <div>
+            <strong>{tf("{0} 的限速", [maskAccountName(entry.name)])}</strong>
+            <small>{t("按每个 Key 计，留空表示不限")}</small>
+          </div>
+          <button aria-label={t("关闭")} className="pf-icon" onClick={onCancel} type="button"><X /></button>
+        </header>
+
+        <div className="pf-body">
+          <section className="pf-section">
+            <h4>{t("限速")}<small>{t("上游限制了 RPM 或并发时，在这里主动限住，不用等 429 再冷却")}</small></h4>
+            <label className="pf-field">
+              <span>{t("每分钟最多请求数")} <small>RPM</small></span>
+              <Input inputMode="numeric" onChange={(event) => setRpm(event.currentTarget.value)} placeholder={t("不限")} value={rpm} />
+            </label>
+            <label className="pf-field">
+              <span>{t("同时进行的最多请求数")} <small>{t("并发")}</small></span>
+              <Input inputMode="numeric" onChange={(event) => setConcurrency(event.currentTarget.value)} placeholder={t("不限")} value={concurrency} />
+            </label>
+            <p className="pf-note">{t("按每个 Key 计；达到上限时先换别的 Key 或下一家，都满了就排队等待（最多 2 分钟）。")}</p>
+          </section>
+        </div>
+
+        <footer className="pf-foot">
+          <span className="pf-error">{invalid ? t("上限要填正整数，留空表示不限") : ""}</span>
+          <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
+          <Button disabled={busy || invalid} size="sm" type="submit">{busy ? t("保存中") : t("保存")}</Button>
+        </footer>
+      </form>
+    </div>,
+    document.body,
+  );
+}
+
+/**
+ * new-api 的访问令牌（#2793）：new-api「个人设置 → 安全设置」里生成的访问令牌，区别于 API Key，
+ * 只用来查账户余额。已保存的令牌只显示打码后的样子；令牌框留空表示沿用。
+ */
+export function ProviderNewApiAccessDialog({
+  entry,
+  busy,
+  onSave,
+  onClear,
+  onCancel,
+}: {
+  entry: GatewayPoolEntry;
+  busy: boolean;
+  onSave: (token: string | null, userId: string) => void;
+  onClear: () => void;
+  onCancel: () => void;
+}) {
+  const saved = entry.newapiAccess ?? null;
+  const [token, setToken] = useState("");
+  const [userId, setUserId] = useState(saved?.userId ?? "");
+  const tokenValue = token.trim();
+  const userIdValue = userId.trim();
+  // 还没保存过令牌时必须填；空着只是不能保存，不提示错误。
+  const missing = !saved && !tokenValue;
+  const error = /\s/.test(tokenValue)
+    ? t("访问令牌里不能有空格或换行")
+    : !/^\d*$/.test(userIdValue)
+      ? t("用户 ID 只能是数字")
+      : "";
+  useEscapeLayer(true, onCancel);
+
+  return createPortal(
+    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
+      <form
+        className="pf-modal pf-extras-modal"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!error && !missing) onSave(tokenValue || null, userIdValue);
+        }}
+      >
+        <header className="pf-head">
+          <Avatar baseUrl={entry.baseUrl} name={entry.name} />
+          <div>
+            <strong>{tf("{0} 的访问令牌", [maskAccountName(entry.name)])}</strong>
+            <small>{t("可选：只用来查 new-api 账户余额，留空不查")}</small>
+          </div>
+          <button aria-label={t("关闭")} className="pf-icon" onClick={onCancel} type="button"><X /></button>
+        </header>
+
+        <div className="pf-body">
+          <section className="pf-section">
+            <h4>{t("访问令牌")}<small>{t("在 new-api 的「个人设置 → 安全设置」里生成，不是 API Key")}</small></h4>
+            <label className="pf-field">
+              <span>{t("访问令牌")}</span>
+              <Input
+                autoComplete="off"
+                onChange={(event) => setToken(event.currentTarget.value)}
+                placeholder={saved ? tf("已保存 {0}，留空不改", [saved.masked]) : t("粘贴访问令牌")}
+                spellCheck={false}
+                type="password"
+                value={token}
+              />
+            </label>
+            <label className="pf-field">
+              <span>{t("用户 ID")} <small>New-Api-User</small></span>
+              <Input inputMode="numeric" onChange={(event) => setUserId(event.currentTarget.value)} placeholder={t("个人设置里显示的 ID")} value={userId} />
+            </label>
+            <p className="pf-note">{t("按 new-api 文档，查余额要同时带访问令牌和用户 ID（旧版必须填用户 ID）；新版的分权限令牌需要勾选「个人资料 · 查看」。令牌只存在本机，和 Key 一样不显示原文。")}</p>
+          </section>
+        </div>
+
+        <footer className="pf-foot">
+          <span className="pf-error">{error}</span>
+          {saved ? (
+            <Button disabled={busy} onClick={onClear} size="sm" type="button" variant="ghost">{t("清除令牌")}</Button>
+          ) : null}
+          <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
+          <Button disabled={busy || missing || Boolean(error)} size="sm" type="submit">{busy ? t("保存中") : t("保存")}</Button>
         </footer>
       </form>
     </div>,

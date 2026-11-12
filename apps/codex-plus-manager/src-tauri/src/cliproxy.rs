@@ -751,6 +751,13 @@ fn should_auto_start(settings: &CliproxyIntegrationSettings, transient: bool) ->
 }
 
 pub fn start_cliproxy_from_saved_settings(transient: bool) {
+    if transient
+        || codex_plus_core::user_scripts::default_user_script_manager()
+            .authorize_local_integration("bundled:local-cliproxy", "/local-integrations/cliproxy")
+            .is_err()
+    {
+        return;
+    }
     let settings = match load_integration_settings() {
         Ok(settings) => settings,
         Err(error) => {

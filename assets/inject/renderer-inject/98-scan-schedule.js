@@ -40,6 +40,10 @@
       'aside.app-shell-left-panel nav[role="navigation"]',
       'nav[data-app-navigation-rail]',
       codexMenuLocalizationScopeSelector(),
+      // 审批卡片出现时补上拓展的 approval 插槽。
+      "[data-codex-approval-surface]",
+      // Codex 设置页导航出现时补上 settings.nav 插槽。
+      "[data-settings-panel-slug]",
       ...(codexPluginMarketplacePatchEnabled() ? [selectors.disabledInstallButton] : []),
     ].join(", ");
   }
@@ -106,13 +110,14 @@
   }
 
   function scheduleScan(mutations) {
-    // 隐藏页面和已排队的扫描也要清理，不能让孤立菜单等待下一次可见扫描。
+    // 隐藏页面和已排队的扫描也要回收已脱离的菜单、插槽，不能等下次可见扫描。
     const sessionActionsNeedScan = pruneRemovedSessionActions(mutations);
     if (!document.hidden) scheduleZedRemoteMenuRefresh(mutations);
+    const slotsNeedScan = pruneRemovedCodexPlusUiSlots(mutations);
     window.__codexSessionDeleteLastMutations = mutations;
     if (window.__codexSessionDeleteScanPending) return;
-    // 原生页面可能只移除带归属标记的按钮组；所属行仍在时需要补回操作入口。
-    if (!sessionActionsNeedScan && !shouldScheduleScan(mutations)) return;
+    // 原生页面可能只移除带归属标记的按钮组或插槽；宿主仍在时需要补回。
+    if (!sessionActionsNeedScan && !slotsNeedScan && !shouldScheduleScan(mutations)) return;
     window.__codexSessionDeleteScanPending = true;
     if (document.hidden) return;
     window.__codexSessionDeleteScanTimer = setTimeout(runScheduledScan, 200);

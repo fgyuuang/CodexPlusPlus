@@ -45,6 +45,19 @@
   const gates = [
     {
       kind: "ui-access",
+      // 核心结构：只锚定门控表达式、`authMethod ?? null` 与紧随的 {authMethod,hostId} 查询键，
+      // 以及后面的 serviceTierAccess 返回值；hook 的缓存槽、加载态写法变了也能认出来。
+      core: {
+        pattern: [
+          `(?<variable>${id})=(?<gate>(?<identity>${id})\\?\\.authMethod===${chatgpt}\\|\\|\\k<identity>\\?\\.authMethod===${token}(?:\\|\\|\\k<identity>\\?\\.authMethod===${literal})*),`,
+          `(?<method>${id})=\\k<identity>\\?\\.authMethod\\?\\?null,[^{}]{0,300}\\{authMethod:\\k<method>,hostId:(?<host>${id})\\}`,
+          `[\\s\\S]{0,1500}?serviceTierAccess:`,
+        ].join(""),
+        distinct: ["identity", "host"],
+        // host 取自查询键，必须在门控之前已经声明，否则补丁会碰到未初始化的绑定。
+        validate: (groups, source, index) => declaredBefore(source, index, groups.host),
+        replacement: (groups) => `(${groups.gate}||${allow(groups.host, `${groups.identity}?.authMethod`)})`,
+      },
       pattern: [
         `function ${id}\\((?<argument>${id})\\)\\{let ${id}=\\(0,${id}\\.c\\)\\(\\d+\\),(?<fallback>${id})=${id}\\(${id}\\),`,
         `(?<host>${id})=\\k<argument>\\?\\.hostId\\?\\?\\k<fallback>,(?<identity>${id})=${id}\\(\\k<host>\\),`,
@@ -59,6 +72,17 @@
     },
     {
       kind: "request-access",
+      // 核心结构：门控 + 之后同一认证变量写入 {authMethod,hostId} 查询键；host 必须是函数参数，避免引用尚未声明的变量。
+      core: {
+        pattern: [
+          `async function ${id}\\((?<params>${id}(?:,${id}){0,4})\\)\\{[^{}]{0,300}?`,
+          `if\\((?<gate>(?<auth>${id})!==${chatgpt}&&\\k<auth>!==${token}(?:&&\\k<auth>!==${literal})*)\\)return null;`,
+          `[^]{0,400}?\\.query\\.setData\\(${id},\\{authMethod:\\k<auth>,hostId:(?<host>${id})\\}`,
+        ].join(""),
+        distinct: ["auth", "host"],
+        validate: (groups) => groups.params.split(",").includes(groups.host),
+        replacement: (groups) => `${groups.gate}&&!(${allow(groups.host, groups.auth)})`,
+      },
       pattern: [
         `async function ${id}\\((?<scope>${id}),(?<host>${id})\\)\\{let (?<auth>${id})=await ${id}\\(\\k<scope>,\\k<host>\\);`,
         `if\\((?<gate>\\k<auth>!==${chatgpt}&&\\k<auth>!==${token}(?:&&\\k<auth>!==${literal})*)\\)return null;`,
@@ -69,6 +93,19 @@
     },
     {
       kind: "queue-default-access",
+      // 核心结构：readServiceTier 里「Copilot 提前返回 → 取账号 → 比较 account.type」这一段。
+      // Copilot 判定的写法历次都在变，这里不认具体写法、原样保留，但必须仍是紧挨着取账号的 `if(…Copilot…)return!1`：
+      // 选了 Copilot 的请求在这里就返回，到不了放行条件；判定整个消失时宁可不改。
+      core: {
+        pattern: [
+          `async readServiceTier\\(${id}\\)\\{[^]{0,600}?`,
+          `if\\([^;]{0,300}?Copilot[^;]{0,300}?\\)return!1;`,
+          `let (?<result>${id})=await (?<manager>${id})\\.getAccount\\(\\{priority:${critical}\\}\\);`,
+          `return (?<gate>\\k<result>\\.account\\?\\.type===${chatgpt}(?:\\|\\|\\k<result>\\.account\\?\\.type===${literal})*)\\}\\)\\},async writeServiceTier\\(`,
+        ].join(""),
+        distinct: ["manager", "result"],
+        replacement: (groups) => `(${groups.gate}||${allow(`${groups.manager}.getHostId()`, `${groups.result}.account?.type`)})`,
+      },
       variants: [
         {
           pattern: [
@@ -95,10 +132,55 @@
           distinct: ["manager", "result"],
           replacement: (groups) => `(${groups.gate}||${allow(`${groups.manager}.getHostId()`, `${groups.result}.account?.type`)})`,
         },
+        {
+          // 26.1021 将 Copilot 判定收进 runtime，不再向默认队列传入 storage。
+          pattern: [
+            `function ${id}\\((?<manager>${id}),\\{runtime:(?<runtime>${id})\\},(?<before>${id}),${id}\\)\\{let (?<pending>${id})=null;`,
+            `return\\{async readServiceTier\\((?<model>${id})\\)\\{for\\(;\\k<pending>!=null;\\)await \\k<pending>\\.catch\\(\\(\\)=>void 0\\);`,
+            `return \\k<before>\\(\\),${id}\\(\\k<manager>\\.requestClient,\\k<manager>\\.logger,\\k<model>,async\\(\\)=>\\{`,
+            `if\\(\\k<manager>\\.getHostId\\(\\)===${local}&&await \\k<runtime>\\.isUsingCopilotInference\\(\\)\\)return!1;`,
+            `let (?<result>${id})=await \\k<manager>\\.getAccount\\(\\{priority:${critical}\\}\\);`,
+            `return (?<gate>\\k<result>\\.account\\?\\.type===${chatgpt}(?:\\|\\|\\k<result>\\.account\\?\\.type===${literal})*)\\}\\)\\},async writeServiceTier\\(`,
+          ].join(""),
+          distinct: ["manager", "result"],
+          replacement: (groups) => `(${groups.gate}||${allow(`${groups.manager}.getHostId()`, `${groups.result}.account?.type`)})`,
+        },
       ],
     },
     {
       kind: "queue-explicit-access",
+      // 核心结构：submissionOptions → executionHostId → 「serviceTier 非空才取账号」这一段。
+      // 外层函数的参数解构（settings/storage/filesystem/runtime）历次可能增减，改为单独解析。
+      core: {
+        pattern: [
+          `(?<options>${id})=${id}\\.submissionOptions[^]{0,600}?`,
+          `(?<host>${id})=\\k<options>\\?\\.executionHostId\\?\\?(?<manager>${id})\\.getHostId\\(\\);[^]{0,2400}?`,
+          `\\(async\\(\\)=>\\{if\\(\\k<options>==null\\)return [^;]{0,200};`,
+          `if\\(\\k<options>\\.serviceTier==null\\)return null;let\\{account:(?<account>${id})\\}=await \\k<manager>\\.getAccount\\(\\{priority:${critical}\\}\\);`,
+          `return (?<gate>\\k<account>\\?\\.type===${chatgpt}(?:\\|\\|\\k<account>\\?\\.type===${literal})*)\\?\\k<options>\\.serviceTier:null`,
+        ].join(""),
+        // 从最近的外层函数头解析 runtime / storage；没有 runtime 就无法保留 Copilot 判定，直接放弃。
+        resolve: (groups, source, index) => {
+          const head = source.slice(Math.max(0, index - 800), index);
+          const headers = [...head.matchAll(new RegExp(`function ${id}\\(${id},\\{(?<fields>[^{}]{0,200})\\}`, "g"))];
+          const fields = headers.at(-1)?.groups?.fields;
+          const runtime = fields && new RegExp(`(?:^|,)runtime:(${id})(?:,|$)`).exec(fields)?.[1];
+          if (!runtime) return null;
+          const storage = new RegExp(`(?:^|,)storage:(${id})(?:,|$)`).exec(fields)?.[1] ?? null;
+          return { runtime, storage };
+        },
+        distinct: ["manager", "host", "account", "runtime", "storage"],
+        // 与严格结构同样：只放行本机执行端，且所选 Copilot 不能借底层 API 身份放行。
+        // Copilot 判定兼容两代写法：新版 runtime.isUsingCopilotInference()，旧版 storage 标记 + isCopilotApiAvailable()。
+        // 两种方法都不在时按「选了 Copilot」处理（不放行），也不会因为方法缺失抛错打断提交。
+        replacement: (groups) => {
+          const legacy = groups.storage
+            ? `typeof ${groups.storage}.readGlobalState==="function"&&typeof ${groups.runtime}.isCopilotApiAvailable==="function"?await ${groups.storage}.readGlobalState(\`use-copilot-auth-if-available\`)===!0&&await ${groups.runtime}.isCopilotApiAvailable():!0`
+            : "!0";
+          const copilot = `(typeof ${groups.runtime}.isUsingCopilotInference==="function"?await ${groups.runtime}.isUsingCopilotInference():${legacy})`;
+          return `(${groups.gate}||${groups.host}===${local}&&${allow(`${groups.manager}.getHostId()`, `${groups.account}?.type`)}&&!${copilot})`;
+        },
+      },
       pattern: [
         `function ${id}\\((?<manager>${id}),\\{settings:(?<settings>${id}),storage:(?<storage>${id}),filesystem:${id},runtime:(?<runtime>${id})\\},(?<readDefault>${id}),${id},${id}\\)\\{`,
         `return async\\(${id},(?<message>${id})\\)=>\\{let (?<options>${id})=\\k<message>\\.submissionOptions,${id}=\\k<message>\\.context\\.workPermissions,${id}=${id}!=null,`,
@@ -114,8 +196,37 @@
     },
   ];
 
+  // 绑定是否在 index 之前已声明（let/const/var、逗号续声明或函数参数）；只往回看一小段，宁可放弃也不猜。
+  function declaredBefore(source, index, name) {
+    if (typeof name !== "string" || !new RegExp(`^${id}$`).test(name)) return false;
+    const head = source.slice(Math.max(0, index - 800), index);
+    const escaped = name.replace(/\$/g, "\\$");
+    return new RegExp(`(?:\\blet |\\bconst |\\bvar |[,(])${escaped}(?:=|,|\\))`).test(head);
+  }
+
+  // 每个门控先试已核对的严格结构；一处都没命中时才退到只锚定核心片段的结构。
+  // 两种策略都要求恰好命中一处，四个门控必须全部命中，否则整体放弃。
+  function gateMatches(source, definition) {
+    const collect = (variants) => variants.flatMap((variant) =>
+      [...source.matchAll(new RegExp(variant.pattern, "g"))].map((match) => ({ match, variant })));
+    let strategy = "strict";
+    let found = collect(definition.variants ?? [definition]);
+    if (!found.length && definition.core) {
+      strategy = "core";
+      found = collect([definition.core]);
+    }
+    const matches = found.map(({ match, variant }) => {
+      const extra = variant.resolve ? variant.resolve(match.groups, source, match.index) : {};
+      if (!extra) return null;
+      const groups = { ...match.groups, ...extra };
+      if (variant.validate && variant.validate(groups, source, match.index) !== true) return null;
+      return { match, variant, groups };
+    }).filter(Boolean);
+    return { strategy: matches.length ? strategy : "none", matches };
+  }
+
   function plan(source, url) {
-    const diagnostics = { url, reason: "ready", matches: {} };
+    const diagnostics = { url, reason: "ready", matches: {}, strategies: {} };
     const failed = (reason) => ({ ok: false, replacements: [], diagnostics: { ...diagnostics, reason } });
     if (typeof source !== "string" || !source || typeof url !== "string" || !url.trim()) {
       return failed("invalid-input");
@@ -123,20 +234,20 @@
     const replacements = [];
     for (const definition of gates) {
       // 同一门控的多个历史结构合并计数：任何版本只允许恰好命中一处。
-      const matches = (definition.variants ?? [definition]).flatMap((variant) =>
-        [...source.matchAll(new RegExp(variant.pattern, "g"))].map((match) => ({ match, variant })));
+      const { strategy, matches } = gateMatches(source, definition);
       diagnostics.matches[definition.kind] = matches.length;
+      diagnostics.strategies[definition.kind] = strategy;
       if (matches.length !== 1) continue;
-      const { match, variant } = matches[0];
-      const names = (variant.distinct ?? []).map((name) => match.groups[name]);
+      const { match, variant, groups } = matches[0];
+      const names = (variant.distinct ?? []).map((name) => groups[name]).filter((name) => name != null);
       if (new Set(names).size !== names.length) return failed("shadowed-bindings");
-      const gate = match.groups.gate;
+      const gate = groups.gate;
       const offset = match[0].indexOf(gate);
       if (offset < 0 || offset !== match[0].lastIndexOf(gate) || /[\r\n]/.test(gate)) {
         return failed("unsupported-shape");
       }
       const start = match.index + offset;
-      const text = variant.replacement(match.groups);
+      const text = variant.replacement(groups);
       if (/[\r\n]/.test(text)) return failed("unsupported-shape");
       replacements.push({ kind: definition.kind, start, end: start + gate.length, text });
     }
@@ -424,6 +535,12 @@
     return { source: chunks.join(""), counts };
   }
 
+  // 入口模块（app-initial）追加执行完成标记；启动守护和重载探针都只看这一个标记。
+  const completionMarker = 'window.__codexPlusNativeFastCompiled="v1";';
+  function entryModuleSource(source, url) {
+    return `${source}\n;${completionMarker}window.__codexPlusNativeFastPatchState="patched";window.__codexPlusNativeFastModuleComplete?.();\n//# sourceURL=${url}\n`;
+  }
+
   function prepareModule(source, url) {
     const failed = (reason, diagnostics = {}) => ({ ok: false, patchedSource: source, diagnostics: { url, ...diagnostics, reason } });
     if (!runtime.status().enabled) return failed("disabled");
@@ -434,7 +551,7 @@
       const rewritten = rewriteModuleBase(transformed.patchedSource, url);
       return {
         ...transformed,
-        patchedSource: `${rewritten.source}\n;window.__codexPlusNativeFastCompiled="v1";window.__codexPlusNativeFastPatchState="patched";window.__codexPlusNativeFastModuleComplete?.();\n//# sourceURL=${url}\n`,
+        patchedSource: entryModuleSource(rewritten.source, url),
         diagnostics: { ...transformed.diagnostics, ...rewritten.counts, reason: "module-prepared" },
       };
     } catch (error) {
@@ -442,19 +559,326 @@
     }
   }
 
+  // ---------- 多改写器模块补丁通道 ----------
+  // 每个改写器声明自己要改的目标块（按文件名前缀识别）与各自的开关；同一块可被多个改写器修改。
+  // 每个改写器对自己负责的块全有或全无：任何一个目标块结构不符，就整体放弃该改写器，
+  // 不影响其它改写器，也不会留下半套补丁。
+  const entryPrefix = "app-initial-";
+  const moduleSourceLimit = 24 * 1024 * 1024;
+  const rewriters = root.__codexPlusNativeModuleRewriters instanceof Map ? root.__codexPlusNativeModuleRewriters : new Map();
+  root.__codexPlusNativeModuleRewriters = rewriters;
+
+  function registerRewriter(rewriter) {
+    if (!rewriter || typeof rewriter.id !== "string" || !Array.isArray(rewriter.targets)
+      || typeof rewriter.plan !== "function" || typeof rewriter.enabled !== "function") return false;
+    rewriters.set(rewriter.id, rewriter);
+    return true;
+  }
+
+  registerRewriter({
+    id: "fast",
+    // 26.1027 的入口经 app-main 引用 app-initial；旧版仍可直接发现目标块。
+    // 文件名只是线索：按名字找不到或结构不符时，再按四个门控都会用到的字符串常量找同一块（换名、拆分入口都能认）。
+    targets: [{
+      name: "app-initial", prefix: entryPrefix, via: ["app-main-"], unique: true, entry: true,
+      anchors: ["readServiceTier", "submissionOptions", "serviceTierAccess"],
+    }],
+    enabled: () => runtime.status().enabled,
+    plan: (source, url) => plan(source, url),
+  });
+
+  function moduleFileName(url) {
+    try {
+      return new URL(url).pathname.split("/").pop() || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function matchesTarget(target, url) {
+    const name = moduleFileName(url);
+    return name.startsWith(target.prefix) && /^[\w-]+\.js$/.test(name.slice(target.prefix.length));
+  }
+
+  function containsAnchors(target, source) {
+    return Array.isArray(target.anchors) && target.anchors.length > 0 && typeof source === "string"
+      && target.anchors.every((anchor) => source.includes(anchor));
+  }
+
+  // 在一组候选块里挑出唯一结构完整的那块。
+  function pickTarget(rewriter, target, candidates) {
+    if (!candidates.length) return { ok: false, reason: `missing-${target.name}` };
+    if (target.unique && candidates.length !== 1) return { ok: false, reason: `ambiguous-${target.name}` };
+    const results = candidates.map((item) => ({ item, result: planRewriter(rewriter, item.source, item.url, target) }));
+    const matched = results.filter(({ result }) => result.ok === true);
+    // 同名前缀的其它块必须完全不含目标结构；部分命中说明结构已变化，不能猜。
+    const partial = results.some(({ result }) => result.ok !== true && Number(result.diagnostics?.matched) > 0);
+    if (matched.length !== 1 || partial) {
+      return {
+        ok: false,
+        reason: matched.length > 1 || partial
+          ? `ambiguous-${target.name}`
+          : `${target.name}:${results[0]?.result?.diagnostics?.reason ?? "unsupported"}`,
+      };
+    }
+    return { ok: true, url: matched[0].item.url, replacements: matched[0].result.replacements };
+  }
+
+  function activeRewriters() {
+    return [...rewriters.values()].filter((rewriter) => {
+      try { return rewriter.enabled() === true; } catch { return false; }
+    });
+  }
+
+  function planRewriter(rewriter, source, url, target) {
+    try {
+      const result = rewriter.plan(source, url, target.name);
+      return result && typeof result === "object" ? result : { ok: false, diagnostics: { reason: "invalid-plan" } };
+    } catch {
+      return { ok: false, diagnostics: { reason: "plan-failed" } };
+    }
+  }
+
+  function overlapping(replacements) {
+    const sorted = [...replacements].sort((left, right) => left.start - right.start || left.end - right.end);
+    return sorted.some((item, index) => index > 0 && item.start < sorted[index - 1].end);
+  }
+
+  function applyReplacements(source, replacements) {
+    let patched = source;
+    for (const replacement of [...replacements].sort((left, right) => right.start - left.start || right.end - left.end)) {
+      patched = patched.slice(0, replacement.start) + replacement.text + patched.slice(replacement.end);
+    }
+    return patched;
+  }
+
+  // Fetch 拦截模式逐个响应改写：只应用开启且结构完整的改写器。
+  function transformModule(source, url) {
+    const diagnostics = { url, reason: "ready", rewriters: {} };
+    const unchanged = (reason) => ({ ok: false, patchedSource: source, applied: [], diagnostics: { ...diagnostics, reason } });
+    if (typeof source !== "string" || !source || typeof url !== "string" || !url.trim()) return unchanged("invalid-input");
+    let replacements = [];
+    const applied = [];
+    for (const rewriter of activeRewriters()) {
+      const target = rewriter.targets.find((item) => matchesTarget(item, url));
+      if (!target) continue;
+      const result = planRewriter(rewriter, source, url, target);
+      diagnostics.rewriters[rewriter.id] = result.ok === true ? "patched" : result.diagnostics?.reason ?? "unsupported";
+      if (result.ok !== true || !Array.isArray(result.replacements)) continue;
+      const next = [...replacements, ...result.replacements];
+      if (overlapping(next)) {
+        diagnostics.rewriters[rewriter.id] = "overlapping-rewriters";
+        continue;
+      }
+      replacements = next;
+      applied.push(rewriter.id);
+    }
+    if (!applied.length) return unchanged("no-applicable-rewriter");
+    return { ok: true, patchedSource: applyReplacements(source, replacements), applied, diagnostics };
+  }
+
+  // app:// 模式在文档开始前一次性准备全部模块，因此可以跨块校验每个改写器的完整性。
+  function prepareModules(modules) {
+    const diagnostics = { reason: "modules-prepared", rewriters: {}, discovery: {}, modules: 0 };
+    const failed = (reason) => ({ ok: false, modules: [], diagnostics: { ...diagnostics, reason } });
+    if (!Array.isArray(modules)) return failed("invalid-input");
+    const sources = modules.filter((item) => item && typeof item.url === "string" && typeof item.source === "string"
+      && item.source.length > 0 && item.source.length <= moduleSourceLimit && moduleUrl(item.url));
+    const active = activeRewriters();
+    if (!active.length) return failed("disabled");
+    const accepted = new Map();
+    const entries = [];
+    for (const rewriter of active) {
+      const perModule = new Map();
+      const entryUrls = [];
+      let reason = "patched";
+      for (const target of rewriter.targets) {
+        let picked = pickTarget(rewriter, target, sources.filter((item) => matchesTarget(target, item.url)));
+        let discovery = "name";
+        if (!picked.ok && target.anchors) {
+          // 按名字没认出来：改在含全部锚点的其它块里找，仍然要求唯一且结构完整。
+          const byContent = sources.filter((item) => !matchesTarget(target, item.url) && containsAnchors(target, item.source));
+          const alternative = byContent.length ? pickTarget(rewriter, target, byContent) : null;
+          if (alternative?.ok) { picked = alternative; discovery = "content"; }
+          // 按名字根本没找到时，诊断报内容查找失败的原因（更接近实际情况）。
+          else if (alternative && picked.reason === `missing-${target.name}`) picked = alternative;
+        }
+        if (!picked.ok) { reason = picked.reason; break; }
+        diagnostics.discovery[`${rewriter.id}:${target.name}`] = discovery;
+        perModule.set(picked.url, picked.replacements);
+        if (target.entry) entryUrls.push(picked.url);
+      }
+      if (reason === "patched") {
+        for (const [url, replacements] of perModule) {
+          const existing = [...accepted.values()].flatMap((other) => other.get(url) ?? []);
+          if (overlapping([...existing, ...replacements])) { reason = "overlapping-rewriters"; break; }
+        }
+      }
+      diagnostics.rewriters[rewriter.id] = reason;
+      if (reason === "patched") { accepted.set(rewriter.id, perModule); entries.push(...entryUrls); }
+    }
+    if (!accepted.size) return failed("unsupported");
+    const urls = new Set([...accepted.values()].flatMap((perModule) => [...perModule.keys()]));
+    // 入口 = 先登记的改写器（Fast）实际改到的入口块；文件名不再作为依据。
+    const entry = entries.find((url) => urls.has(url)) ?? [...urls].find((url) => moduleFileName(url).startsWith(entryPrefix));
+    if (!entry) return failed("entry-not-patched");
+    const prepared = [];
+    for (const url of urls) {
+      const source = sources.find((item) => item.url === url).source;
+      const replacements = [...accepted.values()].flatMap((perModule) => perModule.get(url) ?? []);
+      try {
+        const rewritten = rewriteModuleBase(applyReplacements(source, replacements), url);
+        prepared.push({
+          url,
+          patchedSource: url === entry ? entryModuleSource(rewritten.source, url) : `${rewritten.source}\n//# sourceURL=${url}\n`,
+        });
+      } catch (error) {
+        return failed(error instanceof Error ? error.message : "unsupported-module-syntax");
+      }
+    }
+    // 入口放在第一位，便于新文档按顺序登记 import map 与预加载。
+    prepared.sort((left, right) => (left.url === entry ? -1 : right.url === entry ? 1 : 0));
+    diagnostics.modules = prepared.length;
+    return { ok: true, modules: prepared, diagnostics };
+  }
+
+  async function defaultFetchText(url) {
+    const response = await root.fetch(url);
+    if (!response.ok) return null;
+    const text = await response.text();
+    return text.length > moduleSourceLimit ? null : text;
+  }
+
+  // 从入口脚本沿 Vite 依赖表找目标块；只顺着改写器声明的前缀走，不遍历整个资源目录。
+  async function discoverModules(entries, active, fetchText = defaultFetchText) {
+    const follow = new Set(active.flatMap((rewriter) => rewriter.targets.flatMap((target) => [target.prefix, ...(target.via ?? [])])));
+    const queue = entries.map((url) => ({ url, depth: 0 }));
+    const seen = new Set();
+    const found = [];
+    while (queue.length && seen.size < 24) {
+      const { url, depth } = queue.shift();
+      if (seen.has(url)) continue;
+      seen.add(url);
+      let source = null;
+      try { source = await fetchText(url); } catch { source = null; }
+      if (typeof source !== "string") continue;
+      found.push({ url, source });
+      if (depth >= 4) continue;
+      for (const match of source.matchAll(/["'`]\.\/([\w-]+\.js)["'`]/g)) {
+        const name = match[1];
+        if (![...follow].some((prefix) => name.startsWith(prefix))) continue;
+        try { queue.push({ url: new URL(`./${name}`, url).href, depth: depth + 1 }); } catch { /* 忽略非法地址。 */ }
+      }
+    }
+    await discoverByContent(entries, active, found, fetchText);
+    return found;
+  }
+
+  // 按名字没找到含锚点的块时（换名、入口拆分），从入口起不看文件名广度优先找两层。
+  // 有次数和体积上限，找到即停；只保留含锚点的块，其余读完就丢，不占内存。
+  async function discoverByContent(entries, active, found, fetchText) {
+    const pending = () => active.flatMap((rewriter) => rewriter.targets)
+      .filter((target) => target.anchors && !found.some((item) => containsAnchors(target, item.source)));
+    if (!pending().length) return;
+    const known = new Map(found.map((item) => [item.url, item.source]));
+    const queue = entries.map((url) => ({ url, depth: 0 }));
+    const seen = new Set();
+    let fetched = 0;
+    let bytes = 0;
+    while (queue.length && pending().length && fetched < 320 && bytes < 192 * 1024 * 1024) {
+      const { url, depth } = queue.shift();
+      if (seen.has(url)) continue;
+      seen.add(url);
+      let source = known.get(url);
+      if (source === undefined) {
+        fetched++;
+        try { source = await fetchText(url); } catch { source = null; }
+        if (typeof source !== "string") continue;
+        bytes += source.length;
+        if (pending().some((target) => containsAnchors(target, source))) found.push({ url, source });
+      }
+      if (depth >= 2) continue;
+      for (const match of source.matchAll(/["'`]\.\/([\w-]+\.js)["'`]/g)) {
+        try { queue.push({ url: new URL(`./${match[1]}`, url).href, depth: depth + 1 }); } catch { /* 忽略非法地址。 */ }
+      }
+    }
+  }
+
+  async function prepareDocumentModules(options = {}) {
+    const location = options.location ?? root.location;
+    const document = options.document ?? root.document;
+    if (location?.protocol !== "app:" || location?.host !== "-") {
+      return { ok: false, modules: [], diagnostics: { reason: "unsupported-document-url", rewriters: {} } };
+    }
+    const active = activeRewriters();
+    if (!active.length) return { ok: false, modules: [], diagnostics: { reason: "disabled", rewriters: {} } };
+    const entries = [...(document?.scripts ?? [])].map((script) => script.src).filter((src) => {
+      try {
+        const parsed = new URL(src);
+        // app:// 是 Electron 注册的标准协议；按协议 + 主机比较，不依赖非特殊协议的 origin 序列化。
+        return parsed.protocol === location.protocol && parsed.host === location.host
+          && /^\/assets\/(?:index-[\w-]+|\d+\.[a-f\d]+)\.js$/.test(parsed.pathname);
+      } catch {
+        return false;
+      }
+    }).slice(0, 4);
+    const rspack = root.__codexPlusNativeFastRspack;
+    if (runtime.status().enabled && rspack) {
+      const candidates = [];
+      for (const url of entries.filter(url => /\/\d+\.[a-f\d]+\.js$/.test(url))) {
+        let source;
+        try { source = await (options.fetchText ?? defaultFetchText)(url); } catch { continue; }
+        if (typeof source === "string" && source.length <= moduleSourceLimit && rspack.isRuntime(source)) candidates.push({ url, source });
+      }
+      if (candidates.length > 1) return { ok: false, modules: [], diagnostics: { reason: "ambiguous-rspack-runtime", rewriters: { fast: "ambiguous-rspack-runtime" } } };
+      if (candidates.length === 1) {
+        const { url, source } = candidates[0];
+        try {
+          const factories = await (options.readRspackFactories ?? rspack.readFactories)(url);
+          const chunkUrl = rspack.registrationChunk(source, url);
+          if (!chunkUrl) return { ok: false, modules: [], diagnostics: { reason: "unsupported-rspack-register", rewriters: { fast: "unsupported-rspack-register" } } };
+          const chunk = await (options.fetchText ?? defaultFetchText)(chunkUrl);
+          const prepared = rspack.prepare(chunk, chunkUrl, factories, rewriteModuleBase, entryModuleSource);
+          for (const rewriter of active.filter(item => item.id !== "fast")) prepared.diagnostics.rewriters[rewriter.id] = "unsupported-rspack";
+          return prepared;
+        } catch {
+          return { ok: false, modules: [], diagnostics: { reason: "rspack-modules-unavailable", rewriters: { fast: "rspack-modules-unavailable" } } };
+        }
+      }
+    }
+    const discovered = await discoverModules(entries, active, options.fetchText);
+    return prepareModules(discovered);
+  }
+
   function installModule(patchedSource, url) {
-    const diagnostics = { url, reason: "module-preloaded" };
+    return installModules([{ url, patchedSource }]);
+  }
+
+  function installModules(modules, details = {}) {
+    // 入口按完成标记认（Fast 改到哪块，标记就在哪块）；旧调用方没有标记时退回文件名。
+    const entryModule = Array.isArray(modules)
+      ? modules.find((item) => typeof item?.patchedSource === "string" && item.patchedSource.includes(completionMarker))
+        ?? modules.find((item) => moduleFileName(item?.url).startsWith(entryPrefix)) ?? modules[0]
+      : null;
+    const url = entryModule?.url;
+    const patchedSource = entryModule?.patchedSource;
+    const diagnostics = { url, reason: "module-preloaded", modules: Array.isArray(modules) ? modules.length : 0 };
+    if (details && typeof details === "object" && details.rewriters && typeof details.rewriters === "object") {
+      diagnostics.rewriters = { ...details.rewriters };
+    }
     const failed = (reason) => {
       diagnostics.reason = reason;
       root.__codexPlusNativeFastPatchState = "failed";
       root.__codexPlusNativeFastModuleDiagnostics = diagnostics;
       return { ok: false, diagnostics };
     };
-    if (!runtime.status().enabled) return { ok: false, diagnostics: { url, reason: "disabled" } };
+    if (!activeRewriters().length) return { ok: false, diagnostics: { url, reason: "disabled" } };
     const document = root.document;
-    if (!moduleUrl(url) || !moduleUrl(root.location?.href)) return { ok: false, diagnostics: { url, reason: "unsupported-document-url" } };
+    if (!entryModule || !moduleUrl(url) || !moduleUrl(root.location?.href)
+      || !modules.every((item) => moduleUrl(item?.url))) return { ok: false, diagnostics: { url, reason: "unsupported-document-url" } };
     if (!document || document.documentElement) return failed("document-already-started");
-    if (typeof patchedSource !== "string" || !patchedSource.includes('window.__codexPlusNativeFastCompiled="v1";')) return failed("unprepared-module");
+    if (typeof patchedSource !== "string" || !patchedSource.includes('window.__codexPlusNativeFastCompiled="v1";')
+      || !modules.every((item) => typeof item.patchedSource === "string" && item.patchedSource)) return failed("unprepared-module");
     let temporaryRoot = null;
     try {
       // import map 不能撤销。预加载失败时仅重载一次，下一文档跳过映射并正常加载原模块。
@@ -469,13 +893,19 @@
       storage.removeItem(fallbackKey);
       if (root.HTMLScriptElement?.supports?.("importmap") !== true) return failed("importmap-unavailable");
       const map = document.createElement("script");
-      const preload = document.createElement("link");
-      if (preload.relList?.supports?.("modulepreload") !== true) return failed("modulepreload-unavailable");
-      const blob = root.URL.createObjectURL(new root.Blob([patchedSource], { type: "text/javascript" }));
+      // 入口在前：所有补丁块都必须在 meta CSP 解析前登记映射并开始预加载。
+      const ordered = [entryModule, ...modules.filter((item) => item !== entryModule)];
+      const preloads = ordered.map(() => document.createElement("link"));
+      if (preloads.some((preload) => preload.relList?.supports?.("modulepreload") !== true)) return failed("modulepreload-unavailable");
+      const imports = {};
+      ordered.forEach((item, index) => {
+        const blob = root.URL.createObjectURL(new root.Blob([item.patchedSource], { type: "text/javascript" }));
+        imports[item.url] = blob;
+        preloads[index].rel = "modulepreload";
+        preloads[index].href = blob;
+      });
       map.type = "importmap";
-      map.textContent = JSON.stringify({ imports: { [url]: blob } });
-      preload.rel = "modulepreload";
-      preload.href = blob;
+      map.textContent = JSON.stringify({ imports });
       let watchdog = null;
       let recovering = false;
       const cleanup = () => {
@@ -483,8 +913,9 @@
         document.removeEventListener("DOMContentLoaded", armWatchdog);
         if (root.__codexPlusNativeFastModuleComplete === complete) delete root.__codexPlusNativeFastModuleComplete;
       };
-      const recover = (reason) => {
-        if (recovering || root.__codexPlusNativeFastCompiled === "v1") return;
+      // 懒加载块的预加载失败会让之后的 import 直接报错，即使入口已执行也要回退一次。
+      const recover = (reason, lazyModule = false) => {
+        if (recovering || !lazyModule && root.__codexPlusNativeFastCompiled === "v1") return;
         recovering = true;
         cleanup();
         failed(reason);
@@ -505,11 +936,13 @@
           recover("module-execution-timeout");
         }, 30000);
       };
-      preload.onerror = () => recover("module-preload-failed");
+      preloads.forEach((preload, index) => {
+        preload.onerror = () => recover("module-preload-failed", index > 0);
+      });
       temporaryRoot = document.createElement("html");
       document.appendChild(temporaryRoot);
       temporaryRoot.appendChild(map);
-      temporaryRoot.appendChild(preload);
+      preloads.forEach((preload) => temporaryRoot.appendChild(preload));
       root.__codexPlusNativeFastModuleComplete = complete;
       document.addEventListener("DOMContentLoaded", armWatchdog, { once: true });
       if (document.readyState !== "loading") armWatchdog();
@@ -523,7 +956,10 @@
     }
   }
 
-  const api = { plan, transform, prepareModule, installModule, runtime };
+  const api = {
+    plan, transform, prepareModule, installModule, runtime,
+    registerRewriter, transformModule, prepareModules, discoverModules, prepareDocumentModules, installModules,
+  };
   if (typeof module === "object" && module.exports) module.exports = api;
   if (typeof window === "object") window.__codexPlusNativeFastUnlock = api;
 })();

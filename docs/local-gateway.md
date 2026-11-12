@@ -11,9 +11,10 @@
 
 ## 能做什么
 
+- **本 fork 的本地官方账号迁移**：供应商池「添加供应商 → 导入…」可选择「接入本地账号」或「保留登录并迁移顺序调度」。保存账号库引用，不复制 token，不删除原账户，不接管当前聊天。顺序组按原账号顺序及各账号缓存模型创建，接入网关后需明确选择对应「官方顺序调度」模型组。只有明确额度耗尽时换号，认证失败、普通限流和连接失败停止；裸官方模型仍要求明确、唯一账号。重复迁移不覆盖已经编辑的组。完整记录见[后续修复审计](reports/2026-10-29-official-pool-usage-followup.md)。
 - **共用供应商池**：内置厂商预设（复用 `presets.ts`，另加 Anthropic、xAI、Ollama、LM Studio）、自定义地址，
   或从直连模式的 Codex / Claude / Grok 供应商复制。官方登录账号不能复制：refresh token 每用一次就换新，
-  刷新结果只写回原来那一条，复制会让两边互相把对方刷失效，订阅账号需要在网关里单独登录（待做）。
+  刷新结果只写回原来那一条，复制会让两边互相把对方刷失效。网关支持独立订阅登录；本 fork 的账号库另支持上述引用方式。
 - **按模型名路由**：裸模型名发给池里提供它的供应商，多家时按池顺序依次尝试；`<供应商 id>/<模型>` 只发给那一家；
   `group/<组 id>` 按组展开；多家都有的裸模型名按它的自动组展开。
 - **Claude Code 用任意协议的上游**：Anthropic Messages 请求在网关里转成 Responses，
@@ -40,6 +41,18 @@
 - **订阅额度**：ChatGPT 订阅账号读每次响应的 `x-codex-*` 头，并每 10 分钟查 `wham/usage`；Copilot 查
   `copilot_internal/user` 的本月高级请求。只在内存（`gateway::quota`），供应商池的账号行显示剩余比例和各窗口重置时间。
 
+## 通用 Agent
+
+Codex / Claude Code / Grok 之外的 Agent 由规格表接入（`gateway/agents/`，`catalog_*.rs` 各一批）：每条规格写明怎么
+探测本机装了、主配置文件在哪、接入时往配置里写什么（供应商统一叫 `codexplus`，地址是 `/gw/<id>`，Key 是这个 Agent
+的网关 token）。写入只在内存文档上改（JSON 容忍注释、TOML、YAML 按顶层键、`.env`、整份文件），由框架统一落盘：
+接入前把每个文件的原文和改到的键存到 `backups/agent-<id>-before-gateway.json`，断开时只把这些键改回去；
+配置里找不到 `/gw/<id>` 时算被别的工具改掉。网关对通用 Agent 同时接受 Chat Completions、Responses、
+Anthropic Messages 与 Gemini（`/v1beta/models/<模型>:streamGenerateContent`，Key 可放 `x-goog-api-key` 或 `?key=`）。
+
+只能用环境变量、数据库或运行中的本地 API 配置的应用（Claude Science、Cursor Private Inference、NewMax、
+OpenHanako、Alma、Cindy、AionUi、Lody），以及不支持自定义地址的（Cursor CLI、Devin CLI）没有接入。
+
 ## 结构
 
 ```
@@ -64,11 +77,7 @@ Grok ─────────POST /gw/grok/v1/responses───┤  helper�
   要先「断开并还原」；断开后「Codex++ 网关」那一项还在时，选回它等于重新接入。
   Codex 用 ChatGPT 账号登录着时，托管供应商带 openai 会话身份（`model_provider = "openai"`，传输在
   `[model_providers.custom]`）：Codex 保留官方登录（会话、额度、远程控制照旧），`openai_base_url` 指向本地代理，
-  本地代理这一跳转给网关、不另记请求日志。Codex 自己没登录、池里有网关登录的 ChatGPT 账号时，接入时把它
-  「借给」Codex：token 写进 Codex 的 auth.json，网关里标记 `codex_plus_lent_to_codex`；借出期间同一账号以 Codex
-  那份为准，网关刷新后也写回 auth.json（始终一条 token 链，不会互相刷失效）。断开时把最新一代收回 gateway.json、
-  从 auth.json 拿掉登录；删除借出的账号前也会先收回。都没有时才是普通自定义供应商。启动时若登录状态与
-  托管供应商的身份不一致会重写一次。
+  本地代理这一跳转给网关、不重复记请求日志。本 fork 不把网关登录借给 Codex，不写入或清除 live auth；旧借用标记无法证明归属时停止处理并保留双方凭据。独立网关登录和本地账号库引用是两种清晰的凭据归属，不能用复制 refresh token 替代。无 Codex 官方登录时使用自定义传输身份，不能凭供应商池登录记录伪造 Codex 已登录。
   实时配置被别的工具改过、与直连模式的记录对不上时，接入前把 `config.toml` / `auth.json` 原样存到
   `backups/codex-before-gateway.json`（0600），不往上一个供应商回填；断开时切回原供应商后原样写回。改完设置会通知主窗口重新读取，避免旧设置整份写回。
 - Claude Code：开启时写入托管供应商 `codex-plus-gateway`（`ANTHROPIC_BASE_URL` 指向网关），
@@ -88,7 +97,12 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
 
 - **智能体**：已接入的 Agent 在上，「未设置」的在下。每行：图标、名字和本机 CLI 版本、状态、档位 / 模型入口、模型下拉、接入开关。
   模型下拉顶部是「默认（不经 Codex++）」和「断开 Codex++（还原配置）」，左侧可切到全部 / 收藏 / 某个供应商；
-  未接入时选一个模型即接入。展开后逐行显示：在 Agent 里怎么切模型、模型列表（可挑选供应商）、Claude 档位、其它选项、
+  未接入时选一个模型即接入。池里的模型之后是一组 Agent 自带的模型，标「直连，不经 Codex++」（`gateway/own_models.rs`）：
+  Codex 列断开后会回到的直连供应商的模型（官方登录读 `models_cache.json`，记为 OpenAI；聚合供应商列它发布给 Codex 的模型目录；别的供应商读它的模型列表），
+  Claude Code 列 opus / sonnet / haiku 等别名（直连 Anthropic，或用户自己配的 `ANTHROPIC_BASE_URL`）。
+  选中 = 断开并还原，再把模型写进 Agent 自己的配置（Codex `config.toml` 根上的 `model`，Claude Code `settings.json`
+  的 `model`，供应商写了 `ANTHROPIC_MODEL` 时一起改）；接入着时先确认。托盘面板的下拉同样列出。
+  展开后的「自带模型」开关可以不列这一组（存在 gateway.json 的 `hideOwnModels`），Agent 现在用着的那个照样显示。展开后逐行显示：在 Agent 里怎么切模型、模型列表（可挑选供应商）、Claude 档位、其它选项、
   改动的配置文件（可在访达中查看）和「断开并还原」。
 - **供应商**：网关池里的供应商一行一个，可拖动排序、开关、展开看模型和 Key 状态、编辑、删除；下面是「添加供应商」目录：
   订阅、供应商（厂商 API）、中转、本机四组内置预设，「导入…」从直连模式复制。
@@ -143,15 +157,20 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
   （Responses 协议，带 Grok CLI 的客户端标识头，版本号被 xAI 提高时会回 426，需要跟着改）；access token 快过期时用
   refresh token 换新。部分 SuperGrok 账号会被 xAI 的白名单拒绝（403），这时只能用 API Key。
 - 账号类凭据都带 `codex_plus_account` / `codex_plus_gateway` 标记，与各 Agent 自己的登录互不影响。
-- 没有接入：Claude 订阅（Anthropic 条款只允许官方客户端使用订阅凭据）、Gemini CLI（Google 已于 2026-06-18 停止个人账号的
-  Code Assist，且其说明写明第三方使用违反政策）、Antigravity（客户端密钥未公开，只能从客户端里提取）。
+- 不接入：Claude 订阅（Anthropic 条款只允许官方客户端使用订阅凭据，且不做绕过其第三方流量识别的处理）。
 - **OpenCode Go / Zen**（预设，用 OpenCode 控制台的 Key；也可在「导入…」里用 `opencode auth login` 保存在
   `~/.local/share/opencode/auth.json` 的 Key）：同一个网关里每个模型只在一种协议上提供，网关按 models.dev 目录（与价格表
   共用的缓存）逐个模型切换协议和地址——GPT / Grok / Muse 走 Responses，Claude、MiniMax、部分 Qwen 走 Anthropic，
   其余走 Chat；目录里没有的按模型名推断。每个请求带 `x-opencode-session`（按对话保持不变，缺了上游回 400）。
   Gemini 模型只走 Google 接口、免费模型只对 OpenCode 自己开放，都不列出。
-- 其它订阅（Cursor、Kiro、Devin、Qoder、Zed、WorkBuddy、ZCode、Factory 等）需要模拟各家客户端调用私有接口，
-  暂不内置。
+- **私有接口订阅**（`gateway/subscriptions/`）：Cursor、Kiro、Zed、Command Code、Devin、Factory、
+  Gemini Code Assist、Antigravity。每家实现 `Subscription`（登录、刷新、列模型、发对话），在池里是一个普通的
+  Chat Completions 供应商：请求前地址指到 helper 的 `/sub/<供应商 id>/v1`，适配入口读 gateway.json 里的凭据、
+  快过期时刷新并写回，再按各家协议（protobuf、AWS 事件流、Code Assist、各家 JSON）发出去，答复统一转成
+  Chat SSE；失败按状态码回给管道（401 停用到重新登录、429 冷却）。登录方式按家而定：浏览器、验证码、导入本机
+  官方客户端的登录、粘贴凭据。Gemini Code Assist 只支持 Standard / Enterprise（需要 Google Cloud 项目 id，
+  可在粘贴框里填）；Antigravity 账号有被 Google 停用的风险。
+- 国内厂商的编码套餐（Qoder、WorkBuddy、ZCode、Xiaomi MiMo 等）不内置。
 - 除 ChatGPT API 外，以上登录都是冒用官方客户端身份调用未公开的接口，可能随时失效，也有账号被限制的风险。
 
 ## 限制

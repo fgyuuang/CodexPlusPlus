@@ -1,15 +1,27 @@
-﻿# AGENTS.md
+# AGENTS.md
 
 本文件为 CodexPlusPlus fork 的工作规范，指导 agent 在本仓库工作。
 
 ## 项目概述
 
 本仓库是 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 fork。
-当前整合版本 v2.0.0（正式 tag `d2fb3a6e`），本地分支 `codex/Manage-multiple-official-accounts`。
-本轮整合与验收边界见 `docs/reports/2026-10-29-v2.0.0-local-integration.md`。
+当前整合目标 v2.4.0（正式 tag `8826008d`），本地分支 `codex/Manage-multiple-official-accounts`。
+本轮整合与验收边界见 `docs/reports/2026-11-09-v2.4.0-provider-recovery.md`，实际交付以 release job 为准。
 
 本地扩展了聚合供应商路由与模型别名、认证与会话隔离、插件市场保留等功能，
 详见 `docs/local-features.md` —— 每次上游合并后必须逐条确认回归。
+
+### 优先采用上游实现
+
+2026-11-11 用户进一步明确要求撤下本地网关选路，采用正式 v2.4.0 的 `subagent_models::prepare` → `route::resolve_plan` → pipeline 流程。网关 Responses/compact 不再调用本地 `codex_routing` 或要求原生 thread/session/root-turn 相等；裸模型自动组、子代理模型继承和候选切换采用上游规则。下文关于该旧网关谱系/根账号固定/仅额度耗尽换号的历史规定，不得重新引入此请求路径。加密账号库引用仅作既有凭据兼容，仍由原账号库唯一刷新；旧供应商 ID 和历史 provider 恢复兼容保留。直连旧模式、显式官方图片隔离及登录保护不在本次替换范围内。详见 `docs/reports/2026-11-11-upstream-codex-routing.md`。
+
+2026-11-04 用户明确允许：上游已完整实现的旧本地功能，优先采用上游实现，不再以保留全部本地代码为合并目标。重点保留用户结果：现有官方登录与历史、多官方账户调度、第三方便捷接入、Claudian/WorkBuddy 的实际连接。
+
+- 逐项比较用途、凭据归属、失败策略、模型目录与历史配置兼容，不能仅因功能名称相同认定已覆盖。
+- 第三方 API 与通用 Agent 接入优先复用上游网关、供应商池和注册框架；仅为尚未覆盖的行为保留本地适配，不另建重复接入路径。
+- 已有官方账号引用、额度耗尽后按序换号、子代理来源确认、图片隔离及旧会话恢复，在上游达到同等要求前保留必要兼容；不得为减少差异而丢失登录、静默改派来源或重放请求。
+- CLIProxyAPI/NewAPI 的普通 API 调用可采用上游供应商流程；服务生命周期管理、独立账户配置和历史路由是另外的能力，需要分别核实。WorkBuddy 模型接入与通过 CLI 执行协作任务也分别验收。
+- 停用或移除重复实现前需有配置迁移、回滚和对应验证证据，保留外部服务数据。正常发布期间先记录重叠审查，不修改已冻结输入，不重复启动编译。
 
 ## 仓库结构
 
@@ -75,7 +87,13 @@
 
 ## 测试约定
 
-- 沿用上游 `#[test]` + tempfile 风格
+- 沿用现有 `#[test]` + tempfile 风格（见 `crates/codex-plus-core/tests/all/relay_config.rs`）
+- core / data 的集成测试合并为一个测试程序 `tests/all/`（每个文件是 `main.rs` 里的一个 `mod`），
+  新测试文件放进 `tests/all/` 并在 `main.rs` 登记，不要再在 `tests/` 下直接加文件（每个都会多链接一次整个 core）。
+  只跑某个文件：`cargo test -p codex-plus-core --test all relay_config::`
+- 合并后各文件的用例在同一进程并行：改进程级状态（设置路径覆盖、诊断日志路径、环境变量）的用例
+  必须先拿 `common::global_state_lock()`；需要独占进程的（改 `CODEX_PLUS_STATE_DIR`、常驻 helper 单例）
+  才单独留在 `tests/` 下
 - 断言读 config.toml 文本，如 `assert!(config.contains("model_catalog_json"))`
 - 改行为要同步改/加对应测试
 - Windows 下共享路径的集成测试使用 `--test-threads=1`
@@ -95,9 +113,23 @@
 
 ## 发布编译
 
+2026-11-12 新增成功产物重新交付：`scripts/release.ps1 -Action Redeploy -Job <成功任务编号>`。仅复用指定成功构建的完整封存，校验来源、平台及哈希后生成新的交付任务；不调用 Cargo/Node，不表示当前源码变更已编译。可复用成功的重新交付封存，但必须追溯原始完整构建证据。默认只交付 bin，更新现有安装目录显式传 `-DeployTo`；保持独占锁、备份、回滚、哈希及运行进程核对。该操作同步完成，Agent 仍须确认新任务 succeeded 与交付结果，不自动重启。新源码发布继续执行下文完整流程，详见 docs/release-workflow.md。
+
 日常开发先按 `docs/development-workflow.md` 使用前端热更新、按 crate 检查和定向测试；不要为每个小改动重复完整发布。定向验证不代替最终发布门禁，开发进程不得与发布任务同时编译或修改 dist。
 
-**默认将耗时检查、编译、等待和产物核对交给后台脚本，不占用对话轮询。** Agent 专注代码修改、必要的针对性验证和分片组装；代码准备好后启动一次任务即可交接，并准确报告“已启动，尚未完成”。只修改脚本/文档不必构建产品 Release。
+### 测试通过后自动编译
+
+- 固定顺序：定向验证与代码收敛 → 冻结构建输入 → 完整检查及测试 → Vite 构建 → Rust Release 编译 → 哈希核对与备份交付。完整测试必须在正式 Release 编译前结束。
+- 完整检查及测试统一由一次后台发布任务执行；前台只做必要的定向验证，不先手动跑全量再重复启动同一套后台全量测试。
+- 测试全通过后，原任务自动进入构建与交付，不再等待确认、不重复测试、不再插入无关修改。未改变输入且任务正常运行时，不重启任务、不清缓存、不并行另起编译。
+- 多个对话共享此仓库时，任何源码写入、分片组装或构建前都先检查最新发布状态；已有正常任务时，不修改其冻结输入，后续工作放入隔离目录。若确认并发修改已使快照失效，记录漂移文件与进程身份后仅停止本轮失效发布及所属测试/编译进程，保留修改与日志；审查并发改动后重新冻结，禁止直接绕过哈希保护交付。
+- 进度必须区分「编译并运行测试程序」「构建前端」「编译正式 Release」「核对并交付」。`cargo test` 编译测试 EXE 属于测试阶段，不能称为正式软件正在编译或已经生成。
+- 发布任务启动后，Agent 必须持续跟踪至交付核对完成，不能因已提交任务、测试通过或已进入 `release` 就结束本轮，让用户反复要求“继续”。先核对状态文件及各步骤退出码，阶段之间自动前进，无需人工放行。
+- 检查及测试期间每 30–60 秒检查状态和当前日志；进入耗时的 Release 优化、链接阶段后，每次等待 45–60 秒再检查，避免忙轮询。阶段变化、失败和交付结果及时报告，正常等待只需简短进度说明。不得因总耗时较长或短时没有日志就重启；疑似卡住时比较 PID 与启动时间、CPU/IO 增量、日志和退出码。
+- 同一步骤可能在一个测试程序失败后继续运行其他测试；`state=running` 不表示当前没有错误。同步检查日志中的编译错误、FAILED、异常退出和栈溢出，发现即记录并报告，待原任务和相关编译进程退出后再修复重试。
+- 测试或构建失败时记录具体步骤、退出码和日志，再修复对应问题。源码、依赖或构建配置变化后，原测试证据不能冒充新输入已通过；按新输入重新验证。仅更新未纳入构建快照的说明文档，不重启正常发布任务。
+
+**后台脚本负责执行，Agent 负责跟踪、纠错和核对最终交付。** 代码准备好后只启动一个任务；启动成功只能报告“已启动，尚未完成”，随后继续等待和检查，不能据此结束任务。失败时保留步骤、退出码和日志，确认原编译进程退出，修复对应问题并按新输入启动新任务，继续跟踪。只修改脚本/文档不必构建产品 Release；已有产品发布任务仍需跟进到底。
 
 ~~~powershell
 # 默认交付到 bin/；涉及前端改动时必须提供本次功能的独特文本或标记
@@ -106,11 +138,11 @@ pwsh -NoProfile -File .\scripts\release.ps1 -Action Start -ExpectedUiText '本�
 # 需要更新已授权的现有安装目录时显式指定
 pwsh -NoProfile -File .\scripts\release.ps1 -Action Start -ExpectedUiText '本次功能的独特文本' -DeployTo 'D:\pro\Codex++'
 
-# 需要进度时读取一次，不要循环调用工具等待
+# 跟踪同一任务：在有界等待后读取状态，不重复 Start
 pwsh -NoProfile -File .\scripts\release.ps1 -Action Status
 ~~~
 
-任务由独立、隐藏的 PowerShell 进程执行；不依赖当前聊天轮次。**禁止在对话里用 sleep/write_stdin 持续等 Release，禁止重复启动构建。** 已有任务运行时保留原任务，失败后根据日志修复再启动；状态 queued/running 不代表发布成功。
+任务由独立、隐藏的 PowerShell 进程执行，不依赖聊天保持连接；这不免除 Agent 的跟踪责任。允许使用有界等待工具或短暂 sleep 等待后检查，单次阻塞不超过 60 秒；禁止紧密空轮询、一次长时间阻塞、重复启动构建。已有正常任务保持运行；状态 queued/running 不代表发布成功。
 
 脚本负责完整 Rust/TS 检查与回归、先 Vite 后 Rust Release、源码与文件集 SHA-256、dist 文本/时间戳、编译进程结束检查、三个产物备份/复制/最终哈希、运行进程路径及最终摘要。源码或 dist 在构建期间变化会阻止交付；默认只交付到 bin，指定 -DeployTo 才更新运行目录。不安装依赖、不重启用户应用、不自动提交或推送。
 
@@ -135,7 +167,7 @@ cargo clean --profile dev   # 只清 debug，保留 release；下次开发检查
 
 Agent 完成代码改动与针对性验证后，检查 git status、任务差异及生成文件，不处理任务外既有变更。完整检查与交付通过上述后台发布任务执行，不再前台手动跑一遍相同的 workspace 测试和 Release。
 
-交接时提供任务编号及状态文件路径，说明“后台运行，尚未验收”；不因耗时继续轮询。需要确认结果时单次调用 Status，核对 state、失败步骤、产物哈希、备份目录及实际运行路径。后台失败只修复对应问题，禁止重复并行构建。
+交付前持续跟踪同一任务，核对 state、每步退出码、产物及目标文件哈希、备份目录、编译进程结束情况和实际运行路径。只有 state=succeeded 且交付核对通过，才能结束本轮并报告构建交付完成；同时提供任务编号与证据路径，区分“文件已替换”和“运行中的旧进程已加载新版”。后台失败只修复对应问题，禁止重复并行构建。用户明确要求停止、等待用户必需信息或遇到外部阻碍时，可以暂停跟踪，但必须交代当前状态、错误证据和继续所需条件，不能把失败任务称为仍在正常编译。
 
 提交/推送前必须已有成功任务的检查和交付证据，再由用户确认实际启动新版及界面行为。不得把“启动后台任务”作为测试或发布已完成的证据。
 
@@ -153,6 +185,6 @@ git push -u fork HEAD
 - `origin` = https://github.com/BigPizzaV3/CodexPlusPlus（fetch）
 - `fork` = https://github.com/fgyuuang/CodexPlusPlus.git（push）
 - 工作分支：`codex/Manage-multiple-official-accounts`（执行前用 `git branch --show-current` 核对）
-- 合并策略：`git merge --no-commit --no-ff <已审计的上游提交或正式 tag>`，不以 rebase 方式处理，保留完整本地提交历史；本轮目标为 `v2.0.0`，不自动追入其后的 origin/main
+- 合并策略：`git merge --no-commit --no-ff <已审计的上游提交或正式 tag>`，不以 rebase 方式处理，保留完整本地提交历史；本轮目标为 `v2.4.0`，不自动追入其后的 origin/main
 - 合并后逐文件核对 `docs/local-features.md` 中标记的模块并运行回归测试
 - 上游若修改登录、`model_provider`、启动顺序、会话索引或 SQLite schema，必须人工确认 `docs/provider-auth-session-switching.md` 的状态机仍成立

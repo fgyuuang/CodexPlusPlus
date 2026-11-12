@@ -1,7 +1,12 @@
   // 服务等级由 Codex 原生控件决定；此兼容入口仅负责供应商适配。
   function applyCodexServiceTierRequestOverride(method, params, threadIdHint = "") {
+    // 所有发往 app-server 的请求都经过这里：先做 Codex++ 自己的改写，再交给拓展的 codex/request 中间件。
+    // typeof 守卫：测试会单独执行本分片，那时拓展内核不在作用域里。
     const providerParams = applyCodexRemoteSessionProviderOverride(method, params);
-    return applyCodexServiceTierRequestOnly(method, providerParams, threadIdHint);
+    const patched = applyCodexServiceTierRequestOnly(method, providerParams, threadIdHint);
+    return typeof codexPlusApplyExtensionRequestMiddleware === "function"
+      ? codexPlusApplyExtensionRequestMiddleware(method, patched)
+      : patched;
   }
 
   function codexRemoteSessionActiveProfile() {
@@ -11,6 +16,16 @@
       : [];
     const activeId = String(codexPlusBackendSettings.activeRelayId || "");
     return profiles.find((item) => String(item?.id || "") === activeId) || null;
+  }
+
+  // 网关复用自己的传输身份（有登录为 openai，否则为 custom），不能沿用旧直连账号。
+  function codexGatewaySessionRoutingEnabled() {
+    return codexRemoteSessionActiveProfile()?.id === "codex-plus-gateway";
+  }
+
+  function codexSourceSessionRoutingEnabled() {
+    return (codexPlusBackendSettings?.officialExperienceActive ?? codexPlusBackendSettings?.officialExperience?.enabled) === true
+      || codexGatewaySessionRoutingEnabled();
   }
 
   function codexRemoteSessionProviderPatchEnabled() {
@@ -85,6 +100,16 @@
   }
 
   function codexRemoteSessionTargetProvider(modelName = "", requestedProvider = "") {
+    if (codexGatewaySessionRoutingEnabled()) {
+      const profile = codexRemoteSessionActiveProfile();
+      const model = String(modelName || "").trim();
+      // 目录与当前配置必须属于同一个网关；不能用旧目录猜测新模型的来源。
+      if (model && (codexModelCatalog?.status !== "ok" || codexModelCatalog?.model_provider !== profile.id
+          || !codexModelCatalog.models?.includes(model))) return "";
+      const provider = codexRelayConfigModelProvider(profile.configContents || "")
+        || String(codexModelCatalog?.codex_model_provider || "").trim();
+      return ["openai", "custom"].includes(provider) ? provider : "";
+    }
     if ((codexPlusBackendSettings?.officialExperienceActive ?? codexPlusBackendSettings?.officialExperience?.enabled) === true) {
       const requestedModel = String(modelName || "").trim();
       if (!requestedModel) return "";
@@ -144,31 +169,37 @@
   function applyCodexRemoteSessionProviderOverride(method, params) {
     const requestMethod = String(method || "");
     if (!codexRemoteSessionProviderRequestMethod(requestMethod)) return params;
+    if (requestMethod === "thread/fork" && params?.experimentalPredictionMode === true) return params;
     if (!codexRemoteSessionProviderOverrideEnabled()) return params;
     if (!params || typeof params !== "object" || Array.isArray(params)) return params;
-    const officialExperience = (codexPlusBackendSettings?.officialExperienceActive ?? codexPlusBackendSettings?.officialExperience?.enabled) === true;
+    const officialExperience = codexSourceSessionRoutingEnabled();
     if (officialExperience && params.params && typeof params.params === "object" && !Array.isArray(params.params)) {
       const nestedParams = applyCodexRemoteSessionProviderOverride(requestMethod, params.params);
       return nestedParams === params.params ? params : { ...params, params: nestedParams };
     }
     const profile = codexRemoteSessionActiveProfile();
     const pureApi = String(profile?.relayMode || "") === "pureApi";
-    // 旧会话恢复时保留会话自身的 provider；新框架按显式模型描述符处理。
-    if (!officialExperience && requestMethod === "thread/resume") return params;
     if (requestMethod === "turn/start" && !pureApi && !officialExperience) return params;
     const hasModelProvider = Object.prototype.hasOwnProperty.call(params, "modelProvider")
       || Object.prototype.hasOwnProperty.call(params, "model_provider");
+    const hasModel = Object.prototype.hasOwnProperty.call(params, "model");
+    if (!officialExperience && requestMethod === "thread/resume" && (!pureApi || (!hasModel && !hasModelProvider))) return params;
     if (requestMethod === "turn/start" && !hasModelProvider && !officialExperience) return params;
     const threadId = officialExperience ? codexOfficialThreadRouteKey(params) : "";
     const explicitModel = String(params.model || params.modelId || params.model_id || "").trim();
     const rememberedRoute = officialExperience && requestMethod === "turn/start"
       ? codexOfficialThreadModelRoutes.get(threadId)
       : null;
-    const requestedModel = explicitModel || (officialExperience && requestMethod === "turn/start"
+    let requestedModel = explicitModel || (officialExperience && requestMethod === "turn/start"
       ? rememberedRoute?.modelName || ""
       : "");
     if (officialExperience && !requestedModel) return params;
     const requestedProvider = String(params.modelProvider || params.model_provider || "").trim();
+    if (codexGatewaySessionRoutingEnabled()) {
+      const legacyKey = requestedModel.startsWith("codex_plus_official_") && requestedModel.includes(":")
+        ? requestedModel : `${requestedProvider}:${requestedModel}`;
+      requestedModel = codexModelCatalog?.legacyProviderRoutes?.[legacyKey] || requestedModel;
+    }
     const targetProvider = codexRemoteSessionTargetProvider(
       requestedModel, !explicitModel ? rememberedRoute?.providerId || requestedProvider : requestedProvider,
     );
@@ -176,18 +207,19 @@
       throw new Error(`模型 ${requestedModel} 没有可用的来源路由`);
     }
     if (!targetProvider) return params;
-    if (officialExperience && explicitModel) rememberCodexOfficialThreadModel(threadId, explicitModel, targetProvider);
+    if (officialExperience && explicitModel) rememberCodexOfficialThreadModel(threadId, requestedModel, targetProvider);
     if (!officialExperience && requestedProvider && requestedProvider !== "openai" && requestedProvider !== targetProvider) {
       return params;
     }
     const missingModel = officialExperience && !explicitModel && requestMethod === "turn/start";
-    if (requestedProvider === targetProvider && !missingModel
+    const replacedModel = !!explicitModel && requestedModel !== explicitModel;
+    if (requestedProvider === targetProvider && !missingModel && !replacedModel
         && !Object.prototype.hasOwnProperty.call(params, "model_provider")) {
       return params;
     }
     const nextParams = {
       ...params,
-      ...(missingModel ? { model: requestedModel } : {}),
+      ...(missingModel || replacedModel ? { model: requestedModel } : {}),
       modelProvider: targetProvider,
     };
     delete nextParams.model_provider;
@@ -197,6 +229,127 @@
       to: targetProvider,
     });
     return nextParams;
+  }
+
+  async function prepareCodexPureApiResume(method, params, hostId, refreshFailed = false, sendRequest) {
+    if (hostId !== "local") return params;
+    if ([params?.hostId, params?.host_id].some((host) => typeof host === "string" && host !== "local")) return params;
+    if (method === "send-cli-request-for-host" && params?.method) {
+      if ([params.hostId, params.host_id].some((host) => typeof host === "string" && host !== "local")) return params;
+      const envelope = () => JSON.stringify([params.hostId, params.host_id, params.method]);
+      const before = envelope();
+      const inner = params.params;
+      const assertEnvelope = () => {
+        if (envelope() !== before || params.params !== inner) throw new Error("会话主机已变化，请重新打开会话");
+      };
+      const nested = await prepareCodexPureApiResume(String(params.method), params.params, hostId, refreshFailed,
+        sendRequest && ((nestedMethod, nestedParams, options) => {
+          assertEnvelope();
+          return sendRequest(method, { ...params, method: nestedMethod, params: nestedParams }, options);
+        }));
+      assertEnvelope();
+      return nested === params.params ? params : { ...params, params: nested };
+    }
+    if (method !== "thread/resume" || !params || typeof params !== "object" || Array.isArray(params)
+        || codexRemoteSessionActiveProfile()?.relayMode !== "pureApi") {
+      return params;
+    }
+    const specified = (value) => typeof value === "string" && !!value.trim();
+    const target = codexRemoteSessionTargetProvider();
+    if (target === "openai") return params;
+    const requestedProvider = String(params.modelProvider || params.model_provider || "").trim();
+    // nullable 字段和仅指定供应商不是模型选择；补供应商时必须同时保留保存的模型设置。
+    if (specified(params.model) || (requestedProvider && requestedProvider !== "openai" && requestedProvider !== target)) return params;
+    if (specified(params.config?.model)) {
+      return applyCodexRemoteSessionProviderOverride(method, { ...params, model: params.config.model });
+    }
+    if (!target) throw new Error("当前纯 API 供应商不可用");
+    const requestSignature = () => JSON.stringify([params.threadId,
+      ...["model", "modelProvider", "model_provider"].map((key) => [Object.prototype.hasOwnProperty.call(params, key), params[key]]),
+      params.config]);
+    const requestBefore = requestSignature();
+    const signature = () => {
+      const profile = codexRemoteSessionActiveProfile();
+      return JSON.stringify([profile?.id, profile?.relayMode, profile?.configContents, codexRemoteSessionTargetProvider()]);
+    };
+    const before = signature();
+    const assertUnchanged = () => {
+      if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+      if (requestSignature() !== requestBefore) throw new Error("会话设置已变化，请重新打开会话");
+    };
+    let metadata;
+    let fallbackReason = refreshFailed ? "provider_refresh_failed" : "";
+    if (!fallbackReason) {
+      try {
+        metadata = await readCodexAppServerPreparation("/thread-resume-model-metadata",
+          { thread_id: params.threadId, host_id: "local" }, codexAppServerPreparationTimeoutMs);
+      } catch {
+        fallbackReason = "metadata_unavailable";
+      }
+    }
+    assertUnchanged();
+    if (metadata?.status !== "ok" || metadata.threadId !== params.threadId
+        || typeof metadata.model !== "string" || !metadata.model.trim()
+        || !Object.prototype.hasOwnProperty.call(metadata, "reasoningEffort")
+        || (metadata.reasoningEffort !== null
+          && (typeof metadata.reasoningEffort !== "string" || !metadata.reasoningEffort.trim()))) {
+      fallbackReason ||= "metadata_unavailable";
+    }
+    if (sendRequest) {
+      // 已加载会话可能忽略连接覆盖；不卸载正在被原生界面使用的实例。
+      let timer;
+      let read;
+      try {
+        read = await Promise.race([
+          sendRequest("thread/read", { threadId: params.threadId, includeTurns: false },
+            { timeoutMs: codexAppServerPreparationTimeoutMs }),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("读取会话状态超时")), codexAppServerPreparationTimeoutMs); }),
+        ]);
+      } catch {
+        fallbackReason = "thread_state_unavailable";
+      } finally { clearTimeout(timer); }
+      assertUnchanged();
+      const status = read?.thread?.status?.type;
+      if (!["idle", "notLoaded", "active"].includes(status)) {
+        fallbackReason = "thread_state_unavailable";
+      } else if (status !== "notLoaded" && read.thread.modelProvider !== target) {
+        throw new Error("此会话仍使用旧供应商连接，请重新启动 Codex 后重试");
+      }
+    }
+    const config = { ...(params.config || {}) };
+    delete config.model;
+    // 降级时不带入部分历史设置，显式请求档位始终优先。
+    if (!specified(config.model_reasoning_effort)) {
+      delete config.model_reasoning_effort;
+      if (!fallbackReason && metadata.reasoningEffort !== null) config.model_reasoning_effort = metadata.reasoningEffort;
+    }
+    const next = { ...params, modelProvider: target, config };
+    if (fallbackReason) {
+      // 旧线程缺少可靠设置时优先保持可打开，由原生选择默认模型。
+      delete next.model;
+      sendCodexPlusDiagnostic("pure_api_resume_model_fallback", { reason: fallbackReason });
+    } else {
+      next.model = metadata.model;
+    }
+    delete next.model_provider;
+    (window.__codexPlusPureApiPreparedResumes ||= new WeakSet()).add(next);
+    return next;
+  }
+
+  function verifyCodexPureApiResumeResult(method, params, result, hostId) {
+    if (hostId !== "local") return;
+    if (method === "send-cli-request-for-host" && params?.method) {
+      return verifyCodexPureApiResumeResult(String(params.method), params.params, result, hostId);
+    }
+    if (method !== "thread/resume" || !window.__codexPlusPureApiPreparedResumes?.has(params)) return;
+    const modelMismatch = !!params.model && result?.model !== params.model;
+    const providerMismatch = result?.modelProvider !== params.modelProvider;
+    const reasoningEffortMismatch = Object.prototype.hasOwnProperty.call(params.config, "model_reasoning_effort")
+      && result?.reasoningEffort !== params.config.model_reasoning_effort;
+    if (modelMismatch || providerMismatch || reasoningEffortMismatch) {
+      sendCodexPlusDiagnostic("pure_api_resume_result_mismatch",
+        { modelMismatch, providerMismatch, reasoningEffortMismatch });
+    }
   }
 
   function codexManagedSessionConnection() {
@@ -251,6 +404,9 @@
         (nestedMethod, nestedParams, options) => sendRequest(method,
           { ...params, method: nestedMethod, params: nestedParams }, options));
       return nested === params.params ? params : { ...params, params: nested };
+    }
+    if (typeof prepareCodexGatewaySourceRequest === "function") {
+      params = await prepareCodexGatewaySourceRequest(sendRequest, method, params, hostId);
     }
     const patched = applyCodexManagedSessionConnection(method, params, hostId);
     if (patched !== params || hostId !== "local" || method !== "thread/resume" || !params?.threadId) {
@@ -697,6 +853,8 @@
 
   function installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix = "") {
     if (!dispatcher || typeof dispatcher.subscribe !== "function") return false;
+    // 拓展的会话事件也挂在同一个分发器上（幂等，分发器不变时不重复订阅）。
+    if (typeof installCodexExtensionEventBridge === "function") installCodexExtensionEventBridge(dispatcher);
     if (window.__codexPlusRemoteSessionRecoveryDispatcher === dispatcher
         && window.__codexPlusRemoteSessionRecoveryDispatcherVersion === codexRemoteSessionRecoveryVersion) {
       return true;
@@ -925,9 +1083,9 @@
     serviceTierDispatcherPatchPromise = patch();
   }
 
-  // 保留旧调用入口，语音能力由独立的 opt-in 控件提供。
+  // 保留旧调用入口，语音能力由独立的 opt-in 控件提供（内置拓展「语音听写」登记的步骤）。
   function installDictationSupportPatch() {
-    installCodexPlusDictation();
+    if (typeof runCodexPlusScanStep === "function") runCodexPlusScanStep("builtin:dictation");
   }
 
   const codexAppServerPreparationTimeoutMs = 2000;
@@ -970,12 +1128,19 @@
         codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
         nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
+      // 原生输入预测只接收自己的开关和本机 API 布尔投影。
+      globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+        codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
+        nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
+      });
     } catch (_) {
       return false;
     }
     // 设置已加载成功；语音 UI 的异常不应使 provider/Fast 刷新误判为失败。
     // service-tier harness 在 70 分片提前返回，尚未初始化 93 分片的录音状态。
-    if (!window.__CODEX_PLUS_TEST_SERVICE_TIER__) runScanStep(installCodexPlusDictation);
+    // 语音听写由内置拓展「语音听写」登记成扫描步骤；它停用 / 被顶替时这里什么也不做。
+    if (!window.__CODEX_PLUS_TEST_SERVICE_TIER__ && typeof runCodexPlusScanStep === "function") runCodexPlusScanStep("builtin:dictation");
     return true;
   }
 

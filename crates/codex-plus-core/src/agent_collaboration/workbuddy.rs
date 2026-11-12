@@ -60,6 +60,8 @@ pub(super) fn command(entry: &Path) -> anyhow::Result<Command> {
     } else {
         Command::new(entry)
     };
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
     // 桌面发行包内置 lite-wb；只影响本任务进程，不改用户登录/模型/MCP 配置。
     command.env("CODEBUDDY_FORCE_LITE_WB_BUNDLE", "1");
     Ok(command)

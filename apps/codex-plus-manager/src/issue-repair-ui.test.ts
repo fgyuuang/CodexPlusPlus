@@ -52,9 +52,10 @@ test("active ProjectSessionPage owns repair panel and enabled actions call exist
       if (!previous || deps.some((value, i) => value !== previous[i])) { slots[index] = deps; effects.push(callback); }
     },
     formatProgressPercent: (value: number) => String(value),
-    Panel: "Panel", CardHead: "CardHead", CardContent: "CardContent", Field: "Field", AppSelect: "AppSelect", Button: "Button", ToggleVisual: "ToggleVisual",
+    Panel: "Panel", CardHead: "CardHead", CardContent: "CardContent", Field: "Field", SettingRow: "SettingRow", AppSelect: "AppSelect", Button: "Button", ToggleVisual: "ToggleVisual",
     RefreshCw: "RefreshCw", Wrench: "Wrench", Save: "Save", SettingsAutoSave: "SettingsAutoSave", Info: "Info", ChevronDown: "ChevronDown", isProviderSyncTargetSelectable, providerSyncTargetLabel: () => "人工目标",
     providerSyncItem: enhancementItem("providerSyncEnabled"),
+    sessionIndexRepairItem: enhancementItem("sessionIndexRepairEnabled"),
   });
   vm.runInContext(ts.transpileModule(fn.getText(app), { compilerOptions: { jsx: ts.JsxEmit.React, jsxFactory: "jsx", jsxFragmentFactory: "fragment", target: ts.ScriptTarget.ES2022 } }).outputText, context);
   let synced = 0; let repaired = 0; let saved = 0; let recovered = 0;
@@ -90,7 +91,12 @@ test("active ProjectSessionPage owns repair panel and enabled actions call exist
   nodes.find((node) => node.type === "AppSelect").props.onChange("another-target");
   nodes.find((node) => node.type === "input" && node.props.type === "checkbox").props.onChange({ currentTarget: { checked: true } });
   assert.equal(synced, 1); assert.equal(repaired, 1); assert.equal(saved, 0);
-  assert.deepEqual(targets, ["another-target"]); assert.equal(drafts[0].providerSyncEnabled, true);
+  assert.deepEqual(targets, ["another-target"]); assert.equal(drafts[0].sessionIndexRepairEnabled, true);
+  // providerSync 开关也点一下，确认两条开关独立写回（#2846 拆分后各管各的）。
+  const providerToggle = nodes.find((node) => node.type === "input" && node.props.type === "checkbox" && node.props["aria-label"] === "切换供应商时同步会话归属");
+  assert.ok(providerToggle, "provider sync toggle is rendered by its catalog title");
+  providerToggle.props.onChange({ currentTarget: { checked: true } });
+  assert.equal(drafts[1].providerSyncEnabled, true);
   tree.props.onToggle({ currentTarget: { open: false } });
   assert.equal(render(props).props.open, false);
   tree = render({ ...props, providerSyncProgress: { active: true, percent: 25 } });
@@ -123,7 +129,12 @@ test("all full saves require their own revision and conflicts preserve the calle
   find(app);
   assert.ok(initializer);
   let request: any;
-  const context = vm.createContext({ invoke: async (_command: string, args: unknown) => { request = args; return { message: "settings_revision_conflict: newer settings exist", status: "failed" }; } });
+  // 冲突自动恢复在真实组件里会拉最新设置重试；这里注入不可恢复的桩，
+  // 验证恢复失败时仍按原逻辑抛 settings_revision_conflict 并保留草稿。
+  const context = vm.createContext({
+    invoke: async (_command: string, args: unknown) => { request = args; return { message: "settings_revision_conflict: newer settings exist", status: "failed" }; },
+    retrySaveSettingsAfterConflict: async () => null,
+  });
   vm.runInContext(ts.transpileModule(`const call = ${initializer}; globalThis.callTest = call;`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
   const draft = { revision: "old", model: "draft-model" };
   await assert.rejects(context.callTest("save_settings", { settings: draft }), /settings_revision_conflict/);

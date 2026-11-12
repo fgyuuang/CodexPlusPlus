@@ -37,15 +37,76 @@ pub fn agent_pet_sounds() -> Value {
     Value::Object(values)
 }
 
-fn agent_pet_sounds_json() -> String {
-    agent_pet_sounds().to_string()
+/// 大肥鱼（旧版 DeepSeek 鲸鱼挂件）的角色图、音效与动图，来自上游原样素材，
+/// 许可范围见 `assets/inject/upstream/whale-widget/PROVENANCE.md`。引擎随 Agent 桌宠拓展包发布
+/// （见 [`crate::bundled_extensions`]），素材经路由 `/whale/media` 交给它（`bubble-money1.gif` 超过拓展包单个资源的上限）。
+const WHALE_DEFAULT_IMAGE: &[u8] =
+    include_bytes!("../../../assets/inject/upstream/whale-widget/DSniang1.png");
+const WHALE_MEDIA: &[(&str, &str, &[u8])] = &[
+    ("DSniang1.png", "image/png", WHALE_DEFAULT_IMAGE),
+    (
+        "Ya1.mp3",
+        "audio/mpeg",
+        include_bytes!("../../../assets/inject/upstream/whale-widget/Ya1.mp3"),
+    ),
+    (
+        "Ya2.mp3",
+        "audio/mpeg",
+        include_bytes!("../../../assets/inject/upstream/whale-widget/Ya2.mp3"),
+    ),
+    (
+        "D1.mp3",
+        "audio/mpeg",
+        include_bytes!("../../../assets/inject/upstream/whale-widget/D1.mp3"),
+    ),
+    (
+        "D2.mp3",
+        "audio/mpeg",
+        include_bytes!("../../../assets/inject/upstream/whale-widget/D2.mp3"),
+    ),
+    (
+        "minecraft-exp-orb.wav",
+        "audio/wav",
+        include_bytes!("../../../assets/inject/upstream/whale-widget/minecraft-exp-orb.wav"),
+    ),
+    (
+        "task-end-a.wav",
+        "audio/wav",
+        include_bytes!("../../../assets/inject/upstream/whale-widget/task-end-a.wav"),
+    ),
+    (
+        "bubble-petpet.gif",
+        "image/gif",
+        include_bytes!("../../../assets/inject/upstream/whale-widget/bubble-petpet.gif"),
+    ),
+    (
+        "bubble-money1.gif",
+        "image/gif",
+        include_bytes!("../../../assets/inject/upstream/whale-widget/bubble-money1.gif"),
+    ),
+    (
+        "rua.gif",
+        "image/gif",
+        include_bytes!("../../../assets/inject/upstream/whale-widget/rua.gif"),
+    ),
+];
+
+/// 大肥鱼的默认角色图（data URI），供管理器「Agent 桌宠」页预览。
+pub fn whale_default_image_data_uri() -> String {
+    image_data_uri("image/png", WHALE_DEFAULT_IMAGE)
 }
 
-fn agent_pet_sounds_script() -> String {
-    format!(
-        "window.__CODEX_PLUS_AGENT_PET_SOUNDS__ = {};",
-        agent_pet_sounds_json()
-    )
+/// 大肥鱼的内嵌素材：`{ status, image, assets: { 文件名: data URI } }`，路由 `/whale/media` 原样返回。
+pub fn whale_media() -> Value {
+    let assets: serde_json::Map<String, Value> = WHALE_MEDIA
+        .iter()
+        .map(|(name, mime, bytes)| ((*name).to_string(), json!(image_data_uri(mime, bytes))))
+        .collect();
+    json!({
+        "status": "ok",
+        "image": image_data_uri("image/png", WHALE_DEFAULT_IMAGE),
+        "assets": assets,
+    })
 }
 
 #[cfg(windows)]
@@ -90,8 +151,15 @@ const DREAM_SKIN_DEFAULT_IMAGE: &[u8] =
     include_bytes!("../../../assets/inject/upstream/dream-skin/macos/portal-hero.png");
 const PET_REAL_MOUSE_SCRIPT: &str = include_str!("../../../assets/inject/pet-real-mouse-inject.js");
 const API_QUOTA_GATE_SCRIPT: &str = include_str!("../../../assets/inject/api-quota-gate.js");
-const NATIVE_FAST_UNLOCK_SCRIPT: &str =
-    include_str!("../../../assets/inject/native-fast-unlock.js");
+const NATIVE_FAST_UNLOCK_SCRIPT: &str = concat!(
+    include_str!("../../../assets/inject/native-fast-unlock.js"),
+    "\n",
+    include_str!("../../../assets/inject/native-fast-rspack.js"),
+);
+const NATIVE_PREDICTIONS_SCRIPT: &str =
+    include_str!("../../../assets/inject/native-predictions.js");
+pub(crate) const NATIVE_THREAD_GOAL_SCRIPT: &str =
+    include_str!("../../../assets/inject/native-thread-goal.js");
 const STEPWISE_SCRIPT: &str = concat!(
     "(() => {\n",
     include_str!("../../../assets/inject/floating-panel/runtime/state.js"),
@@ -376,6 +444,10 @@ pub fn native_fast_unlock_script() -> &'static str {
     NATIVE_FAST_UNLOCK_SCRIPT
 }
 
+pub fn native_predictions_script() -> &'static str {
+    NATIVE_PREDICTIONS_SCRIPT
+}
+
 const PET_V2_SPRITE_DETECTION_SCRIPT: &str = r#"
   const isV2Sprite = async (mascot) => {
     if (!mascot) return false;
@@ -499,6 +571,22 @@ fn renderer_after_document_ready(script: &str) -> String {
     )
 }
 
+/// 注入脚本里的皮肤运行时：等文档就绪再安装（#2680）。
+///
+/// 注入脚本同时登记为新文档脚本；只要启动器发过 Page.enable（开了原生 Fast / 输入预测），
+/// Page.reload、启动壳自救重载等每次新文档都会在根节点建立前执行它。这时
+/// `document.documentElement` 为空，皮肤 API 引导里的 `root.style.setProperty` 和
+/// `observer.observe(document.documentElement)` 直接抛错，整个皮肤运行时没装上，
+/// 页面里只剩 Codex++ 的其它增强，看起来就是「重启 Codex 后皮肤不生效」。
+/// 实时注入（Runtime.evaluate，body 已在）仍立即执行；没开皮肤时为空串，不加任何包装。
+fn dream_skin_target_runtime_after_document_ready(settings: &BackendSettings) -> String {
+    let runtime = dream_skin_target_runtime_script(settings, false);
+    if runtime.is_empty() {
+        return runtime;
+    }
+    renderer_after_document_ready(&runtime)
+}
+
 pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettings) -> String {
     let helper_url = format!("http://127.0.0.1:{helper_port}");
     let instance_label = std::env::var("CODEX_PLUS_INSTANCE_LABEL")
@@ -519,17 +607,15 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&local_plugin_marketplaces()).expect("marketplaces serialize"),
         serde_json::to_string(&fast_startup_config(settings)).expect("fast startup serialize"),
     );
-    let image_overlay = image_overlay_config(helper_port, settings);
     let dream_skin_art = dream_skin_art_data_uri(settings);
     let dream_skin_art_signature = dream_skin_art_content_signature(settings);
     let dream_skin_theme = &settings.codex_app_dream_skin_theme_config;
-    let dream_skin_target_runtime = dream_skin_target_runtime_script(settings, false);
+    let dream_skin_target_runtime = dream_skin_target_runtime_after_document_ready(settings);
     let paste_fix = paste_fix_enabled_config(settings);
     let force_chinese_locale = force_chinese_locale_config(settings);
     let hide_official_usage_alert = hide_official_usage_alert_config(settings);
-    // Fast 的新文档脚本需要 Page.enable；DOM 增强必须等正常文档就绪，不能访问空的根节点。
-    let renderer_runtime = if settings.enhancements_enabled && settings.codex_app_native_fast_unlock
-    {
+    // 原生模块补丁的新文档脚本需要 Page.enable；DOM 增强必须等正常文档就绪，不能访问空的根节点。
+    let renderer_runtime = if crate::native_predictions::native_modules_requested(settings) {
         renderer_after_document_ready(renderer_script())
     } else {
         renderer_script().to_string()
@@ -541,12 +627,11 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
             ""
         };
     format!(
-        "{}window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEX_PLUS_VERSION__ = {};\nwindow.__CODEX_PLUS_BUILD__ = {};\nwindow.__CODEX_PLUS_IMAGE_OVERLAY__ = {};\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_PASTE_FIX__ = {};\nwindow.__CODEX_PLUS_FORCE_CHINESE_LOCALE__ = {};\nwindow.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = {};\n{}\n{}\n{}",
+        "{}window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEX_PLUS_VERSION__ = {};\nwindow.__CODEX_PLUS_BUILD__ = {};\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_PASTE_FIX__ = {};\nwindow.__CODEX_PLUS_FORCE_CHINESE_LOCALE__ = {};\nwindow.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = {};\n{}\n{}\n{}",
         format!("{instance_identity}{local_runtime_config}"),
         serde_json::to_string(&helper_url).expect("helper URL should serialize"),
         serde_json::to_string(crate::version::VERSION).expect("version should serialize"),
         serde_json::to_string(DIAGNOSTIC_BUILD_ID).expect("build id should serialize"),
-        serde_json::to_string(&image_overlay).expect("image overlay config should serialize"),
         serde_json::to_string(dream_skin_platform()).expect("dream skin platform should serialize"),
         serde_json::to_string(DREAM_SKIN_RENDERER_REVISION)
             .expect("dream skin renderer revision should serialize"),
@@ -560,15 +645,16 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&hide_official_usage_alert)
             .expect("usage alert config should serialize"),
         format!(
-            "{}\n{}\n{}\n{}",
-            agent_pet_sounds_script(),
+            "{}\n{}\n{}",
             include_str!("../../../assets/inject/composer-readiness.js"),
             format!(
-                "{}\nwindow.__codexPlusNativeFastUnlock.runtime.update({});",
+                "{}\nwindow.__codexPlusNativeFastUnlock.runtime.update({});\n{}\nwindow.__codexPlusNativePredictions.runtime.update({});",
                 native_fast_unlock_script(),
                 json!(crate::native_fast::runtime_settings(settings)),
+                native_predictions_script(),
+                json!(crate::native_predictions::runtime_settings(settings)),
             ),
-            renderer_runtime
+            format!("{}\n{}", NATIVE_THREAD_GOAL_SCRIPT, renderer_runtime)
         ),
         stepwise_runtime,
         dream_skin_target_runtime,
@@ -926,7 +1012,7 @@ fn image_data_uri(mime_type: &str, bytes: &[u8]) -> String {
     )
 }
 
-fn image_file_data_uri(path: &Path) -> Option<String> {
+pub(crate) fn image_file_data_uri(path: &Path) -> Option<String> {
     let mime_type = image_content_type(path)?;
     let bytes = std::fs::read(path).ok()?;
     Some(image_data_uri(mime_type, &bytes))
@@ -982,6 +1068,75 @@ mod tests {
         );
     }
 
+    // 回归 #2680：注入脚本作为新文档脚本执行时根节点还不存在，皮肤运行时必须等文档就绪。
+    #[test]
+    fn dream_skin_runtime_in_injection_waits_for_document_ready() {
+        let mut settings = BackendSettings::default();
+        settings.codex_app_dream_skin_enabled = true;
+        let runtime = dream_skin_target_runtime_script(&settings, false);
+        assert!(!runtime.is_empty());
+        let script = injection_script_with_settings(57321, &settings);
+        assert!(script.contains(&renderer_after_document_ready(&runtime)));
+        // 皮肤运行时只出现在包装里，不能另有一份在根节点建立前直接执行。
+        assert_eq!(script.matches(runtime.as_str()).count(), 1);
+
+        // 没开或暂停皮肤时不注入任何皮肤运行时，也不加包装。
+        for (enabled, paused) in [(false, false), (true, true)] {
+            settings.codex_app_dream_skin_enabled = enabled;
+            settings.codex_app_dream_skin_paused = paused;
+            assert!(dream_skin_target_runtime_after_document_ready(&settings).is_empty());
+        }
+    }
+
+    #[test]
+    fn dream_skin_api_bootstrap_throws_before_root_but_wrapped_installs_after_ready() {
+        let bootstrap =
+            dream_skin_skin_api_bootstrap_script(r##"{"colors":{"background":"#102030"}}"##);
+        let test = format!(
+            r#"
+          const vm=require('node:vm'),assert=require('node:assert/strict');
+          const run=(source)=>{{
+            let listener=null,observed=null;
+            const props={{}};
+            const root={{style:{{setProperty:(name,value)=>{{props[name]=value;}}}}}};
+            // 与 Chromium 新文档脚本一致：根节点、head、body 都还是 null。
+            const document={{documentElement:null,body:null,querySelectorAll:()=>[],
+              addEventListener:(name,callback,options)=>{{
+                assert.equal(name,'DOMContentLoaded');assert.equal(options.once,true);listener=callback;
+              }}}};
+            class MutationObserver{{
+              observe(node){{if(!node)throw new TypeError("parameter 1 is not of type 'Node'");observed=node;}}
+              disconnect(){{}}
+            }}
+            const window={{}};
+            vm.runInNewContext(source,{{window,document,MutationObserver,setTimeout,clearTimeout}});
+            return {{document,root,props,ready:()=>{{document.documentElement=root;document.body={{}};listener();}},observed:()=>observed}};
+          }};
+          // 未包装：新文档阶段直接抛错，整份皮肤运行时就此中断。
+          // vm 里抛出的 TypeError 属于另一个 realm，按 name 判断。
+          assert.throws(()=>run({raw}),(error)=>error.name==='TypeError');
+          // 包装后：新文档阶段不碰 DOM，文档就绪时正常写主题变量、监听根节点。
+          const env=run({wrapped});
+          assert.deepEqual(env.props,{{}});
+          env.ready();
+          assert.equal(env.props['--ds-theme-color-background'],'#102030');
+          assert.equal(env.observed(),env.root);
+        "#,
+            raw = serde_json::to_string(&bootstrap).unwrap(),
+            wrapped = serde_json::to_string(&renderer_after_document_ready(&bootstrap)).unwrap(),
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(test)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn native_shell_compatibility_is_present_without_managed_safe_css() {
         let temp = tempfile::tempdir().unwrap();
@@ -1023,39 +1178,42 @@ mod tests {
     }
 
     #[test]
-    fn agent_pet_sounds_are_embedded_byte_for_byte() {
+    fn pet_media_is_not_embedded_in_the_injection_script() {
+        // 桌宠与大肥鱼改成了 Agent 桌宠拓展：引擎随拓展包发布，素材经 /whale/media 取，注入脚本不再带它们。
         let script = injection_script(57321);
-        let prefix = "window.__CODEX_PLUS_AGENT_PET_SOUNDS__ = ";
-        let value = script.split_once(prefix).unwrap().1.lines().next().unwrap();
-        let sounds: Value = serde_json::from_str(value.trim_end_matches(';')).unwrap();
-        assert_eq!(sounds.as_object().unwrap().len(), 2);
-        let decode = |uri: &Value| {
-            base64::engine::general_purpose::STANDARD
-                .decode(
-                    uri.as_str()
-                        .unwrap()
-                        .strip_prefix("data:audio/mpeg;base64,")
-                        .unwrap(),
-                )
-                .unwrap()
-        };
-        let expected: [(&str, &[u8], &[u8]); 2] = [
-            (
-                "duck",
-                include_bytes!("../../../assets/inject/agent-pet/sounds/Ya1.mp3"),
-                include_bytes!("../../../assets/inject/agent-pet/sounds/Ya2.mp3"),
-            ),
-            (
-                "fx1",
-                include_bytes!("../../../assets/inject/agent-pet/sounds/D1.mp3"),
-                include_bytes!("../../../assets/inject/agent-pet/sounds/D2.mp3"),
-            ),
-        ];
-        for (name, press, release) in expected {
-            assert!(!press.is_empty() && !release.is_empty());
-            assert_eq!(decode(&sounds[name]["press"]), press, "{name} press");
-            assert_eq!(decode(&sounds[name]["release"]), release, "{name} release");
+        assert!(!script.contains("__CODEX_PLUS_WHALE_ENGINE__"));
+        assert!(!script.contains("__CODEX_PLUS_WHALE_ASSETS__"));
+        assert!(!script.contains("__CODEX_PLUS_AGENT_PET_SOUNDS__"));
+    }
+
+    #[test]
+    fn whale_media_preserves_original_audio_and_animation_bytes() {
+        let media = whale_media();
+        assert_eq!(media["status"], "ok");
+        let values = &media["assets"];
+        assert_eq!(values.as_object().unwrap().len(), 10);
+        for (name, mime, expected) in WHALE_MEDIA {
+            let uri = values[*name].as_str().unwrap();
+            let prefix = format!("data:{mime};base64,");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(uri.strip_prefix(&prefix).unwrap())
+                .unwrap();
+            assert_eq!(&decoded, expected);
         }
+        let image = base64::engine::general_purpose::STANDARD
+            .decode(
+                media["image"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("data:image/png;base64,")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(image, WHALE_DEFAULT_IMAGE);
+        // 桌宠按压音与大肥鱼内置音效是同一份原样素材。
+        let sounds = agent_pet_sounds();
+        assert_eq!(sounds["duck"]["press"], values["Ya1.mp3"]);
+        assert_eq!(sounds["fx1"]["release"], values["D2.mp3"]);
     }
 
     #[test]
@@ -1109,31 +1267,6 @@ mod tests {
         assert!(wallpaper_rules.contains("[data-app-shell-titlebar=\"true\"]"));
         assert!(wallpaper_rules.contains("#codex-plus-usage-statusline"));
         assert!(wallpaper_rules.contains(".codex-token-usage-badge"));
-    }
-
-    #[test]
-    fn image_overlay_config_includes_fit_mode() {
-        let settings = BackendSettings {
-            codex_app_image_overlay_fit_mode: "fill".to_string(),
-            ..BackendSettings::default()
-        };
-        let config = image_overlay_config(57321, &settings);
-
-        assert_eq!(config["fitMode"].as_str(), Some("fill"));
-    }
-
-    #[test]
-    fn image_overlay_config_clears_endpoint_when_asset_is_unavailable() {
-        let settings = BackendSettings {
-            codex_app_image_overlay_enabled: true,
-            codex_app_image_overlay_path: "C:\\missing\\overlay.png".to_string(),
-            ..BackendSettings::default()
-        };
-        let config = image_overlay_config(57321, &settings);
-
-        assert_eq!(config["enabled"], false);
-        assert_eq!(config["dataUrl"], "");
-        assert_eq!(config["imageUrl"], "");
     }
 
     #[test]

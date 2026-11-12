@@ -26,6 +26,12 @@ pub fn set_navigation_handler(handler: impl Fn(Value) -> Result<()> + Send + Syn
         .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(handler));
 }
 
+/// 与查询使用同一主目录，关闭设置后立即释放用量索引。
+pub fn clear_usage_history() {
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    codex_plus_data::usage_history::clear_history(&home);
+}
+
 fn show_gui(payload: Value) -> Result<()> {
     let handler = NAVIGATION_HANDLER
         .get_or_init(|| Mutex::new(None))
@@ -49,7 +55,11 @@ impl StartupReply {
         if result.is_ok() {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.ready = true;
-            record_session_probe(&state.options, state.status_started_at_ms);
+            record_session_probe(
+                &state.options,
+                state.status_started_at_ms,
+                state.launch_extra_args.clone(),
+            );
         }
         self.reply.send(result)
     }
@@ -61,6 +71,7 @@ struct SessionState {
     options: LaunchOptions,
     requested_at_ms: u64,
     status_started_at_ms: u64,
+    launch_extra_args: Option<Vec<String>>,
 }
 
 /// 本进程 launcher 会话的只读快照，供自动接管的判据使用。
@@ -77,6 +88,10 @@ pub struct SessionSnapshot {
     /// `latest-status.json` 里的状态（`running` / `running_degraded` / …）。
     pub status: Option<String>,
     pub debug_port: Option<u16>,
+    /// 已就绪会话实际使用的应用目录，不从旧状态文件推测。
+    pub app_dir: Option<PathBuf>,
+    /// 本会话启动时实际使用的附加参数；接管已有实例时可能未知。
+    pub launch_extra_args: Option<Vec<String>>,
     /// 该会话的状态代际，用来判断是不是同一次启动。
     pub started_at_ms: Option<u64>,
 }
@@ -91,18 +106,24 @@ struct SessionProbe {
     helper_port: u16,
     app_dir: Option<std::path::PathBuf>,
     started_at_ms: u64,
+    launch_extra_args: Option<Vec<String>>,
 }
 
 fn session_probe_slot() -> &'static Mutex<Option<SessionProbe>> {
     SESSION_PROBE.get_or_init(|| Mutex::new(None))
 }
 
-fn record_session_probe(options: &LaunchOptions, started_at_ms: u64) {
+fn record_session_probe(
+    options: &LaunchOptions,
+    started_at_ms: u64,
+    launch_extra_args: Option<Vec<String>>,
+) {
     let probe = SessionProbe {
         debug_port: options.debug_port,
         helper_port: options.helper_port,
         app_dir: options.app_dir.clone(),
         started_at_ms,
+        launch_extra_args,
     };
     *session_probe_slot()
         .lock()
@@ -180,6 +201,7 @@ impl EmbeddedSession {
             options: options.clone(),
             requested_at_ms,
             status_started_at_ms: requested_at_ms,
+            launch_extra_args: None,
         }));
         let ready = StartupReply {
             reply: ready,
@@ -412,6 +434,10 @@ pub fn session_snapshot() -> SessionSnapshot {
             .as_ref()
             .map(|probe| probe.debug_port)
             .or_else(|| latest.as_ref().and_then(|latest| latest.debug_port)),
+        app_dir: probe.as_ref().and_then(|probe| probe.app_dir.clone()),
+        launch_extra_args: probe
+            .as_ref()
+            .and_then(|probe| probe.launch_extra_args.clone()),
         started_at_ms: probe
             .as_ref()
             .map(|probe| probe.started_at_ms)
@@ -456,11 +482,11 @@ async fn runtime_commands(
                         if let Some(current) = &session {
                             let current_options = {
                                 let state = current.state.lock().unwrap_or_else(|error| error.into_inner());
-                                state.ready.then(|| (state.options.clone(), state.status_started_at_ms))
+                                state.ready.then(|| (state.options.clone(), state.status_started_at_ms, state.launch_extra_args.clone()))
                             };
                             let result = match current_options {
-                                Some((current_options, started_at_ms)) => {
-                                    record_session_probe(&current_options, started_at_ms);
+                                Some((current_options, started_at_ms, launch_extra_args)) => {
+                                    record_session_probe(&current_options, started_at_ms, launch_extra_args);
                                     if attach_only { Ok(()) } else { activate(current_options, started_at_ms).await }
                                 }
                                 None => Err(StartupBusy.into()),
@@ -622,13 +648,18 @@ async fn run_embedded_session(
     };
     // 启动包含 spawn_blocking 的数据库/系统浏览器事务；停止请求要等它们完成，
     // 再销毁 monitor owner，不能直接取消 future 让已开始的系统改写失去恢复句柄。
-    let result = match launcher_session(options.clone(), &hooks, &mut ready, guard.is_some()).await
-    {
+    let owns_guard = guard.is_some();
+    let result = match launcher_session(options.clone(), &hooks, &mut ready, owns_guard).await {
         Ok(Some(handle)) => {
             let (host_stop, result) = run_periodic_until_exit(
                 wait_for_session_exit_or_stop(handle.wait_for_codex_exit(), &mut stop),
                 std::time::Duration::from_secs(30 * 60),
-                || repair_session_index_automatically(hooks.index_repair_checks_setting()),
+                || {
+                    repair_session_index_automatically(
+                        hooks.index_repair_checks_setting(),
+                        Some(handle.debug_port),
+                    )
+                },
             )
             .await;
             handle.stop_isolated_api_quota_gate().await;
@@ -660,7 +691,15 @@ async fn run_embedded_session(
     }
     drop(guard);
     if let Err(error) = result {
-        record_launch_failure(&options, requested_at_ms, &error);
+        if owns_guard {
+            record_launch_failure(&options, requested_at_ms, &error);
+        } else {
+            // 锁持有者可能正在退出；二实例不能覆盖它的状态或把退出重新解释为启动。
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.nonowner_activation_rejected",
+                json!({"message": error.to_string()}),
+            );
+        }
         if let Some(ready) = ready.take() {
             let _ = ready.send(Err(ReportedLaunchFailure(error).into()));
         }
@@ -714,6 +753,7 @@ async fn launcher_session(
         {
             anyhow::bail!("已有 Codex++ 启动服务正在运行，请退出旧版本后再启动 Codex");
         }
+        #[cfg(not(windows))]
         let started_at_ms = ready
             .as_ref()
             .map(|reply| {
@@ -724,6 +764,17 @@ async fn launcher_session(
                     .requested_at_ms
             })
             .unwrap_or_else(current_timestamp_ms);
+        #[cfg(windows)]
+        {
+            // AUMID 的“激活”也能新建进程；未持锁的旧启动器绝不能走 launch_codex。
+            // 特别是用户正在关闭 Codex 时，包激活会撤销退出并触发反复启动。
+            focus_existing_codex_window_only(
+                codex_plus_core::cdp::endpoint_available(options.debug_port),
+                &codex_plus_core::watcher::find_codex_processes(),
+                codex_plus_core::windows_activate_process_window,
+            )?;
+        }
+        #[cfg(not(windows))]
         activate_and_write_running_status(&options, started_at_ms).await?;
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
@@ -745,6 +796,9 @@ async fn launcher_session(
             state.options.app_dir = Some(handle.app_dir.clone());
             state.options.debug_port = handle.debug_port;
             state.options.helper_port = handle.helper_port;
+            // 「重启」许可只对这一次启动有效：之后再点「启动」复用本会话激活时，
+            // 不能沿用它去结束用户另开的 Codex。
+            state.options.replace_blocking_main_instance = false;
             state.status_started_at_ms = handle
                 .status_store
                 .load_latest()
@@ -756,6 +810,19 @@ async fn launcher_session(
         let _ = ready.send(Ok(()));
     }
     Ok(Some(handle))
+}
+
+#[cfg(any(windows, test))]
+fn focus_existing_codex_window_only(
+    cdp_ready: bool,
+    process_ids: &[u32],
+    mut focus: impl FnMut(u32) -> bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        cdp_ready && process_ids.iter().copied().any(&mut focus),
+        "已有 Codex++ 后台服务正在运行，但没有可聚焦的 Codex 窗口；可能正在退出，本次未重新启动"
+    );
+    Ok(())
 }
 
 async fn activate_and_write_running_status(
@@ -816,67 +883,86 @@ where
     }
 }
 
-async fn repair_session_index_automatically(check_setting: bool) {
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        if check_setting
-            && !codex_plus_core::settings::SettingsStore::default()
-                .load()?
-                .provider_sync_enabled
-        {
-            return Ok(());
-        }
-        let report = codex_plus_data::repair_session_index(None)?;
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "launcher.session_index_repair.completed",
-            json!({
-                "elapsed_ms": report.elapsed_ms,
-                "scanned_files": report.scanned_files,
-                "cached_files": report.cached_files,
-                "repaired_items": report.repaired_items,
-            }),
-        );
-        Ok(())
-    })
+async fn repair_session_index_automatically(check_setting: bool, debug_port: Option<u16>) {
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Option<codex_plus_data::SessionIndexRepairReport>> {
+            // 索引修复只补 thread_items 投影，不改 provider；由独立的
+            // sessionIndexRepairEnabled 门控，与 provider sync 的批量改写分开（#2846）。
+            if check_setting
+                && !codex_plus_core::settings::SettingsStore::default()
+                    .load()?
+                    .session_index_repair_enabled
+            {
+                return Ok(None);
+            }
+            let report = codex_plus_data::repair_session_index(None)?;
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.session_index_repair.completed",
+                json!({
+                    "elapsed_ms": report.elapsed_ms,
+                    "scanned_files": report.scanned_files,
+                    "cached_files": report.cached_files,
+                    "repaired_items": report.repaired_items,
+                }),
+            );
+            Ok(Some(report))
+        },
+    )
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    if let Err(error) = result {
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "launcher.session_index_repair.failed",
-            json!({ "message": error.to_string() }),
-        );
+    match result {
+        Ok(Some(report)) => {
+            codex_plus_core::history_turn_recovery::after_index_repair(
+                debug_port,
+                report.aborted_reason.is_some(),
+                report.checked_at_ms,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.session_index_repair.failed",
+                json!({ "message": error.to_string() }),
+            );
+        }
     }
 }
 
-/// 「激活已有实例」路径上的供应商同步。
+/// 「激活已有实例」路径上的供应商同步与会话索引修复。
 ///
-/// 与完整启动流程保持一致：仅在设置里启用了供应商同步时执行，
-/// 前后各取一次 app state 快照；此路径没有启动后 monitor，因此在这里修复索引。
-/// 同步失败只记日志——用户这次点击
-/// 的诉求是把已有窗口拉到前台，不能因为同步失败就整个中止。
+/// 两件事由独立开关控制（#2846）：
+/// - providerSyncEnabled：启动/激活时做供应商同步（批量改写会话 model_provider），
+///   前后各取一次 app state 快照；
+/// - sessionIndexRepairEnabled：激活路径没有启动后 monitor，在这里补跑索引修复。
+/// 同步失败只记日志——用户这次点击的诉求是把已有窗口拉到前台，不能因同步失败而中止。
 async fn run_activation_provider_sync(
     hooks: &LauncherHooks,
     settings: &codex_plus_core::settings::BackendSettings,
 ) {
-    if !settings.provider_sync_enabled {
-        return;
-    }
-    let home = codex_plus_core::relay_config::default_codex_home_dir();
-    codex_plus_core::codex_app_state::capture_app_state_snapshot_nonfatal(
-        &home,
-        "launcher.activate_existing.before",
-    );
-    if let Err(error) = hooks.run_provider_sync().await {
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "launcher.activate_existing_provider_sync.failed",
-            json!({ "message": error.to_string() }),
+    if settings.provider_sync_enabled {
+        let home = codex_plus_core::relay_config::default_codex_home_dir();
+        codex_plus_core::codex_app_state::capture_app_state_snapshot_nonfatal(
+            &home,
+            "launcher.activate_existing.before",
+        );
+        if let Err(error) = hooks.run_provider_sync().await {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.activate_existing_provider_sync.failed",
+                json!({ "message": error.to_string() }),
+            );
+        }
+        codex_plus_core::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
+            &home,
+            "launcher.activate_existing.after_provider_sync",
         );
     }
-    repair_session_index_automatically(hooks.index_repair_checks_setting()).await;
-    codex_plus_core::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
-        &home,
-        "launcher.activate_existing.after_provider_sync",
-    );
+    // 索引修复走自己的开关；不开 provider sync 的用户也会想修历史会话。
+    repair_session_index_automatically(
+        hooks.index_repair_checks_setting(),
+        session_snapshot().debug_port,
+    )
+    .await;
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -966,6 +1052,15 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     // 于是「切换登录方式后 model_provider 没跟着切换」「历史会话没被自动修复」，
     // 只有管理工具的「重启」才生效（issue #2080）。失败不阻断激活，只记日志。
     run_activation_provider_sync(&hooks, &settings).await;
+    if let Err(error) = codex_plus_core::relay_config::ensure_managed_session_provider_in_home(
+        &codex_plus_core::relay_config::default_codex_home_dir(),
+        &settings,
+    ) {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.managed_session_provider_repair_failed",
+            json!({ "message": error.to_string(), "phase": "activate_existing" }),
+        );
+    }
     let launch_result = hooks
         .launch_codex(
             &app_dir,
@@ -978,14 +1073,16 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     // 复用后台服务也属于用户主动启动；已有资源补丁由原服务持有，
     // 这里只执行与完整启动相同的首次应用检查，不能重新创建 helper 或 watchdog。
     if settings.enhancements_enabled
-        && settings.codex_app_native_fast_unlock
+        && (settings.codex_app_native_fast_unlock || settings.codex_app_native_predictions)
         && let Ok(launch) = &launch_result
         && let Err(error) = hooks
-            .apply_native_fast_unlock_on_launch(launch.debug_port().unwrap_or(options.debug_port))
+            .apply_native_module_patches_on_launch(
+                launch.debug_port().unwrap_or(options.debug_port),
+            )
             .await
     {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "launcher.native_fast_unlock_failed",
+            "launcher.native_module_patch_failed",
             json!({"message": error.to_string(), "phase": "activate_existing"}),
         );
     }
@@ -1094,8 +1191,11 @@ impl LaunchHooks for LauncherHooks {
         }
     }
 
-    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
-        self.core.cleanup_unsupported_config()
+    fn cleanup_unsupported_config(
+        &self,
+        settings: &codex_plus_core::settings::BackendSettings,
+    ) -> anyhow::Result<()> {
+        self.core.cleanup_unsupported_config(settings)
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
@@ -1353,6 +1453,12 @@ impl LaunchHooks for LauncherHooks {
                 ),
             });
         }
+        if let Some(state) = &self.session_state {
+            state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .launch_extra_args = Some(extra_args.to_vec());
+        }
         self.core
             .launch_codex(app_dir, debug_port, settings, extra_args, instance)
             .await
@@ -1389,13 +1495,13 @@ impl LaunchHooks for LauncherHooks {
         self.core.inject(debug_port, helper_port).await
     }
 
-    async fn apply_native_fast_unlock_on_launch(&self, debug_port: u16) -> anyhow::Result<()> {
+    async fn apply_native_module_patches_on_launch(&self, debug_port: u16) -> anyhow::Result<()> {
         // 恢复后台服务只补回桥接，不刷新用户正在使用的页面。
         if self.attach_only {
             return Ok(());
         }
         self.core
-            .apply_native_fast_unlock_on_launch(debug_port)
+            .apply_native_module_patches_on_launch(debug_port)
             .await
     }
 
@@ -1476,6 +1582,48 @@ impl Default for LauncherDataService {
 
 #[async_trait::async_trait]
 impl BridgeDataService for LauncherDataService {
+    async fn migrate_gateway_thread_provider(
+        &self,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let field = |key: &str| {
+            payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("缺少单会话迁移字段：{key}"))
+        };
+        anyhow::ensure!(
+            payload
+                .get("nativeUnloaded")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
+            "需要原生接口确认会话已经卸载"
+        );
+        let (thread, source, target, model) = (
+            field("threadId")?,
+            field("sourceProvider")?,
+            field("targetProvider")?,
+            field("model")?,
+        );
+        let home = codex_plus_core::codex_home::default_codex_home_dir();
+        let gateway = codex_plus_core::gateway::store::GatewayStore::default().load()?;
+        let profile = codex_plus_core::settings::SettingsStore::default()
+            .load()?
+            .active_relay_profile();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_data::provider_sync::migrate_gateway_thread_provider(
+                &home,
+                &thread,
+                &source,
+                &target,
+                &model,
+                &gateway,
+                Some(&profile),
+            )
+        })
+        .await?
+    }
     async fn delete(&self, session: SessionRef) -> anyhow::Result<DeleteResult> {
         // 只读本地 SQLite 的实现不能接收远端/未知来源；同 ID 不代表同一主机。
         session.require_local_delete()?;
@@ -1521,6 +1669,47 @@ impl BridgeDataService for LauncherDataService {
         tokio::task::spawn_blocking(move || adapter.codex_thread_usage_live(&session))
             .await
             .map_err(|error| anyhow::anyhow!("thread usage live task failed: {error}"))
+    }
+
+    async fn usage_history(&self, query: Value) -> anyhow::Result<Value> {
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_data::usage_history::query_history(&home, &query)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("structured usage history task failed: {error}"))
+    }
+
+    async fn usage_archive(&self, request: Value) -> anyhow::Result<Value> {
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        let settings = codex_plus_core::paths::default_settings_path();
+        Ok(tokio::task::spawn_blocking(move || {
+            codex_plus_data::usage_archive::query_archive(&home, &settings, &request)
+        })
+        .await
+        .unwrap_or_else(|_| json!({"status":"failed","code":"archive-task-failed"})))
+    }
+
+    async fn clear_usage_history(&self) {
+        let _ = tokio::task::spawn_blocking(clear_usage_history).await;
+    }
+
+    async fn whale_session(&self, session: SessionRef) -> anyhow::Result<Value> {
+        let adapter = self.storage_adapter();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_data::whale_usage::session_summary(&adapter, &session)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("whale session task failed: {error}"))
+    }
+
+    async fn whale_history(&self, query: Value) -> anyhow::Result<Value> {
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_data::whale_history::query_history(&home, &query)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("whale history task failed: {error}"))
     }
 
     async fn find_archived_thread_by_title(
@@ -1670,12 +1859,17 @@ impl BridgeRuntimeService for LauncherRuntimeService {
     }
 
     async fn set_user_script_enabled(&self, key: String, enabled: bool) -> anyhow::Result<Value> {
-        self.user_scripts.set_script_enabled(&key, enabled)?;
+        let result = self.user_scripts.set_script_enabled(&key, enabled);
+        // 与管理器一致：拓展带的钩子 / Codex 资产跟着启停写回 Codex 配置。
+        codex_plus_core::extension_hooks::sync_default(&self.user_scripts);
+        result?;
         self.user_scripts.inventory()
     }
 
     async fn delete_user_script(&self, key: String) -> anyhow::Result<Value> {
-        self.user_scripts.delete_user_script(&key)?;
+        let result = self.user_scripts.delete_user_script(&key);
+        codex_plus_core::extension_hooks::sync_default(&self.user_scripts);
+        result?;
         self.user_scripts.inventory()
     }
 
@@ -1707,6 +1901,22 @@ impl BridgeRuntimeService for LauncherRuntimeService {
     async fn cdp_evaluate(&self, payload: Value) -> anyhow::Result<Value> {
         let debug_port = *self.debug_port.lock().unwrap();
         codex_plus_core::routes::evaluate_extension_cdp(debug_port, &payload).await
+    }
+
+    async fn request_app_server_client_capture(&self) -> anyhow::Result<Value> {
+        let websocket_url = self
+            .websocket_url
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Codex 页面尚未连接"))?;
+        let started = codex_plus_core::bridge::request_app_server_client_capture(&websocket_url);
+        Ok(serde_json::json!({ "status": "ok", "started": started }))
+    }
+
+    async fn set_thread_goal_in_owner(&self, payload: Value) -> anyhow::Result<Value> {
+        let debug_port = *self.debug_port.lock().unwrap();
+        codex_plus_core::native_thread_goal::set_in_owner(debug_port, payload).await
     }
 
     async fn script_market_list(&self) -> anyhow::Result<Value> {
@@ -1932,28 +2142,8 @@ fn open_url(url: &str) -> anyhow::Result<()> {
 }
 
 fn default_user_script_manager() -> UserScriptManager {
-    let config_dir = default_user_scripts_config_dir();
-    UserScriptManager::new(
-        builtin_user_scripts_dir(),
-        config_dir.join("user_scripts"),
-        config_dir.join("user_scripts.json"),
-    )
-}
-
-fn default_user_scripts_config_dir() -> PathBuf {
-    if cfg!(windows) {
-        if let Some(roaming) = std::env::var_os("APPDATA") {
-            return PathBuf::from(roaming).join("Codex++");
-        }
-        if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
-            return home.join("AppData").join("Roaming").join("Codex++");
-        }
-    }
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("Codex++")
+    // 目录算法统一在 core，管理器、本地代理、钩子分发共用同一份。
+    codex_plus_core::user_scripts::default_user_script_manager()
 }
 
 #[cfg(test)]
@@ -2418,6 +2608,47 @@ mod tests {
     #[test]
     fn embedded_runtime_deduplicates_start_and_waits_for_cleanup_before_restarting() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let child_root = std::env::var_os("CODEX_PLUS_RUNTIME_PROBE_TEST_ROOT");
+        if child_root.is_none() {
+            let fixture = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tests::embedded_runtime_deduplicates_start_and_waits_for_cleanup_before_restarting",
+                    "--nocapture",
+                ])
+                .env("CODEX_PLUS_RUNTIME_PROBE_TEST_ROOT", fixture.path());
+            for (variable, directory) in [
+                ("CODEX_PLUS_STATE_DIR", "state"),
+                ("CODEX_HOME", "home"),
+                ("CODEX_SQLITE_HOME", "sqlite"),
+                ("APPDATA", "appdata"),
+                ("XDG_CONFIG_HOME", "xdg"),
+            ] {
+                let directory = fixture.path().join(directory);
+                std::fs::create_dir(&directory).unwrap();
+                command.env(variable, directory);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(codex_plus_core::windows_create_no_window());
+            }
+            // 其他 runtime 用例也会清空进程级快照；在单独测试进程内验证该快照。
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(fixture.path().join("completed")).unwrap(),
+                b"ok"
+            );
+            return;
+        }
         let launched = Arc::new(AtomicUsize::new(0));
         let cleaned = Arc::new(AtomicUsize::new(0));
         let activations = Arc::new(AtomicUsize::new(0));
@@ -2445,6 +2676,9 @@ mod tests {
                         std::future::pending::<()>().await;
                     });
                     tokio::task::yield_now().await;
+                    ready.state.lock().unwrap().launch_extra_args = Some(vec![
+                        "--user-data-dir=C:\\test\\started-instance".to_string(),
+                    ]);
                     ready.send(Ok(())).unwrap();
                     let _ = stop.await;
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2467,6 +2701,17 @@ mod tests {
             test_start_command(LaunchOptions::default(), reply)
         })
         .unwrap();
+        assert_eq!(
+            session_probe_slot()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .launch_extra_args,
+            Some(vec![
+                "--user-data-dir=C:\\test\\started-instance".to_string()
+            ])
+        );
         send_test_command(&worker, |reply| {
             test_start_command(
                 LaunchOptions {
@@ -2477,6 +2722,17 @@ mod tests {
             )
         })
         .unwrap();
+        assert_eq!(
+            session_probe_slot()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .launch_extra_args,
+            Some(vec![
+                "--user-data-dir=C:\\test\\started-instance".to_string()
+            ])
+        );
         assert_eq!(launched.load(Ordering::SeqCst), 1);
         assert_eq!(activations.load(Ordering::SeqCst), 1);
         send_test_command(&worker, RuntimeCommand::Stop).unwrap();
@@ -2491,6 +2747,7 @@ mod tests {
         worker.thread.join().unwrap();
         assert_eq!(cleaned.load(Ordering::SeqCst), 2);
         assert_eq!(connections_dropped.load(Ordering::SeqCst), 2);
+        std::fs::write(PathBuf::from(child_root.unwrap()).join("completed"), b"ok").unwrap();
     }
 
     #[test]
@@ -2652,6 +2909,38 @@ mod tests {
         *NAVIGATION_HANDLER.get().unwrap().lock().unwrap() = None;
     }
 
+    #[tokio::test]
+    async fn thread_goal_uses_the_launchers_current_instance_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let length = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /json "));
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+            ).await.unwrap();
+        });
+        let runtime = LauncherRuntimeService::new(1, default_user_script_manager());
+        runtime.set_debug_port(port);
+        let result = runtime
+            .set_thread_goal_in_owner(json!({
+                "hostId": "local", "threadId": "synthetic-thread", "requestId": "test-request",
+                "params": { "objective": "synthetic objective" }
+            }))
+            .await;
+        let served = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
+        assert!(served.unwrap().is_ok());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "会话所在窗口暂不可用，请稍后重试设置目标"
+        );
+    }
+
     #[test]
     fn existing_launcher_path_drains_pending_remote_control_recovery_before_activation() {
         let source = include_str!("main.rs");
@@ -2729,7 +3018,9 @@ mod tests {
             .expect("next function after existing launcher activation");
         let body = &source[start..end];
         let launch = body.find("let launch_result = hooks").unwrap();
-        let patch = body.find(".apply_native_fast_unlock_on_launch(").unwrap();
+        let patch = body
+            .find(".apply_native_module_patches_on_launch(")
+            .unwrap();
 
         assert!(
             launch < patch,
@@ -2738,9 +3029,10 @@ mod tests {
         let guard = &body[launch..patch];
         assert!(guard.contains("settings.enhancements_enabled"));
         assert!(guard.contains("settings.codex_app_native_fast_unlock"));
+        assert!(guard.contains("settings.codex_app_native_predictions"));
         assert!(guard.contains("let Ok(launch) = &launch_result"));
         assert!(body[patch..].contains("launch.debug_port().unwrap_or(options.debug_port)"));
-        assert!(body[patch..].contains("launcher.native_fast_unlock_failed"));
+        assert!(body[patch..].contains("launcher.native_module_patch_failed"));
         assert!(body[patch..].contains("launch_result.map(|_| ())"));
     }
 
@@ -2756,13 +3048,27 @@ mod tests {
             .expect("next function after the helper");
         let body = &source[start..end];
 
-        // 只在设置启用时同步，与完整启动流程一致。
-        assert!(body.contains("if !settings.provider_sync_enabled"));
+        // provider sync 只在设置启用时做，与完整启动流程一致（#2846 拆开后仍由 providerSyncEnabled 门控）。
+        assert!(body.contains("if settings.provider_sync_enabled"));
         // 同步失败只记日志，不能把用户这次「激活已有窗口」的诉求一起弄失败。
         assert!(!body.contains("hooks.run_provider_sync().await?"));
         assert!(body.contains("launcher.activate_existing_provider_sync.failed"));
-        assert!(body.contains(
-            "repair_session_index_automatically(hooks.index_repair_checks_setting()).await"
+        // 索引修复由独立开关控制，即使 provider sync 关着也要照常跑：
+        // 断言 repair_session_index_automatically 本体的开关读的是 sessionIndexRepairEnabled。
+        let repair_body_start = source
+            .find("async fn repair_session_index_automatically")
+            .expect("repair helper");
+        let repair_body_end = source[repair_body_start..]
+            .find("\n}\n\n/// 「激活已有实例」")
+            .map(|offset| repair_body_start + offset + 3)
+            .expect("end of repair helper");
+        let repair_body = &source[repair_body_start..repair_body_end];
+        assert!(repair_body.contains("session_index_repair_enabled"));
+        // 且 repair 不再被 providerSyncEnabled 顺带门控。
+        assert!(!repair_body.contains("provider_sync_enabled"));
+        let compact = body.split_whitespace().collect::<String>();
+        assert!(compact.contains(
+            "repair_session_index_automatically(hooks.index_repair_checks_setting(),session_snapshot().debug_port,).await"
         ));
     }
 
@@ -2831,7 +3137,7 @@ mod tests {
     async fn launcher_hooks_forward_native_fast_instead_of_using_the_default_noop() {
         let hooks = LauncherHooks::default();
         // 没有 CDP 端点时核心实现会返回错误；trait 默认的空实现则错误地成功。
-        let result = hooks.apply_native_fast_unlock_on_launch(0).await;
+        let result = hooks.apply_native_module_patches_on_launch(0).await;
         assert!(
             result.is_err(),
             "native Fast hook must reach the core launcher"
@@ -2845,7 +3151,10 @@ mod tests {
             ..LauncherHooks::default()
         };
         // 后台恢复不访问 CDP，因此相同的不可用端点也应成功跳过。
-        hooks.apply_native_fast_unlock_on_launch(0).await.unwrap();
+        hooks
+            .apply_native_module_patches_on_launch(0)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2895,6 +3204,44 @@ fn builtin_user_scripts_dir() -> PathBuf {
 /// 保留 Windows 独立启动器入口；嵌入式 Manager 与旧快捷方式共用同一生命周期实现。
 pub fn run_standalone() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let command = standalone_command(&args);
+    if matches!(command.as_ref(), Ok(StandaloneCommand::Version)) {
+        println!("Codex++ {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if matches!(command.as_ref(), Ok(StandaloneCommand::Help)) {
+        println!(
+            "Codex++ [--app-path PATH] [--debug-port PORT] [--helper-port PORT] [--helper-only]"
+        );
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let processes = codex_plus_core::windows_enumerate_processes();
+        let parent = processes
+            .iter()
+            .find(|process| process.process_id == std::process::id())
+            .and_then(|process| {
+                processes
+                    .iter()
+                    .find(|parent| parent.process_id == process.parent_process_id)
+            });
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.standalone_requested",
+            json!({"parentPid": parent.map(|process| process.process_id),
+                "parentExecutable": parent.and_then(|process| process.executable_path.as_ref()),
+                "argumentCount": args.len(), "command": command.as_ref().ok().map(|value| format!("{value:?}"))}),
+        );
+    }
+    let command = command?;
+    if command == StandaloneCommand::Autostart {
+        // 兼容旧开机快捷方式，交给 Manager 读取禁用标记/最小化设置，不直接启动 Codex。
+        codex_plus_core::install::spawn_companion(
+            codex_plus_core::install::MANAGER_BINARY,
+            ["--autostart"],
+        )?;
+        return Ok(());
+    }
     let options = parse_launch_options(args.iter());
     set_navigation_handler(|payload| {
         let navigation =
@@ -2906,7 +3253,7 @@ pub fn run_standalone() -> Result<()> {
             .map_err(|error| codex_plus_core::manager_navigation::rollback_pending_manager_navigation_after_launch_failure(navigation.as_ref(), error))
     });
     ensure_weixin_manager_started();
-    if args.iter().any(|arg| arg == "--helper-only") {
+    if command == StandaloneCommand::HelperOnly {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -2922,6 +3269,41 @@ pub fn run_standalone() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     shutdown()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandaloneCommand {
+    Launch,
+    Autostart,
+    HelperOnly,
+    Version,
+    Help,
+}
+
+fn standalone_command(args: &[String]) -> Result<StandaloneCommand> {
+    match args.first().map(String::as_str) {
+        Some("--autostart") if args.len() == 1 => return Ok(StandaloneCommand::Autostart),
+        Some("--version" | "-V") if args.len() == 1 => return Ok(StandaloneCommand::Version),
+        Some("--help" | "-h") if args.len() == 1 => return Ok(StandaloneCommand::Help),
+        _ => {}
+    }
+    let mut command = StandaloneCommand::Launch;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--app-path" | "--debug-port" | "--helper-port" => {
+                anyhow::ensure!(
+                    args.next().is_some_and(|value| !value.starts_with("--")),
+                    "Codex++ 启动参数缺少值；本次未启动 Codex"
+                );
+            }
+            "--helper-only" => command = StandaloneCommand::HelperOnly,
+            _ => anyhow::bail!(
+                "Codex++ 桌面启动器不接受此命令；请使用官方 Codex CLI，本次未启动 Codex"
+            ),
+        }
+    }
+    Ok(command)
 }
 
 fn parse_launch_options<I, S>(args: I) -> LaunchOptions
@@ -2990,6 +3372,91 @@ fn should_start_weixin_manager(enabled: bool, token: &str) -> bool {
 #[cfg(test)]
 mod local_launcher_contracts {
     use super::*;
+    #[test]
+    fn duplicate_launcher_only_focuses_a_window_that_still_exists() {
+        let mut attempted = Vec::new();
+        focus_existing_codex_window_only(true, &[11, 22, 33], |pid| {
+            attempted.push(pid);
+            pid == 22
+        })
+        .unwrap();
+        assert_eq!(attempted, [11, 22]);
+        assert!(
+            focus_existing_codex_window_only(true, &[], |_| panic!("no existing process")).is_err()
+        );
+        assert!(focus_existing_codex_window_only(true, &[11], |_| false).is_err());
+        assert!(
+            focus_existing_codex_window_only(false, &[11], |_| panic!("closing instance")).is_err()
+        );
+    }
+
+    #[test]
+    fn nonowner_windows_branch_never_launches_or_writes_owner_status() {
+        let source = include_str!("main.rs");
+        let start = source.find("async fn launcher_session(").unwrap();
+        let body = &source[start
+            ..source[start..]
+                .find("let started = std::time::Instant::now()")
+                .unwrap()
+                + start];
+        assert!(body.contains("focus_existing_codex_window_only("));
+        assert!(!body.contains(".launch_codex("));
+        let helper_start = source.find("fn focus_existing_codex_window_only(").unwrap();
+        let helper_end = source[helper_start..]
+            .find("async fn activate_and_write_running_status")
+            .unwrap()
+            + helper_start;
+        let helper = &source[helper_start..helper_end];
+        assert!(!helper.contains("launch_codex"));
+        assert!(!helper.contains("save_latest"));
+    }
+
+    #[test]
+    fn standalone_probes_and_unknown_cli_commands_cannot_start_the_desktop() {
+        let classify = |args: &[&str]| {
+            standalone_command(
+                &args
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            classify(&["--version"]).unwrap(),
+            StandaloneCommand::Version
+        );
+        assert_eq!(classify(&["--help"]).unwrap(), StandaloneCommand::Help);
+        assert_eq!(classify(&[]).unwrap(), StandaloneCommand::Launch);
+        assert_eq!(
+            classify(&["--autostart"]).unwrap(),
+            StandaloneCommand::Autostart
+        );
+        assert_eq!(
+            classify(&["--helper-only", "--helper-port", "57322"]).unwrap(),
+            StandaloneCommand::HelperOnly
+        );
+        for args in [
+            &["debug", "models", "--bundled"][..],
+            &["--watch"],
+            &["exec", "--json"],
+            &["--app-path"],
+        ] {
+            assert!(classify(args).is_err(), "unexpected launch for {args:?}");
+        }
+        let source = include_str!("main.rs");
+        let start = source.find("pub fn run_standalone()").unwrap();
+        let end = source[start..].find("fn standalone_command(").unwrap() + start;
+        let body = &source[start..end];
+        assert!(
+            body.find("StandaloneCommand::Version").unwrap()
+                < body.find("ensure_weixin_manager_started()").unwrap()
+        );
+        assert!(
+            body.find("let command = command?").unwrap()
+                < body.find("ensure_weixin_manager_started()").unwrap()
+        );
+    }
+
     #[test]
     fn existing_launcher_activation_never_restarts_the_desktop() {
         let source = include_str!("main.rs");

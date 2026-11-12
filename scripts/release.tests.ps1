@@ -44,6 +44,7 @@ function New-Fixture($Mode) {
     }
     Write-Text (Join-Path $root 'tools/node.ps1') @'
 $root = Split-Path -Parent $PSScriptRoot
+[IO.File]::AppendAllText((Join-Path $root 'tool-calls.txt'), "node`n")
 if ($args -contains '-v') { 'v24.0.0'; exit 0 }
 if ($args[0] -like '*vite.js') {
     $dist = Join-Path $root 'apps/codex-plus-manager/dist'
@@ -54,8 +55,10 @@ if ($args[0] -like '*vite.js') {
 }
 exit 0
 '@
-    Write-Text (Join-Path $root 'tools/cargo.ps1') @'
+Write-Text (Join-Path $root 'tools/cargo.ps1') @'
 $root = Split-Path -Parent $PSScriptRoot
+[IO.File]::AppendAllText((Join-Path $root 'tool-calls.txt'), "cargo`n")
+if ($args[0] -eq 'check' -and $args -notcontains '--all-targets') { 'test targets were not checked before execution'; exit 18 }
 if ($args -contains '--release') {
     [IO.File]::WriteAllText((Join-Path $root 'release-started.txt'), 'started')
     Start-Sleep -Seconds 3
@@ -91,7 +94,7 @@ function Start-Fixture($Fixture, [switch]$BinOnly) {
     if (-not $BinOnly) { $options.DeployTo = $Fixture.runtime }
     $output = & $Fixture.script @options
     $task = ($output -join "`n") | ConvertFrom-Json -AsHashtable
-    Assert ($watch.Elapsed.TotalSeconds -lt 3) 'Start must return without waiting for the 3-second fake release.'
+    Assert ($task.state -eq 'queued' -and (Get-Process -Id $task.pid -ErrorAction SilentlyContinue)) 'Start must return a live detached worker.'
     $task
 }
 function Assert-OldArtifacts($Fixture) {
@@ -142,6 +145,116 @@ foreach ($directory in @('bin', 'runtime with spaces')) {
     Assert (-not (Test-Path -LiteralPath (Join-Path $fixture.root "$directory/unrelated.dll"))) 'Do not distribute arbitrary DLLs from target/release.'
 }
 Write-Output 'PASS shared speech runtime provenance, backup, delivery and hashes'
+
+# 源码/target 已变化仍只能交付原成功快照；工具调用次数必须不变。
+Wait-Until { -not (Get-Process -Id $task.pid -ErrorAction SilentlyContinue) } 'source worker exit'
+$sourceTask = $task
+$sourceStatus = Get-Content -LiteralPath (Join-Path $task.jobDirectory 'status.json') -Raw
+$sourceRequest = Get-Content -LiteralPath (Join-Path $task.jobDirectory 'request.json') -Raw
+$toolHash = (Get-FileHash -LiteralPath (Join-Path $fixture.root 'tool-calls.txt')).Hash
+Write-Text (Join-Path $fixture.root 'crates/core/lib.rs') 'later source changes'
+foreach ($name in $names) { Write-Text (Join-Path $fixture.root "target/release/$name") 'later build' }
+$redeployed = (& $fixture.script -Action Redeploy -Job $task.id -DeployTo $fixture.runtime -NodePath 'missing-node' -CargoPath 'missing-cargo') -join "`n" | ConvertFrom-Json -AsHashtable
+Assert ($redeployed.state -eq 'succeeded' -and $redeployed.sourceJob -eq $task.id -and $redeployed.id -ne $task.id) 'Redeploy must create a separate successful job.'
+Assert ($redeployed.artifacts.Count -eq 5 -and $redeployed.delivery.Count -eq 10) 'Redeploy must include runtime DLLs.'
+foreach ($item in $redeployed.delivery) { Assert ((Get-FileHash -LiteralPath $item.path).Hash -eq $item.sha256) 'Redeployed hash mismatch.' }
+Assert ((Get-FileHash -LiteralPath (Join-Path $fixture.root 'tool-calls.txt')).Hash -eq $toolHash) 'Redeploy must never invoke Node/Cargo.'
+Assert ((Get-Content -LiteralPath (Join-Path $task.jobDirectory 'status.json') -Raw) -ceq $sourceStatus) 'Source evidence must remain unchanged.'
+Write-Output 'PASS redeploy archived EXEs/DLLs despite changed source/target with zero tool calls'
+
+$lockFile = [IO.File]::Open((Join-Path $fixture.root 'output/release-jobs/active.lock'), 'Open', 'ReadWrite', 'None')
+try {
+    $rejected = $false
+    try { & $fixture.script -Action Redeploy -Job $task.id | Out-Null } catch { $rejected = $_.Exception.Message -match 'lock' }
+    Assert $rejected 'Redeploy must respect the workspace lock.'
+} finally { $lockFile.Dispose() }
+
+foreach ($mode in @('failed-source','missing-step','duplicate','unsafe-name','platform','foreign-repo','damaged','missing')) {
+    $status = $sourceStatus | ConvertFrom-Json -AsHashtable
+    $req = $sourceRequest | ConvertFrom-Json -AsHashtable
+    $file = Join-Path $task.jobDirectory 'artifacts/onnxruntime.dll'
+    $bytes = [IO.File]::ReadAllBytes($file)
+    switch ($mode) {
+        'failed-source' { $status.state = 'failed' }
+        'missing-step' { $status.steps = @($status.steps | Where-Object name -ne 'typescript') }
+        'duplicate' { $status.artifacts[0].name = $status.artifacts[1].name }
+        'unsafe-name' { $status.artifacts[0].name = '../escape.exe' }
+        'platform' { $req.platform = 'wrong-architecture' }
+        'foreign-repo' { $req.repoRoot = 'C:\another-repository' }
+        'damaged' { Write-Text $file 'damaged' }
+        'missing' { Move-Item -LiteralPath $file -Destination "$file.held" }
+    }
+    Write-Text (Join-Path $task.jobDirectory 'status.json') ($status | ConvertTo-Json -Depth 12)
+    Write-Text (Join-Path $task.jobDirectory 'request.json') ($req | ConvertTo-Json -Depth 12)
+    $before = @($redeployed.delivery | ForEach-Object { (Get-FileHash -LiteralPath $_.path).Hash }) -join ','
+    $rejected = $false
+    try { & $fixture.script -Action Redeploy -Job $task.id -DeployTo $fixture.runtime | Out-Null } catch { $rejected = $true }
+    Assert $rejected "$mode must reject redeploy."
+    Assert ((@($redeployed.delivery | ForEach-Object { (Get-FileHash -LiteralPath $_.path).Hash }) -join ',') -eq $before) "$mode must preserve targets."
+    if ($mode -eq 'missing') { Move-Item -LiteralPath "$file.held" -Destination $file } else { [IO.File]::WriteAllBytes($file, $bytes) }
+    Write-Text (Join-Path $task.jobDirectory 'status.json') $sourceStatus
+    Write-Text (Join-Path $task.jobDirectory 'request.json') $sourceRequest
+}
+Write-Output 'PASS redeploy rejects failed/incomplete/unsafe/foreign/damaged source and respects lock'
+
+# 可读但不允许 Replace 的第二个运行目录文件，让前面的替换成功后触发回滚。
+foreach ($item in $redeployed.delivery) { Write-Text $item.path 'rollback baseline' }
+$held = [IO.File]::Open((Join-Path $fixture.runtime $names[1]), 'Open', 'Read', 'Read')
+try {
+    $rejected = $false
+    try { & $fixture.script -Action Redeploy -Job $task.id -DeployTo $fixture.runtime | Out-Null } catch { $rejected = $_.Exception.Message -match 'Redeploy failed' }
+    Assert $rejected 'Locked destination must fail delivery.'
+    foreach ($item in $redeployed.delivery) { Assert ((Get-Content -LiteralPath $item.path -Raw) -eq 'rollback baseline') 'Partial delivery must restore old files.' }
+} finally { $held.Dispose() }
+$binResult = (& $fixture.script -Action Redeploy -Job $task.id) -join "`n" | ConvertFrom-Json -AsHashtable
+Assert ($binResult.state -eq 'succeeded' -and $binResult.delivery.Count -eq 5) 'Redeploy defaults to bin only.'
+foreach ($name in $names) { Assert ((Get-Content -LiteralPath (Join-Path $fixture.runtime $name) -Raw) -eq 'rollback baseline') 'Default redeploy must preserve runtime.' }
+Assert ((Get-FileHash -LiteralPath (Join-Path $fixture.root 'tool-calls.txt')).Hash -eq $toolHash) 'All redeploy paths must avoid build tools.'
+Write-Output 'PASS redeploy rollback after partial replacement and default bin-only delivery'
+$reused = (& $fixture.script -Action Redeploy -Job $binResult.id) -join "`n" | ConvertFrom-Json -AsHashtable
+Assert ($reused.state -eq 'succeeded' -and $reused.sourceJob -eq $task.id) 'Captured archive must be reusable with original build evidence.'
+
+# 旧任务没有封存与平台字段：只允许 bin 完整匹配原清单并通过 PE 架构核对。
+$legacyStatus = $sourceStatus | ConvertFrom-Json -AsHashtable
+$legacyRequest = $sourceRequest | ConvertFrom-Json -AsHashtable
+$legacyRequest.Remove('platform')
+foreach ($artifact in $legacyStatus.artifacts) {
+    if ($artifact.name -like '*.exe') {
+        $pe = [byte[]]::new(128)
+        [BitConverter]::GetBytes([uint16]0x5A4D).CopyTo($pe, 0)
+        [BitConverter]::GetBytes([uint32]64).CopyTo($pe, 60)
+        [BitConverter]::GetBytes([uint32]0x4550).CopyTo($pe, 64)
+        $machine = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -eq 'Arm64') { 0xAA64 } else { 0x8664 }
+        [BitConverter]::GetBytes([uint16]$machine).CopyTo($pe, 68)
+        $file = Join-Path $fixture.root "bin/$($artifact.name)"
+        [IO.File]::WriteAllBytes($file, $pe)
+        $artifact.sha256 = (Get-FileHash -LiteralPath $file).Hash
+        $artifact.length = $pe.Length
+    }
+}
+Write-Text (Join-Path $task.jobDirectory 'status.json') ($legacyStatus | ConvertTo-Json -Depth 12)
+Write-Text (Join-Path $task.jobDirectory 'request.json') ($legacyRequest | ConvertTo-Json -Depth 12)
+$archive = [IO.Path]::GetFullPath((Join-Path $task.jobDirectory 'artifacts'))
+Assert ($archive.StartsWith([IO.Path]::GetFullPath($testRoot) + '\')) 'Archive move must remain inside test workspace.'
+Move-Item -LiteralPath $archive -Destination "$archive.held"
+$legacyResult = (& $fixture.script -Action Redeploy -Job $task.id) -join "`n" | ConvertFrom-Json -AsHashtable
+Assert ($legacyResult.state -eq 'succeeded') 'Matching legacy bin must be captured and delivered.'
+Write-Text (Join-Path $fixture.root 'bin/onnxruntime.dll') 'newer unrelated runtime'
+$legacyReused = (& $fixture.script -Action Redeploy -Job $legacyResult.id) -join "`n" | ConvertFrom-Json -AsHashtable
+Assert ($legacyReused.state -eq 'succeeded') 'Legacy capture must remain usable after bin changes.'
+$captured = [IO.Path]::GetFullPath((Join-Path $fixture.root "output/release-jobs/$($legacyResult.id)/artifacts"))
+Assert ($captured.StartsWith([IO.Path]::GetFullPath($testRoot) + '\')) 'Captured archive must remain inside test workspace.'
+Move-Item -LiteralPath $captured -Destination "$captured.held"
+$rejected = $false
+try { & $fixture.script -Action Redeploy -Job $legacyResult.id | Out-Null } catch { $rejected = $_.Exception.Message -match 'Source archive is missing' }
+Assert $rejected 'A missing captured archive must not fall back to legacy bin.'
+Move-Item -LiteralPath "$captured.held" -Destination $captured
+Write-Text (Join-Path $fixture.root 'bin/onnxruntime.dll') 'newer unrelated runtime'
+$rejected = $false
+try { & $fixture.script -Action Redeploy -Job $task.id | Out-Null } catch { $rejected = $_.Exception.Message -match 'Source artifact mismatch' }
+Assert $rejected 'Legacy mismatch must never fall back to target/release.'
+Assert ((Get-FileHash -LiteralPath (Join-Path $fixture.root 'tool-calls.txt')).Hash -eq $toolHash) 'Legacy capture must not invoke build tools.'
+Write-Output 'PASS legacy capture checks PE architecture and full manifest without target fallback'
 
 foreach ($mode in @('sherpa-missing', 'sherpa-mismatch')) {
     $fixture = New-Fixture $mode

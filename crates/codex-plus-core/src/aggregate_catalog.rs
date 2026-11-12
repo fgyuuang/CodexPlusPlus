@@ -196,6 +196,86 @@ fn resolve_by_default_provider(
     }))
 }
 
+/// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
+pub const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
+
+/// 写进 Codex 模型目录的 `visibility`：审批模型只给「替我审批」内部用，和官方目录一样
+/// 标成 `hide`，不进 Codex 的模型选择器；`<供应商 id>/codex-auto-review` 同样隐藏。
+pub fn catalog_visibility(slug: &str) -> &'static str {
+    let slug = slug.trim();
+    let is_review = slug.eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL)
+        || slug
+            .rsplit_once('/')
+            .is_some_and(|(_, model)| model.eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL));
+    if is_review { "hide" } else { "list" }
+}
+
+/// 聚合的「审批成员」（#2703）：活动聚合（按模型聚合或轮转池都算）指定了审批成员时，
+/// `codex-auto-review` 只交给这个成员，模型取它的「自动审批模型」，没填用它的默认模型
+/// （第三方上游不认识 codex-auto-review，原样转发只会报错）。
+///
+/// 未设置或请求不是审批请求时返回 Ok(None)，调用方照原有规则路由。
+/// 设置了但成员不可用（被移出成员、供应商被删、未就绪）时硬报错：
+/// 用户指定审批成员就是不想让审批落到别的成员（例如官方登录）上，不能静默回落。
+pub fn resolve_auto_review_member(
+    settings: &BackendSettings,
+    requested: &str,
+) -> anyhow::Result<Option<AggregateModelBinding>> {
+    if requested.trim() != CODEX_AUTO_REVIEW_MODEL {
+        return Ok(None);
+    }
+    let Some(aggregate) = settings.active_aggregate_relay_profile() else {
+        return Ok(None);
+    };
+    let relay_id = aggregate.auto_review_relay_id.trim();
+    if relay_id.is_empty() {
+        return Ok(None);
+    }
+    if !aggregate
+        .members
+        .iter()
+        .any(|member| member.relay_id == relay_id)
+    {
+        anyhow::bail!(
+            "聚合的审批成员（{relay_id}）已不是聚合成员：请到聚合供应商里重新选择审批成员，或清空让审批请求按原规则路由"
+        );
+    }
+    let Some(relay) = settings
+        .relay_profiles
+        .iter()
+        .find(|relay| relay.id == relay_id)
+    else {
+        anyhow::bail!("聚合的审批成员当前不可用：成员供应商不存在（{relay_id}），请检查聚合配置");
+    };
+    if !crate::relay_rotation::member_relay_ready(relay) {
+        anyhow::bail!(
+            "聚合的审批成员「{}」当前不可用：需要可用的 API 地址与认证配置，或完成官方登录",
+            relay.name
+        );
+    }
+    let configured = relay.auto_review_model.trim();
+    let upstream_model = if configured.is_empty() {
+        crate::relay_config::relay_profile_model(relay)
+            .trim()
+            .to_string()
+    } else {
+        configured.to_string()
+    };
+    if upstream_model.is_empty() {
+        anyhow::bail!(
+            "聚合的审批成员「{}」没有可用的模型：请给它填写「自动审批模型」或默认模型",
+            relay.name
+        );
+    }
+    // 不记诊断日志：请求日志里已有成员与上游模型，逐请求记录只会把诊断文件刷大（#2681）。
+    Ok(Some(AggregateModelBinding {
+        catalog_model: requested.trim().to_string(),
+        relay_id: relay.id.clone(),
+        upstream_model,
+        relay: relay.clone(),
+    }))
+}
+
 /// 默认供应商配置有效（指向当前成员）时，解析不到的模型名都能兜底转发；
 /// 供「最近使用」模型清理判断：此时任何目录外的名字都还有可能被服务，不再按目录清理。
 pub fn default_backs_unbound_models(aggregate: &AggregateRelayProfile) -> bool {
@@ -321,9 +401,21 @@ fn aggregate_member_availability(
 pub(crate) fn profile_catalog_entries(
     profile: &RelayProfile,
 ) -> anyhow::Result<Vec<ModelCatalogEntry>> {
+    profile_catalog_entries_with_home(profile, &crate::codex_home::default_codex_home_dir())
+}
+
+fn profile_catalog_entries_with_home(
+    profile: &RelayProfile,
+    codex_home: &Path,
+) -> anyhow::Result<Vec<ModelCatalogEntry>> {
     let mut windows = parse_string_map(&profile.model_windows, "model_windows")?;
     validate_windows(&windows, "model_windows")?;
-    let (list, suffix_windows) = migrate_model_list_with_suffixes(&profile.model_list);
+    let model_list = if uses_official_model_directory(profile) {
+        official_directory_models(codex_home).join("\n")
+    } else {
+        profile.model_list.clone()
+    };
+    let (list, suffix_windows) = migrate_model_list_with_suffixes(&model_list);
     for (slug, window) in suffix_windows {
         windows.entry(slug).or_insert(window);
     }
@@ -335,6 +427,52 @@ pub(crate) fn profile_catalog_entries(
         &compact,
         &crate::relay_config::relay_profile_model(profile),
     ))
+}
+
+/// 官方登录成员一个模型都没填（模型列表和默认模型都空）：按 Codex 自己的官方模型目录发布（#2763）。
+/// 「系统默认」是从本机 config.toml 导入的，导入时 Codex 没在里面写 `model` 的话
+/// 它的模型列表就是空的，聚合里这一家一个模型都发布不出来，选择器里只看得到别的成员。
+fn uses_official_model_directory(profile: &RelayProfile) -> bool {
+    crate::official_login::is_official_login_profile(profile)
+        && profile.model_list.trim().is_empty()
+        && crate::relay_config::relay_profile_model(profile)
+            .trim()
+            .is_empty()
+}
+
+/// 本机 Codex 为登录的 ChatGPT 账号缓存的官方模型目录（`models_cache.json`）里列出的模型；
+/// 标成隐藏的（如自动审批模型）不算。读不到缓存时为空，保持「请填写模型列表」的原状。
+fn official_directory_models(codex_home: &Path) -> Vec<String> {
+    let Some(cache) = std::fs::read_to_string(codex_home.join("models_cache.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let mut models: Vec<String> = Vec::new();
+    for entry in cache
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(slug) = entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|slug| !slug.is_empty())
+        else {
+            continue;
+        };
+        let listed = entry
+            .get("visibility")
+            .and_then(Value::as_str)
+            .is_none_or(|visibility| visibility.is_empty() || visibility == "list");
+        if listed && !models.iter().any(|known| known == slug) {
+            models.push(slug.to_string());
+        }
+    }
+    models
 }
 
 /// 每个成员只构建一次目录，然后修改身份字段；先按真实模型应用元数据，
@@ -407,7 +545,9 @@ pub fn build_catalog_json(
             // 聚合会切换上游；经典子代理任务使用明文，避免跨成员解密失败。
             model["multi_agent_version"] = json!("v1");
             model["use_responses_lite"] = json!(false);
-            model["visibility"] = json!("list");
+            model["visibility"] = json!(catalog_visibility(
+                model["slug"].as_str().unwrap_or_default()
+            ));
             model["priority"] = json!(1000 + models.len());
             models.push(model);
         }
@@ -658,6 +798,7 @@ pub fn catalog_summary(
     aggregate: &AggregateRelayProfile,
 ) -> anyhow::Result<Value> {
     let config = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+    let effective_config_model = crate::model_catalog::effective_config_model(&config);
     let published = config_catalog_pointer(&config)
         .and_then(|pointer| owned_catalog_path(home, &aggregate.id, &pointer))
         .and_then(|path| std::fs::read_to_string(path).ok());
@@ -695,6 +836,7 @@ pub fn catalog_summary(
         "path": home.join("config.toml").to_string_lossy(),
         "service_tier": Value::Null,
         "model": ids.first().cloned().unwrap_or_default(),
+        "effective_config_model": effective_config_model,
         "model_provider": aggregate.id,
         "codex_model_provider": crate::model_catalog::codex_model_provider_for_relay_profile(home, profile),
         "provider_name": aggregate.name,
@@ -725,8 +867,15 @@ pub(crate) fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Val
         return Ok(json!({ "models": [] }));
     }
     let fallback = parse_window_token(&profile.context_window);
-    let catalog_json =
-        build_model_catalog_json_with_capabilities(&entries, fallback, None, Some(false), false);
+    // 聚合不适用供应商级 Multi-Agent 选择（#2683）：成员可能跨上游，保持钉 v1。
+    let catalog_json = build_model_catalog_json_with_capabilities(
+        &entries,
+        fallback,
+        None,
+        Some(false),
+        false,
+        None,
+    );
     let metadata = crate::relay_config::parse_model_metadata_map(&profile.model_metadata)?;
     let catalog_json =
         crate::relay_config::apply_model_metadata_overrides(&catalog_json, &metadata)?;
@@ -805,13 +954,25 @@ pub fn multi_agent_v2_enabled(config_text: &str) -> bool {
     })
 }
 
-/// 模型聚合处于活动状态、且用户用 `[features] multi_agent_v2` 覆盖了经典子代理设置时，
-/// 返回一条可展示给管理器的提示；无冲突或读取失败时返回 None。
+/// 用户配置与 `[features] multi_agent_v2` 冲突时返回一条可展示给管理器的提示；
+/// 无冲突或读取失败时返回 None。覆盖两类场景：
+/// - 模型聚合活动时被闸门覆盖经典子代理设置（原有行为）；
+/// - 普通供应商显式选择 v1（#2683）后被闸门重新打开——切换时 Codex++ 已写
+///   `multi_agent_v2 = false` 压闸，这里捕捉之后用户手改或 Codex 回写的漂移。
 pub fn subagent_conflict_warning(home: &Path, settings: &BackendSettings) -> Option<String> {
-    active_model_aggregation(settings)?;
     let config_text = std::fs::read_to_string(home.join("config.toml")).ok()?;
+    if active_model_aggregation(settings).is_some() {
+        return multi_agent_v2_enabled(&config_text).then(|| {
+            "检测到 config.toml 已启用 [features] multi_agent_v2：它优先于模型聚合目录中的经典子代理设置，跨供应商的子代理任务可能报无法解密。如遇到该问题，请移除或关闭该项，或让子代理与主代理使用同一供应商的模型。"
+                .to_string()
+        });
+    }
+    let profile = settings.active_relay_profile();
+    if profile.multi_agent.trim() != "v1" {
+        return None;
+    }
     multi_agent_v2_enabled(&config_text).then(|| {
-        "检测到 config.toml 已启用 [features] multi_agent_v2：它优先于模型聚合目录中的经典子代理设置，跨供应商的子代理任务可能报无法解密。如遇到该问题，请移除或关闭该项，或让子代理与主代理使用同一供应商的模型。"
+        "当前供应商已显式选择 Multi-Agent 协议 v1，但 config.toml 里 [features] multi_agent_v2 处于开启状态：它会覆盖目录中的 v1 声明，子代理任务可能无法与第三方上游通信。请关闭该项，或重新保存一次该供应商让 Codex++ 自动压下闸门。"
             .to_string()
     })
 }
@@ -837,6 +998,24 @@ mod tests {
         )
         .unwrap();
         (temp, store, home)
+    }
+
+    #[test]
+    fn aggregate_catalog_default_identity_comes_from_live_config() {
+        let settings = settings();
+        let aggregate = active_model_aggregation(&settings).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let summary = catalog_summary(home.path(), &settings, &aggregate).unwrap();
+        assert!(!summary["default_model"].as_str().unwrap().is_empty());
+        assert_eq!(summary["effective_config_model"], "");
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model = 'root'\nprofile = 'work'\n[profiles.work]\nmodel = 'actual-model'\n",
+        )
+        .unwrap();
+        let summary = catalog_summary(home.path(), &settings, &aggregate).unwrap();
+        assert_eq!(summary["effective_config_model"], "actual-model");
+        assert_ne!(summary["default_model"], summary["effective_config_model"]);
     }
 
     #[test]
@@ -960,6 +1139,7 @@ mod tests {
             session_provider: crate::settings::RelaySessionProvider::Custom,
             model_aggregation_enabled: true,
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
             strategy: AggregateRelayStrategy::Failover,
             members: vec![
                 AggregateRelayMember {
@@ -1220,6 +1400,42 @@ mod tests {
         assert_eq!(binding.upstream_model, "deepseek-reasoner");
     }
 
+    /// #2703：审批成员只接 codex-auto-review；未设置时不接管；成员未就绪时点名报错，不回落。
+    #[test]
+    fn auto_review_member_only_takes_review_requests() {
+        let mut settings = settings();
+        assert!(
+            resolve_auto_review_member(&settings, "codex-auto-review")
+                .unwrap()
+                .is_none()
+        );
+
+        settings.aggregate_relay_profiles[0].auto_review_relay_id = "deepseek".to_string();
+        assert!(
+            resolve_auto_review_member(&settings, "deepseek-reasoner")
+                .unwrap()
+                .is_none()
+        );
+        let binding = resolve_auto_review_member(&settings, "codex-auto-review")
+            .unwrap()
+            .expect("审批请求交给审批成员");
+        assert_eq!(binding.relay_id, "deepseek");
+        assert_eq!(
+            binding.upstream_model, "deepseek-chat",
+            "没填审批模型时用默认模型"
+        );
+
+        settings.relay_profiles[0].auto_review_model = " deepseek-reasoner ".to_string();
+        let binding = resolve_auto_review_member(&settings, "codex-auto-review")
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.upstream_model, "deepseek-reasoner");
+
+        settings.relay_profiles[0].api_key = String::new();
+        let error = resolve_auto_review_member(&settings, "codex-auto-review").unwrap_err();
+        assert!(error.to_string().contains("DeepSeek"), "{error}");
+    }
+
     /// 活动目录发布的模型 ID：聚合是 `cpx-*`，普通供应商是它自己的目录条目加路由源模型名。
     #[test]
     fn active_published_model_ids_follow_active_provider() {
@@ -1341,6 +1557,52 @@ mod tests {
         }
     }
 
+    /// #2763：官方登录成员一个模型都没填时，按本机 Codex 缓存的官方模型目录发布（隐藏的不算）；
+    /// 填过模型列表的照旧只发布自己填的；读不到缓存时保持空。
+    #[test]
+    fn official_member_without_models_publishes_codex_official_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let official = RelayProfile {
+            id: "official".to_string(),
+            name: "系统默认".to_string(),
+            relay_mode: RelayMode::Official,
+            auth_contents: r#"{"auth_mode":"chatgpt","tokens":{"access_token":"a","refresh_token":"r","account_id":"acct-1"}}"#.to_string(),
+            ..RelayProfile::default()
+        };
+        let slugs = |profile: &RelayProfile| -> Vec<String> {
+            profile_catalog_entries_with_home(profile, home.path())
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.slug)
+                .collect()
+        };
+        assert!(slugs(&official).is_empty(), "没有缓存时保持原状");
+
+        std::fs::write(
+            home.path().join("models_cache.json"),
+            json!({"models": [
+                {"slug": "gpt-6.1-sol", "visibility": "list"},
+                {"slug": "codex-auto-review", "visibility": "hide"},
+                {"slug": "gpt-6-astra"},
+                {"slug": "gpt-6.1-sol", "visibility": "list"},
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(slugs(&official), vec!["gpt-6.1-sol", "gpt-6-astra"]);
+
+        let listed = RelayProfile {
+            model_list: "gpt-5.6-sol".to_string(),
+            ..official.clone()
+        };
+        assert_eq!(slugs(&listed), vec!["gpt-5.6-sol"], "填过的只发布自己填的");
+        let api = RelayProfile {
+            relay_mode: RelayMode::PureApi,
+            ..official
+        };
+        assert!(slugs(&api).is_empty(), "只有官方登录成员用官方目录");
+    }
+
     #[test]
     fn official_member_without_login_is_rejected() {
         let mut settings = settings();
@@ -1442,5 +1704,50 @@ mod tests {
         // 关闭模型聚合（故障转移类型）后不再提示。
         settings.aggregate_relay_profiles[0].model_aggregation_enabled = false;
         assert!(subagent_conflict_warning(temp.path(), &settings).is_none());
+    }
+
+    /// #2683：普通供应商显式 v1 后闸门被重新打开 → 提示；闸门关闭或未选择 v1 → 静默。
+    #[test]
+    fn subagent_conflict_warning_covers_provider_level_v1_choice() {
+        let temp = tempfile::tempdir().unwrap();
+        // 无聚合：普通 API 供应商。
+        let mut settings = settings();
+        settings.aggregate_relay_profiles.clear();
+        settings.active_aggregate_relay_id = String::new();
+        settings.active_relay_id = "relay-api".to_string();
+        settings.relay_profiles = vec![RelayProfile {
+            id: "relay-api".to_string(),
+            name: "API".to_string(),
+            multi_agent: "v1".to_string(),
+            ..RelayProfile::default()
+        }];
+
+        // 未显式选 v1 或闸门关闭时都静默。
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"x\"\n[features]\nmulti_agent_v2 = true\n",
+        )
+        .unwrap();
+        settings.relay_profiles[0].multi_agent = String::new();
+        assert!(subagent_conflict_warning(temp.path(), &settings).is_none());
+        settings.relay_profiles[0].multi_agent = "v2".to_string();
+        assert!(subagent_conflict_warning(temp.path(), &settings).is_none());
+        settings.relay_profiles[0].multi_agent = "v1".to_string();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"x\"\n[features]\nmulti_agent_v2 = false\n",
+        )
+        .unwrap();
+        assert!(subagent_conflict_warning(temp.path(), &settings).is_none());
+
+        // v1 + 闸门开启 → 提示（用户手改或 Codex 回写造成的漂移）。
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"x\"\n[features]\nmulti_agent_v2 = true\n",
+        )
+        .unwrap();
+        let warning = subagent_conflict_warning(temp.path(), &settings).unwrap();
+        assert!(warning.contains("v1"), "{warning}");
+        assert!(warning.contains("multi_agent_v2"), "{warning}");
     }
 }

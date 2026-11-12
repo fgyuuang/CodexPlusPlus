@@ -1562,6 +1562,7 @@ mod tests {
             },
         ];
         settings.aggregate_relay_profiles = vec![AggregateRelayProfile {
+            auto_review_relay_id: String::new(),
             id: "only-newapi".to_string(),
             name: "Only NewAPI".to_string(),
             session_provider: RelaySessionProvider::Custom,

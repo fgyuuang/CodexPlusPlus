@@ -327,22 +327,46 @@ pub fn codex_prompt_from_models(value: &Value, model: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Codex CLI 的版本：读模型缓存里记录的，没有就用内置的。
+/// 使用已确认目录的客户端版本；原生缓存可能被更旧的 CLI 覆写，不能压过新目录。
+/// 请求路径只读缓存，不在每个模型请求中派生 CLI 进程。
 pub fn codex_version(codex_home: &Path) -> String {
-    std::fs::read_to_string(codex_home.join("models_cache.json"))
+    let official_catalog =
+        std::fs::read(crate::official_model_catalog::official_model_catalog_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    codex_version_with_catalog(codex_home, official_catalog.as_ref())
+}
+
+fn codex_version_with_catalog(codex_home: &Path, official_catalog: Option<&Value>) -> String {
+    let native_version = std::fs::read_to_string(codex_home.join("models_cache.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|value| {
             value
                 .get("client_version")
                 .and_then(Value::as_str)
+                // 拒绝控制字符污染，同时保留 prerelease/build 等既有版本归一化兼容。
+                .filter(|version| !version.chars().any(char::is_control))
                 .map(str::to_string)
-        })
-        .filter(|version| {
-            version
-                .split('.')
-                .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
-        })
+        });
+    let mut versions: Vec<_> = native_version.into_iter().collect();
+    versions.push(crate::model_catalog::OFFICIAL_MODELS_CLIENT_VERSION.to_string());
+    if official_catalog
+        .and_then(|catalog| catalog.get("version"))
+        .and_then(Value::as_u64)
+        == Some(1)
+        && let Some(accounts) = official_catalog
+            .and_then(|catalog| catalog.get("accounts"))
+            .and_then(Value::as_object)
+    {
+        versions.extend(accounts.values().filter_map(|snapshot| {
+            (snapshot.get("source").and_then(Value::as_str) == Some("account_snapshot"))
+                .then(|| snapshot.get("clientVersion").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_string)
+        }));
+    }
+    crate::official_model_catalog::latest_client_version(versions)
         .unwrap_or_else(|| crate::model_catalog::OFFICIAL_MODELS_CLIENT_VERSION.to_string())
 }
 
@@ -434,6 +458,7 @@ pub fn adapt_api_request(body: &mut Value) {
     }
     object.insert("store".to_string(), Value::Bool(false));
     object.insert("stream".to_string(), Value::Bool(true));
+    let mut pending_reasoning: Option<Map<String, Value>> = None;
     match object.get_mut("input") {
         Some(Value::String(text)) => {
             let text = std::mem::take(text);
@@ -443,6 +468,27 @@ pub fn adapt_api_request(body: &mut Value) {
             );
         }
         Some(Value::Array(items)) => {
+            // 中途改思考强度时，新版 Codex 不改请求级 reasoning，而是插一条位置型的
+            // configuration_update 输入项（保住提示词缓存）。用 ChatGPT 登录的共享额度不接受
+            // 这种输入项，会直接 400（subscription_sharing_unsupported_capability，#2834）。
+            // 去掉它们，把最后一条的设置写回请求级 reasoning：强度照样生效，只是这次切换不命中缓存。
+            let mut configured: Option<Map<String, Value>> = None;
+            items.retain(|item| {
+                if item.get("type").and_then(Value::as_str) != Some("configuration_update") {
+                    return true;
+                }
+                if let Some(Value::Object(reasoning)) = item.get("reasoning") {
+                    configured.get_or_insert_with(Map::new).extend(
+                        reasoning
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone())),
+                    );
+                }
+                false
+            });
+            if let Some(configured) = configured {
+                pending_reasoning = Some(configured);
+            }
             for item in items.iter_mut() {
                 let Some(item) = item.as_object_mut() else {
                     continue;
@@ -459,6 +505,17 @@ pub fn adapt_api_request(body: &mut Value) {
             }
         }
         _ => {}
+    }
+    if let Some(configured) = pending_reasoning {
+        let reasoning = object
+            .entry("reasoning")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !reasoning.is_object() {
+            *reasoning = Value::Object(Map::new());
+        }
+        if let Some(reasoning) = reasoning.as_object_mut() {
+            reasoning.extend(configured);
+        }
     }
     // 按对话命名缓存键：OpenAI 按它保留 ChatGPT 登录的提示词缓存。
     let has_cache_key = object
@@ -544,6 +601,47 @@ mod tests {
         assert!(only_hosted.get("tools").is_none());
         assert!(only_hosted.get("tool_choice").is_none());
         assert_eq!(only_hosted["input"][0]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn api_requests_fold_configuration_updates_into_request_reasoning() {
+        // #2834：中途切换思考强度时 Codex 插入的 configuration_update 会被共享额度拒绝。
+        let mut body = json!({
+            "model": "gpt-6-luna",
+            "reasoning": { "effort": "low", "summary": "auto" },
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "test1" }] },
+                { "type": "configuration_update", "reasoning": { "effort": "medium" } },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "test2" }] },
+                { "type": "configuration_update", "reasoning": { "effort": "high" } },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "test3" }] }
+            ]
+        });
+        adapt_api_request(&mut body);
+        let types: Vec<&str> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["message", "message", "message"]);
+        assert_eq!(
+            body["reasoning"],
+            json!({ "effort": "high", "summary": "auto" }),
+            "最后一次切换生效，其余字段保留"
+        );
+
+        // 请求里原本没有 reasoning 时补上；没有 configuration_update 时不动 reasoning。
+        let mut bare = json!({
+            "input": [{ "type": "configuration_update", "reasoning": { "effort": "xhigh" } }]
+        });
+        adapt_api_request(&mut bare);
+        assert_eq!(bare["reasoning"], json!({ "effort": "xhigh" }));
+        assert_eq!(bare["input"], json!([]));
+
+        let mut untouched = json!({ "reasoning": { "effort": "low" }, "input": "hi" });
+        adapt_api_request(&mut untouched);
+        assert_eq!(untouched["reasoning"], json!({ "effort": "low" }));
     }
 
     #[test]
@@ -638,12 +736,94 @@ mod tests {
         assert_eq!(codex_prompt_from_models(&cache, "x"), None);
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("models_cache.json"), cache.to_string()).unwrap();
-        assert_eq!(codex_version(temp.path()), "0.170.2");
+        assert_eq!(codex_version_with_catalog(temp.path(), None), "0.170.2");
         assert_eq!(
-            codex_version(&temp.path().join("missing")),
+            codex_version_with_catalog(&temp.path().join("missing"), None),
             crate::model_catalog::OFFICIAL_MODELS_CLIENT_VERSION
         );
         assert!(codex_user_agent("0.170.2").starts_with("codex_cli_rs/0.170.2 ("));
+    }
+
+    #[test]
+    fn current_official_catalog_version_overrides_stale_native_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("models_cache.json"),
+            json!({"client_version":"0.157.1"}).to_string(),
+        )
+        .unwrap();
+        let catalog = json!({"version":1,"accounts":{
+            "first":{"source":"account_snapshot","clientVersion":"0.166.0-alpha.5.1"},
+            "second":{"source":"account_snapshot","clientVersion":"0.165.0"},
+            "unknown":{"source":"compatibility","clientVersion":"99.0.0"}
+        }});
+        assert_eq!(
+            codex_version_with_catalog(temp.path(), Some(&catalog)),
+            "0.166.0"
+        );
+        assert_eq!(
+            codex_version_with_catalog(temp.path(), Some(&json!({"version":2}))),
+            crate::model_catalog::OFFICIAL_MODELS_CLIENT_VERSION
+        );
+        std::fs::write(
+            temp.path().join("models_cache.json"),
+            json!({"client_version":"0.170.2+build"}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_version_with_catalog(temp.path(), Some(&catalog)),
+            "0.170.2"
+        );
+    }
+
+    #[test]
+    fn obsolete_or_invalid_cache_cannot_downgrade_official_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let builtin = crate::model_catalog::OFFICIAL_MODELS_CLIENT_VERSION;
+        for version in [
+            "0.124.0",
+            "0.99.9",
+            "0",
+            "1.2",
+            "1.2.3.4",
+            "9.bad.0",
+            "9.0.0\n",
+            "9.0.0\r\nheader: value",
+            "\t9.0.0",
+            "",
+            "18446744073709551616.0.0",
+        ] {
+            let cache = json!({"client_version": version}).to_string();
+            std::fs::write(temp.path().join("models_cache.json"), &cache).unwrap();
+            assert_eq!(
+                codex_version_with_catalog(temp.path(), None),
+                builtin,
+                "{version}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("models_cache.json")).unwrap(),
+                cache,
+                "版本选择不改写客户端缓存"
+            );
+        }
+        for version in [builtin, "0.170.2", "1.0.0"] {
+            std::fs::write(
+                temp.path().join("models_cache.json"),
+                json!({"client_version": version}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(codex_version_with_catalog(temp.path(), None), version);
+        }
+        for version in ["0.170.2+build", "v0.170.2-alpha.5.1"] {
+            std::fs::write(
+                temp.path().join("models_cache.json"),
+                json!({"client_version": version}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(codex_version_with_catalog(temp.path(), None), "0.170.2");
+        }
+        std::fs::write(temp.path().join("models_cache.json"), "{invalid").unwrap();
+        assert_eq!(codex_version_with_catalog(temp.path(), None), builtin);
     }
 
     #[test]

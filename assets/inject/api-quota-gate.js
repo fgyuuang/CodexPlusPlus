@@ -1,10 +1,9 @@
 (() => {
-  // 本机官登只要勾了混入 Key，就解除官方订阅额度的发送锁。不看上游地址。
+  // 独立模式的「官方额度解锁」开关就是唯一判据：开关打开就解除官方订阅额度的发送锁，
+  // 不再等上游先拒绝、也不再按供应商模式（官登混入 / 网关 / 聚合）挑条件。
   function permitsExternalApi(settings, hostId) {
-    if (hostId !== "local" || settings?.relayProfilesEnabled !== true) return false;
-    if (!Array.isArray(settings.relayProfiles)) return false;
-    const profile = settings.relayProfiles.find((item) => item?.id === settings.activeRelayId);
-    return !!profile && profile.relayMode === "official" && profile.officialMixApiKey === true;
+    if (hostId !== "local") return false;
+    return settings?.codexAppStandaloneQuotaUnlock === true;
   }
 
   function locate(text, url) {
@@ -87,8 +86,8 @@
       rawPayloads: new WeakMap(), pendingPublications: new WeakMap(), rewriteDepth: 0,
     };
     function officialUsagePolicy() {
-      const enabled = currentSettings?.codexAppStandaloneQuotaUnlock === true
-        && permitsExternalApi(currentSettings, "local");
+      // 与增强模式同一条判据：独立模式的开关打开就解除发送锁，与当前供应商是什么模式无关。
+      const enabled = currentSettings?.codexAppStandaloneQuotaUnlock === true;
       return { official: true, hideAlerts: false, unlockSend: enabled };
     }
     function officialUsagePolicyKey() {

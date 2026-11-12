@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{color-scheme:light;--bg:#fff;--fg:#18181b;--muted:#64748b;--line:#d4d4d8;--accent:#087f65}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#18181b;--fg:#fafafa;--muted:#a1a1aa;--line:#3f3f46;--accent:#41c6a0}
+body{font:14px system-ui,sans-serif;color:var(--fg);background:var(--bg);margin:0;padding:24px;max-width:960px}
+h1{margin:0 0 8px;font-size:25px}h2{font-size:17px}p{line-height:1.7;color:var(--muted)}
+section{border:1px solid var(--line);border-radius:12px;margin:20px 0;padding:18px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:12px 0}
+label{display:grid;gap:6px;margin:12px 0}input,select,button{font:inherit;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);padding:9px}
+button{cursor:pointer}button:hover{border-color:var(--accent)}button:disabled{opacity:.5;cursor:wait}input{min-width:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:0 16px}
+#notice{white-space:pre-wrap;overflow-wrap:anywhere;min-height:24px}#status{font-weight:600;color:var(--accent)}
+[hidden]{display:none!important}small{color:var(--muted)}
+</style></head><body data-service="__LOCAL_SERVICE__">
+<h1 id="title">本地服务插件</h1>
+<p>沿用现有服务、加密凭据和供应商。停用插件仅关闭入口与自启动；停止服务、移除接入需分别操作。</p>
+<div id="notice" role="status" aria-live="polite"></div>
+<section><h2>服务状态</h2><div id="status">正在读取…</div><p id="details"></p>
+<div class="row"><button data-action="status">刷新状态</button><button data-action="start">启动服务</button><button data-action="stop">停止服务</button><button data-action="restart">重启服务</button><button data-action="management">打开控制台</button></div>
+<div class="row" id="cliActions" hidden><button data-action="install">安装锁定版本（下载）</button><label><span>随管理器自启动</span><input id="autoStart" type="checkbox"></label><button id="saveAutoStart">保存自启动</button></div>
+<div class="row" id="newapiActions" hidden><button data-action="channels">渠道页面</button><button data-action="tokens">令牌页面</button><small>Compose 操作不删除卷、不更新镜像。</small></div>
+</section>
+<section><h2>连接设置</h2><form id="connection"><div class="grid" id="connectionFields"></div><button type="submit">保存连接</button></form></section>
+<section><h2>访问凭据</h2><p id="keyState"></p><form id="credentials" autocomplete="off">
+<label>新 API Key / 用户令牌<input id="apiKey" type="password" required autocomplete="new-password" placeholder="留空不修改，不回显已保存密钥"></label>
+<label id="managementKeyLabel" hidden>新管理密钥（留空沿用）<input id="managementKey" type="password" autocomplete="new-password"></label>
+<button type="submit">加密保存密钥</button></form></section>
+<section><h2>模型与供应商接入</h2><div class="row"><button id="refreshModels">刷新模型</button><button id="testApi">测试 API（产生用量）</button></div>
+<label>默认模型<select id="model"><option value="">先刷新模型</option></select></label>
+<label id="channelLabel" hidden>接入通道<select id="channel"><option value="generalRelay">通用 API 专用供应商</option><option value="officialCodex">Codex 官方模型专用供应商</option></select></label>
+<p id="modelHint">接入只保存受管供应商；使用供应商池现有入口导入后，可供其他 Agent 使用。</p>
+<div class="row"><button id="apply">保存供应商接入</button><button data-action="disable">移除本服务供应商接入</button><button id="disableOfficial" hidden data-action="disableOfficial">移除官方通道接入</button><button id="openPool">打开供应商池</button></div>
+</section>
+<script>/*__LOCAL_SERVICE_PANEL__*/</script></body></html>

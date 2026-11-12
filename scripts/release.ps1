@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('Start', 'Status', 'Worker')][string]$Action = 'Status',
+    [ValidateSet('Start', 'Status', 'Worker', 'Redeploy')][string]$Action = 'Status',
     [string]$Job,
     [string]$ExpectedUiText = '',
     [string]$DeployTo = '',
@@ -171,14 +171,14 @@ function Publish-Artifacts {
                 if ((Get-FileHash -LiteralPath $backup).Hash -ne $oldHash) { throw 'Backup hash mismatch.' }
             }
             $staged = Join-Path $target.backup "staged/$($artifact.name)"
-            Copy-Item -LiteralPath (Join-Path $repoRoot "target/release/$($artifact.name)") -Destination $staged
+            Copy-Item -LiteralPath (Join-Path $jobDirectory "artifacts/$($artifact.name)") -Destination $staged
             if ((Get-FileHash -LiteralPath $staged).Hash -ne $artifact.sha256) { throw 'Staging hash mismatch.' }
             $pending += @{ path=$destination; backup=$backup; staged=$staged; oldHash=$oldHash; sha256=$artifact.sha256 }
         }
     }
     $script:state.delivery = $pending
     Save-State
-    Assert-Inputs
+    if (-not $request.ContainsKey('sourceJob')) { Assert-Inputs }
     $changed = @()
     try {
         foreach ($item in $pending) {
@@ -197,12 +197,113 @@ function Publish-Artifacts {
             if ($item.oldHash) {
                 try {
                     Copy-Item -LiteralPath $item.backup -Destination "$($item.staged).restore"
-                    [IO.File]::Replace("$($item.staged).restore", $item.path, $null, $true)
+                    [IO.File]::Replace("$($item.staged).restore", $item.path, "$($item.backup).rollback-replaced", $true)
+                    if ((Get-FileHash -LiteralPath $item.path).Hash -ne $item.oldHash) { throw 'Restored hash mismatch.' }
                 } catch { $failure += " Rollback failed for $($item.path): $($_.Exception.Message)" }
             } else { $failure += " Newly created file retained for review: $($item.path)." }
         }
         throw $failure
     }
+}
+
+function Save-Artifacts($SourceDirectory) {
+    $archive = Join-Path $jobDirectory 'artifacts'
+    Assert-PlainPath $archive
+    [IO.Directory]::CreateDirectory($archive) | Out-Null
+    foreach ($artifact in $script:state.artifacts) {
+        $source = Join-Path $SourceDirectory $artifact.name
+        Assert-PlainPath $source
+        $file = Get-Item -LiteralPath $source
+        if ($file.Length -ne $artifact.length -or (Get-FileHash -LiteralPath $source).Hash -ne $artifact.sha256) { throw "Source artifact mismatch: $($artifact.name)" }
+        $destination = Join-Path $archive $artifact.name
+        Copy-Item -LiteralPath $source -Destination $destination
+        if ((Get-FileHash -LiteralPath $destination).Hash -ne $artifact.sha256) { throw 'Archive hash mismatch.' }
+    }
+}
+
+function Invoke-Redeploy {
+    if ($Job -notmatch '^\d{8}-\d{6}-[a-f0-9]{8}$') { throw 'Redeploy requires a successful build -Job identifier.' }
+    $latest = Join-Path $jobsRoot 'latest.json'
+    if (Test-Path -LiteralPath $latest) {
+        if ((Read-Status (Join-Path $jobsRoot (Read-Json $latest).id)).state -in @('queued', 'running')) { throw 'A release job is already queued/running.' }
+    }
+    Assert-NoCompiler
+    $sourceDirectory = Join-Path $jobsRoot $Job
+    Assert-PlainPath $sourceDirectory
+    foreach ($file in @('status.json', 'request.json')) { Assert-PlainPath (Join-Path $sourceDirectory $file) }
+    $original = Read-Json (Join-Path $sourceDirectory 'status.json')
+    $sourceRequest = Read-Json (Join-Path $sourceDirectory 'request.json')
+    $buildDirectory = $sourceDirectory
+    $buildJob = $Job
+    if ($sourceRequest.ContainsKey('sourceJob')) {
+        if ($original.id -ne $Job -or $sourceRequest.id -ne $Job -or $sourceRequest.repoRoot -ne $repoRoot -or $original.state -ne 'succeeded' -or $original.stage -ne 'complete' -or $sourceRequest.sourceJob -notmatch '^\d{8}-\d{6}-[a-f0-9]{8}$') { throw 'Invalid redeploy source record.' }
+        $buildJob = $sourceRequest.sourceJob
+        $buildDirectory = Join-Path $jobsRoot $buildJob
+        foreach ($file in @('status.json', 'request.json')) { Assert-PlainPath (Join-Path $buildDirectory $file) }
+        if ((Get-FileHash -LiteralPath (Join-Path $buildDirectory 'status.json')).Hash -ne $sourceRequest.sourceStatusHash -or (Get-FileHash -LiteralPath (Join-Path $buildDirectory 'request.json')).Hash -ne $sourceRequest.sourceRequestHash) { throw 'Original build evidence changed.' }
+        $original = Read-Json (Join-Path $buildDirectory 'status.json')
+        $sourceRequest = Read-Json (Join-Path $buildDirectory 'request.json')
+    }
+    $required = @('renderer-check','rust-fmt','rust-check','test-codex-plus-core','test-codex-plus-data','test-codex-plus-manager','typescript','frontend-tests','vite','release')
+    if ($original.id -ne $buildJob -or $sourceRequest.id -ne $buildJob -or $sourceRequest.repoRoot -ne $repoRoot -or $sourceRequest.ContainsKey('sourceJob') -or $original.state -ne 'succeeded' -or $original.stage -ne 'complete' -or @($original.steps).Count -ne $required.Count -or @($original.steps | Where-Object { $_.exitCode -ne 0 }).Count -or @($required | Where-Object { $_ -notin $original.steps.name }).Count) { throw 'Source must be a complete successful build from this repository.' }
+    $platform = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    if ($sourceRequest.ContainsKey('platform') -and $sourceRequest.platform -ne $platform) { throw 'Source platform mismatch.' }
+    $runtime = @($original.runtimeDependencies)
+    $expectedNames = @($names) + @($runtime | ForEach-Object { $_.name })
+    if (@($original.artifacts).Count -ne $expectedNames.Count -or @($expectedNames | Select-Object -Unique).Count -ne $expectedNames.Count -or @($original.artifacts.name | Select-Object -Unique).Count -ne $expectedNames.Count) { throw 'Incomplete or duplicate artifact manifest.' }
+    foreach ($artifact in $original.artifacts) {
+        if ($artifact.name -notin $expectedNames -or $artifact.name -notmatch '^[A-Za-z0-9_.-]+\.(exe|dll)$' -or $artifact.sha256 -notmatch '^[A-Fa-f0-9]{64}$' -or $artifact.length -le 0) { throw 'Invalid artifact manifest.' }
+        if ($artifact.name -like '*.dll' -and @($runtime | Where-Object { $_.name -eq $artifact.name -and $_.sha256 -eq $artifact.sha256 }).Count -ne 1) { throw 'Runtime provenance mismatch.' }
+    }
+    if ($DeployTo) {
+        $DeployTo = (Get-Item -LiteralPath $DeployTo).FullName.TrimEnd('\')
+        Assert-PlainPath $DeployTo
+        if ($DeployTo -eq (Join-Path $repoRoot 'bin')) { throw 'bin is already delivered by default; omit -DeployTo.' }
+        foreach ($name in $names) { if (-not (Test-Path -LiteralPath (Join-Path $DeployTo $name) -PathType Leaf)) { throw "Not an existing runtime directory: missing $name" } }
+    }
+    $sourceArtifacts = Join-Path $sourceDirectory 'artifacts'
+    $legacy = $Job -eq $buildJob -and -not $sourceRequest.ContainsKey('platform') -and -not (Test-Path -LiteralPath $sourceArtifacts)
+    if ($legacy) { $sourceArtifacts = Join-Path $repoRoot 'bin' }
+    Assert-PlainPath $sourceArtifacts
+    if (-not (Test-Path -LiteralPath $sourceArtifacts -PathType Container)) { throw 'Source archive is missing.' }
+    if (-not $sourceRequest.ContainsKey('platform')) {
+        # 旧记录没有架构字段，核对真实 PE；绝不按文件名猜架构。
+        foreach ($name in $names) {
+            $file = Join-Path $sourceArtifacts $name
+            Assert-PlainPath $file
+            $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($file))
+            try {
+                if ($reader.ReadUInt16() -ne 0x5A4D) { throw 'Invalid PE artifact.' }
+                $reader.BaseStream.Position = 0x3c; $offset = $reader.ReadUInt32()
+                $reader.BaseStream.Position = $offset
+                if ($reader.ReadUInt32() -ne 0x4550) { throw 'Invalid PE signature.' }
+                $machine = $reader.ReadUInt16()
+                if (($platform -eq 'X64' -and $machine -ne 0x8664) -or ($platform -eq 'Arm64' -and $machine -ne 0xAA64) -or $platform -notin @('X64','Arm64')) { throw 'Source platform mismatch.' }
+            } finally { $reader.Dispose() }
+        }
+    }
+    $id = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $jobDirectory = Join-Path $jobsRoot $id
+    [IO.Directory]::CreateDirectory($jobDirectory) | Out-Null
+    $request = @{ id=$id; repoRoot=$repoRoot; sourceJob=$buildJob; copiedFromJob=$Job; deployTo=$DeployTo; platform=$platform; legacyCapture=$legacy; sourceStatusHash=(Get-FileHash -LiteralPath (Join-Path $buildDirectory 'status.json')).Hash; sourceRequestHash=(Get-FileHash -LiteralPath (Join-Path $buildDirectory 'request.json')).Hash }
+    Write-Json (Join-Path $jobDirectory 'request.json') $request
+    $script:state = @{ id=$id; state='running'; stage='archive-validation'; createdAt=(Get-Date).ToUniversalTime().ToString('o'); updatedAt=''; error=$null; steps=@(); artifacts=$original.artifacts; runtimeDependencies=$runtime; delivery=@(); sourceJob=$buildJob; restartPerformed=$false }
+    Save-State
+    Write-Json (Join-Path $jobDirectory 'process.json') @{ pid=$PID; startedAt=(Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o') }
+    Write-Json $latest @{ id=$id }
+    try {
+        Save-Artifacts $sourceArtifacts
+        Copy-Item -LiteralPath (Join-Path $buildDirectory 'status.json') -Destination (Join-Path $jobDirectory 'source-status.json')
+        Copy-Item -LiteralPath (Join-Path $buildDirectory 'request.json') -Destination (Join-Path $jobDirectory 'source-request.json')
+        $script:state.stage = 'delivery'; Save-State
+        Publish-Artifacts
+        $script:state['runningInstances'] = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in $names } | Select-Object ProcessId, Name, CreationDate, ExecutablePath)
+        $script:state.state = 'succeeded'; $script:state.stage = 'complete'
+    } catch { $script:state.state='failed'; $script:state.error=$_.Exception.Message }
+    Save-State
+    [IO.File]::WriteAllText((Join-Path $jobDirectory 'summary.md'), "# Redeploy $id`nSource build: $buildJob`nArchive job: $Job`nState: $($script:state.state)`nError: $($script:state.error)`nNo Cargo/Node invocation. No application restart. This delivers the source build, not current source changes.`n")
+    $script:state | ConvertTo-Json -Depth 12
+    if ($script:state.state -ne 'succeeded') { throw "Redeploy failed: $($script:state.error)" }
 }
 
 if ($Action -eq 'Worker') {
@@ -228,11 +329,12 @@ try {
     for ($attempt = 0; $attempt -lt 100; $attempt++) {
         try { $lock = [IO.File]::Open((Join-Path $jobsRoot 'active.lock'), 'OpenOrCreate', 'ReadWrite', 'None'); break }
         catch [IO.IOException] {
-            if ($Action -eq 'Start') { throw 'A release job already owns the workspace lock. Use -Action Status.' }
+            if ($Action -in @('Start', 'Redeploy')) { throw 'A release job already owns the workspace lock. Use -Action Status.' }
             Start-Sleep -Milliseconds 100
         }
     }
     if (-not $lock) { throw 'Unable to acquire the release lock.' }
+    if ($Action -eq 'Redeploy') { Invoke-Redeploy; exit 0 }
     if ($Action -eq 'Start') {
         $latest = Join-Path $jobsRoot 'latest.json'
         if (Test-Path -LiteralPath $latest) {
@@ -263,6 +365,7 @@ try {
         $jobDirectory = Join-Path $jobsRoot $id
         [IO.Directory]::CreateDirectory($jobDirectory) | Out-Null
         $request = @{ id=$id; repoRoot=$repoRoot; node=$node; cargo=$cargo; rg=$script:rgPath; jobs=$Jobs; expectedUiText=$ExpectedUiText; deployTo=$DeployTo; inputs=@(Get-Snapshot) }
+        $request['platform'] = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
         Write-Json (Join-Path $jobDirectory 'request.json') $request
         $script:state = @{ id=$id; state='queued'; stage='queued'; createdAt=(Get-Date).ToUniversalTime().ToString('o'); updatedAt=''; error=$null; steps=@(); artifacts=@(); delivery=@(); restartPerformed=$false }
         Save-State
@@ -285,7 +388,7 @@ try {
             Assert-Inputs
             Invoke-Step 'renderer-check' $request.node @('scripts/assemble-renderer-inject.mjs', '--check')
             Invoke-Step 'rust-fmt' $request.cargo @('fmt', '--all', '--', '--check')
-            Invoke-Step 'rust-check' $request.cargo @('check', '--workspace', '-j', "$($request.jobs)")
+            Invoke-Step 'rust-check' $request.cargo @('check', '--workspace', '--all-targets', '-j', "$($request.jobs)")
             foreach ($package in @('codex-plus-core', 'codex-plus-data', 'codex-plus-manager')) {
                 $selection = if ($package -eq 'codex-plus-manager') { '--lib' } else { '--tests' }
                 Invoke-Step "test-$package" $request.cargo @('test', '-p', $package, $selection, '--no-fail-fast', '-j', "$($request.jobs)", '--', '--test-threads=1')
@@ -319,6 +422,7 @@ try {
             }
             $script:state.stage = 'delivery'
             Save-State
+            Save-Artifacts (Join-Path $repoRoot 'target/release')
             Publish-Artifacts
             $script:state['runningInstances'] = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in $names } | Select-Object ProcessId, Name, CreationDate, ExecutablePath)
             $script:state.state = 'succeeded'

@@ -2,12 +2,28 @@ name: PR build artifacts
 
 on:
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch:
+    inputs:
+      rust_test_filter:
+        description: "只跑名字匹配的 Rust 用例并串行执行（留空跑全量），排查平台相关失败时用"
+        default: ""
+        required: false
 
 permissions:
   contents: read
+
+# 同一个 PR 推了新提交就取消旧的那轮；main 上每次推送都完整跑完，方便事后定位是哪次提交红的。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows-artifacts:
@@ -25,7 +41,17 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # 只缓存第三方依赖的编译产物（rust-cache 会剔除本仓库 crate）。只在 main 上写缓存：
+      # PR 读 main 的缓存，各 PR 不再各占一份，免得 10 GB 配额被挤爆、main 的缓存被逐出。
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Install NSIS
+        # 安装包只在推 main / 手动触发时打，PR 不需要 NSIS。
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           $makensis = $null
@@ -58,6 +84,16 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm test
 
+      - name: Native Fast regression tests
+        run: >-
+          node --test
+          assets/inject/native-fast-unlock.test.cjs
+          assets/inject/native-fast-module.test.cjs
+          assets/inject/native-fast-settings.test.cjs
+          assets/inject/native-fast-rspack.test.cjs
+          assets/inject/native-predictions.test.cjs
+          scripts/tests/check-native-fast.test.cjs
+
       - name: Check native browser inspector bundle
         run: node scripts/assemble-native-browser-inspector.mjs --check
 
@@ -70,12 +106,25 @@ jobs:
         run: npm run vite:build
 
       - name: Rust tests
-        run: cargo test --workspace
+        # 有用例卡死时到点失败，不要一直占着 runner 到作业 6 小时上限（编译加测试平时 20 分钟左右）。
+        timeout-minutes: 60
+        env:
+          RUST_TEST_FILTER: ${{ inputs.rust_test_filter }}
+        run: |
+          if ($env:RUST_TEST_FILTER) {
+            cargo test --workspace -- $env:RUST_TEST_FILTER --test-threads=1
+          } else {
+            cargo test --workspace
+          }
 
       - name: Build release application
+        # PR 上只跑测试：release 是第二套完整编译，Windows 上要多 10 多分钟。
+        # main 每次推送仍出安装包，release profile 才有的问题最晚在合入后一轮暴露；发版走 release-assets.yml。
+        if: github.event_name != 'pull_request'
         run: cargo build --release
 
       - name: Stage Windows app files
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/windows/app | Out-Null
@@ -83,6 +132,7 @@ jobs:
           if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 安装包必须只有一个应用程序。" }
 
       - name: Build Windows installer
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v", "V")
@@ -112,6 +162,7 @@ jobs:
           }
 
       - name: Upload Windows binaries
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: codex-plus-plus-windows-binaries
@@ -119,6 +170,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Windows installer
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: codex-plus-plus-windows-installer
@@ -129,7 +181,11 @@ jobs:
     # PR 构建也出通用包，跟发版产物保持一致，避免只在发版时才暴露问题。
     # 没有签名密钥，所以这里走 ad-hoc（脚本的默认行为）。
     name: macOS DMG (universal)
-    runs-on: macos-14
+    # macos-14 镜像 2026-11-02 退役，期间还有计划性停机（任务分配 runner 前就被取消）。
+    runs-on: macos-15
+    env:
+      # 与 Info.plist 的 LSMinimumSystemVersion 一致，不随 runner 的 SDK 抬高 C 依赖的最低系统版本。
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -144,9 +200,27 @@ jobs:
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
 
+      # 只缓存第三方依赖的编译产物（rust-cache 会剔除本仓库 crate）。只在 main 上写缓存：
+      # PR 读 main 的缓存，各 PR 不再各占一份，免得 10 GB 配额被挤爆、main 的缓存被逐出。
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
         run: npm ci
+
+      - name: Native Fast regression tests
+        run: >-
+          node --test
+          assets/inject/native-fast-unlock.test.cjs
+          assets/inject/native-fast-module.test.cjs
+          assets/inject/native-fast-settings.test.cjs
+          assets/inject/native-fast-rspack.test.cjs
+          assets/inject/native-predictions.test.cjs
+          scripts/tests/check-native-fast.test.cjs
 
       - name: Check native browser inspector bundle
         run: node scripts/assemble-native-browser-inspector.mjs --check
@@ -197,4 +271,103 @@ jobs:
         with:
           name: codex-plus-plus-macos-universal-dmg
           path: dist/macos/*.dmg
+          if-no-files-found: error
+
+  linux-deb:
+    name: Linux DEB (Ubuntu 24.04, amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 只缓存第三方依赖的编译产物（rust-cache 会剔除本仓库 crate）。只在 main 上写缓存：
+      # PR 读 main 的缓存，各 PR 不再各占一份，免得 10 GB 配额被挤爆、main 的缓存被逐出。
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl git pkg-config libssl-dev libsqlite3-dev \
+            libdbus-1-dev libglib2.0-dev libgtk-3-dev \
+            libayatana-appindicator3-dev libjavascriptcoregtk-4.1-dev \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev libz3-dev
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm ci
+
+      - name: Frontend tests
+        working-directory: apps/codex-plus-manager
+        run: npm test
+
+      - name: Native Fast regression tests
+        run: >-
+          node --test
+          assets/inject/native-fast-unlock.test.cjs
+          assets/inject/native-fast-module.test.cjs
+          assets/inject/native-fast-settings.test.cjs
+          assets/inject/native-fast-rspack.test.cjs
+          assets/inject/native-predictions.test.cjs
+          scripts/tests/check-native-fast.test.cjs
+
+      - name: Check native browser inspector bundle
+        run: node scripts/assemble-native-browser-inspector.mjs --check
+
+      - name: TypeScript check
+        working-directory: apps/codex-plus-manager
+        run: npm run check
+
+      - name: Build frontend
+        working-directory: apps/codex-plus-manager
+        run: npm run vite:build
+
+      - name: Rust tests
+        # 有用例卡死时到点失败，不要一直占着 runner 到作业 6 小时上限（编译加测试平时 20 分钟左右）。
+        timeout-minutes: 60
+        run: cargo test --workspace
+
+      - name: Build Linux application
+        run: cargo build --release -p codex-plus-manager
+      - name: Check default version outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          "$GITHUB_WORKSPACE/scripts/installer/linux/build-deb.sh" --help
+          test -f "$GITHUB_WORKSPACE/apps/codex-plus-manager/package.json"
+      - name: Build DEB from outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          bash "$GITHUB_WORKSPACE/scripts/installer/linux/build-deb.sh" --package-only
+      - name: Verify package and install
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb_file="$(find dist/linux -maxdepth 1 -name "*.deb" -print -quit)"
+          test -n "$deb_file"
+          test "$(dpkg-deb -f "$deb_file" Package)" = "codex-plus-plus"
+          test "$(dpkg-deb -f "$deb_file" Version)" = "$(node -p 'require("./apps/codex-plus-manager/package.json").version')"
+          dpkg-deb -c "$deb_file" | grep -F "./usr/bin/codex-plus-plus"
+          if dpkg-deb -c "$deb_file" | grep -Fq "./usr/bin/codex-plus-plus-manager"; then exit 1; fi
+          sudo apt-get install -y "./$deb_file"
+          test -x /usr/bin/codex-plus-plus
+          dpkg -V codex-plus-plus
+          ldd /usr/bin/codex-plus-plus | tee /tmp/codex-plus-plus-ldd.log
+          ! grep -q "not found" /tmp/codex-plus-plus-ldd.log
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-plus-plus-linux-amd64-deb
+          path: dist/linux/*.deb
           if-no-files-found: error

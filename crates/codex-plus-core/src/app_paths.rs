@@ -436,15 +436,19 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(app_dir) = app_dir {
         return normalize_codex_app_path(app_dir);
     }
-    if cfg!(target_os = "macos") {
-        return find_macos_codex_app_default();
+    #[cfg(target_os = "macos")]
+    {
+        find_macos_codex_app_default()
     }
     #[cfg(target_os = "linux")]
     {
-        return find_linux_codex_app_default();
+        find_linux_codex_app_default()
     }
-    // Windows: try MS Store version first, then standalone install
-    find_latest_codex_app_dir_default().or_else(|| find_standalone_codex_app_dir())
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // Windows: try MS Store version first, then standalone install
+        find_latest_codex_app_dir_default().or_else(|| find_standalone_codex_app_dir())
+    }
 }
 
 /// Search for standalone Codex installations (non-MS Store).
@@ -920,6 +924,29 @@ pub(crate) fn find_desktop_managed_codex_cli_from_var(
         })
         .max_by(|left, right| left.0.cmp(&right.0))
         .map(|(_, exe)| exe)
+}
+
+/// 保存的路径是否指向桌面版托管目录下的 CLI（`bin\codex.exe` 或 `bin\<哈希>\codex.exe`）。
+///
+/// 桌面版更新会删掉旧哈希目录，之前保存的路径随之失效（#2751）。只认这两种布局，
+/// 用户自定义的其他路径不在此列；分隔符和大小写按 Windows 规则归一后比较。
+pub fn is_desktop_managed_codex_cli_path(configured: &str, local_appdata: &Path) -> bool {
+    let normalize = |value: &str| value.replace('\\', "/").to_ascii_lowercase();
+    let bin = local_appdata.join("OpenAI").join("Codex").join("bin");
+    let prefix = format!(
+        "{}/",
+        normalize(&bin.to_string_lossy()).trim_end_matches('/')
+    );
+    normalize(configured.trim())
+        .strip_prefix(&prefix)
+        .is_some_and(|suffix| {
+            let parts: Vec<_> = suffix.split('/').collect();
+            parts == ["codex.exe"]
+                || (parts.len() == 2
+                    && !parts[0].is_empty()
+                    && parts[0].bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && parts[1] == "codex.exe")
+        })
 }
 
 pub fn codex_app_version(app_dir: &Path) -> Option<String> {

@@ -13,8 +13,12 @@ use serde_json::{Value, json};
 
 static OPERATION: Mutex<()> = Mutex::new(());
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+// 单次探测（查应用包、读版本号、查进程）的上限。Windows 上 PowerShell 第一次启动要加载
+// Appx 模块，冷启动常超过 3 秒，旧的 3 秒上限会让检测一直报超时、只有先打开 Claude
+// 预热后才检测得到（#2831）。卡死的探测仍会在上限后被终止回收。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+// 一次完整状态检测的总上限：Windows 上要依次跑三四次 PowerShell。
+const STATUS_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// 探测输出落在临时文件，避免子进程填满管道后阻塞；超时确实终止并回收子进程。
 #[derive(Debug)]
@@ -157,6 +161,10 @@ fn replace_copy_with(
 
 const ASSETS: &[(&str, &[u8])] = &[
     (
+        "bash-timeout.js",
+        include_bytes!("../../../assets/claude-localization/bash-timeout.js"),
+    ),
+    (
         "build-copy.py",
         include_bytes!("../../../assets/claude-localization/build-copy.py"),
     ),
@@ -221,11 +229,17 @@ pub struct ClaudeLocalizationStatus {
     pub voice_input: bool,
     /// 是否注入中文界面；关掉后副本按原语言启动，与「准备副本」互不影响。
     pub localization: bool,
+    /// 是否在受管副本里加载明确适配 Claude Code 的拓展。
+    pub extensions: bool,
     /// 是否在副本里解锁 Computer Use（改写 asar + 关闭 asar 完整性校验）。
     pub computer_use: bool,
     /// 当前平台是否真的能应用 Computer Use；Windows 的构建脚本不改写 asar，
     /// 打开开关只会存设置，界面据此禁用该开关（#2673）。
     pub computer_use_supported: bool,
+    pub bash_timeout: crate::settings::ClaudeBashTimeoutSettings,
+    /// 最近一次启动的 Cowork 适配提示，不改变其他增强的成功状态。
+    pub bash_timeout_warning: Option<String>,
+    pub bash_timeout_pending: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -349,6 +363,17 @@ fn is_claude_msix_path(path: &Path) -> bool {
             || (tail.len() == 2 && tail[1].eq_ignore_ascii_case("claude-desktop.exe")))
 }
 
+/// MSIX 入口是否只是 App Execution Alias（`claude-desktop.exe`）。
+///
+/// 别名是重解析点，所在目录是放满各应用别名的 `Microsoft\WindowsApps`，
+/// 不能当成 Claude 应用目录整个复制；只有包内真实的 `app\Claude.exe` 才能复制成副本。
+#[cfg(any(target_os = "windows", test))]
+fn is_claude_msix_alias(path: &Path) -> bool {
+    let text = path.to_string_lossy().replace('/', "\\");
+    let name = text.rsplit('\\').next().unwrap_or_default();
+    is_claude_msix_path(path) && name.eq_ignore_ascii_case("claude-desktop.exe")
+}
+
 #[cfg(target_os = "windows")]
 fn windows_msix_source(path: &Path) -> bool {
     is_claude_msix_path(path)
@@ -357,6 +382,315 @@ fn windows_msix_source(path: &Path) -> bool {
 #[cfg(not(target_os = "windows"))]
 fn windows_msix_source(_path: &Path) -> bool {
     false
+}
+
+/// Electron fuse 表前的固定标记；其后依次是版本字节、长度字节和逐个 fuse 的 ASCII 值。
+#[cfg(any(target_os = "windows", test))]
+const ELECTRON_FUSE_SENTINEL: &[u8] = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX";
+/// fuse 表里 `EnableNodeCliInspectArguments` 的位置（从 0 计）；为 '0' 时 `--inspect` 会被忽略。
+#[cfg(any(target_os = "windows", test))]
+const INSPECT_FUSE_INDEX: usize = 3;
+
+/// 关闭 inspect fuse 的 Claude 没法通过调试端口注入（#2818）：说清原因和用户能做什么。
+#[cfg(any(target_os = "windows", test))]
+const INSPECT_FUSE_DISABLED_MESSAGE: &str = "增强版副本的 Electron 调试开关（EnableNodeCliInspectArguments fuse）处于关闭状态，\
+Claude 会忽略 --inspect 参数，汉化与 Bash 时限增强都无法注入。请完全退出 Claude 后，\
+在 Codex++「Claude 增强」里点「制作增强版 / 更新副本」重新制作副本再启动；\
+若重新制作后仍提示此错误，请在 issue 中附上 Codex++ 状态目录下 claude-localization\\operation.log。";
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectFuse {
+    Enabled,
+    Disabled,
+}
+
+/// 找出每一处有效 fuse 表中第 `index` 个 fuse 字节的偏移。
+///
+/// 与 macOS 的 build-copy.py 同口径：标记后第二个字节是 fuse 个数，fuse 值只能是
+/// '0' / '1' / 'r'（已移除），目标那一位必须是 '0' 或 '1'，否则视为格式变化。
+#[cfg(any(target_os = "windows", test))]
+fn fuse_offsets(bytes: &[u8], index: usize) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(position) = bytes.get(from..).and_then(|rest| {
+        rest.windows(ELECTRON_FUSE_SENTINEL.len())
+            .position(|window| window == ELECTRON_FUSE_SENTINEL)
+    }) {
+        let start = from + position + ELECTRON_FUSE_SENTINEL.len();
+        from = start;
+        let Some(&count) = bytes.get(start + 1) else {
+            break;
+        };
+        let count = count as usize;
+        let Some(flags) = bytes.get(start + 2..start + 2 + count) else {
+            continue;
+        };
+        if count > index
+            && count <= 32
+            && flags.iter().all(|flag| matches!(flag, b'0' | b'1' | b'r'))
+            && matches!(flags[index], b'0' | b'1')
+        {
+            found.push(start + 2 + index);
+        }
+    }
+    found
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn inspect_fuse_offsets(bytes: &[u8]) -> Vec<usize> {
+    fuse_offsets(bytes, INSPECT_FUSE_INDEX)
+}
+
+/// fuse 表里 `EnableEmbeddedAsarIntegrityValidation` 的位置；改写 ion-dist.asar 后必须关掉（#2884）。
+#[cfg(any(target_os = "windows", test))]
+const ASAR_INTEGRITY_FUSE_INDEX: usize = 4;
+
+/// 在内存中关掉所有 asar 完整性校验 fuse，返回需要改写的偏移。
+#[cfg(any(target_os = "windows", test))]
+fn disable_asar_integrity_fuse(bytes: &mut [u8]) -> Result<Vec<usize>> {
+    let offsets = fuse_offsets(bytes, ASAR_INTEGRITY_FUSE_INDEX);
+    ensure!(
+        !offsets.is_empty(),
+        "此版本缺少 asar 完整性 fuse，无法汉化打包成 ion-dist.asar 的本地界面"
+    );
+    let changed = offsets
+        .into_iter()
+        .filter(|&offset| bytes[offset] != b'0')
+        .collect::<Vec<_>>();
+    for &offset in &changed {
+        bytes[offset] = b'0';
+    }
+    Ok(changed)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn asar_integrity_fuse_disabled(bytes: &[u8]) -> bool {
+    let offsets = fuse_offsets(bytes, ASAR_INTEGRITY_FUSE_INDEX);
+    !offsets.is_empty() && offsets.iter().all(|&offset| bytes[offset] == b'0')
+}
+
+/// 读取 inspect fuse：多处 fuse 表（多架构拼接）必须全部打开才算打开。
+#[cfg(any(target_os = "windows", test))]
+fn inspect_fuse_state(bytes: &[u8]) -> Result<InspectFuse> {
+    let offsets = inspect_fuse_offsets(bytes);
+    ensure!(
+        !offsets.is_empty(),
+        "找不到 Electron fuse，此 Claude 版本的格式已变化，无法安全注入"
+    );
+    Ok(if offsets.iter().all(|&offset| bytes[offset] == b'1') {
+        InspectFuse::Enabled
+    } else {
+        InspectFuse::Disabled
+    })
+}
+
+/// 在内存中打开所有 inspect fuse，返回需要改写的偏移（已打开的不重复写）。
+#[cfg(any(target_os = "windows", test))]
+fn enable_inspect_fuse(bytes: &mut [u8]) -> Result<Vec<usize>> {
+    let offsets = inspect_fuse_offsets(bytes);
+    ensure!(
+        !offsets.is_empty(),
+        "找不到 Electron fuse，此 Claude 版本的格式已变化，无法安全注入"
+    );
+    let changed = offsets
+        .into_iter()
+        .filter(|&offset| bytes[offset] != b'1')
+        .collect::<Vec<_>>();
+    for &offset in &changed {
+        bytes[offset] = b'1';
+    }
+    Ok(changed)
+}
+
+/// 只改副本可执行文件里的 fuse 字节，不重写整个文件；返回是否真的改动过。
+/// 官方安装（含 WindowsApps 里的 MSIX 包）从不经过这里。
+#[cfg(any(target_os = "windows", test))]
+fn enable_inspect_fuse_file(path: &Path) -> Result<bool> {
+    use std::io::Write;
+    let mut bytes =
+        fs::read(path).with_context(|| format!("无法读取 Claude 副本 {}", path.display()))?;
+    let changed = enable_inspect_fuse(&mut bytes)?;
+    if changed.is_empty() {
+        return Ok(false);
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("无法写入 Claude 副本 {}", path.display()))?;
+    for offset in &changed {
+        file.seek(SeekFrom::Start(*offset as u64))?;
+        file.write_all(b"1")?;
+    }
+    file.sync_all()?;
+    ensure!(
+        inspect_fuse_state(&fs::read(path)?)? == InspectFuse::Enabled,
+        "{INSPECT_FUSE_DISABLED_MESSAGE}"
+    );
+    Ok(true)
+}
+
+/// 副本里打包成 asar 的本地界面（新版 Claude，#2884）：ion-dist 目录里没有真实界面时返回 ion-dist.asar。
+/// 新版在 asar 旁边留了个只有占位 index.html 的 ion-dist 目录（#2943），不能凭 index.html 判定。
+#[cfg(any(target_os = "windows", test))]
+fn packed_ion_asar(copy_exe: &Path) -> Option<PathBuf> {
+    let resources = copy_exe.parent()?.join("resources");
+    let asar = resources.join("ion-dist.asar");
+    (!ion_dir_has_ui(&resources.join("ion-dist")) && asar.is_file()).then_some(asar)
+}
+
+/// 与 build-copy.py 的 `ion_dir_has_ui` 同口径：index.html 加 assets 下至少一个 .js。
+#[cfg(any(target_os = "windows", test))]
+fn ion_dir_has_ui(ion: &Path) -> bool {
+    fn has_js(dir: &Path) -> bool {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    has_js(&path)
+                } else {
+                    path.extension().is_some_and(|ext| ext == "js")
+                }
+            })
+    }
+    ion.join("index.html").is_file() && has_js(&ion.join("assets"))
+}
+
+/// 内置中文词表，按 `i18n` 下的相对路径给出。
+#[cfg(any(target_os = "windows", test))]
+fn ion_catalogs() -> Vec<(&'static str, &'static [u8])> {
+    ASSETS
+        .iter()
+        .filter_map(|(name, bytes)| {
+            name.strip_prefix("catalogs/")
+                .map(|relative| (relative, *bytes))
+        })
+        .collect()
+}
+
+/// 只改副本：改写 ion-dist.asar 并关掉 asar 完整性 fuse，改完复核。
+#[cfg(any(target_os = "windows", test))]
+fn localize_packed_ion_copy(copy_exe: &Path) -> Result<()> {
+    use std::io::Write;
+    let Some(asar) = packed_ion_asar(copy_exe) else {
+        return Ok(());
+    };
+    let mut bytes = fs::read(copy_exe)
+        .with_context(|| format!("无法读取 Claude 副本 {}", copy_exe.display()))?;
+    let changed = disable_asar_integrity_fuse(&mut bytes)?;
+    crate::claude_ion_asar::localize_ion_asar(&asar, &ion_catalogs())?;
+    if !changed.is_empty() {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(copy_exe)
+            .with_context(|| format!("无法写入 Claude 副本 {}", copy_exe.display()))?;
+        for offset in &changed {
+            file.seek(SeekFrom::Start(*offset as u64))?;
+            file.write_all(b"0")?;
+        }
+        file.sync_all()?;
+    }
+    verify_packed_ion_copy(copy_exe)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn verify_packed_ion_copy(copy_exe: &Path) -> Result<()> {
+    let Some(asar) = packed_ion_asar(copy_exe) else {
+        return Ok(());
+    };
+    crate::claude_ion_asar::verify_ion_asar(&asar)?;
+    ensure!(
+        asar_integrity_fuse_disabled(&fs::read(copy_exe)?),
+        "增强版副本改写了 ion-dist.asar，但 asar 完整性校验 fuse 仍是打开的，Claude 会拒绝加载。请在 Codex++「Claude 增强」里点「制作增强版 / 更新副本」重新制作副本。"
+    );
+    Ok(())
+}
+
+/// 读取 Claude 安装目录失败时的说明：WindowsApps 有专门的 ACL，要讲清楚原因与出路。
+#[cfg(any(target_os = "windows", test))]
+fn source_read_error_message(path: &Path, error: &std::io::Error, copy_root: &Path) -> String {
+    let path = path.display();
+    let copy_root = copy_root.display();
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => format!(
+            "无法读取 Claude 安装文件 {path}：当前账户没有读取权限（{error}）。\
+Windows 商店版（MSIX）Claude 的官方程序关闭了 Electron 调试开关，Codex++ 需要先把它复制到 {copy_root} \
+并在副本里打开调试开关，才能注入汉化与 Bash 时限增强。请用安装 Claude 的同一个 Windows 账户运行 Codex++，\
+不要以管理员或其他用户身份运行；若仍被拒绝，可改装 Claude 官网安装包后重新「制作增强版」。"
+        ),
+        std::io::ErrorKind::NotFound => format!(
+            "找不到 Claude 安装文件 {path}：Claude 可能正在更新或已被卸载。请打开一次官方 Claude 确认能正常启动，\
+再回到 Codex++ 重新「制作增强版」。"
+        ),
+        _ => format!(
+            "读取 Claude 安装文件 {path} 失败：{error}。请确认 Claude 已安装完整后重新「制作增强版」。"
+        ),
+    }
+}
+
+/// 复制前先确认官方程序可读，避免 robocopy 只给一个退出码。
+#[cfg(any(target_os = "windows", test))]
+fn ensure_source_readable(path: &Path, copy_root: &Path) -> Result<()> {
+    let result = fs::File::open(path).and_then(|mut file| file.read(&mut [0u8; 1]).map(|_| ()));
+    result.map_err(|error| anyhow::anyhow!(source_read_error_message(path, &error, copy_root)))
+}
+
+/// 准备 Windows 副本前的检查：别名入口无法定位应用目录，官方文件必须可读。
+#[cfg(target_os = "windows")]
+fn windows_prepare_preflight(source: &Path) -> Result<()> {
+    ensure!(
+        !is_claude_msix_alias(source),
+        "只找到了 Windows 商店版 Claude 的启动别名 {}，无法定位 WindowsApps 里的应用目录。\
+请确认 Windows 应用包服务（AppX 部署服务）正常、能在 PowerShell 里用 Get-AppxPackage 查到 Claude 后重试。",
+        source.display()
+    );
+    let root = source.parent().context("Claude 可执行文件缺少目录")?;
+    let copy_root = runtime_dir().join(COPY_DIR_NAME);
+    ensure_source_readable(source, &copy_root)?;
+    ensure_source_readable(&root.join(r"resources\app.asar"), &copy_root)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_prepare_preflight(_source: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Windows 副本必须打开 inspect fuse：准备时打开，启动前再核对一次。
+#[cfg(target_os = "windows")]
+fn windows_copy_inspect_fuse(copy: &Path, patch: bool) -> Result<()> {
+    if patch {
+        enable_inspect_fuse_file(copy)?;
+        return Ok(());
+    }
+    let bytes =
+        fs::read(copy).with_context(|| format!("无法读取 Claude 副本 {}", copy.display()))?;
+    ensure!(
+        inspect_fuse_state(&bytes)? == InspectFuse::Enabled,
+        "{INSPECT_FUSE_DISABLED_MESSAGE}"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_copy_inspect_fuse(_copy: &Path, _patch: bool) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_packed_ion(copy: &Path, patch: bool) -> Result<()> {
+    if patch {
+        localize_packed_ion_copy(copy)
+    } else {
+        verify_packed_ion_copy(copy)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_packed_ion(_copy: &Path, _patch: bool) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -381,13 +715,11 @@ fn copy_app(_source: &Path) -> PathBuf {
     runtime_dir().join(COPY_BUNDLE_NAME)
 }
 
+/// MSIX 版也用可写目录里的副本：商店版 4.4212 起官方程序关闭了 inspect fuse，
+/// 直接启动官方 exe 时 `--inspect` 会被忽略（#2818）。
 #[cfg(target_os = "windows")]
-fn copy_app(source: &Path) -> PathBuf {
-    if windows_msix_source(source) {
-        source.to_path_buf()
-    } else {
-        runtime_dir().join(COPY_DIR_NAME).join("Claude.exe")
-    }
+fn copy_app(_source: &Path) -> PathBuf {
+    runtime_dir().join(COPY_DIR_NAME).join("Claude.exe")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -731,8 +1063,14 @@ fn initial_status(source: &Path, copy: &Path) -> ClaudeLocalizationStatus {
         localization: settings
             .as_ref()
             .is_none_or(|settings| settings.claude_app_localization),
+        extensions: settings
+            .as_ref()
+            .is_some_and(|settings| settings.claude_app_extensions),
         computer_use: computer_use_enabled(),
         computer_use_supported: cfg!(target_os = "macos"),
+        bash_timeout: bash_timeout_settings(),
+        bash_timeout_warning: None,
+        bash_timeout_pending: false,
     }
 }
 
@@ -814,6 +1152,12 @@ pub fn status() -> Result<ClaudeLocalizationStatus> {
                 .and_then(|config| read_config(config).ok())
                 .and_then(|v| v.get("locale")?.as_str().map(str::to_string));
             state.running = claude_running(deadline)?;
+            let report = runtime_dir().join("operation.log");
+            if state.prepared && report.is_file() {
+                let timeout = bash_timeout_status_at(&report, &state.bash_timeout);
+                state.bash_timeout_warning = timeout.warning;
+                state.bash_timeout_pending = timeout.pending;
+            }
             state.node_available = find_runtime("node", deadline)?.is_some();
             // Windows 的准备脚本用 PowerShell，不需遍历或执行 Python 安装别名。
             state.python_available = if cfg!(windows) {
@@ -863,11 +1207,27 @@ fn localization_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn extensions_enabled() -> bool {
+    crate::settings::SettingsStore::default()
+        .load()
+        .map(|settings| settings.claude_app_extensions)
+        .unwrap_or(false)
+}
+
 /// 写入语音入口开关。只改 Codex++ 自己的设置，不触碰副本与官方应用。
 pub fn set_voice_input(enabled: bool) -> Result<ClaudeLocalizationStatus> {
     let store = crate::settings::SettingsStore::default();
     let mut settings = store.load()?;
     settings.claude_app_voice_input = enabled;
+    store.save(&settings)?;
+    status()
+}
+
+/// 仅保存受管副本的拓展开关，插件在下一次启动增强版时生成和加载。
+pub fn set_extensions_enabled(enabled: bool) -> Result<ClaudeLocalizationStatus> {
+    let store = crate::settings::SettingsStore::default();
+    let mut settings = store.load()?;
+    settings.claude_app_extensions = enabled;
     store.save(&settings)?;
     status()
 }
@@ -880,6 +1240,102 @@ pub fn set_computer_use(enabled: bool) -> Result<ClaudeLocalizationStatus> {
     settings.claude_app_computer_use = enabled;
     store.save(&settings)?;
     status()
+}
+
+fn bash_timeout_settings() -> crate::settings::ClaudeBashTimeoutSettings {
+    crate::settings::SettingsStore::default()
+        .load()
+        .map(|settings| settings.claude_app_bash_timeout)
+        .unwrap_or_default()
+}
+
+pub fn set_bash_timeout(
+    mut timeout: crate::settings::ClaudeBashTimeoutSettings,
+) -> Result<ClaudeLocalizationStatus> {
+    timeout.normalize();
+    let store = crate::settings::SettingsStore::default();
+    let mut settings = store.load()?;
+    settings.claude_app_bash_timeout = timeout;
+    store.save(&settings)?;
+    status()
+}
+
+const BASH_PENDING_MESSAGE: &str = "已准备，暂未确认。将在增强版启动后自动确认。";
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeBashTimeoutStatus {
+    pub warning: Option<String>,
+    pub pending: bool,
+}
+
+/// 轮询只读状态文件，不重复探测 Claude、Node 或 PowerShell。
+pub fn bash_timeout_status() -> ClaudeBashTimeoutStatus {
+    bash_timeout_status_at(
+        &runtime_dir().join("operation.log"),
+        &bash_timeout_settings(),
+    )
+}
+
+fn bash_timeout_status_at(
+    report: &Path,
+    settings: &crate::settings::ClaudeBashTimeoutSettings,
+) -> ClaudeBashTimeoutStatus {
+    if !settings.enabled || (!settings.default_enabled && !settings.max_enabled) {
+        return ClaudeBashTimeoutStatus::default();
+    }
+    let text = fs::read_to_string(report).unwrap_or_default();
+    let logged_id = text
+        .lines()
+        .find_map(|line| line.strip_prefix("CODEX_PLUS_CLAUDE_BASH_LAUNCH="));
+    let root = report.parent().unwrap_or_else(|| Path::new("."));
+    let launch = fs::read(root.join("bash-timeout-launch.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let launch_id = launch
+        .as_ref()
+        .and_then(|value| value.get("launchId"))
+        .and_then(Value::as_str)
+        .or(logged_id)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok());
+    let live = launch_id.and_then(|id| {
+        let value: Value =
+            serde_json::from_slice(&fs::read(root.join(format!("bash-timeout-{id}.json"))).ok()?)
+                .ok()?;
+        (value.get("launchId")?.as_str()? == id.to_string())
+            .then(|| value.get("result").cloned())
+            .flatten()
+    });
+    let result = live.or_else(|| {
+        // 兼容旧启动器的快照；新启动的快照必须属于本次 launchId。
+        if launch_id.is_some_and(|id| logged_id != Some(id.to_string().as_str())) {
+            return None;
+        }
+        text.lines()
+            .rev()
+            .find_map(|line| line.strip_prefix("CODEX_PLUS_CLAUDE_BASH_RESULT="))
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+    });
+    if let Some(error) = result
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(Value::as_str)
+    {
+        return ClaudeBashTimeoutStatus {
+            warning: Some(error.to_string()),
+            pending: false,
+        };
+    }
+    if result.as_ref().is_some_and(|value| {
+        value.get("prepared").and_then(Value::as_bool) == Some(true)
+            && value.get("loaded").and_then(Value::as_bool) == Some(true)
+    }) {
+        return ClaudeBashTimeoutStatus::default();
+    }
+    ClaudeBashTimeoutStatus {
+        warning: Some(BASH_PENDING_MESSAGE.to_string()),
+        pending: true,
+    }
 }
 
 pub fn set_localization(enabled: bool) -> Result<ClaudeLocalizationStatus> {
@@ -940,6 +1396,23 @@ fn hidden_script_command(program: &Path) -> Command {
     command
 }
 
+fn merged_plugin_dirs(
+    existing: Option<&std::ffi::OsStr>,
+    plugin: &Path,
+) -> Result<std::ffi::OsString> {
+    ensure!(plugin.is_absolute(), "Claude 拓展插件路径必须是绝对路径");
+    let mut paths: Vec<PathBuf> = existing
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect();
+    if !paths.iter().any(|path| path == plugin) {
+        paths.push(plugin.to_path_buf());
+    }
+    std::env::join_paths(paths).context("无法合并 Claude 拓展插件路径")
+}
+
 fn run_script(
     program: &Path,
     script: &str,
@@ -950,11 +1423,46 @@ fn run_script(
 ) -> Result<()> {
     let root = runtime_dir();
     let log = root.join("operation.log");
-    let output = fs::File::create(&log)?;
+    let mut output = fs::File::create(&log)?;
     // 只隐藏脚本宿主，不给 Claude 本身加 WindowStyle Hidden，否则会破坏注入。
     let mut command = hidden_script_command(program);
     if cfg!(target_os = "windows") && script.ends_with(".ps1") {
         command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+    }
+    if script.starts_with("inject-cn.") {
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        fs::write(
+            root.join("bash-timeout-launch.json"),
+            serde_json::to_vec(&json!({ "launchId": launch_id }))?,
+        )?;
+        std::io::Write::write_all(
+            &mut output,
+            format!("CODEX_PLUS_CLAUDE_BASH_LAUNCH={launch_id}\n").as_bytes(),
+        )?;
+        command
+            .env("CODEX_PLUS_CLAUDE_BASH_LAUNCH_ID", &launch_id)
+            .env(
+                "CODEX_PLUS_CLAUDE_BASH_REPORT_FILE",
+                root.join(format!("bash-timeout-{launch_id}.json")),
+            );
+        let timeout = bash_timeout_settings();
+        command.env(
+            "CODEX_PLUS_CLAUDE_BASH_TIMEOUT",
+            serde_json::to_string(&timeout)?,
+        );
+        for (key, value) in timeout.environment() {
+            command.env(key, value);
+        }
+        if extensions_enabled() {
+            let plugin = crate::extension_claude::prepare_managed_plugin()?;
+            command.env(
+                "CLAUDE_CODE_PLUGIN_DIRS",
+                merged_plugin_dirs(
+                    std::env::var_os("CLAUDE_CODE_PLUGIN_DIRS").as_deref(),
+                    &plugin,
+                )?,
+            );
+        }
     }
     let mut child = command
         .arg(root.join(script))
@@ -1115,66 +1623,66 @@ pub fn perform_with_progress(
                 find_runtime("node", Instant::now() + STATUS_TIMEOUT)?.is_some(),
                 "需要带有内置 WebSocket 的 Node.js 22 或更新版本才能中文启动"
             );
-            if cfg!(target_os = "windows") && windows_msix_source(&source) {
-                fs::write(
-                    root.join("prepared.json"),
-                    serde_json::to_vec(&json!({
-                        "sourceBuild": app_version(&source, "ProductVersion", Instant::now() + STATUS_TIMEOUT)?,
-                        "msix": true
-                    }))?,
-                )?;
-                "已检测到 Windows MSIX 版 Claude；保留官方包不变，使用启动注入。".to_string()
+            // MSIX 与普通安装同走副本流程：复制到状态目录、打开 inspect fuse、校验后替换（#2818）。
+            let msix = windows_msix_source(&source);
+            windows_prepare_preflight(&source)?;
+            let staged = staged_copy_path(&format!("Claude-staging-{}", uuid::Uuid::new_v4()));
+            let script = if cfg!(target_os = "windows") {
+                "build-copy.ps1"
             } else {
-                let staged = staged_copy_path(&format!("Claude-staging-{}", uuid::Uuid::new_v4()));
-                let script = if cfg!(target_os = "windows") {
-                    "build-copy.ps1"
-                } else {
-                    "build-copy.py"
-                };
-                progress(2, "准备增强版目录");
-                run_script(&script_runtime, script, &source, &staged, &[], progress)?;
-                progress(92, "校验增强版");
-                run_script(
-                    &script_runtime,
-                    script,
-                    &source,
-                    &staged,
-                    &["--check"],
-                    progress,
-                )?;
-                // 校验通过后才替换；旧副本保留，构建失败时不会影响它。
-                let old = staged_copy_path(&format!("Claude-backup-{}", uuid::Uuid::new_v4()));
-                replace_copy(AppLayout::current(), &staged, &copy, &old)?;
-                fs::write(
-                    root.join("prepared.json"),
-                    serde_json::to_vec(&json!({
-                        "sourceBuild": app_version(&source, "CFBundleVersion", Instant::now() + STATUS_TIMEOUT)?,
-                        "computerUse": computer_use_enabled()
-                    }))?,
-                )?;
+                "build-copy.py"
+            };
+            progress(2, "准备增强版目录");
+            run_script(&script_runtime, script, &source, &staged, &[], progress)?;
+            // Windows 的 fuse 由这里改写（PowerShell 逐字节扫描 exe 太慢），改完立即复核。
+            windows_copy_inspect_fuse(&staged, true)?;
+            // 新版 Claude 的本地界面打包成 ion-dist.asar：Windows 由这里改写（#2884）。
+            windows_packed_ion(&staged, true)?;
+            progress(92, "校验增强版");
+            run_script(
+                &script_runtime,
+                script,
+                &source,
+                &staged,
+                &["--check"],
+                progress,
+            )?;
+            windows_copy_inspect_fuse(&staged, false)?;
+            windows_packed_ion(&staged, false)?;
+            // 校验通过后才替换；旧副本保留，构建失败时不会影响它。
+            let old = staged_copy_path(&format!("Claude-backup-{}", uuid::Uuid::new_v4()));
+            replace_copy(AppLayout::current(), &staged, &copy, &old)?;
+            let mut receipt = json!({
+                "sourceBuild": app_version(&source, "CFBundleVersion", Instant::now() + STATUS_TIMEOUT)?,
+                "computerUse": computer_use_enabled()
+            });
+            if msix {
+                receipt["msix"] = Value::Bool(true);
+            }
+            fs::write(root.join("prepared.json"), serde_json::to_vec(&receipt)?)?;
+            if msix {
+                "已从 Windows 商店版 Claude 复制出增强版并打开调试开关，官方包未修改。".to_string()
+            } else {
                 "增强版已制作，签名与 app.asar 校验通过。".to_string()
             }
         }
         "check" => {
-            if cfg!(target_os = "windows") && windows_msix_source(&source) {
-                ensure!(source.exists(), "未找到 Claude MSIX 安装入口");
-                "Windows MSIX 安装入口已检测到，采用原版包启动注入。".to_string()
+            let script = if cfg!(target_os = "windows") {
+                "build-copy.ps1"
             } else {
-                let script = if cfg!(target_os = "windows") {
-                    "build-copy.ps1"
-                } else {
-                    "build-copy.py"
-                };
-                run_script(
-                    &script_runtime,
-                    script,
-                    &source,
-                    &copy,
-                    &["--check"],
-                    &|_, _| {},
-                )?;
-                "副本签名、中文词表、注入开关及 app.asar 一致性校验通过。".to_string()
-            }
+                "build-copy.py"
+            };
+            run_script(
+                &script_runtime,
+                script,
+                &source,
+                &copy,
+                &["--check"],
+                &|_, _| {},
+            )?;
+            windows_copy_inspect_fuse(&copy, false)?;
+            windows_packed_ion(&copy, false)?;
+            "副本签名、中文词表、注入开关及 app.asar 一致性校验通过。".to_string()
         }
         "launch" | "restore" => {
             let launcher = if cfg!(target_os = "windows") {
@@ -1183,21 +1691,22 @@ pub fn perform_with_progress(
                 find_runtime("node", Instant::now() + STATUS_TIMEOUT)?
                     .context("未找到带内置 WebSocket 的 Node.js 22 或更新版本")?
             };
-            if !(cfg!(target_os = "windows") && windows_msix_source(&source)) {
-                let script = if cfg!(target_os = "windows") {
-                    "build-copy.ps1"
-                } else {
-                    "build-copy.py"
-                };
-                run_script(
-                    &script_runtime,
-                    script,
-                    &source,
-                    &copy,
-                    &["--check"],
-                    &|_, _| {},
-                )?;
-            }
+            let script = if cfg!(target_os = "windows") {
+                "build-copy.ps1"
+            } else {
+                "build-copy.py"
+            };
+            run_script(
+                &script_runtime,
+                script,
+                &source,
+                &copy,
+                &["--check"],
+                &|_, _| {},
+            )?;
+            // 启动前确认副本的 inspect fuse 是开的，不再等 45 秒才报「inspector 没有启动」。
+            windows_copy_inspect_fuse(&copy, false)?;
+            windows_packed_ion(&copy, false)?;
             // 所有候选配置逐个处理（Windows 上官方版与商店版各有一份，见 #2616）。
             let configs = config_paths();
             let previous = current_locales(&configs)?;
@@ -1267,8 +1776,9 @@ pub fn perform_with_progress(
         }
         _ => unreachable!(),
     };
+    let state = status()?;
     Ok(ClaudeLocalizationResult {
-        status: status()?,
+        status: state,
         message,
     })
 }
@@ -1276,6 +1786,28 @@ pub fn perform_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_plugin_dirs_preserve_existing_paths_and_do_not_duplicate_managed_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("another plugin");
+        let plugin = dir.path().join("codexpp");
+        let existing = std::env::join_paths([&first]).unwrap();
+        let merged = merged_plugin_dirs(Some(&existing), &plugin).unwrap();
+        assert_eq!(
+            std::env::split_paths(&merged).collect::<Vec<_>>(),
+            vec![first, plugin.clone()]
+        );
+        assert_eq!(merged_plugin_dirs(Some(&merged), &plugin).unwrap(), merged);
+        assert_eq!(
+            std::env::split_paths(
+                &merged_plugin_dirs(Some(std::ffi::OsStr::new("")), &plugin).unwrap()
+            )
+            .collect::<Vec<_>>(),
+            vec![plugin],
+        );
+        assert!(merged_plugin_dirs(None, Path::new("relative-plugin")).is_err());
+    }
 
     /// Windows 上 Claude 的 config.json 带 UTF-8 BOM 时也能读、能汉化（#2728）。
     #[test]
@@ -1287,6 +1819,111 @@ mod tests {
         localize_configs(&[config.clone()], "zh-Hans").unwrap();
         assert_eq!(read_config(&config).unwrap()["locale"], "zh-Hans");
         assert_eq!(read_config(&config).unwrap()["other"], 1);
+    }
+
+    #[test]
+    fn optional_cowork_report_preserves_failure_and_unknown_without_failing_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("operation.log");
+        let mut settings = crate::settings::ClaudeBashTimeoutSettings::default();
+        assert!(bash_timeout_status_at(&report, &settings).warning.is_none());
+        settings.enabled = true;
+        assert!(
+            bash_timeout_status_at(&report, &settings)
+                .warning
+                .unwrap()
+                .contains("暂未确认")
+        );
+        fs::write(&report, "CODEX_PLUS_CLAUDE_BASH_RESULT={\"prepared\":false,\"error\":\"unsupported workspace\"}\nlaunch complete").unwrap();
+        assert_eq!(
+            bash_timeout_status_at(&report, &settings)
+                .warning
+                .as_deref(),
+            Some("unsupported workspace")
+        );
+        fs::write(
+            &report,
+            "CODEX_PLUS_CLAUDE_BASH_RESULT={\"prepared\":true,\"loaded\":false}\nlaunch complete",
+        )
+        .unwrap();
+        assert_eq!(
+            bash_timeout_status_at(&report, &settings)
+                .warning
+                .as_deref(),
+            Some(BASH_PENDING_MESSAGE)
+        );
+        fs::write(
+            &report,
+            "CODEX_PLUS_CLAUDE_BASH_RESULT={\"prepared\":true}\nlaunch complete",
+        )
+        .unwrap();
+        assert_eq!(
+            bash_timeout_status_at(&report, &settings)
+                .warning
+                .as_deref(),
+            Some(BASH_PENDING_MESSAGE)
+        );
+        fs::write(
+            &report,
+            "CODEX_PLUS_CLAUDE_BASH_RESULT={\"prepared\":true,\"loaded\":true}\nlaunch complete",
+        )
+        .unwrap();
+        assert!(bash_timeout_status_at(&report, &settings).warning.is_none());
+        fs::write(&report, b"not json").unwrap();
+        assert!(bash_timeout_status_at(&report, &settings).warning.is_some());
+        settings.default_enabled = false;
+        settings.max_enabled = false;
+        assert!(bash_timeout_status_at(&report, &settings).warning.is_none());
+    }
+
+    #[test]
+    fn bash_confirmation_is_live_and_scoped_to_each_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("operation.log");
+        let marker = dir.path().join("bash-timeout-launch.json");
+        let settings = crate::settings::ClaudeBashTimeoutSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let old = uuid::Uuid::new_v4();
+        let current = uuid::Uuid::new_v4();
+        fs::write(
+            &marker,
+            json!({ "launchId": current.to_string() }).to_string(),
+        )
+        .unwrap();
+        fs::write(&report, format!("CODEX_PLUS_CLAUDE_BASH_LAUNCH={old}\nCODEX_PLUS_CLAUDE_BASH_RESULT={{\"prepared\":true,\"loaded\":true}}\n")).unwrap();
+        assert!(
+            bash_timeout_status_at(&report, &settings).pending,
+            "上次成功不能替本次确认"
+        );
+        let receipt = dir.path().join(format!("bash-timeout-{current}.json"));
+        fs::write(&receipt, json!({ "launchId": current.to_string(), "result": { "prepared": true, "loaded": false } }).to_string()).unwrap();
+        assert!(bash_timeout_status_at(&report, &settings).pending);
+        fs::write(&receipt, json!({ "launchId": current.to_string(), "result": { "prepared": true, "loaded": true } }).to_string()).unwrap();
+        let confirmed = bash_timeout_status_at(&report, &settings);
+        assert!(!confirmed.pending && confirmed.warning.is_none());
+        fs::write(&report, "copy integrity check passed").unwrap();
+        assert!(
+            bash_timeout_status_at(&report, &settings).warning.is_none(),
+            "检查副本不能抹掉确认结果"
+        );
+        fs::write(
+            &receipt,
+            json!({ "launchId": old.to_string(), "result": { "prepared": true, "loaded": true } })
+                .to_string(),
+        )
+        .unwrap();
+        assert!(
+            bash_timeout_status_at(&report, &settings).pending,
+            "错误启动标识不能取消提示"
+        );
+        fs::write(&receipt, b"partial json").unwrap();
+        assert!(bash_timeout_status_at(&report, &settings).pending);
+        fs::write(&receipt, json!({ "launchId": current.to_string(), "result": { "error": "unsupported workspace" } }).to_string()).unwrap();
+        let failed = bash_timeout_status_at(&report, &settings);
+        assert!(!failed.pending);
+        assert_eq!(failed.warning.as_deref(), Some("unsupported workspace"));
     }
 
     #[test]
@@ -1325,6 +1962,290 @@ mod tests {
         }
     }
 
+    /// 拼一段带 fuse 表的假可执行文件：前后填充无关字节，fuse 值按字符串给出。
+    fn fake_electron_binary(flags: &str) -> Vec<u8> {
+        let mut bytes = b"MZ padding before fuse".to_vec();
+        bytes.extend_from_slice(ELECTRON_FUSE_SENTINEL);
+        bytes.push(1); // fuse 表版本
+        bytes.push(flags.len() as u8);
+        bytes.extend_from_slice(flags.as_bytes());
+        bytes.extend_from_slice(b"trailing bytes");
+        bytes
+    }
+
+    /// #2818 报告里 MSIX 版 4.4212.0 的 fuse 为 010011011：第 4 位 inspect 关闭。
+    #[test]
+    fn msix_claude_fuse_from_issue_is_read_as_inspect_disabled_and_can_be_enabled() {
+        let mut bytes = fake_electron_binary("010011011");
+        assert_eq!(inspect_fuse_state(&bytes).unwrap(), InspectFuse::Disabled);
+        let changed = enable_inspect_fuse(&mut bytes).unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(inspect_fuse_state(&bytes).unwrap(), InspectFuse::Enabled);
+        // 只动 inspect 这一位，其他 fuse（含 asar 完整性校验）保持原样。
+        assert_eq!(bytes, fake_electron_binary("010111011"));
+        // 已打开时不再改写。
+        assert!(enable_inspect_fuse(&mut bytes).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inspect_fuse_requires_every_valid_table_and_rejects_changed_formats() {
+        // 多架构拼接时有多处 fuse 表，必须全部打开才算打开。
+        let mut bytes = fake_electron_binary("0101");
+        bytes.extend(fake_electron_binary("0100"));
+        assert_eq!(inspect_fuse_offsets(&bytes).len(), 2);
+        assert_eq!(inspect_fuse_state(&bytes).unwrap(), InspectFuse::Disabled);
+        assert_eq!(enable_inspect_fuse(&mut bytes).unwrap().len(), 1);
+        assert_eq!(inspect_fuse_state(&bytes).unwrap(), InspectFuse::Enabled);
+        // 其他位已移除（'r'）不影响；inspect 位本身被移除或格式异常时视为找不到。
+        assert_eq!(
+            inspect_fuse_state(&fake_electron_binary("r1r0r")).unwrap(),
+            InspectFuse::Disabled
+        );
+        for broken in ["010r1", "010", "01x01"] {
+            assert!(
+                inspect_fuse_state(&fake_electron_binary(broken)).is_err(),
+                "{broken}"
+            );
+        }
+        assert!(inspect_fuse_state(b"no fuse here").is_err());
+        // 标记出现在文件末尾、长度字节被截断时不能越界。
+        let mut truncated = b"xx".to_vec();
+        truncated.extend_from_slice(ELECTRON_FUSE_SENTINEL);
+        truncated.push(1);
+        assert!(inspect_fuse_offsets(&truncated).is_empty());
+    }
+
+    /// #2884：副本只有 ion-dist.asar 时改写它、关掉 asar 完整性 fuse，并能通过复核。
+    #[test]
+    fn packed_ion_copy_is_localized_and_integrity_fuse_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("Claude.exe");
+        fs::write(&exe, fake_electron_binary("010111011")).unwrap();
+        // 没有 ion-dist.asar 时什么都不做。
+        assert!(packed_ion_asar(&exe).is_none());
+        localize_packed_ion_copy(&exe).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), fake_electron_binary("010111011"));
+
+        let resources = dir.path().join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let js = r#"x=["en-US","de-DE","fr-FR","ko-KR","ja-JP","es-419","es-ES","it-IT","hi-IN","pt-BR","id-ID"]"#;
+        fs::write(
+            resources.join("ion-dist.asar"),
+            crate::claude_ion_asar::build_test_asar(&[
+                ("assets/a.js", js.as_bytes()),
+                ("i18n/en-US.json", b"{}"),
+                ("index.html", b"<html><head></head></html>"),
+            ]),
+        )
+        .unwrap();
+        assert!(
+            verify_packed_ion_copy(&exe).is_err(),
+            "未汉化的副本不能通过复核"
+        );
+        localize_packed_ion_copy(&exe).unwrap();
+        // 只关第 4 位（asar 完整性），inspect 等其他位不动。
+        assert_eq!(fs::read(&exe).unwrap(), fake_electron_binary("010101011"));
+        verify_packed_ion_copy(&exe).unwrap();
+        // #2943：ion-dist 目录只有占位 index.html（没有 assets 脚本）时仍走 asar。
+        fs::create_dir_all(resources.join("ion-dist")).unwrap();
+        fs::write(
+            resources.join("ion-dist").join("index.html"),
+            "<head></head>",
+        )
+        .unwrap();
+        assert_eq!(packed_ion_asar(&exe), Some(resources.join("ion-dist.asar")));
+        // 目录形态的老版本（目录里有真实界面脚本）不走这里。
+        fs::create_dir_all(resources.join("ion-dist/assets/chunks")).unwrap();
+        fs::write(resources.join("ion-dist/assets/chunks/a.js"), js).unwrap();
+        assert!(packed_ion_asar(&exe).is_none());
+    }
+
+    /// #2943：macOS 走 build-copy.py。占位 ion-dist 目录 + 真 ion-dist.asar 时要选 asar；
+    /// 目录里有真实界面时保持原行为走目录。直接调用脚本里的 `ion_asar_for`，机器上没有 python3 时跳过。
+    #[test]
+    fn build_copy_py_prefers_asar_over_placeholder_ion_dir() {
+        let Some(python) = find_runtime("python3", Instant::now() + Duration::from_secs(5))
+            .expect("Python runtime discovery")
+        else {
+            return;
+        };
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/claude-localization/build-copy.py");
+        let probe = r#"
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("build_copy", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+found = module.ion_asar_for(pathlib.Path(sys.argv[2]))
+print(found.name if found else "dir")
+"#;
+        let run = |app: &Path| -> Option<String> {
+            let output = std::process::Command::new(&python)
+                .arg("-B")
+                .arg("-I")
+                .arg("-c")
+                .arg(probe)
+                .arg(&script)
+                .arg(app)
+                .output()
+                .ok()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("Claude.app");
+        let resources = app.join("Contents/Resources");
+        fs::create_dir_all(resources.join("ion-dist")).unwrap();
+        fs::write(resources.join("ion-dist/index.html"), "<head></head>").unwrap();
+        fs::write(resources.join("ion-dist.asar"), b"asar").unwrap();
+        let Some(placeholder) = run(&app) else {
+            return;
+        };
+        assert_eq!(placeholder, "ion-dist.asar");
+        // 两边都有真实内容时保持原行为：走目录。
+        fs::create_dir_all(resources.join("ion-dist/assets")).unwrap();
+        fs::write(resources.join("ion-dist/assets/index.js"), "x").unwrap();
+        assert_eq!(run(&app).unwrap(), "dir");
+        // 只有占位目录、没有 asar 时也走目录（随后照旧报不兼容）。
+        fs::remove_file(resources.join("ion-dist/assets/index.js")).unwrap();
+        fs::remove_file(resources.join("ion-dist.asar")).unwrap();
+        assert_eq!(run(&app).unwrap(), "dir");
+    }
+
+    #[test]
+    fn enabling_inspect_fuse_on_copy_file_only_touches_the_fuse_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("Claude.exe");
+        fs::write(&exe, fake_electron_binary("010011011")).unwrap();
+        assert!(enable_inspect_fuse_file(&exe).unwrap());
+        assert_eq!(fs::read(&exe).unwrap(), fake_electron_binary("010111011"));
+        // 第二次准备（版本未变）不重复写。
+        assert!(!enable_inspect_fuse_file(&exe).unwrap());
+        fs::write(&exe, b"not electron").unwrap();
+        assert!(
+            enable_inspect_fuse_file(&exe)
+                .unwrap_err()
+                .to_string()
+                .contains("找不到 Electron fuse")
+        );
+    }
+
+    #[test]
+    fn msix_alias_is_not_copied_but_packaged_exe_is() {
+        assert!(is_claude_msix_alias(Path::new(
+            r"C:\Users\test\AppData\Local\Microsoft\WindowsApps\claude-desktop.exe"
+        )));
+        assert!(is_claude_msix_alias(Path::new(
+            r"C:\Users\test\AppData\Local\Microsoft\WindowsApps\Claude_pzs8sxrjxfjjc\claude-desktop.exe"
+        )));
+        let packaged = r"C:\Program Files\WindowsApps\AnthropicPBC.Claude_4.4212.0.0_x64__fnn82j28hfe8t\app\Claude.exe";
+        assert!(is_claude_msix_path(Path::new(packaged)));
+        assert!(!is_claude_msix_alias(Path::new(packaged)));
+        assert!(!is_claude_msix_alias(Path::new(
+            r"C:\Users\test\AppData\Local\Programs\Claude\Claude.exe"
+        )));
+    }
+
+    #[test]
+    fn unreadable_windowsapps_source_explains_cause_and_next_step() {
+        let copy_root = Path::new("state/claude-localization/Claude Enhanced");
+        let source = Path::new(
+            r"C:\Program Files\WindowsApps\AnthropicPBC.Claude_4.4212.0.0_x64__fnn82j28hfe8t\app\Claude.exe",
+        );
+        let denied = source_read_error_message(
+            source,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            copy_root,
+        );
+        for needle in [
+            "没有读取权限",
+            "WindowsApps",
+            "调试开关",
+            "Claude Enhanced",
+            "同一个 Windows 账户",
+        ] {
+            assert!(denied.contains(needle), "{needle}: {denied}");
+        }
+        let missing = source_read_error_message(
+            source,
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+            copy_root,
+        );
+        assert!(missing.contains("找不到") && missing.contains("重新「制作增强版」"));
+        let dir = tempfile::tempdir().unwrap();
+        let error = ensure_source_readable(&dir.path().join("Claude.exe"), copy_root)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("找不到 Claude 安装文件"), "{error}");
+        let readable = dir.path().join("app.asar");
+        fs::write(&readable, b"asar").unwrap();
+        ensure_source_readable(&readable, copy_root).unwrap();
+    }
+
+    #[test]
+    fn inspect_fuse_disabled_message_says_why_and_what_to_do() {
+        for needle in [
+            "EnableNodeCliInspectArguments",
+            "--inspect",
+            "更新副本",
+            "operation.log",
+        ] {
+            assert!(INSPECT_FUSE_DISABLED_MESSAGE.contains(needle), "{needle}");
+        }
+        let inject = std::str::from_utf8(
+            ASSETS
+                .iter()
+                .find(|(name, _)| *name == "inject-cn.ps1")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert!(!inject.contains("可能禁用了 Electron 调试参数"));
+        assert!(
+            inject.contains("$proc.HasExited") && inject.contains("EnableNodeCliInspectArguments")
+        );
+        // MSIX 不再直接启动 WindowsApps 里的官方 exe，而是复制后由 Rust 打开 fuse。
+        let build = std::str::from_utf8(
+            ASSETS
+                .iter()
+                .find(|(name, _)| *name == "build-copy.ps1")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert!(!build.contains("Patch-Fuse"));
+        assert!(build.contains("WindowsApps"));
+    }
+
+    /// 老的 MSIX 回执（`{"sourceBuild":..,"msix":true}`）配合新版本号应判为需要更新。
+    #[test]
+    fn msix_receipt_is_cached_per_source_build() {
+        let receipt = json!({ "sourceBuild": "4.29.0", "msix": true });
+        assert!(copy_needs_rebuild(
+            true,
+            Some(&receipt),
+            "4.4212.0",
+            "4.29.0",
+            "4.4212.0",
+            false,
+            false
+        ));
+        let receipt = json!({ "sourceBuild": "4.4212.0", "computerUse": false, "msix": true });
+        assert!(!copy_needs_rebuild(
+            true,
+            Some(&receipt),
+            "4.4212.0",
+            "4.4212.0",
+            "4.4212.0",
+            false,
+            false
+        ));
+    }
+
     #[test]
     fn catalog_entries_come_from_the_chinese_catalog() {
         // 曾经用 ASSETS[7] 取词表：往资产清单里插一个文件就让下标整体错位，
@@ -1349,8 +2270,12 @@ mod tests {
             catalog_entries: 0,
             voice_input: true,
             localization: true,
+            extensions: false,
             computer_use: false,
             computer_use_supported: cfg!(target_os = "macos"),
+            bash_timeout: Default::default(),
+            bash_timeout_warning: None,
+            bash_timeout_pending: false,
         }
     }
 
@@ -1561,6 +2486,13 @@ mod tests {
         fs::write(&marker, b"started").unwrap();
         std::thread::sleep(Duration::from_millis(900));
         fs::write(marker, b"not killed").unwrap();
+    }
+
+    #[test]
+    fn probe_limits_leave_room_for_a_cold_powershell_start() {
+        // #2831：Windows PowerShell 冷启动加载 Appx 模块要好几秒，上限太紧就会一直报检测超时。
+        assert!(PROBE_TIMEOUT >= Duration::from_secs(10));
+        assert!(STATUS_TIMEOUT >= PROBE_TIMEOUT * 3);
     }
 
     #[test]

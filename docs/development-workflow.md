@@ -1,6 +1,10 @@
 # Windows 日常修改、快速验证与缓存管理
 
-本 fork 基于正式 v2.0.0，使用 PowerShell 7、现有 Rust 工具链、Node 24+ 和已安装的项目依赖。日常修改先跑受影响范围；准备交付时再运行一次[后台发布](release-workflow.md)。纯文档修改无需编译产品。
+本 fork 当前源码整合目标为正式 v2.3.1，是否已交付以成功的 release job 为准；使用 PowerShell 7、现有 Rust 工具链、Node 24+ 和已安装的项目依赖。日常修改先跑受影响范围；准备交付时再运行一次[后台发布](release-workflow.md)。纯文档修改无需编译产品。
+
+开发阶段只做必要的定向验证，完整测试统一留给一次后台发布任务。流程固定为「全部检查及测试通过 → 前端构建 → 正式 Release 编译 → 核对交付」；全通过后自动前进，不需要再次放行，也不在正式编译阶段重复测试。`cargo test` 编译的是测试程序，应在进度中明确说明。发布期间保留缓存并冻结输入，不因耗时重新启动任务。详细阶段与监视规范见[测试与编译的固定交接](release-workflow.md#测试与编译的固定交接)。
+
+发布启动后继续跟踪至交付核对完成，不能以“已提交后台任务”结束。检查和测试期间及时检查失败；正式优化、链接阶段每次等待 45–60 秒后核对状态和进程活动，正常耗时不重启、不清缓存。失败时记录步骤、退出码和日志，确认旧编译进程退出后修复，按新输入启动唯一任务并继续跟踪。只有任务 succeeded 且产物、备份及目标哈希核对通过，才报告构建交付完成；用户重启和界面验收单独说明。
 
 ## 按改动选择最小验证
 
@@ -20,10 +24,10 @@ cargo check -p codex-plus-core --lib
 # 数据层改动时换成这个，不必重复跑无关 crate
 cargo check -p codex-plus-data --lib
 
-# 以本轮网关谱系为例，过滤到相关单元测试
-cargo test -p codex-plus-core --lib gateway::codex_routing -- --test-threads=1
+# 网关选路采用上游，验证 helper 到模拟上游的真实请求链
+cargo test -p codex-plus-core --test gateway_e2e -- --test-threads=1
 # 只有修改协作接入时才选此集成测试目标
-cargo test -p codex-plus-core --test agent_collaboration_integration -- --test-threads=1
+cargo test -p codex-plus-core --test all agent_collaboration_integration:: -- --test-threads=1
 ```
 
 测试名称过滤只减少执行范围；所选测试程序仍需编译。`--lib` 和 `--test <目标>` 可以避免无关集成测试程序的编译与链接。共享路径集成测试保持单线程。无需反复运行已经通过且不受后续改动影响的检查。
@@ -54,6 +58,8 @@ debug 同时容纳依赖、符号、增量缓存和多个测试程序；独立 w
 
 ## 可选：减少开发符号体积
 
+本轮后续同步已吸纳上游 `5e1d8c1e`：Cargo.toml 默认让开发/测试构建仅保留行号表，依赖不带调试符号；Release 的 fat LTO 等设置保持原样。优先复用这一默认配置，不需要每个终端再设置变量。本轮已同步上游测试程序合并，主集成目标为 `--test all`；独立进程边界用例保留原测试目标。
+
 需要持续节省空间时，可在专用开发 PowerShell 窗口先设置：
 
 ```powershell
@@ -62,7 +68,7 @@ $env:CARGO_PROFILE_TEST_DEBUG = '0'
 # 然后运行上方所需的 cargo check / cargo test
 ```
 
-这只减少开发和测试的调试符号，不改变 Release 优化。代价是原生调试、崩溃定位可用的信息减少；切换设置会使相关缓存失效，首次仍需重建。统一保留同一组设置才有复用收益；遇到需调试崩溃时恢复符号。增量编译继续使用 Cargo 默认值，不为省空间默认关闭。本文没有修改 Cargo.toml、全局环境或发布脚本，也未实测这组设置的速度或空间收益。
+这会进一步去掉开发和测试的行号信息，不改变 Release 优化。代价是原生调试、崩溃定位可用的信息减少；切换设置会使相关缓存失效，首次仍需重建。统一保留同一组设置才有复用收益；遇到需单步查看变量时可在专用开发窗口设置 `CARGO_PROFILE_DEV_DEBUG=2` 和 `CARGO_PROFILE_TEST_DEBUG=2`。增量编译继续使用 Cargo 默认值，不为省空间默认关闭。没有修改全局环境或发布脚本，也不把上游 A/B 数据当作本机提速结果。
 
 关闭该开发窗口即可撤销临时变量。启动正式发布前使用普通窗口，避免临时设置被后台进程继承。不要在开发窗口内调整 Release 环境变量来绕过正式优化要求。
 

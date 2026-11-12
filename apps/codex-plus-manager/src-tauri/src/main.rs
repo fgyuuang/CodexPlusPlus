@@ -2,6 +2,22 @@
 
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--codex-plus-migrate-official-pool")
+    {
+        match codex_plus_core::gateway::official_accounts::migrate_inactive_pool() {
+            Ok(added) => println!(
+                "{}",
+                serde_json::json!({"state":"succeeded", "added":added, "agentsChanged":false, "loginCopied":false})
+            ),
+            Err(error) => {
+                eprintln!("官方账号池迁移失败：{error:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     // MCP 是独立 stdio 进程，必须在 GUI、单实例锁和启动日志之前处理。
     if args.get(1).is_some_and(|arg| arg == "--codex-plus-cu-mcp") {
         if let Err(error) = codex_plus_manager_lib::run_computer_use_mcp() {
@@ -16,6 +32,16 @@ fn main() {
     {
         if let Err(error) = codex_plus_manager_lib::run_browser_use_mcp() {
             eprintln!("浏览器控制 MCP 退出：{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == codex_plus_core::extension_claude::MCP_FLAG)
+    {
+        if let Err(error) = run_claude_extension_mcp(&args[2..]) {
+            eprintln!("Claude 拓展 MCP 退出：{error:#}");
             std::process::exit(1);
         }
         return;
@@ -71,6 +97,47 @@ fn main() {
     {
         if let Err(error) = codex_plus_manager_lib::run_agent_collaboration_mcp(&args[2..]) {
             eprintln!("Agent 协作 MCP 启动失败：{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == codex_plus_core::dsh_plugins::MCP_FLAG)
+    {
+        match codex_plus_core::dsh_plugins::run_mcp(&args[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("dsh 插件 MCP 启动失败：{error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // Codex 钩子分发：拓展在 codexpp.json 里声明的 hooks 都经这一条命令运行，stdout 写合并后的决定。
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == codex_plus_core::extension_hooks::HOOK_FLAG)
+    {
+        let event = args
+            .get(2)
+            .and_then(|arg| arg.to_str())
+            .unwrap_or_default()
+            .to_string();
+        std::process::exit(codex_plus_manager_lib::run_extension_hook(&event));
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == codex_plus_core::extension_backend::HOST_CALL_FLAG)
+    {
+        std::process::exit(codex_plus_manager_lib::run_extension_host_call());
+    }
+    // 旧参数 --codex-plus-plugin-mcp 是改名前接入写下的，重新接入前仍要能启动。
+    if args.get(1).is_some_and(|arg| {
+        arg == codex_plus_core::extension_creator::MCP_FLAG
+            || arg == codex_plus_core::extension_creator::LEGACY_MCP_FLAG
+    }) {
+        if let Err(error) = codex_plus_manager_lib::run_extension_creator_mcp(&args[2..]) {
+            eprintln!("拓展创作 MCP 启动失败：{error:#}");
             std::process::exit(1);
         }
         return;
@@ -131,27 +198,8 @@ fn main() {
             if codex_plus_manager_lib::handle_dream_skin_url(&arg) {
                 codex_plus_manager_lib::focus_existing_manager_window();
             }
-        } else if arg.starts_with("codexplusplus://") {
-            match codex_plus_core::provider_import::save_pending_provider_import_from_url(&arg) {
-                Ok(request) => {
-                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                        "manager.provider_import_url.pending",
-                        serde_json::json!({
-                            "name": request.name,
-                            "baseUrl": request.base_url
-                        }),
-                    );
-                    codex_plus_manager_lib::focus_existing_manager_window();
-                }
-                Err(error) => {
-                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                        "manager.provider_import_url.failed",
-                        serde_json::json!({
-                            "error": error.to_string()
-                        }),
-                    );
-                }
-            }
+        } else if codex_plus_manager_lib::handle_provider_import_url(&arg) {
+            codex_plus_manager_lib::focus_existing_manager_window();
         }
     }
     if std::env::args().any(|arg| arg == "--show-update") {
@@ -174,9 +222,88 @@ fn should_skip_autostart(args: impl IntoIterator<Item = String>, disabled: bool)
     disabled && args.into_iter().any(|arg| arg == "--autostart")
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClaudeExtensionOptions {
+    state_dir: Option<std::path::PathBuf>,
+    settings_path: Option<std::path::PathBuf>,
+}
+
+fn claude_extension_options(args: &[std::ffi::OsString]) -> anyhow::Result<ClaudeExtensionOptions> {
+    let mut options = ClaudeExtensionOptions::default();
+    let mut args = args.chunks_exact(2);
+    for pair in &mut args {
+        let target = match pair[0].to_str() {
+            Some("--state-dir") => &mut options.state_dir,
+            Some("--settings-path") => &mut options.settings_path,
+            _ => anyhow::bail!("Claude 拓展 MCP 仅接受 --state-dir 与 --settings-path"),
+        };
+        anyhow::ensure!(target.is_none(), "Claude 拓展 MCP 参数不能重复");
+        let path = std::path::PathBuf::from(&pair[1]);
+        anyhow::ensure!(path.is_absolute(), "Claude 拓展 MCP 路径必须是绝对路径");
+        *target = Some(path);
+    }
+    anyhow::ensure!(args.remainder().is_empty(), "Claude 拓展 MCP 参数缺少路径");
+    Ok(options)
+}
+
+fn run_claude_extension_mcp(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
+    let options = claude_extension_options(args)?;
+    if let Some(directory) = options.state_dir {
+        // 独立 stdio 入口尚未启动线程；插件必须使用所属管理器的状态目录。
+        unsafe { std::env::set_var(codex_plus_core::paths::STATE_DIR_ENV, directory) };
+    }
+    codex_plus_core::extension_claude::run_mcp_cli(options.settings_path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_skip_autostart;
+    use super::{ClaudeExtensionOptions, claude_extension_options, should_skip_autostart};
+
+    #[test]
+    fn claude_extension_mcp_rejects_unrecognized_or_relative_arguments() {
+        use std::ffi::OsString;
+        assert_eq!(
+            claude_extension_options(&[]).unwrap(),
+            ClaudeExtensionOptions::default()
+        );
+        for args in [
+            vec!["--state-dir"],
+            vec!["--state-dir", "relative"],
+            vec!["--settings-path", "relative"],
+            vec!["--other", "/tmp"],
+            vec!["--state-dir", "/tmp", "--state-dir", "/tmp"],
+            vec!["--settings-path", "/tmp", "--settings-path", "/tmp"],
+        ] {
+            assert!(
+                claude_extension_options(&args.into_iter().map(OsString::from).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+        let directory = std::env::temp_dir();
+        let settings = directory.join("custom-settings.json");
+        for args in [
+            vec![
+                OsString::from("--state-dir"),
+                directory.as_os_str().to_owned(),
+                OsString::from("--settings-path"),
+                settings.as_os_str().to_owned(),
+            ],
+            vec![
+                OsString::from("--settings-path"),
+                settings.as_os_str().to_owned(),
+                OsString::from("--state-dir"),
+                directory.as_os_str().to_owned(),
+            ],
+        ] {
+            assert_eq!(
+                claude_extension_options(&args).unwrap(),
+                ClaudeExtensionOptions {
+                    state_dir: Some(directory.clone()),
+                    settings_path: Some(settings.clone()),
+                }
+            );
+        }
+    }
 
     #[test]
     fn disabling_login_startup_still_allows_opening_the_gui() {

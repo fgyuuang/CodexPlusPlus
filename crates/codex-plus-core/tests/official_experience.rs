@@ -194,6 +194,7 @@ fn selected_aggregate_exposes_only_members_and_rejects_stale_bindings() {
     settings
         .aggregate_relay_profiles
         .push(AggregateRelayProfile {
+            auto_review_relay_id: String::new(),
             id: "selected-aggregate".to_string(),
             name: "选中聚合".to_string(),
             session_provider: Default::default(),
@@ -583,6 +584,7 @@ async fn aggregate_deepseek_alias_uses_selected_member_and_never_fails_over() {
     ];
     let aggregate_id = "aggregate-test";
     settings.aggregate_relay_profiles = vec![AggregateRelayProfile {
+        auto_review_relay_id: String::new(),
         id: aggregate_id.to_string(),
         name: "selected aggregate".to_string(),
         session_provider: Default::default(),

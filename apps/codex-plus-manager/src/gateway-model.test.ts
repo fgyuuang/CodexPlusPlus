@@ -2,6 +2,13 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  ownPickerSection,
+  visibleOwnModels,
+  defaultProviderAgents,
+  glanceAgents,
+  skippedAgents,
+  isDirectProxy,
+  proxyAddressError,
   agentModels,
   bindingFromDraft,
   blankBinding,
@@ -9,6 +16,7 @@ import {
   dispatchStatus,
   draftFromBinding,
   formatRemaining,
+  keyLabel,
   activeSponsorIds,
   gatewayPresets,
   groupModelId,
@@ -19,6 +27,11 @@ import {
   prettyModelName,
   modelRoutable,
   parseContextWindow,
+  parseKeyLimit,
+  formatQueueWait,
+  queueWaitMs,
+  foreignCompactionDropped,
+  FOREIGN_COMPACTION_DROPPED_REASON,
   pickerSections,
   presetAdded,
   presetHost,
@@ -30,6 +43,7 @@ import {
   splitModels,
   validateDraft,
   validateProviderDraft,
+  type GatewayAgentView,
   type GatewayPayload,
 } from "./gateway-model.ts";
 
@@ -270,7 +284,18 @@ test("供应商表单：多 Key 每行一个；本机服务预填 Key；编辑�
     price: null,
     modelPrices: null,
     proxy: "",
+    stripImageGenerationTool: false,
+    stripResponsesImageDetail: false,
+    disableToolSearch: false,
   });
+  // #228：「移除托管生图工具」从池条目读回、原样提交。
+  assert.equal(providerDraftFromEntry({ ...payload().pool[0], stripImageGenerationTool: true }).stripImageGenerationTool, true);
+  assert.equal(providerInput({ ...editing, stripImageGenerationTool: true }).stripImageGenerationTool, true);
+  assert.equal(providerDraftFromEntry({ ...payload().pool[0], stripResponsesImageDetail: true }).stripResponsesImageDetail, true);
+  assert.equal(providerInput({ ...editing, stripResponsesImageDetail: true }).stripResponsesImageDetail, true);
+  // #2868：「不发送 tool_search」从池条目读回、原样提交。
+  assert.equal(providerDraftFromEntry({ ...payload().pool[0], disableToolSearch: true }).disableToolSearch, true);
+  assert.equal(providerInput({ ...editing, disableToolSearch: true }).disableToolSearch, true);
   assert.equal(validateProviderDraft({ ...editing, proxy: "127.0.0.1:7890" }, true), "代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）");
   assert.equal(validateProviderDraft({ ...editing, proxy: "socks5://127.0.0.1:1080" }, true), null);
   assert.deepEqual(providerInput({ ...editing, priceInput: "2", priceCached: "0.5", priceOutput: "abc" }).price, { currency: "CNY", input: 2, cachedInput: 0.5, output: 0 });
@@ -293,6 +318,9 @@ test("网关页接入导航，命令已注册", () => {
     "reset_gateway_key_health",
     "create_gateway_provider",
     "update_gateway_provider",
+    "add_gateway_provider_key",
+    "replace_gateway_provider_key",
+    "delete_gateway_provider_key",
     "delete_gateway_provider",
     "set_gateway_provider_enabled",
     "reorder_gateway_providers",
@@ -362,9 +390,10 @@ test("全应用不用系统原生的确认 / 提示 / 输入框，统一用 app-
   assert.match(app, /<AppDialogHost \/>/);
 });
 
-test("供应商的价格与代理在供应商池详情里编辑，添加 / 编辑弹窗只管连接、Key 与模型", () => {
+test("普通供应商的价格与代理在详情里编辑，官方账号可在编辑弹窗设置代理", () => {
   const form = readFileSync(new URL("./ProviderFormDialog.tsx", import.meta.url), "utf8");
-  assert.doesNotMatch(form, /t\("价格"\)|t\("代理"\)|priceInput: event|proxy: event/);
+  assert.doesNotMatch(form, /t\("价格"\)|t\("代理"\)|priceInput: event/);
+  assert.match(form, /subscriptionEditing[\s\S]*t\("HTTP 代理"\)/);
   const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
   assert.match(providers, /"save_gateway_provider_extras"/);
   assert.match(providers, /<ProviderExtrasDialog/);
@@ -376,16 +405,149 @@ test("供应商的价格与代理在供应商池详情里编辑，添加 / 编�
 test("赞助商单独一组放在「添加供应商」最前面，不再混在中转里", () => {
   const presets = gatewayPresets(new Date(2026, 9, 26));
   const sponsors = presets.filter((preset) => preset.section === "sponsor").map((preset) => preset.key);
-  assert.deepEqual(sponsors, ["jojocode-max", "runapi", "apikeyfun"]);
+  assert.deepEqual(sponsors, ["jojocode-max", "runapi", "apikeyfun", "cccccc-api"]);
   // 到期日当天仍显示，第二天起从目录里去掉。
   const keys = (date: Date) => gatewayPresets(date).map((preset) => preset.key);
   assert.ok(keys(new Date(2026, 10, 7)).includes("runapi"));
   assert.ok(!keys(new Date(2026, 10, 8)).includes("runapi"));
-  assert.deepEqual(activeSponsorIds(new Date(2026, 10, 23)), ["jojocode-max"]);
+  assert.deepEqual(activeSponsorIds(new Date(2026, 10, 23)), ["jojocode-max", "cccccc-api"]);
+  assert.deepEqual(activeSponsorIds(new Date(2026, 11, 2)), ["jojocode-max"]);
   for (const gone of ["pateway", "therouter", "shengsuanyun", "ccsub"]) assert.ok(!keys(new Date(2026, 9, 26)).includes(gone), gone);
   assert.equal(presets[0].section, "sponsor");
   const relays = presets.filter((preset) => preset.section === "relay").map((preset) => preset.key);
   assert.ok(relays.includes("openrouter") && relays.includes("siliconflow") && relays.includes("opencode-go"));
   const catalog = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
   assert.ok(catalog.indexOf('key: "sponsor"') < catalog.indexOf('key: "subscription"'));
+});
+
+test("起名模型随绑定草稿往返，空值和旧版后端缺字段都当成不指定", () => {
+  const legacy = { ...blankBinding(), enabled: true, model: "deepseek-v4-pro" };
+  assert.equal(draftFromBinding(legacy).titleModel, "");
+  const draft = { ...draftFromBinding(legacy), titleModel: " kimi/kimi-k3 " };
+  const binding = bindingFromDraft(draft, legacy);
+  assert.equal(binding.titleModel, "kimi/kimi-k3");
+  assert.equal(draftFromBinding(binding).titleModel, "kimi/kimi-k3");
+  assert.equal(bindingFromDraft({ ...draft, titleModel: "  " }, binding).titleModel, "");
+});
+
+test("主动限速：留空不限，只认正整数", () => {
+  assert.equal(parseKeyLimit(""), null);
+  assert.equal(parseKeyLimit("  "), null);
+  assert.equal(parseKeyLimit("20"), 20);
+  assert.equal(parseKeyLimit(" 5 "), 5);
+  for (const bad of ["0", "-1", "1.5", "abc", "10k"]) assert.ok(Number.isNaN(parseKeyLimit(bad)), bad);
+});
+
+test("请求日志认出网关记的限速排队", () => {
+  assert.equal(queueWaitMs(undefined), null);
+  assert.equal(queueWaitMs(["upstream_stream_failed:server_is_overloaded"]), null);
+  assert.equal(queueWaitMs(["upstream_stream_failed:x", "local_rate_limit_wait_ms:3200"]), 3200);
+  assert.equal(formatQueueWait(3200), "3.2s");
+  assert.equal(formatQueueWait(400), "0.4s");
+  assert.equal(formatQueueWait(45_400), "45s");
+  assert.match(app, /tf\("限速排队 \{0\}", \[formatQueueWait\(queued\)\]\)/);
+});
+
+test("请求日志认出去掉别家签发的压缩上下文，并显示成说明文字", () => {
+  assert.equal(FOREIGN_COMPACTION_DROPPED_REASON, "foreign_compaction_dropped");
+  assert.equal(foreignCompactionDropped(undefined), false);
+  assert.equal(foreignCompactionDropped(["invalid_encrypted_content"]), false);
+  assert.equal(foreignCompactionDropped(["invalid_encrypted_content", "foreign_compaction_dropped"]), true);
+  assert.match(app, /t\("已去掉别家签发的压缩上下文，较早的对话内容不可用"\)/);
+  assert.match(app, /t\("已去掉别家压缩上下文"\)/);
+});
+
+test("供应商池详情能编辑每个 Key 的限速", () => {
+  const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
+  assert.match(providers, /"save_gateway_provider_limits", \{ id: entry\.id, rpm, concurrency \}/);
+  assert.match(lib, /gateway_commands::save_gateway_provider_limits,/);
+});
+
+test("供应商池：编辑在标题栏、各处编辑是图标按钮；已保存的 Key 打码列出，按标识单独替换、删除（#2782）", () => {
+  const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
+  // 详情里不再有「编辑」文字按钮，底部也没有「编辑 >」；标题栏有铅笔按钮，悬停与无障碍名保留文案。
+  assert.doesNotMatch(providers, /\{t\("编辑"\)\}/);
+  assert.match(providers, /aria-label=\{tf\("编辑 \{0\}", \[maskAccountName\(entry\.name\)\]\)\}\s+className="gw-icon-button gw-pool-edit"/);
+  assert.match(providers, /<button aria-label=\{label\} className="gw-icon-button gw-inline-icon"[^>]*title=\{label\}/);
+  for (const label of ["编辑模型列表", "编辑价格", "编辑上下文窗口", "编辑思考等级", "编辑代理", "编辑限速"]) {
+    assert.match(providers, new RegExp(`<EditIcon [^>]*label=\\{t\\("${label}"\\)\\}`), label);
+  }
+  assert.match(providers, /<ProviderKeyList busy=\{busy\} entry=\{entry\} onTest=\{\(keyId\) => setTestKey\(keyId\)\} run=\{run\} \/>/);
+  const keys = readFileSync(new URL("./ProviderKeyList.tsx", import.meta.url), "utf8");
+  assert.match(keys, /"add_gateway_provider_key", \{ id: entry\.id, key \}/);
+  assert.match(keys, /"replace_gateway_provider_key", \{ id: entry\.id, keyId: editing\.keyId, key \}/);
+  assert.match(keys, /"delete_gateway_provider_key", \{ id: entry\.id, keyId \}/);
+  assert.match(keys, /type="password"/, "新填的 Key 不明文显示");
+  assert.match(keys, /disabled=\{busy !== null \|\| last\}/, "只剩一个 Key 时不能删");
+  // 编辑弹窗里已保存的 Key 只列打码后的样子，不再是「留空表示不改」的空输入框。
+  const form = readFileSync(new URL("./ProviderFormDialog.tsx", import.meta.url), "utf8");
+  assert.match(form, /savedKeys\.map\(\(key\) => <span className="pf-chip" key=\{key\.id\}><span className="pf-mono">\{key\.masked\}<\/span><\/span>\)/);
+  // Key 池健康状态里的 Key 标识换成打码后的 Key；单 Key 时 Key 池记作 primary。
+  const saved = [{ id: "key-1", masked: "sk-alp…AAAA" }, { id: "key-2", masked: "sk-bra…BBBB" }];
+  assert.equal(keyLabel(saved, "key-2"), "sk-bra…BBBB");
+  assert.equal(keyLabel(saved, "primary"), "primary");
+  assert.equal(keyLabel([saved[0]], "primary"), "sk-alp…AAAA");
+  assert.equal(keyLabel(undefined, "key-9"), "key-9");
+});
+
+test("供应商代理：留空和直连都合法，直连不分大小写（#2760）", () => {
+  assert.equal(proxyAddressError(""), null);
+  assert.equal(proxyAddressError(" direct "), null);
+  assert.equal(proxyAddressError("DIRECT"), null);
+  assert.equal(proxyAddressError("socks5://127.0.0.1:1080"), null);
+  assert.match(proxyAddressError("127.0.0.1:7890") ?? "", /代理地址要写成/);
+  assert.equal(isDirectProxy("Direct"), true);
+  assert.equal(isDirectProxy(""), false);
+  assert.equal(isDirectProxy("http://direct.example:8080"), false);
+});
+
+test("添加供应商：只给内置和已接入的 Agent 勾选，装了没接入的既不列出也不跳过", () => {
+  const view = (agent: string, enabled: boolean) => ({ agent, name: agent, enabled, baseUrl: "", defaultModel: "", models: [] });
+  const payload = {
+    agents: [view("codex", true), view("claude", false), view("grok", false), view("opencode", true), view("hermes", false)],
+    gateway: { bindings: {} },
+  } as unknown as GatewayPayload;
+  assert.deepEqual(glanceAgents(payload.agents).map((agent) => agent.agent), ["codex", "claude", "grok", "opencode"]);
+  assert.deepEqual(defaultProviderAgents(payload), ["codex", "claude", "grok", "opencode"]);
+  assert.deepEqual(skippedAgents(payload, ["codex"]), ["claude", "grok", "opencode"]);
+});
+
+test("Agent 自带的模型：单独一组、标出直连对象，按名字或厂商筛", () => {
+  const own = { vendor: "OpenAI", current: "gpt-6-sol", models: [{ id: "gpt-6-sol", label: "GPT-6-Sol" }, { id: "gpt-6-luna", label: "gpt-6-luna" }] };
+  const section = ownPickerSection(own, "", (name) => name);
+  assert.equal(section?.key, "own");
+  assert.equal(section?.title, "OpenAI");
+  assert.deepEqual(section?.items.map((item) => [item.model, item.label, item.sub, item.direct]), [
+    ["gpt-6-sol", "GPT-6-Sol", "gpt-6-sol", "OpenAI"],
+    ["gpt-6-luna", "gpt-6-luna", "", "OpenAI"],
+  ]);
+  assert.deepEqual(ownPickerSection(own, "luna", (name) => name)?.items.map((item) => item.model), ["gpt-6-luna"]);
+  assert.equal(ownPickerSection(own, "openai", (name) => name)?.items.length, 2, "搜厂商名列出整组");
+  assert.equal(ownPickerSection(own, "deepseek", (name) => name), null);
+  assert.equal(ownPickerSection(null, "", (name) => name), null);
+});
+
+test("模型下拉：接入着选自带模型先预览还原，主窗口和托盘确认后才带token切换", () => {
+  const agents = readFileSync(new URL("./GatewayAgents.tsx", import.meta.url), "utf8");
+  assert.match(agents, /"use_gateway_own_model"/);
+  assert.match(agents, /if \(connected \|\| agent\.requiresDisconnectPreview\) \{\s*setDisconnectTarget\(item\)/);
+  assert.match(agents, /<AgentDisconnectDialog/);
+  assert.match(agents, /model: disconnectTarget\.model, previewToken/);
+  const tray = readFileSync(new URL("./TrayPanel.tsx", import.meta.url), "utf8");
+  assert.match(tray, /onPickOwn=\{/);
+  assert.match(tray, /"use_gateway_own_model"/);
+  assert.match(tray, /if \(agent\.enabled \|\| agent\.requiresDisconnectPreview\) setDisconnectTarget\(item\)/);
+  assert.match(tray, /model: disconnectTarget\.model, previewToken/);
+});
+
+test("自带模型开关：关掉后只留 Agent 现在用着的那一个，没用着就整组不列", () => {
+  const own = { vendor: "OpenAI", current: "", models: [{ id: "gpt-6-sol", label: "GPT-6-Sol" }, { id: "gpt-6-luna", label: "gpt-6-luna" }] };
+  const agent = { agent: "codex", name: "Codex", enabled: true, baseUrl: "", defaultModel: "", models: [], ownModels: own } as GatewayAgentView;
+  const payload = (hide: string[]) => ({ gateway: { bindings: {}, hideOwnModels: hide } }) as unknown as GatewayPayload;
+  assert.equal(visibleOwnModels(agent, payload([]))?.models.length, 2);
+  assert.equal(visibleOwnModels(agent, payload(["claude"]))?.models.length, 2, "只看自己的开关");
+  assert.equal(visibleOwnModels(agent, payload(["codex"])), null);
+  const onLuna = { ...agent, ownModels: { ...own, current: "GPT-6-LUNA" } };
+  assert.deepEqual(visibleOwnModels(onLuna, payload(["codex"]))?.models.map((model) => model.id), ["gpt-6-luna"]);
+  assert.equal(visibleOwnModels({ ...agent, ownModels: null }, payload([])), null);
 });

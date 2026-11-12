@@ -23,6 +23,21 @@ pub struct BridgeContext {
 }
 
 impl BridgeContext {
+    #[cfg(test)]
+    pub(crate) fn with_test_settings(store: SettingsStore, app_dir: PathBuf) -> Self {
+        Self::new(
+            Arc::new(CoreSettingsService {
+                store,
+                app_dir: Some(app_dir.clone()),
+            }),
+            Arc::new(CoreRuntimeService::new(
+                0,
+                StatusStore::new(app_dir.join("status.json")),
+            )),
+            Arc::new(UnavailableDataService),
+        )
+    }
+
     pub fn new(
         settings: Arc<dyn BridgeSettingsService>,
         runtime: Arc<dyn BridgeRuntimeService>,
@@ -72,6 +87,75 @@ pub trait BridgeSettingsService: Send + Sync {
     fn agent_pet_cache_dir(&self) -> PathBuf {
         crate::agent_pet::default_cache_dir()
     }
+
+    /// Agent 桌宠自定义音效目录；测试可覆盖成临时目录。
+    fn agent_pet_custom_dir(&self) -> PathBuf {
+        crate::agent_pet::default_custom_dir()
+    }
+
+    fn whale_ledger_path(&self) -> PathBuf {
+        // 账本固定在状态目录：迁移设置文件路径后不能跟着换位置，否则余额历史看似清空。
+        crate::paths::default_app_state_dir().join("whale-balance.sqlite3")
+    }
+
+    /// 有没有启用中的拓展包在清单里声明了这条路由。桌宠 / 大肥鱼的数据路由（图片、音效、用量、余额）
+    /// 只在有拓展用它时才干活：Agent 桌宠拓展停用后不联网、不扫会话日志、不查余额。测试可覆盖。
+    fn extension_route_declared(&self, route: &str) -> bool {
+        cached_route_declared(route)
+    }
+}
+
+/// [`BridgeSettingsService::extension_route_declared`] 的默认实现：按默认拓展目录判断，3 秒缓存。
+fn cached_route_declared(route: &str) -> bool {
+    static CACHE: std::sync::Mutex<
+        Option<(std::time::Instant, std::collections::BTreeMap<String, bool>)>,
+    > = std::sync::Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache
+        .as_ref()
+        .is_none_or(|(at, _)| at.elapsed() >= std::time::Duration::from_secs(3))
+    {
+        *cache = Some((std::time::Instant::now(), Default::default()));
+    }
+    let (_, entries) = cache.as_mut().expect("cache initialized");
+    if let Some(value) = entries.get(route) {
+        return *value;
+    }
+    let declared = crate::user_scripts::default_user_script_manager().route_declared(route);
+    entries.insert(route.to_string(), declared);
+    declared
+}
+
+/// 大肥鱼数据路由用的设置：拓展用到了就按「选中大肥鱼」处理，余额接口按请求里带的 `balance`（来自 Agent 桌宠拓展的配置）。
+fn whale_settings(mut settings: BackendSettings, payload: &Value) -> BackendSettings {
+    settings.agent_pet = crate::settings::AgentPetSettings::whale_widget();
+    if let Some(balance) = payload.get("balance").and_then(Value::as_object) {
+        if let Some(protocol) = balance.get("protocol").and_then(Value::as_str) {
+            settings.codex_app_whale_balance_protocol = match protocol {
+                "custom" | "off" => protocol.to_string(),
+                _ => "auto".to_string(),
+            };
+        }
+        if let Some(path) = balance.get("path").and_then(Value::as_str) {
+            settings.codex_app_whale_balance_path = path.trim().to_string();
+        }
+        if let Some(field) = balance.get("field").and_then(Value::as_str) {
+            settings.codex_app_whale_balance_field = field.trim().to_string();
+        }
+        if let Some(currency) = balance.get("currency").and_then(Value::as_str) {
+            settings.codex_app_whale_balance_currency = currency.trim().to_ascii_uppercase();
+        }
+        if let Some(scale) = balance
+            .get("scale")
+            .and_then(Value::as_f64)
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+        {
+            settings.codex_app_whale_balance_scale = scale;
+        }
+    }
+    settings
 }
 
 #[async_trait]
@@ -86,6 +170,20 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn set_user_scripts_enabled(&self, enabled: bool) -> anyhow::Result<Value>;
     async fn set_user_script_enabled(&self, key: String, enabled: bool) -> anyhow::Result<Value>;
     async fn delete_user_script(&self, key: String) -> anyhow::Result<Value>;
+    /// 保存一个拓展包的配置（Codex 里「拓展」详情页的设置面板用），回 `{status, config}`，config 是生效配置。
+    async fn set_extension_config(
+        &self,
+        key: String,
+        values: serde_json::Map<String, Value>,
+    ) -> anyhow::Result<Value> {
+        let config = crate::user_scripts::default_user_script_manager()
+            .set_extension_config(&key, &values)?;
+        Ok(json!({ "status": "ok", "config": config }))
+    }
+    /// 拓展的 README（Codex 里「拓展」详情页的「细节」页签用），见 [`crate::user_scripts::UserScriptManager::extension_readme`]。
+    async fn extension_readme(&self, key: String) -> anyhow::Result<Value> {
+        crate::user_scripts::default_user_script_manager().extension_readme(&key)
+    }
     async fn reload_user_scripts(&self) -> anyhow::Result<Value>;
     async fn load_user_scripts(&self) -> anyhow::Result<Value> {
         self.user_script_inventory().await
@@ -97,6 +195,13 @@ pub trait BridgeRuntimeService: Send + Sync {
     /// 在指定 Codex 页面执行表达式。默认关闭。
     async fn cdp_evaluate(&self, _payload: Value) -> anyhow::Result<Value> {
         anyhow::bail!("CDP evaluate is unavailable")
+    }
+    /// 按需开启 app-server 客户端捕获（拓展的 codex/request 中间件需要）。默认不可用。
+    async fn request_app_server_client_capture(&self) -> anyhow::Result<Value> {
+        anyhow::bail!("app-server client capture is unavailable")
+    }
+    async fn set_thread_goal_in_owner(&self, _payload: Value) -> anyhow::Result<Value> {
+        anyhow::bail!("会话目标转发暂不可用")
     }
     /// 拉市场清单，并合并本地已安装状态。
     async fn script_market_list(&self) -> anyhow::Result<Value> {
@@ -189,14 +294,38 @@ pub trait BridgeRuntimeService: Send + Sync {
 
 #[async_trait]
 pub trait BridgeDataService: Send + Sync {
+    /// 内部来源兼容入口；不加入第三方拓展路由白名单。
+    async fn migrate_gateway_thread_provider(&self, _payload: Value) -> anyhow::Result<Value> {
+        anyhow::bail!("当前后端不支持单会话来源迁移")
+    }
+    async fn whale_history(&self, _payload: Value) -> anyhow::Result<Value> {
+        Ok(json!({"status":"unavailable","message":"本机用量统计暂不可用"}))
+    }
     async fn delete(&self, session: SessionRef) -> anyhow::Result<DeleteResult>;
     async fn undo(&self, undo_token: String) -> anyhow::Result<DeleteResult>;
     async fn export_markdown(&self, session: SessionRef) -> anyhow::Result<ExportResult>;
     async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value>;
     /// Codex 输入框下方状态栏的轻量用量快照：只给最近的 token 事件，不返回全量历史。
-    /// 内置状态栏专用，不进第三方拓展路由白名单。
+    /// 内置状态栏和拓展（路由白名单里的只读项）共用。
     async fn thread_usage_live(&self, _session: SessionRef) -> anyhow::Result<Value> {
         Ok(json!({"status": "unavailable", "message": "本机用量快照暂不可用", "events": []}))
+    }
+    /// 向本机拓展提供只读用量历史，与状态栏和 Gateway 计费分离。
+    async fn usage_history(&self, _query: Value) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "unavailable",
+            "complete": false,
+            "message": "结构化用量历史服务未接入",
+        }))
+    }
+    /// 独立消费者封存，不是原生账单或归属验证，不参与 usage_history。
+    async fn usage_archive(&self, _request: Value) -> anyhow::Result<Value> {
+        Ok(json!({"status":"unavailable","code":"archive-unavailable"}))
+    }
+    /// 关闭查询时释放本进程的只读缓存，默认实现兼容其他数据服务。
+    async fn clear_usage_history(&self) {}
+    async fn whale_session(&self, _session: SessionRef) -> anyhow::Result<Value> {
+        Ok(json!({"status": "unavailable", "message": "当前后端暂不支持会话用量摘要"}))
     }
     async fn find_archived_thread_by_title(
         &self,
@@ -264,6 +393,44 @@ pub async fn evaluate_extension_cdp(debug_port: u16, payload: &Value) -> anyhow:
     Ok(json!({ "status": "ok", "results": results }))
 }
 
+async fn confirm_gateway_thread_unloaded(payload: &Value) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let id = payload
+        .get("threadId")
+        .and_then(Value::as_str)
+        .context("缺少会话 ID")?;
+    uuid::Uuid::parse_str(id).context("会话 ID 无效")?;
+    let port = StatusStore::default()
+        .load_latest()?
+        .and_then(|status| status.debug_port)
+        .context("没有原生会话核验入口，停止迁移")?;
+    let targets = crate::cdp::list_targets(port).await?;
+    let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
+    let websocket = target
+        .web_socket_debugger_url
+        .context("缺少原生会话调试地址")?;
+    let script = format!(
+        "(async()=>{{const read=window.__codexPlusReadNativeThreadMetadata;if(typeof read!==\"function\")throw new Error(\"native reader unavailable\");return JSON.stringify(await read({}));}})()",
+        serde_json::to_string(id)?
+    );
+    let response =
+        crate::bridge::evaluate_script_with_await_promise(&websocket, &script, true).await?;
+    let value: Value = serde_json::from_str(
+        response
+            .pointer("/result/result/value")
+            .and_then(Value::as_str)
+            .context("原生会话核验未返回结果")?,
+    )?;
+    anyhow::ensure!(
+        value["id"] == id
+            && value["statusType"] == "notLoaded"
+            && value["modelProvider"] == payload["sourceProvider"]
+            && value["isSubagent"] == false,
+        "会话仍在运行或被其他窗口加载，未迁移；请关闭其他窗口，或保存工作后重启 Codex 再打开原会话"
+    );
+    Ok(())
+}
+
 pub async fn handle_bridge_request(
     ctx: BridgeContext,
     path: &str,
@@ -304,6 +471,11 @@ pub async fn handle_bridge_request(
         }
         "/settings/set" => {
             let result = ctx.settings.set_settings(payload.clone()).await;
+            if let Ok(settings) = &result
+                && !settings.usage_history_enabled
+            {
+                ctx.data.clear_usage_history().await;
+            }
             // Codex 设置页改了设置：通知管理器重新读取，两边开关保持一致。
             if result.is_ok() {
                 crate::settings::notify_external_settings_change();
@@ -312,6 +484,14 @@ pub async fn handle_bridge_request(
         }
         // 只读：设置项清单（标题、说明、分组等），注入页据此生成设置行。
         "/settings/catalog" => crate::settings_catalog::enhancement_settings_catalog(),
+        // 开放给拓展的设置只读子集：当前供应商的名称、模式、模型与上下文窗口。整份设置（/settings/get）仍不开放。
+        "/settings/public" => match ctx.settings.get_settings().await {
+            Ok(settings) => {
+                let codex_app_version = ctx.settings.codex_app_version().await.unwrap_or_default();
+                Ok(public_settings_value(&settings, codex_app_version))
+            }
+            Err(error) => Err(error),
+        },
         "/user-scripts/list" => {
             ctx.runtime
                 .user_script_inventory_with_runtime_status(payload.clone())
@@ -344,10 +524,81 @@ pub async fn handle_bridge_request(
                 .to_string();
             ctx.runtime.delete_user_script(key).await
         }
+        // Codex++ 内部用：「拓展」详情页里拓展自己的设置面板保存配置。只写这一个拓展清单里声明过的配置项，
+        // 不进拓展路由白名单（拓展经 ctx.registerSettingsPanel 拿到的 saveConfig 只能存它自己的）。
+        "/user-scripts/set-config" => {
+            let key = payload
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let values = payload
+                .get("values")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            if key.is_empty() {
+                Ok(json!({ "status": "failed", "message": "拓展 key 不能为空" }))
+            } else {
+                match ctx.runtime.set_extension_config(key, values).await {
+                    Ok(value) => Ok(value),
+                    Err(error) => {
+                        Ok(json!({ "status": "failed", "message": format!("{error:#}") }))
+                    }
+                }
+            }
+        }
+        // Codex++ 内部用：「拓展」详情页「细节」页签读拓展的 README。只读，不进拓展路由白名单。
+        "/user-scripts/readme" => {
+            let key = payload
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if key.is_empty() {
+                Ok(json!({ "status": "failed", "message": "拓展 key 不能为空" }))
+            } else {
+                match ctx.runtime.extension_readme(key).await {
+                    Ok(value) => Ok(value),
+                    Err(error) => {
+                        Ok(json!({ "status": "failed", "message": format!("{error:#}") }))
+                    }
+                }
+            }
+        }
         "/user-scripts/load" => ctx.runtime.load_user_scripts().await,
         "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
         "/cdp/targets" => ctx.runtime.cdp_targets().await,
         "/cdp/evaluate" => ctx.runtime.cdp_evaluate(payload.clone()).await,
+        // 系统鼠标位置：拓展写「桌宠跟随鼠标」这类功能用（页面里拿不到窗口外的鼠标）。只读。
+        "/system/cursor-position" => crate::launcher::cursor_position()
+            .map(|(x, y)| json!({ "status": "ok", "x": x, "y": y })),
+        // Codex++ 内部用：拓展要改写发往 app-server 的请求时补开客户端捕获。不进拓展路由白名单。
+        "/extensions/request-capture" => ctx.runtime.request_app_server_client_capture().await,
+        // 拓展常驻后台：页面侧 ctx.backend 用。进程由处理桥接的这个进程托管，与具体运行时无关。
+        "/extensions/backend/call" => crate::extension_backend::route_call(&payload).await,
+        "/extensions/backend/events" => crate::extension_backend::route_events(&payload).await,
+        "/extensions/backend/stop" => crate::extension_backend::route_stop(&payload).await,
+        "/extensions/services/call" => crate::extension_backend::route_service_call(&payload).await,
+        // 拓展自己调模型（ctx.llm）：经协议代理用当前供应商，不跑拓展网关中间件。
+        "/extensions/llm/complete" => crate::extension_llm::route_complete(&payload).await,
+        "/extensions/llm/models" => crate::extension_llm::route_models(),
+        "/extensions/history" => {
+            let payload = payload.clone();
+            tokio::task::spawn_blocking(move || crate::extension_history::route(&payload))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        }
+        "/thread-goal/set-in-owner" => Ok(match ctx.settings.get_settings().await {
+            Ok(settings) if settings.enhancements_enabled => thread_goal_result_value(
+                ctx.runtime.set_thread_goal_in_owner(payload.clone()).await,
+            ),
+            Ok(_) => crate::native_thread_goal::GoalForwardError::EnhancementsDisabled.response(),
+            Err(_) => crate::native_thread_goal::GoalForwardError::ForwardFailed.response(),
+        }),
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager(payload.clone()).await,
         "/manager/open-transient" => ctx.runtime.open_transient_manager(payload.clone()).await,
@@ -358,6 +609,22 @@ pub async fn handle_bridge_request(
         "/codex-model-catalog" | "/codex-config-model" => ctx.runtime.codex_model_catalog().await,
         "/official-accounts/list" => ctx.runtime.official_accounts().await,
         "/official-accounts/refresh" => ctx.runtime.refresh_official_account(payload.clone()).await,
+        "/session/gateway-provider/migrate" => {
+            match confirm_gateway_thread_unloaded(&payload).await {
+                Ok(()) => {
+                    ctx.data
+                        .migrate_gateway_thread_provider(payload.clone())
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        // 开放给拓展的模型目录：只给模型列表与每模型元数据（含上下文窗口），去掉来源地址、config 路径。
+        "/model-catalog/public" => ctx
+            .runtime
+            .codex_model_catalog()
+            .await
+            .map(public_model_catalog_value),
         "/diagnostics/log" => diagnostic_log_value(payload.clone()),
         "/llm-proxy" => llm_proxy_value(payload.clone()).await,
         "/ads" => ctx.runtime.ads().await,
@@ -435,31 +702,125 @@ pub async fn handle_bridge_request(
                 .thread_usage_live(session_from_payload(&payload))
                 .await
         }
-        // 仅内置 Agent 桌宠使用，不加入第三方拓展路由白名单。payload 忽略，只按当前设置取图。
-        "/agent-pet/image" => match ctx.settings.get_settings().await {
-            Ok(settings) if crate::agent_pet::enabled_for(&settings.agent_pet, "codex") => {
-                let pet = &settings.agent_pet;
-                match crate::agent_pet::load_image(
-                    &pet.image,
-                    &pet.custom_image_url,
-                    &ctx.settings.agent_pet_cache_dir(),
-                )
-                .await
-                {
-                    Ok(image) => Ok(json!({
-                        "status": "ok",
-                        "image": image.data_uri,
-                        "id": pet.image,
-                    })),
-                    Err(error) => Ok(json!({"status": "failed", "message": format!("{error:#}")})),
-                }
+        "/usage/archive" => match ctx.settings.get_settings().await {
+            Ok(settings) if settings.usage_history_enabled => {
+                ctx.data.usage_archive(payload.clone()).await
+            }
+            _ => Ok(json!({"status":"unavailable","enabled":false})),
+        },
+        "/usage/history" => match ctx.settings.get_settings().await {
+            Ok(settings) if settings.usage_history_enabled => {
+                ctx.data.usage_history(payload.clone()).await
+            }
+            _ => {
+                ctx.data.clear_usage_history().await;
+                Ok(json!({
+                    "status": "unavailable",
+                    "enabled": false,
+                    "complete": false,
+                    "records": [],
+                    "message": "本机用量历史未开启或设置不可用",
+                }))
+            }
+        },
+        // 大肥鱼（Agent 桌宠拓展）的数据路由：拓展白名单里开放，但只有启用中的拓展在清单里声明了它才干活。
+        // 本机用量统计与余额查询都在 Codex++ 里做，供应商的 Key 不交给页面。
+        "/whale/media" if ctx.settings.extension_route_declared(path) => {
+            Ok(crate::assets::whale_media())
+        }
+        "/whale/media" => Ok(json!({"status":"disabled"})),
+        "/whale/history" => match ctx.settings.get_settings().await {
+            Ok(_)
+                if ctx.settings.extension_route_declared(path)
+                    && crate::whale_full::history_enabled(&ctx.settings.whale_ledger_path()) =>
+            {
+                ctx.data.whale_history(payload.clone()).await
+            }
+            Ok(_) => Ok(json!({"status":"disabled"})),
+            Err(_) => Ok(json!({"status":"unavailable","message":"无法读取挂件设置"})),
+        },
+        "/whale/full" if !ctx.settings.extension_route_declared(path) => {
+            Ok(json!({"status":403,"body":{"ok":false,"error":"Codex 用量挂件已关闭"}}))
+        }
+        "/whale/full" => match ctx.settings.get_settings().await {
+            Ok(settings) => {
+                let settings = whale_settings(settings, &payload);
+                let path = ctx.settings.whale_ledger_path();
+                let requested_path = payload
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let history = if crate::whale::enabled(&settings)
+                    && crate::whale_full::history_enabled(&path)
+                    && matches!(
+                        requested_path,
+                        "/dsh-whale/usage-records.json" | "/dsh-whale/api-models.json"
+                    ) {
+                    ctx.data
+                        .whale_history(crate::whale_full::history_query(&path))
+                        .await
+                        .unwrap_or_else(|_| json!({"status":"unavailable"}))
+                } else {
+                    Value::Null
+                };
+                Ok(crate::whale_full::handle(&settings, path, payload.clone(), history).await)
+            }
+            Err(_) => Ok(json!({"status":503,"body":{"ok":false,"error":"无法读取挂件设置"}})),
+        },
+        "/whale/balance" => match ctx.settings.get_settings().await {
+            Ok(settings) if ctx.settings.extension_route_declared(path) => {
+                let settings = whale_settings(settings, &payload);
+                Ok(crate::whale::balance(&settings, ctx.settings.whale_ledger_path()).await)
+            }
+            Ok(_) => Ok(
+                json!({"status":"disabled","provider":{"id":"","name":"","accountId":""},"balances":[],"updatedAt":0,"stale":false}),
+            ),
+            Err(_) => Ok(crate::whale::unavailable("无法读取挂件设置")),
+        },
+        "/whale/session" => match ctx.settings.get_settings().await {
+            Ok(_)
+                if ctx.settings.extension_route_declared(path)
+                    && crate::whale_full::history_enabled(&ctx.settings.whale_ledger_path()) =>
+            {
+                ctx.data.whale_session(session_from_payload(&payload)).await
             }
             Ok(_) => Ok(json!({"status": "disabled"})),
-            Err(error) => Ok(json!({
-                "status": "failed",
-                "message": format!("无法读取 Agent 桌宠设置：{error}"),
-            })),
+            Err(_) => Ok(json!({"status": "unavailable", "message": "无法读取挂件设置"})),
         },
+        // Agent 桌宠拓展的数据路由（图库、图片、音效、导入自定义音效）：参数来自拓展配置，按原来的设置规则校验；
+        // 下载走 Codex++ 的地址校验（只 https、拦截本机地址）与缓存。只有启用中的拓展声明了它才干活。
+        "/agent-pet/catalog"
+        | "/agent-pet/image"
+        | "/agent-pet/sound"
+        | "/agent-pet/import-sound" => {
+            if ctx.settings.extension_route_declared(path) {
+                Ok(crate::agent_pet::route(
+                    path,
+                    &payload,
+                    &ctx.settings.agent_pet_cache_dir(),
+                    &ctx.settings.agent_pet_custom_dir(),
+                )
+                .await
+                .unwrap_or_else(|| json!({"status": "failed", "message": "未知的桌宠路由"})))
+            } else {
+                Ok(json!({"status": "disabled"}))
+            }
+        }
+        // 背景图拓展的读图路由：只读这个拓展配置里的那张本机图片（页面拿不到本机文件）。
+        // 只有启用中的拓展在清单里声明了它才干活。
+        "/image-overlay/image" => {
+            if ctx.settings.extension_route_declared(path) {
+                tokio::task::spawn_blocking(|| {
+                    crate::bundled_extensions::image_overlay_image(
+                        &crate::user_scripts::default_user_script_manager(),
+                    )
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+            } else {
+                Ok(json!({"status": "disabled", "dataUrl": ""}))
+            }
+        }
         "/archived-thread" => {
             let title = payload
                 .get("title")
@@ -483,6 +844,32 @@ pub async fn handle_bridge_request(
                 .await
         }
         "/session/import" => ctx.data.import_session_file(payload.clone()).await,
+        "/thread-resume-model-metadata" => {
+            let request = payload.clone();
+            tokio::task::spawn_blocking(move || {
+                anyhow::ensure!(
+                    request.get("host_id").and_then(Value::as_str) == Some("local")
+                        && request
+                            .get("hostId")
+                            .is_none_or(|host| host.as_str() == Some("local")),
+                    "Thread model metadata is local-only"
+                );
+                let thread_id = request
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Thread ID is required"))?;
+                let snapshot = crate::codex_sqlite::thread_resume_model_metadata(
+                    &crate::codex_home::default_codex_home_dir(),
+                    thread_id,
+                )?
+                .ok_or_else(|| anyhow::anyhow!("Saved thread model settings were not found"))?;
+                let mut value = serde_json::to_value(snapshot)?;
+                value["status"] = json!("ok");
+                Ok(value)
+            })
+            .await
+            .unwrap_or_else(|error| Err(anyhow::anyhow!(error.to_string())))
+        }
         "/side-chat/source" | "/side-chat/save" => {
             let request = payload.clone();
             let operation = if path == "/side-chat/source" {
@@ -495,6 +882,26 @@ pub async fn handle_bridge_request(
             })
             .await
             .unwrap_or_else(|error| Err(anyhow::anyhow!(error.to_string())))
+        }
+        "/request-log/recent" => {
+            // 只读：最近已完成的模型请求（与托盘「实时请求」同一份 request-log.jsonl），
+            // 开放给拓展做请求提示这类功能。进行中的请求只在代理进程内存里，这里不返回，
+            // 需要的话走 /proxy-status。
+            let limit = payload
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(20)
+                .clamp(1, 100) as usize;
+            tokio::task::spawn_blocking(move || {
+                crate::request_log::read_recent_request_logs_at(
+                    &crate::request_log::request_log_path(),
+                    limit,
+                )
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .and_then(|result| result.map_err(|error| anyhow::anyhow!(error.to_string())))
+            .map(|entries| json!({ "status": "ok", "entries": entries }))
         }
         "/proxy-status" => {
             // 代理进程的实时请求状态只存在管理器内存里；桥接进程通过本地 helper
@@ -667,17 +1074,29 @@ impl BridgeRuntimeService for CoreRuntimeService {
     async fn set_user_script_enabled(&self, key: String, enabled: bool) -> anyhow::Result<Value> {
         match &self.user_scripts {
             Some(user_scripts) => {
-                user_scripts.set_script_enabled(&key, enabled)?;
+                let result = user_scripts.set_script_enabled(&key, enabled);
+                // 与管理器一致：拓展带的钩子 / Codex 资产跟着启停写回 Codex 配置。
+                crate::extension_hooks::sync_default(user_scripts);
+                result?;
                 user_scripts.inventory()
             }
             None => Ok(empty_user_script_inventory()),
         }
     }
 
+    async fn extension_readme(&self, key: String) -> anyhow::Result<Value> {
+        match &self.user_scripts {
+            Some(user_scripts) => user_scripts.extension_readme(&key),
+            None => anyhow::bail!("没有找到拓展 {key}"),
+        }
+    }
+
     async fn delete_user_script(&self, key: String) -> anyhow::Result<Value> {
         match &self.user_scripts {
             Some(user_scripts) => {
-                user_scripts.delete_user_script(&key)?;
+                let result = user_scripts.delete_user_script(&key);
+                crate::extension_hooks::sync_default(user_scripts);
+                result?;
                 user_scripts.inventory()
             }
             None => Ok(empty_user_script_inventory()),
@@ -739,6 +1158,19 @@ impl BridgeRuntimeService for CoreRuntimeService {
 
     async fn cdp_evaluate(&self, payload: Value) -> anyhow::Result<Value> {
         evaluate_extension_cdp(self.debug_port, &payload).await
+    }
+
+    async fn request_app_server_client_capture(&self) -> anyhow::Result<Value> {
+        let websocket_url = self
+            .websocket_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Codex 页面尚未连接"))?;
+        let started = crate::bridge::request_app_server_client_capture(websocket_url);
+        Ok(json!({ "status": "ok", "started": started }))
+    }
+
+    async fn set_thread_goal_in_owner(&self, payload: Value) -> anyhow::Result<Value> {
+        crate::native_thread_goal::set_in_owner(self.debug_port, payload).await
     }
 
     async fn open_devtools(&self) -> anyhow::Result<Value> {
@@ -928,6 +1360,9 @@ fn settings_payload_value(
     settings.dictation = crate::dictation::effective_settings(&settings);
     let native_fast = crate::native_fast::runtime_settings(&settings);
     let official_experience_active = settings.official_experience_active();
+    // 页面心跳比较这两项，发拓展事件 relayProfile/switched、modelCatalog/changed（见 40-backend-settings.js）。
+    let active_relay_profile_public = public_active_relay_profile(&settings);
+    let catalog_fingerprint = model_catalog_fingerprint(&settings);
     let mut value = serde_json::to_value(settings)?;
     fn remove_named_keys(value: &mut Value) {
         match value {
@@ -950,6 +1385,10 @@ fn settings_payload_value(
         object.insert(
             "officialExperienceActive".to_string(),
             json!(official_experience_active),
+        );
+        object.insert(
+            "weixinDesktopSync".to_string(),
+            serde_json::to_value(crate::connect::desktop_sync::pending())?,
         );
         object.remove("codexAppStepwiseApiKey");
         if let Some(dictation) = object.get_mut("dictation").and_then(Value::as_object_mut) {
@@ -976,11 +1415,106 @@ fn settings_payload_value(
             Value::String(codex_app_version),
         );
         object.insert(
+            "activeRelayProfilePublic".to_string(),
+            active_relay_profile_public,
+        );
+        object.insert(
+            "modelCatalogFingerprint".to_string(),
+            Value::String(catalog_fingerprint),
+        );
+        object.insert(
             "nativeFastLocalApiConfigured".to_string(),
+            Value::Bool(native_fast.native_fast_local_api_configured),
+        );
+        // 原生输入预测与 Fast 共用同一份本机自定义 API 判定，只读一次 config.toml。
+        object.insert(
+            "nativePredictionsLocalApiConfigured".to_string(),
             Value::Bool(native_fast.native_fast_local_api_configured),
         );
     }
     Ok(value)
+}
+
+/// 当前供应商里拓展能看的部分（`/settings/public` 与设置载荷的 `activeRelayProfilePublic` 共用）。
+/// 只有名称、模式、模型和窗口这类展示用字段：不含地址、Key、config.toml / auth.json 内容。
+fn public_active_relay_profile(settings: &BackendSettings) -> Value {
+    let profile = settings.active_relay_profile();
+    json!({
+        "id": profile.id,
+        "name": profile.name,
+        "relayMode": profile.relay_mode,
+        "protocol": profile.protocol,
+        "model": crate::relay_config::relay_profile_model(&profile),
+        "contextWindow": profile.context_window,
+        "autoCompactLimit": profile.auto_compact_limit,
+        "aggregate": settings.active_aggregate_relay_profile().is_some(),
+    })
+}
+
+/// 当前供应商的模型目录指纹：决定 Codex 模型目录的字段（模型列表、每模型窗口 / 压缩 / 元数据、聚合成员、换供应商）
+/// 变了它就变。页面比较前后两次的值发 `modelCatalog/changed`；只用来判断「变没变」，不承诺跨版本稳定。
+fn model_catalog_fingerprint(settings: &BackendSettings) -> String {
+    use std::hash::{Hash, Hasher};
+    let profile = settings.active_relay_profile();
+    let aggregate = settings
+        .active_aggregate_relay_profile()
+        .and_then(|aggregate| serde_json::to_string(&aggregate).ok())
+        .unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (
+        settings.relay_profiles_enabled,
+        profile.id.as_str(),
+        profile.name.as_str(),
+        crate::relay_config::relay_profile_model(&profile),
+        profile.model_list.as_str(),
+        profile.model_windows.as_str(),
+        profile.model_auto_compact.as_str(),
+        profile.model_metadata.as_str(),
+        profile.context_window.as_str(),
+        profile.auto_compact_limit.as_str(),
+        aggregate,
+    )
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// `/settings/public`：拓展可读的设置子集。
+fn public_settings_value(settings: &BackendSettings, codex_app_version: String) -> Value {
+    json!({
+        "status": "ok",
+        "codexPlusVersion": crate::version::VERSION,
+        "codexAppVersion": codex_app_version,
+        "enhancementsEnabled": settings.enhancements_enabled,
+        "relayProfilesEnabled": settings.relay_profiles_enabled,
+        "activeProfile": public_active_relay_profile(settings),
+        "modelCatalogFingerprint": model_catalog_fingerprint(settings),
+    })
+}
+
+/// `/model-catalog/public` 保留的字段。`sources`（带供应商地址）、`path`（本机 config 路径）、`responses_api` 不给拓展。
+const PUBLIC_MODEL_CATALOG_KEYS: &[&str] = &[
+    "status",
+    "message",
+    "service_tier",
+    "model",
+    "model_provider",
+    "codex_model_provider",
+    "provider_name",
+    "default_model",
+    "models",
+    "modelMetadata",
+];
+
+fn public_model_catalog_value(catalog: Value) -> Value {
+    let mut public = serde_json::Map::new();
+    if let Some(object) = catalog.as_object() {
+        for key in PUBLIC_MODEL_CATALOG_KEYS {
+            if let Some(value) = object.get(*key) {
+                public.insert((*key).to_string(), value.clone());
+            }
+        }
+    }
+    Value::Object(public)
 }
 
 fn managed_session_connection(settings: &BackendSettings) -> Value {
@@ -1033,6 +1567,7 @@ mod dictation_privacy_tests {
                 sync_default_member_login: false,
                 model_mappings_enabled: true,
                 model_mappings: Vec::new(),
+                auto_review_relay_id: String::new(),
             }],
             ..BackendSettings::default()
         };
@@ -1097,17 +1632,9 @@ mod dictation_privacy_tests {
     }
 
     #[test]
-    fn settings_bridge_preserves_session_share_choice_for_renderer_master_gating() {
-        for enabled in [false, true] {
-            let settings = BackendSettings {
-                codex_app_session_share: enabled,
-                enhancements_enabled: false,
-                ..BackendSettings::default()
-            };
-            let result = settings_payload_value(settings, String::new()).unwrap();
-            assert_eq!(result["codexAppSessionShare"], enabled);
-            assert_eq!(result["enhancementsEnabled"], false);
-        }
+    fn settings_bridge_omits_retired_session_share_switch() {
+        let result = settings_payload_value(BackendSettings::default(), String::new()).unwrap();
+        assert!(result.get("codexAppSessionShare").is_none());
     }
 
     #[test]
@@ -1161,10 +1688,19 @@ fn backend_status_value(
 ) -> anyhow::Result<Value> {
     let mut status = status?;
     if let Some(object) = status.as_object_mut() {
+        let settings = settings.ok();
         let hide = settings
-            .map(|settings| crate::assets::hide_official_usage_alert_config(&settings))
+            .as_ref()
+            .map(crate::assets::hide_official_usage_alert_config)
             .unwrap_or(false);
         object.insert("hideOfficialUsageAlert".to_string(), Value::Bool(hide));
+        // 设置快照的版本。前端 5 秒一次的心跳靠它判断设置有没有变：没变就不用再拉一次整份
+        // /settings/get（166 KB 的 JSON，编解码开销全落在渲染进程主线程上）。
+        let revision = settings
+            .as_ref()
+            .map(|settings| settings.settings_revision.clone())
+            .unwrap_or_default();
+        object.insert("settingsRevision".to_string(), Value::from(revision));
     }
     Ok(status)
 }
@@ -1523,6 +2059,14 @@ fn failed_from_error(payload: &Value, error: anyhow::Error) -> Value {
     })
 }
 
+fn thread_goal_result_value(result: anyhow::Result<Value>) -> Value {
+    match result {
+        Ok(value) if value.get("status").and_then(Value::as_str) == Some("ok") => value,
+        Ok(_) => crate::native_thread_goal::GoalForwardError::ForwardFailed.response(),
+        Err(error) => crate::native_thread_goal::failed_response(&error),
+    }
+}
+
 fn session_from_payload(payload: &Value) -> SessionRef {
     let parse_host = |value: &Value| {
         value
@@ -1567,6 +2111,43 @@ fn empty_user_script_inventory() -> Value {
         "enabled": true,
         "scripts": []
     })
+}
+
+#[cfg(test)]
+mod thread_goal_route_tests {
+    use super::*;
+    use crate::native_thread_goal::GoalForwardError;
+
+    #[test]
+    fn goal_route_keeps_only_known_structured_error_codes() {
+        for (error, expected_code) in [
+            (GoalForwardError::OwnerChanged, "goal-owner-changed"),
+            (GoalForwardError::RequestLimit, "goal-request-limit"),
+            (
+                GoalForwardError::RequestIdConflict,
+                "goal-request-id-conflict",
+            ),
+            (
+                GoalForwardError::NativeGetterAmbiguous,
+                "goal-native-getter-ambiguous",
+            ),
+        ] {
+            let response = thread_goal_result_value(Err(error.into()));
+            assert_eq!(
+                response,
+                json!({
+                    "status": "failed", "code": expected_code,
+                    "message": "会话所在窗口暂不可用，请稍后重试设置目标"
+                })
+            );
+        }
+        let response = thread_goal_result_value(Err(anyhow::anyhow!(
+            "Runtime.evaluate: secret-token at app://-/private.js"
+        )));
+        assert_eq!(response["code"], "goal-forward-failed");
+        assert!(!response.to_string().contains("secret"));
+        assert!(!response.to_string().contains("app://"));
+    }
 }
 
 #[cfg(test)]

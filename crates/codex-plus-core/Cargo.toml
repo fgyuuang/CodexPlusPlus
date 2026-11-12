@@ -14,6 +14,7 @@ async-trait = "0.1"
 base64.workspace = true
 chrono.workspace = true
 directories.workspace = true
+ecb = { version = "0.1", features = ["alloc"] }
 futures-util = "0.3"
 md-5 = "0.10"
 http.workspace = true
@@ -36,6 +37,9 @@ uuid.workspace = true
 url.workspace = true
 zip.workspace = true
 zstd.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # 窗口取流（ScreenCaptureKit）——仅 macOS 有这套框架

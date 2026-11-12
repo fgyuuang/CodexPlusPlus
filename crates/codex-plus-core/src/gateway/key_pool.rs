@@ -2,7 +2,8 @@
 //!
 //! 一个供应商配了多个 Key（`RelayProfile.api_keys`）时，网关把每个 Key 展开成一个候选：
 //! 某个 Key 被限流（429）或额度耗尽就冷却它、换下一个；Key 失效（401）停用到 Key 本身被改掉；
-//! 上游连续 5xx 时熔断整个供应商一小段时间。
+//! 上游连续 5xx 时熔断整个供应商一小段时间。用户还可以按供应商给每个 Key 设 RPM / 并发上限
+//! （主动限速，见文件后半部分），满了的 Key 先跳过、都满了排队，不等 429 再冷却。
 //!
 //! 状态只放内存：网关跑在 Codex++ 管理器进程里，重启后从头探测即可，不值得落盘。
 //! 默认「会话粘性」：同一会话固定用一个 Key，出错才换，避免按请求轮换打散上游 prompt cache。
@@ -17,8 +18,11 @@ use serde::Serialize;
 use crate::gateway::store::KeyRotationMode;
 use crate::settings::RelayProfile;
 
-/// 限流没给 Retry-After 时的首个冷却时长，之后按连续次数翻倍。
-const RATE_LIMIT_BASE_COOLDOWN: Duration = Duration::from_secs(30);
+/// 限流没给任何恢复时间（Retry-After / x-ratelimit-reset*）时的首个冷却时长，之后按连续次数翻倍。
+///
+/// 原来 30 秒起步（#2802）：只有一个 Key 时，一次 429 就让所有会话被网关本地拒绝半分钟，
+/// 而 Codex 自己的重试几秒内就用完了，比直连还糟。偶发的 429 多半几秒就恢复，先短冷却、连续再翻倍。
+const RATE_LIMIT_BASE_COOLDOWN: Duration = Duration::from_secs(5);
 const RATE_LIMIT_MAX_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// 额度耗尽且上游没说何时恢复时的冷却时长。
 const QUOTA_DEFAULT_COOLDOWN: Duration = Duration::from_secs(60 * 60);
@@ -111,7 +115,7 @@ pub fn classify_failure(
             reset_after: reset_after_from_body(&text).or_else(|| retry_after(headers)),
         },
         429 => FailureClass::RateLimited {
-            retry_after: retry_after(headers),
+            retry_after: retry_after(headers).or_else(|| rate_limit_reset(headers)),
         },
         401 => FailureClass::AuthInvalid,
         403 if text.contains("invalid_api_key")
@@ -140,6 +144,95 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         return Some(Duration::from_millis(ms as u64));
     }
     crate::protocol_proxy::exec_retry_after_duration(headers, SystemTime::now())
+}
+
+/// OpenAI 风格的限流重置头（#2802）：`x-ratelimit-reset-requests` / `x-ratelimit-reset-tokens`
+/// （`1s`、`6m0s`、`250ms` 这类写法），以及不少中转站用的 `x-ratelimit-reset`（秒数或 Unix 时间戳）。
+///
+/// 对应的 `x-ratelimit-remaining-*` 为 0 的那一项才是这次超限的原因，取它们里最晚的；
+/// 看不出是哪一项时取最早的，宁可早点再试也不多冷却。上限与指数退避的上限一致。
+fn rate_limit_reset(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let mut exhausted: Vec<Duration> = Vec::new();
+    let mut any: Vec<Duration> = Vec::new();
+    for kind in ["requests", "tokens"] {
+        let Some(reset) = header(&format!("x-ratelimit-reset-{kind}")).and_then(parse_reset_value)
+        else {
+            continue;
+        };
+        any.push(reset);
+        if header(&format!("x-ratelimit-remaining-{kind}"))
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(|remaining| remaining <= 0.0)
+        {
+            exhausted.push(reset);
+        }
+    }
+    if let Some(reset) = header("x-ratelimit-reset").and_then(parse_reset_value) {
+        any.push(reset);
+    }
+    exhausted
+        .into_iter()
+        .max()
+        .or_else(|| any.into_iter().min())
+        .map(|reset| reset.min(RATE_LIMIT_MAX_COOLDOWN))
+}
+
+/// 重置时间的几种写法：`1h2m3.5s` / `250ms` 这类时长、纯秒数，或 Unix 时间戳（秒或毫秒）。
+fn parse_reset_value(value: &str) -> Option<Duration> {
+    if let Ok(number) = value.parse::<f64>() {
+        if !number.is_finite() || number < 0.0 {
+            return None;
+        }
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64();
+        let seconds = if number >= 1e12 {
+            // 毫秒时间戳。
+            (number / 1000.0 - now).max(0.0)
+        } else if number >= 1e9 {
+            // 秒时间戳。
+            (number - now).max(0.0)
+        } else {
+            number
+        };
+        return Some(Duration::from_secs_f64(seconds));
+    }
+    let mut total = 0.0_f64;
+    let mut rest = value;
+    let mut matched = false;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let amount = rest[..digits].parse::<f64>().ok()?;
+        rest = &rest[digits..];
+        let (unit, len) = if rest.starts_with("ms") {
+            (0.001, 2)
+        } else if rest.starts_with('h') {
+            (3600.0, 1)
+        } else if rest.starts_with('m') {
+            (60.0, 1)
+        } else if rest.starts_with('s') {
+            (1.0, 1)
+        } else {
+            return None;
+        };
+        rest = &rest[len..];
+        total += amount * unit;
+        matched = true;
+    }
+    (matched && total.is_finite()).then(|| Duration::from_secs_f64(total))
 }
 
 /// ChatGPT 订阅额度耗尽时错误体里带 `resets_in_seconds`。
@@ -284,16 +377,66 @@ pub fn order_keys_with(
     now: Instant,
     advance: bool,
 ) -> (Vec<KeyCandidate>, Option<Duration>) {
+    let order = order_keys_detailed(relay, mode, conversation, now, advance);
+    (order.available, order.soonest)
+}
+
+/// 供应商是否正处于熔断中（只读，诊断与测试用）。
+pub fn breaker_open(relay_id: &str, now: Instant) -> bool {
+    lock()
+        .providers
+        .get(relay_id)
+        .and_then(|provider| provider.open_until)
+        .is_some_and(|open_until| open_until > now)
+}
+
+/// 暂时不可用的 Key 为什么不可用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitReason {
+    /// 这个 Key 自己在冷却（429 / 额度耗尽 / 官方登录 401）。
+    Cooling,
+    /// Key 本身没事，是整个供应商在熔断（连续 5xx / 连接失败）。
+    Breaker,
+}
+
+/// 冷却或熔断中的一个 Key：多久后恢复、为什么。停用（401）的 Key 不在这里。
+#[derive(Debug, Clone)]
+pub struct WaitingKey {
+    pub candidate: KeyCandidate,
+    pub remaining: Duration,
+    pub reason: WaitReason,
+}
+
+/// [`order_keys_detailed`] 的结果。
+#[derive(Debug, Clone, Default)]
+pub struct KeyOrder {
+    /// 现在可用的 Key，按策略排好序。
+    pub available: Vec<KeyCandidate>,
+    /// 冷却 / 熔断中的 Key 里最早多久后恢复。
+    pub soonest: Option<Duration>,
+    /// 冷却 / 熔断中的 Key（按书写顺序），供候选全空时决定是等一等还是放行（#2802）。
+    pub waiting: Vec<WaitingKey>,
+}
+
+/// 同 [`order_keys_with`]，另外交回冷却 / 熔断中的 Key 及其原因。
+pub fn order_keys_detailed(
+    relay: &RelayProfile,
+    mode: KeyRotationMode,
+    conversation: Option<&str>,
+    now: Instant,
+    advance: bool,
+) -> KeyOrder {
     let all = expand_keys(relay);
     let mut state = lock();
-    if let Some(provider) = state.providers.get(&relay.id)
-        && let Some(open_until) = provider.open_until
-        && open_until > now
-    {
-        return (Vec::new(), Some(open_until - now));
-    }
+    let breaker = state
+        .providers
+        .get(&relay.id)
+        .and_then(|provider| provider.open_until)
+        .filter(|open_until| *open_until > now)
+        .map(|open_until| open_until - now);
     let mut available = Vec::new();
-    let mut soonest: Option<Duration> = None;
+    let mut waiting = Vec::new();
+    let mut soonest: Option<Duration> = breaker;
     for candidate in all {
         let health = state
             .keys
@@ -306,9 +449,24 @@ pub fn order_keys_with(
                 && until > now
             {
                 let remaining = until - now;
-                soonest = Some(soonest.map_or(remaining, |current| current.min(remaining)));
+                if breaker.is_none() {
+                    soonest = Some(soonest.map_or(remaining, |current| current.min(remaining)));
+                }
+                waiting.push(WaitingKey {
+                    candidate,
+                    remaining,
+                    reason: WaitReason::Cooling,
+                });
                 continue;
             }
+        }
+        if let Some(remaining) = breaker {
+            waiting.push(WaitingKey {
+                candidate,
+                remaining,
+                reason: WaitReason::Breaker,
+            });
+            continue;
         }
         available.push(candidate);
     }
@@ -344,7 +502,21 @@ pub fn order_keys_with(
             available.rotate_left(offset);
         }
     }
-    (available, soonest)
+    KeyOrder {
+        available,
+        soonest,
+        waiting,
+    }
+}
+
+/// 这个 Key 自己还要冷却多久；没在冷却返回 None（供应商熔断不算，见 [`WaitReason::Breaker`]）。
+pub fn cooling_remaining(key: &KeyRef, now: Instant) -> Option<Duration> {
+    lock()
+        .keys
+        .get(&(key.relay_id.clone(), key.key_id.clone()))
+        .and_then(|health| health.cooldown_until)
+        .filter(|until| *until > now)
+        .map(|until| until - now)
 }
 
 /// 记一次失败。返回是否应该换下一个候选。
@@ -424,6 +596,22 @@ pub fn reset(relay_id: &str) {
     state.providers.remove(relay_id);
     state.sticky.retain(|(relay, _), _| relay != relay_id);
     state.round_robin.remove(relay_id);
+}
+
+/// 某个 Key 被删除或换成新值（#2782）：清掉它的冷却 / 停用记录、限速计数，以及固定到它的会话。
+///
+/// 会话固定指向已删的 Key 时，下次请求按策略重新选 Key；进行中的请求名额释放时找不到计数，自然无事。
+/// 供应商级的熔断不动：那是上游地址的问题，与哪个 Key 无关。
+pub fn forget_key(relay_id: &str, key_id: &str) {
+    let mut state = lock();
+    state
+        .keys
+        .remove(&(relay_id.to_string(), key_id.to_string()));
+    state
+        .sticky
+        .retain(|(relay, _), pinned| !(relay == relay_id && pinned == key_id));
+    drop(state);
+    usage_lock().remove(&(relay_id.to_string(), key_id.to_string()));
 }
 
 /// UI 展示用的健康快照，不含 Key 原文。
@@ -511,6 +699,182 @@ fn now_unix_ms() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// 主动限速（#1130 / #2726）
+//
+// 用户按供应商填「每个 Key 每分钟最多请求数」「每个 Key 同时进行的最多请求数」，网关发请求前先占名额：
+// 名额满了的 Key 像冷却中一样先跳过（换同一家的下一个 Key 或下一家），但不算失败、不冷却、不熔断，
+// 也不改会话固定；所有候选都满了由候选循环排队等最早空出的名额（见 `pipeline`）。
+// 计数和冷却一样只放内存：按 (供应商 id, Key id) 记最近 60 秒发出的时间和进行中的请求数。
+// 没填上限的 Key 完全不进这张表，行为和以前一样。
+// ---------------------------------------------------------------------------
+
+/// 所有候选都因限速满了时，最多排队等这么久；超时返回本地限速错误。
+pub const LIMIT_QUEUE_TIMEOUT: Duration = Duration::from_secs(120);
+/// RPM 的滑动窗口。
+const RPM_WINDOW: Duration = Duration::from_secs(60);
+
+/// 一个 Key 的主动限速上限；都为 None 表示不限。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyLimits {
+    /// 每分钟最多发出的请求数（滑动 60 秒）。
+    pub rpm: Option<u32>,
+    /// 同时进行中的最多请求数。
+    pub concurrency: Option<u32>,
+}
+
+impl KeyLimits {
+    pub fn is_unlimited(&self) -> bool {
+        self.rpm.is_none() && self.concurrency.is_none()
+    }
+}
+
+/// 某个 Key 现在能不能再发一个请求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLimitState {
+    Free,
+    /// 满了。`retry_in` 是按 RPM 窗口算出的最早空出时间；只因并发满了时为 None（要等进行中的请求结束）。
+    Full {
+        retry_in: Option<Duration>,
+    },
+}
+
+#[derive(Debug, Default)]
+struct KeyUsage {
+    /// 最近 60 秒内发出请求的时间，按先后排。
+    sent: std::collections::VecDeque<Instant>,
+    in_flight: u32,
+}
+
+impl KeyUsage {
+    fn prune(&mut self, now: Instant) {
+        while self
+            .sent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= RPM_WINDOW)
+        {
+            self.sent.pop_front();
+        }
+    }
+
+    fn state(&self, limits: KeyLimits, now: Instant) -> KeyLimitState {
+        let rpm_full = limits
+            .rpm
+            .is_some_and(|rpm| self.sent.len() >= rpm as usize);
+        let busy = limits
+            .concurrency
+            .is_some_and(|concurrency| self.in_flight >= concurrency);
+        if !rpm_full && !busy {
+            return KeyLimitState::Free;
+        }
+        // 窗口里第 (len - rpm + 1) 早的那次滑出窗口后才有名额。
+        let retry_in = rpm_full
+            .then(|| {
+                let rpm = limits.rpm.unwrap_or_default() as usize;
+                self.sent
+                    .len()
+                    .checked_sub(rpm.max(1))
+                    .and_then(|index| self.sent.get(index))
+            })
+            .flatten()
+            .map(|at| (*at + RPM_WINDOW).saturating_duration_since(now));
+        KeyLimitState::Full { retry_in }
+    }
+}
+
+type UsageTable = HashMap<(String, String), KeyUsage>;
+
+fn usage_lock() -> std::sync::MutexGuard<'static, UsageTable> {
+    static USAGE: OnceLock<Mutex<UsageTable>> = OnceLock::new();
+    USAGE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn limit_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// 有名额被释放时会被唤醒的 future。排队方要先 `enable` 再检查名额，避免漏掉检查和等待之间的释放。
+pub fn limit_released() -> tokio::sync::futures::Notified<'static> {
+    limit_notify().notified()
+}
+
+/// 这个 Key 按上限看现在有没有名额（不占名额）。
+pub fn limit_state(key: &KeyRef, limits: KeyLimits, now: Instant) -> KeyLimitState {
+    if limits.is_unlimited() {
+        return KeyLimitState::Free;
+    }
+    let mut table = usage_lock();
+    match table.get_mut(&(key.relay_id.clone(), key.key_id.clone())) {
+        Some(usage) => {
+            usage.prune(now);
+            usage.state(limits, now)
+        }
+        None => KeyLimitState::Free,
+    }
+}
+
+/// 占一个名额：有名额时记一次发出（计入 RPM）并把进行中加一，返回的 [`KeySlot`] drop 时释放并发名额。
+/// 满了返回 None。没设上限时不记任何东西，直接给一个空名额。
+pub fn try_acquire(key: &KeyRef, limits: KeyLimits, now: Instant) -> Option<KeySlot> {
+    if limits.is_unlimited() {
+        return Some(KeySlot { held: None });
+    }
+    let id = (key.relay_id.clone(), key.key_id.clone());
+    let mut table = usage_lock();
+    let usage = table.entry(id.clone()).or_default();
+    usage.prune(now);
+    if usage.state(limits, now) != KeyLimitState::Free {
+        return None;
+    }
+    usage.sent.push_back(now);
+    usage.in_flight = usage.in_flight.saturating_add(1);
+    Some(KeySlot {
+        held: Some((id, now)),
+    })
+}
+
+/// 占着的一个名额。drop 时（响应转发完、出错、客户端断开）释放并发名额并唤醒排队的请求；
+/// RPM 的那一次留在窗口里，60 秒后自然滑出。
+#[derive(Debug)]
+#[must_use = "名额在 drop 时释放，要持有到请求真正结束"]
+pub struct KeySlot {
+    held: Option<((String, String), Instant)>,
+}
+
+impl KeySlot {
+    /// 请求其实没发出去（例如发之前换 token 失败）：连 RPM 的这一次也退掉。
+    pub fn cancel(mut self) {
+        if let Some((id, at)) = self.held.take() {
+            let mut table = usage_lock();
+            if let Some(usage) = table.get_mut(&id) {
+                if let Some(position) = usage.sent.iter().rposition(|sent| *sent == at) {
+                    usage.sent.remove(position);
+                }
+                usage.in_flight = usage.in_flight.saturating_sub(1);
+            }
+            drop(table);
+            limit_notify().notify_waiters();
+        }
+    }
+}
+
+impl Drop for KeySlot {
+    fn drop(&mut self) {
+        if let Some((id, _)) = self.held.take() {
+            let mut table = usage_lock();
+            if let Some(usage) = table.get_mut(&id) {
+                usage.in_flight = usage.in_flight.saturating_sub(1);
+            }
+            drop(table);
+            limit_notify().notify_waiters();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -809,6 +1173,138 @@ mod tests {
         assert_eq!(keys.len(), 1);
     }
 
+    /// 429 没给 Retry-After 时看限流重置头（#2802）：超限的那一项（remaining 为 0）说了算。
+    #[test]
+    fn rate_limit_reset_headers_set_the_cooldown() {
+        let class = |pairs: &[(&'static str, &str)]| classify_failure(429, &headers(pairs), b"{}");
+        assert_eq!(
+            class(&[
+                ("x-ratelimit-remaining-requests", "0"),
+                ("x-ratelimit-reset-requests", "1m2.5s"),
+                ("x-ratelimit-remaining-tokens", "5000"),
+                ("x-ratelimit-reset-tokens", "250ms"),
+            ]),
+            FailureClass::RateLimited {
+                retry_after: Some(Duration::from_millis(62_500))
+            }
+        );
+        assert_eq!(
+            class(&[
+                ("x-ratelimit-reset-requests", "6s"),
+                ("x-ratelimit-reset-tokens", "250ms"),
+            ]),
+            FailureClass::RateLimited {
+                retry_after: Some(Duration::from_millis(250))
+            },
+            "看不出是哪一项超限时取最早的"
+        );
+        assert_eq!(
+            class(&[("x-ratelimit-reset", "3")]),
+            FailureClass::RateLimited {
+                retry_after: Some(Duration::from_secs(3))
+            }
+        );
+        assert_eq!(
+            class(&[("retry-after", "7"), ("x-ratelimit-reset-requests", "1s")]),
+            FailureClass::RateLimited {
+                retry_after: Some(Duration::from_secs(7))
+            },
+            "Retry-After 优先"
+        );
+        assert_eq!(
+            class(&[("x-ratelimit-reset-requests", "5h")]),
+            FailureClass::RateLimited {
+                retry_after: Some(RATE_LIMIT_MAX_COOLDOWN)
+            },
+            "重置头给的时间同样封顶"
+        );
+        assert_eq!(
+            class(&[("x-ratelimit-reset-requests", "soon")]),
+            FailureClass::RateLimited { retry_after: None },
+            "看不懂的写法当没给"
+        );
+        let epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 30;
+        let FailureClass::RateLimited {
+            retry_after: Some(wait),
+        } = class(&[("x-ratelimit-reset", &epoch.to_string())])
+        else {
+            panic!("Unix 时间戳也认");
+        };
+        assert!(
+            (Duration::from_secs(28)..=Duration::from_secs(30)).contains(&wait),
+            "{wait:?}"
+        );
+        // 额度耗尽不看这些头：它们说的是限流窗口，不是额度何时恢复。
+        assert_eq!(
+            classify_failure(
+                429,
+                &headers(&[("x-ratelimit-reset-requests", "1s")]),
+                br#"{"error":{"code":"insufficient_quota"}}"#
+            ),
+            FailureClass::QuotaExhausted { reset_after: None }
+        );
+    }
+
+    /// 无提示的 429：第一次只冷却 5 秒，连续再翻倍（#2802，原来 30 秒起步）。
+    #[test]
+    fn first_rate_limit_without_hint_cools_briefly() {
+        let relay = relay("kp-short-cool", &[("a", "sk-a")]);
+        let now = Instant::now();
+        let key = expand_keys(&relay)[0].key.clone();
+        let limited = FailureClass::RateLimited { retry_after: None };
+        record_failure(&key, &limited, now);
+        assert_eq!(cooling_remaining(&key, now), Some(Duration::from_secs(5)));
+        record_failure(&key, &limited, now);
+        assert_eq!(cooling_remaining(&key, now), Some(Duration::from_secs(10)));
+        record_success(&key, None);
+        assert_eq!(cooling_remaining(&key, now), None);
+        record_failure(&key, &limited, now);
+        assert_eq!(
+            cooling_remaining(&key, now),
+            Some(Duration::from_secs(5)),
+            "成功一次后从头算"
+        );
+    }
+
+    /// 熔断中的 Key 交回时标明是熔断，自己在冷却的标明是冷却（候选全空时据此决定放行还是等）。
+    #[test]
+    fn waiting_keys_carry_the_reason() {
+        let relay = relay("kp-waiting", &[("a", "sk-a"), ("b", "sk-b")]);
+        let now = Instant::now();
+        let keys = expand_keys(&relay);
+        record_failure(
+            &keys[0].key,
+            &FailureClass::RateLimited {
+                retry_after: Some(Duration::from_secs(8)),
+            },
+            now,
+        );
+        let order = order_keys_detailed(&relay, KeyRotationMode::Sticky, None, now, false);
+        assert_eq!(order.available.len(), 1);
+        assert_eq!(order.waiting.len(), 1);
+        assert_eq!(order.waiting[0].reason, WaitReason::Cooling);
+        assert_eq!(order.waiting[0].remaining, Duration::from_secs(8));
+        for _ in 0..BREAKER_THRESHOLD {
+            record_failure(&keys[1].key, &FailureClass::ServerError, now);
+        }
+        let order = order_keys_detailed(&relay, KeyRotationMode::Sticky, None, now, false);
+        assert!(order.available.is_empty());
+        assert_eq!(order.soonest, Some(BREAKER_OPEN));
+        let reasons = order
+            .waiting
+            .iter()
+            .map(|item| (item.candidate.key.key_id.as_str(), item.reason))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![("a", WaitReason::Cooling), ("b", WaitReason::Breaker)]
+        );
+    }
+
     #[test]
     fn client_errors_do_not_failover_or_cool_down() {
         let relay = relay("kp-client", &[("a", "sk-a"), ("b", "sk-b")]);
@@ -817,5 +1313,130 @@ mod tests {
         assert!(!record_failure(&key, &FailureClass::ClientError, now));
         let (keys, _) = order_keys(&relay, KeyRotationMode::Sticky, None, now);
         assert_eq!(keys.len(), 2);
+    }
+
+    fn limits(rpm: Option<u32>, concurrency: Option<u32>) -> KeyLimits {
+        KeyLimits { rpm, concurrency }
+    }
+
+    /// 选出第一个有名额的 Key（候选循环里跳过满了的 Key 就是这样）。
+    fn first_free(relay: &RelayProfile, limits: KeyLimits, now: Instant) -> Option<String> {
+        order_keys(relay, KeyRotationMode::Sticky, None, now)
+            .0
+            .into_iter()
+            .find(|key| limit_state(&key.key, limits, now) == KeyLimitState::Free)
+            .map(|key| key.key.key_id)
+    }
+
+    #[test]
+    fn rpm_full_key_is_skipped_for_the_next_key() {
+        let relay = relay("kp-rpm", &[("a", "sk-a"), ("b", "sk-b")]);
+        let limits = limits(Some(2), None);
+        let now = Instant::now();
+        let key_a = expand_keys(&relay)[0].key.clone();
+        for _ in 0..2 {
+            drop(try_acquire(&key_a, limits, now).expect("有名额"));
+        }
+        assert!(
+            try_acquire(&key_a, limits, now).is_none(),
+            "一分钟内第 3 次超出上限"
+        );
+        assert_eq!(first_free(&relay, limits, now).as_deref(), Some("b"));
+        assert_eq!(
+            limit_state(&key_a, limits, now + Duration::from_secs(10)),
+            KeyLimitState::Full {
+                retry_in: Some(Duration::from_secs(50))
+            },
+            "最早那次滑出 60 秒窗口才有名额"
+        );
+        // 滑动窗口：60 秒后又有名额。
+        let later = now + RPM_WINDOW;
+        assert_eq!(limit_state(&key_a, limits, later), KeyLimitState::Free);
+        assert_eq!(first_free(&relay, limits, later).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn concurrency_full_key_recovers_when_the_slot_is_released() {
+        let relay = relay("kp-conc", &[("a", "sk-a"), ("b", "sk-b")]);
+        let limits = limits(None, Some(1));
+        let now = Instant::now();
+        let key_a = expand_keys(&relay)[0].key.clone();
+        let slot = try_acquire(&key_a, limits, now).unwrap();
+        assert_eq!(
+            limit_state(&key_a, limits, now),
+            KeyLimitState::Full { retry_in: None },
+            "只因并发满了：要等进行中的请求结束"
+        );
+        assert!(try_acquire(&key_a, limits, now).is_none());
+        assert_eq!(first_free(&relay, limits, now).as_deref(), Some("b"));
+        drop(slot);
+        assert_eq!(limit_state(&key_a, limits, now), KeyLimitState::Free);
+        assert_eq!(first_free(&relay, limits, now).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn cancelled_slot_refunds_the_rpm_count() {
+        let relay = relay("kp-cancel", &[("a", "sk-a")]);
+        let limits = limits(Some(1), Some(1));
+        let now = Instant::now();
+        let key = expand_keys(&relay)[0].key.clone();
+        try_acquire(&key, limits, now).unwrap().cancel();
+        assert_eq!(limit_state(&key, limits, now), KeyLimitState::Free);
+        let slot = try_acquire(&key, limits, now).unwrap();
+        drop(slot);
+        assert!(
+            matches!(
+                limit_state(&key, limits, now),
+                KeyLimitState::Full { retry_in: Some(_) }
+            ),
+            "真正发出去的那次留在 RPM 窗口里"
+        );
+    }
+
+    #[test]
+    fn unlimited_keys_are_never_tracked() {
+        let relay = relay("kp-unlimited", &[("a", "sk-a")]);
+        let key = expand_keys(&relay)[0].key.clone();
+        let now = Instant::now();
+        let slots: Vec<KeySlot> = (0..100)
+            .map(|_| try_acquire(&key, KeyLimits::default(), now).unwrap())
+            .collect();
+        assert_eq!(
+            limit_state(&key, KeyLimits::default(), now),
+            KeyLimitState::Free
+        );
+        assert!(
+            !usage_lock().contains_key(&(key.relay_id.clone(), key.key_id.clone())),
+            "没设上限的 Key 不进计数表"
+        );
+        drop(slots);
+    }
+
+    #[test]
+    fn saturated_keys_do_not_cool_down_or_trip_the_breaker() {
+        let relay = relay("kp-limit-health", &[("a", "sk-a")]);
+        let limits = limits(Some(1), Some(1));
+        let now = Instant::now();
+        let key = expand_keys(&relay)[0].key.clone();
+        let _slot = try_acquire(&key, limits, now).unwrap();
+        for _ in 0..5 {
+            assert!(try_acquire(&key, limits, now).is_none());
+        }
+        let (keys, soonest) = order_keys(&relay, KeyRotationMode::Sticky, None, now);
+        assert_eq!(keys.len(), 1, "限速满了不算冷却，Key 仍在候选里");
+        assert_eq!(soonest, None);
+        let snapshot = snapshot(now);
+        assert!(
+            snapshot
+                .keys
+                .iter()
+                .all(|view| view.relay_id != "kp-limit-health")
+        );
+        assert!(
+            snapshot
+                .providers
+                .iter()
+                .all(|view| view.relay_id != "kp-limit-health")
+        );
     }
 }

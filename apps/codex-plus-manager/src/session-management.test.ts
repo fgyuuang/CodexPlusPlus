@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
-import { matchesManagementQuery, sessionGroups, type ManagedSession } from "./management-model.ts";
+import { matchesManagementQuery, normalizeProjectPath, sessionGroups, type ManagedSession } from "./management-model.ts";
 
 type Tree = { type: string; props: Record<string, any>; children: unknown[] };
 const source = readFileSync(new URL("./ProjectSessionPage.tsx", import.meta.url), "utf8");
@@ -50,7 +50,10 @@ function fixture(overrides: Record<string, any> = {}) {
     },
     useMemo: (create: () => unknown) => create(),
     Archive: "Archive", ArrowLeft: "ArrowLeft", ArrowRight: "ArrowRight", ChevronDown: "ChevronDown", Copy: "Copy", History: "History", Info: "Info",
-    RefreshCw: "RefreshCw", Search: "Search", Trash2: "Trash2", ManagementDrawer: "ManagementDrawer",
+    RefreshCw: "RefreshCw", Search: "Search", Trash2: "Trash2", Check: "Check", ManagementDrawer: "ManagementDrawer",
+    // 骨架组件（cx-layout）与顶栏挂载点在这里只当普通节点；搜索框是 CxToolbar 的 onQuery。
+    TopbarActions: "TopbarActions", CxToolbar: "CxToolbar", CxCard: "CxCard", CxEmpty: "CxEmpty", CxRow: "CxRow",
+    setTimeout,
   });
   vm.runInContext(code, context);
   let props = {
@@ -103,9 +106,9 @@ test("search and pagination retain selected sessions, and cancelled deletion kee
   await flushActions();
   assert.deepEqual(offsets, [2]);
   tree = f.render({ sessions: { sessions: [session("third", "/projects/alpha"), session("fourth", "/projects/beta")], totalCount: 4, hasMore: false, offset: 2, limit: 2 } });
-  const search = nodes(tree).find((node) => node.type === "input" && node.props.placeholder);
+  const search = nodes(tree).find((node) => node.type === "CxToolbar" && node.props.placeholder);
   assert.ok(search);
-  search.props.onChange({ target: { value: "third" } });
+  search.props.onQuery("third");
   tree = f.render();
   button(tree, "全选当前列表").props.onClick();
   tree = f.render(); button(tree, "删除已选 (3)").props.onClick();
@@ -127,7 +130,7 @@ test("whole-project selection includes sessions outside the page and archive rec
   });
   let tree = f.render(); button(tree, "选择多个…").props.onClick();
   tree = f.render();
-  const group = nodes(tree).find((node) => node.props.className === "mg-session-group-header" && text(node).includes("/projects/alpha"));
+  const group = nodes(tree).find((node) => node.props.className === "cx-session-group-head" && text(node).includes("/projects/alpha"));
   assert.ok(group);
   button(group, "全选项目").props.onClick();
   await flushActions();
@@ -138,28 +141,58 @@ test("whole-project selection includes sessions outside the page and archive rec
   assert.equal(button(f.render(), "删除已选 (0)").props.disabled, true);
 });
 
-test("project headings expose their controlled region and can expand and collapse independently", () => {
+test("project headings expose their controlled region, start expanded and can collapse and expand independently", () => {
   const f = fixture(); let tree = f.render();
-  const toggle = (root: Tree) => nodes(root).find((node) => node.type === "button" && node.props.className === "mg-session-group-toggle" && text(node).includes("/projects/alpha"))!;
+  const toggle = (root: Tree) => nodes(root).find((node) => node.type === "button" && node.props.className === "cx-session-group-toggle" && text(node).includes("/projects/alpha"))!;
+  const rows = (root: Tree) => nodes(root).filter((node) => node.props.className === "cx-session-row").length;
   const initial = toggle(tree); assert.ok(initial);
-  assert.equal(initial.props["aria-expanded"], false);
+  // 按项目分节的列表默认展开，一眼能看到全部会话。
+  assert.equal(initial.props["aria-expanded"], true);
   const regionId = initial.props["aria-controls"]; assert.ok(regionId);
-  assert.equal(nodes(tree).find((node) => node.props.id === regionId)?.props.hidden, true);
-  initial.props.onClick(); tree = f.render();
-  assert.equal(toggle(tree).props["aria-expanded"], true);
   assert.equal(nodes(tree).find((node) => node.props.id === regionId)?.props.hidden, false);
-  assert.equal(nodes(tree).filter((node) => node.props.className === "mg-session-row").length, 1);
-  toggle(tree).props.onClick(); tree = f.render();
+  assert.equal(rows(tree), 2);
+  initial.props.onClick(); tree = f.render();
   assert.equal(toggle(tree).props["aria-expanded"], false);
-  assert.equal(nodes(tree).filter((node) => node.props.className === "mg-session-row").length, 0);
+  assert.equal(nodes(tree).find((node) => node.props.id === regionId)?.props.hidden, true);
+  assert.equal(rows(tree), 1, "只折叠这一个项目");
+  toggle(tree).props.onClick(); tree = f.render();
+  assert.equal(toggle(tree).props["aria-expanded"], true);
+  assert.equal(rows(tree), 2);
 });
 
 test("a single project starts expanded and respects a manual collapse", () => {
   const f = fixture({ sessions: { sessions: [session("only", "/projects/alpha")], totalCount: 1, hasMore: false, offset: 0, limit: 2 } });
   let tree = f.render();
-  const toggle = nodes(tree).find((node) => node.props.className === "mg-session-group-toggle");
+  const toggle = nodes(tree).find((node) => node.props.className === "cx-session-group-toggle");
   assert.ok(toggle); assert.equal(toggle.props["aria-expanded"], true);
   toggle.props.onClick(); tree = f.render();
-  assert.equal(nodes(tree).find((node) => node.props.className === "mg-session-group-toggle")?.props["aria-expanded"], false);
-  assert.equal(nodes(tree).filter((node) => node.props.className === "mg-session-row").length, 0);
+  assert.equal(nodes(tree).find((node) => node.props.className === "cx-session-group-toggle")?.props["aria-expanded"], false);
+  assert.equal(nodes(tree).filter((node) => node.props.className === "cx-session-row").length, 0);
+});
+
+test("Windows long-path prefixes are stripped from project headings and grouping (#2791)", () => {
+  assert.equal(normalizeProjectPath("\\\\?\\C:\\Users\\me\\Documents\\ChatGPT\\my app\\"), "C:/Users/me/Documents/ChatGPT/my app");
+  assert.equal(normalizeProjectPath("\\\\?\\UNC\\server\\share\\repo"), "//server/share/repo");
+  assert.equal(normalizeProjectPath("\\\\server\\share\\repo"), "//server/share/repo");
+  assert.equal(normalizeProjectPath("\\\\?\\E:\\"), "E:");
+  assert.equal(normalizeProjectPath("/projects/alpha/"), "/projects/alpha");
+  // 不是盘符或 UNC 的命名空间路径不知道如何还原，保持原样。
+  assert.equal(normalizeProjectPath("\\\\?\\Volume{abc}\\repo"), "//?/Volume{abc}/repo");
+  const groups = sessionGroups([session("long", "\\\\?\\E:\\Work\\new-chat"), session("plain", "E:\\Work\\new-chat\\")], "project");
+  assert.equal(groups.length, 1, "带不带前缀是同一个项目");
+  assert.equal(groups[0].path, "E:/Work/new-chat");
+  assert.equal(groups[0].label, "new-chat");
+});
+
+test("盘符大小写统一成大写，c:\\ 与 C:\\ 归为同一个项目（#2937）", () => {
+  assert.equal(normalizeProjectPath("c:\\Users\\me\\.copilot\\chats\\1"), "C:/Users/me/.copilot/chats/1");
+  assert.equal(normalizeProjectPath("c:/Users/me/app/"), "C:/Users/me/app");
+  assert.equal(normalizeProjectPath("\\\\?\\d:\\Work"), "D:/Work");
+  assert.equal(normalizeProjectPath("e:"), "E:");
+  // 只动盘符；路径其余部分以及非盘符开头的路径保持原样。
+  assert.equal(normalizeProjectPath("/users/me/app"), "/users/me/app");
+  assert.equal(normalizeProjectPath("ab:/x"), "ab:/x");
+  const groups = sessionGroups([session("claude", "c:\\Work\\app"), session("codex", "C:\\Work\\app")], "project");
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].path, "C:/Work/app");
 });

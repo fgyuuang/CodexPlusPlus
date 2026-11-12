@@ -1,0 +1,9 @@
+{
+  "id": "local-newapi",
+  "name": "NewAPI 本地服务",
+  "version": "1.0.0",
+  "description": "连接现有 NewAPI API，管理独立 Compose 服务与加密用户令牌。停用插件不停止服务、不删除供应商。",
+  "engines": { "codexpp": ">=2.2.0" },
+  "manager": { "page": "manager.html", "title": "NewAPI", "nav": "tools", "icon": "server" },
+  "permissions": { "routes": ["/local-integrations/newapi"] }
+}

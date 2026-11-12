@@ -6,7 +6,7 @@
 
 浏览市场只获取 `plugin-index.json`，不克隆整个插件仓库，也不检出一个包含千个插件的市场目录。点击安装时，后端读取索引中的固定 Git revision，用 `blob:none` 和精确的单目录检出获取所选插件，核对 Git tree 后写入 Codex 插件缓存。实际网络量还包括 Git 的树元数据；需要本机可运行 Git。
 
-公开索引为 520 个条目（约 283 KiB）；当前完整索引为 5,491 个条目（约 4.4 MiB）。完整缓存仓库保持私有，使用已有 `gh auth login` 登录信息访问。GitHub 凭据只用于本次请求，不写入索引、插件包或日志。完整库可访问时，原生列表优先显示完整库；不可访问时显示公开库并保留加载错误。
+公开索引为 520 个条目（约 283 KiB）；当前完整索引为 5,491 个条目（约 4.4 MiB）。完整缓存仓库已公开，和公开库一样匿名访问，不需要 `gh auth login`；raw.githubusercontent.com 连不上时会改走 api.github.com 的 contents 接口取索引。完整库可访问时，原生列表优先显示完整库；不可访问时显示公开库并保留加载错误。
 
 ## 原生接口适配
 
@@ -49,7 +49,7 @@ node scripts/assemble-renderer-inject.mjs --check
 显式联网测试在临时 Codex home 中安装两个样本，不修改用户的 Codex 配置，也不调用原生授权流程：
 
 ```sh
-cargo test -p codex-plus-core --test plugin_market_live -- --ignored --nocapture
+cargo test -p codex-plus-core --test all plugin_market_live:: -- --ignored --nocapture
 ```
 
 2026-10-08 验证：公开和完整索引读取成功，分别安装 Google Drive 和 Life Sciences Databases；原生 `skills/list` 加载 49 个 Skills、0 个错误。原生客户端、两类消息协议、超时恢复、远程主机隔离和插件身份去重复均有行为测试。当前运行的旧版本需要重新构建管理工具和启动器后重启，才能加载新增后端和注入代码。

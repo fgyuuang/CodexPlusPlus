@@ -3,7 +3,8 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -11,8 +12,14 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
-use super::{AgentConfig, MAX_OUTPUT_BYTES, MAX_PROMPT_BYTES, Store, TaskRecord};
+use super::{AgentConfig, MAX_OUTPUT_BYTES, MAX_PROMPT_BYTES, QueueTurn, Store, TaskRecord};
 
+/// 排在队首（前面只剩正在运行的那个）时检查是否轮到的间隔；本进程内任务结束时会立即唤醒，不必等满。
+const QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// 前面还有别的排队任务时的检查间隔：一时轮不到，放慢以减少对协作数据库的读取。
+const QUEUE_BACKOFF_INTERVAL: Duration = Duration::from_secs(5);
+/// 连续读取队列失败这么多次才放弃，避免偶发的 SQLite 忙碌让排队任务直接失败。
+const MAX_QUEUE_POLL_FAILURES: u32 = 5;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 2 * 1024 * 1024;
@@ -24,6 +31,8 @@ struct OwnedTask {
     handle: tokio::task::JoinHandle<()>,
     store: Store,
     id: String,
+    /// 已开始启动 CLI；为 false 时确定什么都没执行过。
+    launched: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -57,17 +66,105 @@ impl Provider {
     }
 }
 
+/// 可执行文件的定位结果，附带「已保存路径失效」的诊断信息。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutableResolution {
+    pub path: Option<PathBuf>,
+    /// 用户保存了一个看起来是路径的值，但该文件已不存在。
+    pub configured_missing: bool,
+}
+
+impl ExecutableResolution {
+    /// 已保存路径失效，本次改用自动查找到的 CLI（不回写用户设置）。
+    pub fn recovered(&self) -> bool {
+        self.configured_missing && self.path.is_some()
+    }
+}
+
 /// 只定位可执行文件，不读取登录状态，也不运行检测命令。
 pub fn resolve_executable(agent: &AgentConfig) -> Option<PathBuf> {
-    let provider = Provider::from_id(&agent.id).ok()?;
-    let configured = agent.executable.trim();
-    if !configured.is_empty() {
-        return resolve_command(configured);
-    }
+    resolve_executable_detailed(agent).path
+}
 
+/// 同 [`resolve_executable`]，额外返回已保存路径是否失效、是否发生了回退。
+pub fn resolve_executable_detailed(agent: &AgentConfig) -> ExecutableResolution {
+    let local_appdata = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    resolve_executable_with(agent, local_appdata.as_deref(), |provider| {
+        auto_detect_executable(provider, local_appdata.as_deref())
+    })
+}
+
+/// 解析逻辑本体；托管目录根与自动查找由调用方注入，便于用临时目录测试。
+fn resolve_executable_with(
+    agent: &AgentConfig,
+    local_appdata: Option<&Path>,
+    auto_detect: impl FnOnce(Provider) -> Option<PathBuf>,
+) -> ExecutableResolution {
+    let Ok(provider) = Provider::from_id(&agent.id) else {
+        return ExecutableResolution::default();
+    };
+    let configured = agent.executable.trim();
+    if configured.is_empty() {
+        return ExecutableResolution {
+            path: auto_detect(provider),
+            configured_missing: false,
+        };
+    }
+    if let Some(path) = resolve_command(configured) {
+        return ExecutableResolution {
+            path: Some(path),
+            configured_missing: false,
+        };
+    }
+    let looks_like_path = Path::new(configured).is_absolute()
+        || configured.contains('/')
+        || configured.contains('\\');
+    if !looks_like_path || Path::new(configured).exists() {
+        // 裸命令名找不到、或文件存在但不可执行：保持原样报错，不替用户换 CLI。
+        return ExecutableResolution::default();
+    }
+    // 已保存的文件不存在。桌面版更新会换掉 bin\<哈希>\ 目录（#2751），
+    // 这里只在运行时改用当前安装的 CLI，不覆盖用户保存的路径。
+    let path = if provider == Provider::Codex {
+        local_appdata
+            .filter(|local| crate::app_paths::is_desktop_managed_codex_cli_path(configured, local))
+            .and_then(|local| {
+                crate::app_paths::find_desktop_managed_codex_cli_from_var(Some(local))
+            })
+            // 原来指向的就是 codex 本体（如包管理器升级后旧版本目录被删）时，
+            // 再按留空时的顺序自动查找：桌面版托管 CLI → 用户目录 → PATH。
+            .or_else(|| {
+                is_codex_file_name(configured)
+                    .then(|| auto_detect(provider))
+                    .flatten()
+            })
+    } else {
+        None
+    };
+    ExecutableResolution {
+        path,
+        configured_missing: true,
+    }
+}
+
+/// 路径最后一段是否是 codex 本体；Windows 风格的反斜杠在其他平台上也要能拆开。
+fn is_codex_file_name(configured: &str) -> bool {
+    configured.rsplit(['/', '\\']).next().is_some_and(|name| {
+        name.eq_ignore_ascii_case("codex") || name.eq_ignore_ascii_case("codex.exe")
+    })
+}
+
+/// 未填写路径时的自动查找顺序。
+fn auto_detect_executable(provider: Provider, local_appdata: Option<&Path>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if provider == Provider::WorkBuddy {
         candidates.extend(super::workbuddy::candidates());
+    }
+    if cfg!(windows) && provider == Provider::Codex {
+        // Windows 桌面版把可独立运行的 CLI 维护在 %LOCALAPPDATA%\OpenAI\Codex\bin\<哈希>\ 下。
+        candidates.extend(crate::app_paths::find_desktop_managed_codex_cli_from_var(
+            local_appdata,
+        ));
     }
     if cfg!(target_os = "macos") {
         match provider {
@@ -160,29 +257,19 @@ pub fn spawn_task(store: Store, id: String) {
         .unwrap_or_else(|error| error.into_inner());
     if owned.shutting_down {
         drop(owned);
-        let _ = store.finish(
-            &id,
-            "interrupted",
-            "",
-            "协作执行进程正在退出，CLI 未启动",
-            "",
-        );
+        refuse_during_shutdown(&store, &id);
         return;
     }
     owned.tasks.retain(|task| !task.handle.is_finished());
     let retained_store = store.clone();
     let retained_id = id.clone();
+    let launched = Arc::new(AtomicBool::new(false));
+    let retained_launched = launched.clone();
     let handle = tokio::spawn(async move {
-        let claimed = match store.claim(&id) {
-            Ok(claimed) => claimed,
-            Err(_) => {
-                let _ = store.finish(&id, "failed", "", "无法认领协作任务，CLI 未启动", "");
-                return;
-            }
-        };
-        if !claimed {
+        if !wait_for_turn(&store, &id).await {
             return;
         }
+        launched.store(true, Ordering::SeqCst);
         let outcome = match run_task(&store, &id).await {
             Ok(outcome) => outcome,
             Err(error) => Outcome {
@@ -199,12 +286,97 @@ pub fn spawn_task(store: Store, id: String) {
             &outcome.error,
             &outcome.session_id,
         );
+        // 本进程排在后面的任务立即重新检查，不必等到下一次轮询。
+        queue_wakeup().notify_waiters();
     });
     owned.tasks.push(OwnedTask {
         handle,
         store: retained_store,
         id: retained_id,
+        launched: retained_launched,
     });
+}
+
+/// 进程正在退出时提交的任务从未启动：与排队中被放弃的任务一样标记为未启动、可重新提交，
+/// 而不是「结果不确定」的中断。
+fn refuse_during_shutdown(store: &Store, id: &str) {
+    let _ = store.abandon_queued(
+        id,
+        "协作执行进程正在退出，任务未启动，没有执行任何操作；可以重新提交",
+    );
+}
+
+fn queue_wakeup() -> &'static tokio::sync::Notify {
+    static WAKEUP: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    WAKEUP.get_or_init(tokio::sync::Notify::new)
+}
+
+/// 同一 Agent 的任务按提交顺序排队：轮询直到轮到本任务并认领执行权（#2772）。
+/// 返回 false 表示任务已取消、已结束或协作已关闭，不再启动。轮询同时为排队任务续租，
+/// 本进程退出或失联后租约过期，任务会被标记为未启动的失败，不会卡在 queued。
+///
+/// 只有排在队首的任务每秒检查，其余退避；平时只做只读查询，轮到、该续租或进度有变时才开写事务。
+async fn wait_for_turn(store: &Store, id: &str) -> bool {
+    let mut failures = 0;
+    // 第一次直接走写事务：登记本进程为该任务的持有者。
+    let mut peek = false;
+    loop {
+        // 先登记唤醒再检查，避免检查后、等待前恰好有任务结束而错过通知。
+        let wakeup = queue_wakeup().notified();
+        let interval = match check_turn(store, id, peek).await {
+            Ok(QueueTurn::Start) => return true,
+            Ok(QueueTurn::Stop) => return false,
+            Ok(QueueTurn::Wait { ahead }) => {
+                failures = 0;
+                peek = true;
+                if ahead <= 1 {
+                    QUEUE_POLL_INTERVAL
+                } else {
+                    QUEUE_BACKOFF_INTERVAL
+                }
+            }
+            Err(_) => {
+                failures += 1;
+                if failures >= MAX_QUEUE_POLL_FAILURES {
+                    let abandon_id = id.to_owned();
+                    let _ = on_store(store, move |store| {
+                        store.abandon_queued(
+                            &abandon_id,
+                            "无法读取协作任务队列，任务未启动，没有执行任何操作；可以重新提交",
+                        )
+                    })
+                    .await;
+                    return false;
+                }
+                QUEUE_POLL_INTERVAL
+            }
+        };
+        // 其他进程拥有的任务结束时不会通知这里，靠定时轮询兜底。
+        let _ = tokio::time::timeout(interval, wakeup).await;
+    }
+}
+
+/// 检查一次是否轮到：`peek` 时先只读查看，仍要等且不用续租就不开写事务。
+async fn check_turn(store: &Store, id: &str, peek: bool) -> anyhow::Result<QueueTurn> {
+    let id = id.to_owned();
+    on_store(store, move |store| {
+        if peek && let Some(ahead) = store.peek_queue(&id)? {
+            return Ok(QueueTurn::Wait { ahead });
+        }
+        store.poll_queue(&id)
+    })
+    .await
+}
+
+/// 协作数据库是同步 SQLite（忙时最多等 10 秒）：放到 blocking 线程执行，不占 tokio 工作线程。
+async fn on_store<T: Send + 'static>(
+    store: &Store,
+    call: impl FnOnce(&Store) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || call(&store))
+        .await
+        .context("协作数据库操作意外中止")?
 }
 
 /// 只中止当前进程登记的任务；其他 manager/MCP 进程拥有的任务不受影响。
@@ -226,6 +398,18 @@ async fn stop_owned_tasks(tasks: Vec<OwnedTask>) {
     for task in tasks {
         // await 完成意味着 run_task 的 future 已析构，独立进程组 guard 已发送终止信号。
         let _ = task.handle.await;
+        // 还没启动 CLI 的任务（排队中，或中止时恰好刚认领）什么都没执行，单独说明，提示可以重新提交。
+        // 检查队列放在 blocking 线程里，中止时可能已认领却来不及启动，所以按 launched 判断。
+        if matches!(
+            task.store.abandon_before_launch(
+                &task.id,
+                "协作执行进程已退出，排队中的任务未启动，没有执行任何操作；可以重新提交",
+                !task.launched.load(Ordering::SeqCst),
+            ),
+            Ok(true)
+        ) {
+            continue;
+        }
         let _ = task.store.finish(
             &task.id,
             "interrupted",
@@ -258,8 +442,17 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
         .find(|agent| agent.id == task.agent_id && agent.enabled)
         .context("协作 Agent 已停用或不存在")?;
     let provider = Provider::from_id(&agent.id)?;
-    let executable =
-        resolve_executable(agent).context("未找到原生 CLI，请在协作设置中填写可执行文件路径")?;
+    let resolution = resolve_executable_detailed(agent);
+    let Some(executable) = resolution.path else {
+        if resolution.configured_missing {
+            bail!(
+                "协作设置中保存的 CLI 路径已不存在：{}\n桌面版更新后版本目录可能已变化，\
+                 请清空路径保存（留空自动查找）或重新填写。",
+                agent.executable.trim()
+            );
+        }
+        bail!("未找到原生 CLI，请在协作设置中填写可执行文件路径");
+    };
     if task.prompt.trim().is_empty() || task.prompt.len() > MAX_PROMPT_BYTES {
         bail!("协作提示词为空或超过 64 KiB 限制");
     }
@@ -1331,6 +1524,7 @@ mod tests {
             handle,
             store: store.clone(),
             id: task.id.clone(),
+            launched: Arc::new(AtomicBool::new(true)),
         }])
         .await;
         assert_eq!(store.task(&task.id).unwrap().status, "interrupted");
@@ -1341,5 +1535,284 @@ mod tests {
             !directory.path().join("escaped.txt").exists(),
             "退出后登记的子进程组不能继续写文件"
         );
+    }
+
+    /// 退出时仍在排队的任务从未启动，标记为失败并说明可重新提交，而不是「结果不确定」的中断。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_marks_owned_queued_task_as_not_started() {
+        let (directory, store, running, _command) = fixture(":");
+        let queued = store
+            .submit(super::super::TaskRequest {
+                agent_id: "codex".to_owned(),
+                prompt: "排在后面".to_owned(),
+                cwd: directory.path().to_string_lossy().into_owned(),
+                continue_task_id: None,
+            })
+            .unwrap();
+        let waiter_store = store.clone();
+        let waiter_id = queued.id.clone();
+        let handle = tokio::spawn(async move {
+            assert!(
+                !wait_for_turn(&waiter_store, &waiter_id).await,
+                "前一个任务仍在运行，不应轮到"
+            );
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(store.task(&queued.id).unwrap().status, "queued");
+        stop_owned_tasks(vec![OwnedTask {
+            handle,
+            store: store.clone(),
+            id: queued.id.clone(),
+            launched: Arc::new(AtomicBool::new(false)),
+        }])
+        .await;
+        let abandoned = store.task(&queued.id).unwrap();
+        assert_eq!(abandoned.status, "failed");
+        assert!(abandoned.error.contains("未启动"), "{}", abandoned.error);
+        assert_eq!(store.task(&running.id).unwrap().status, "running");
+    }
+
+    fn queued_task(store: &Store, directory: &Path, prompt: &str) -> TaskRecord {
+        store
+            .submit(super::super::TaskRequest {
+                agent_id: "codex".to_owned(),
+                prompt: prompt.to_owned(),
+                cwd: directory.to_string_lossy().into_owned(),
+                continue_task_id: None,
+            })
+            .unwrap()
+    }
+
+    /// 进程正在退出时提交的任务没有启动：标记为未启动、可重新提交，而不是结果不确定的 interrupted。
+    #[cfg(unix)]
+    #[test]
+    fn task_submitted_during_shutdown_is_marked_not_started() {
+        let (directory, store, _running, _command) = fixture(":");
+        let task = queued_task(&store, directory.path(), "退出时提交");
+        refuse_during_shutdown(&store, &task.id);
+        let refused = store.task(&task.id).unwrap();
+        assert_eq!(refused.status, "failed");
+        assert!(refused.error.contains("未启动"), "{}", refused.error);
+        assert!(refused.error.contains("重新提交"), "{}", refused.error);
+    }
+
+    /// 排队检查的只读路径：别的连接正占着写锁时照样能读，轮到时才交给写事务认领。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queue_peek_is_read_only_and_defers_the_turn_to_the_write_path() {
+        let (directory, store, running, _command) = fixture(":");
+        let first = queued_task(&store, directory.path(), "排第一");
+        let second = queued_task(&store, directory.path(), "排第二");
+        assert_eq!(
+            check_turn(&store, &first.id, false).await.unwrap(),
+            QueueTurn::Wait { ahead: 1 }
+        );
+        assert_eq!(
+            check_turn(&store, &second.id, false).await.unwrap(),
+            QueueTurn::Wait { ahead: 2 }
+        );
+
+        let mut writer = rusqlite::Connection::open(store.path()).unwrap();
+        let held = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(store.peek_queue(&first.id).unwrap(), Some(1));
+        assert_eq!(store.peek_queue(&second.id).unwrap(), Some(2));
+        drop(held);
+
+        store
+            .finish(&running.id, "completed", "done", "", "native-1")
+            .unwrap();
+        assert_eq!(
+            store.peek_queue(&first.id).unwrap(),
+            None,
+            "轮到时交给写事务"
+        );
+        assert_eq!(
+            check_turn(&store, &first.id, true).await.unwrap(),
+            QueueTurn::Start
+        );
+        // 前面的任务数变了，进度文字要更新，也交给写事务。
+        assert_eq!(store.peek_queue(&second.id).unwrap(), None);
+        assert_eq!(
+            check_turn(&store, &second.id, true).await.unwrap(),
+            QueueTurn::Wait { ahead: 1 }
+        );
+        assert_eq!(store.peek_queue(&second.id).unwrap(), Some(1));
+    }
+
+    /// 中止时检查恰好已认领、CLI 还没启动的任务，同样按未启动处理。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_marks_a_claimed_but_unlaunched_task_as_not_started() {
+        let (directory, store, running, _command) = fixture(":");
+        store
+            .finish(&running.id, "completed", "done", "", "native-1")
+            .unwrap();
+        let claimed = queued_task(&store, directory.path(), "刚认领");
+        assert!(store.claim(&claimed.id).unwrap());
+        stop_owned_tasks(vec![OwnedTask {
+            handle: tokio::spawn(async {}),
+            store: store.clone(),
+            id: claimed.id.clone(),
+            launched: Arc::new(AtomicBool::new(false)),
+        }])
+        .await;
+        let abandoned = store.task(&claimed.id).unwrap();
+        assert_eq!(abandoned.status, "failed");
+        assert!(abandoned.error.contains("未启动"), "{}", abandoned.error);
+    }
+
+    fn codex_agent(executable: &str) -> AgentConfig {
+        AgentConfig {
+            id: "codex".to_owned(),
+            name: "Codex".to_owned(),
+            executable: executable.to_owned(),
+            enabled: true,
+            model: String::new(),
+            reuse_saved_auth: false,
+            max_concurrent_tasks: 1,
+        }
+    }
+
+    /// 模拟桌面版更新：旧哈希目录被删除，新哈希目录里放着当前 CLI。
+    fn managed_bin_with_updated_hash() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("OpenAI").join("Codex").join("bin");
+        let old = bin.join("08d187884f2330d1").join("codex.exe");
+        let new = bin.join("0ab0e7a8f3779036").join("codex.exe");
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::write(&new, "new").unwrap();
+        (temp, old, new)
+    }
+
+    /// #2751：保存的 bin\<旧哈希>\codex.exe 失效后，运行时改用当前哈希目录里的 CLI，
+    /// 并标记为回退，便于界面提示；不需要再走自动查找。
+    #[test]
+    fn stale_managed_codex_path_recovers_to_current_hash_dir() {
+        let (temp, old, new) = managed_bin_with_updated_hash();
+        let agent = codex_agent(&old.to_string_lossy());
+        let resolution = resolve_executable_with(&agent, Some(temp.path()), |_| {
+            panic!("托管路径能直接恢复时不应再走自动查找")
+        });
+        assert_eq!(resolution.path.as_deref(), Some(new.as_path()));
+        assert!(resolution.configured_missing);
+        assert!(resolution.recovered());
+        // 用户保存的路径保持原样，不被静默覆盖。
+        assert_eq!(agent.executable, old.to_string_lossy());
+    }
+
+    /// Windows 风格的反斜杠路径（大小写不同）同样识别为托管路径。
+    #[test]
+    fn stale_managed_codex_path_matches_windows_separators() {
+        let (temp, _old, new) = managed_bin_with_updated_hash();
+        let configured = format!(
+            "{}\\OPENAI\\Codex\\bin\\08D187884F2330D1\\codex.exe",
+            temp.path().to_string_lossy()
+        );
+        let resolution =
+            resolve_executable_with(&codex_agent(&configured), Some(temp.path()), |_| None);
+        assert_eq!(resolution.path.as_deref(), Some(new.as_path()));
+        assert!(resolution.recovered());
+    }
+
+    /// 已保存的路径仍存在时照常使用，即使托管目录里有更新的 CLI。
+    #[cfg(unix)]
+    #[test]
+    fn existing_configured_path_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, _old, _new) = managed_bin_with_updated_hash();
+        let custom = temp.path().join("custom").join("codex");
+        std::fs::create_dir_all(custom.parent().unwrap()).unwrap();
+        std::fs::write(&custom, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolution = resolve_executable_with(
+            &codex_agent(&custom.to_string_lossy()),
+            Some(temp.path()),
+            |_| panic!("路径有效时不应自动查找"),
+        );
+        assert_eq!(
+            resolution.path,
+            Some(std::fs::canonicalize(&custom).unwrap())
+        );
+        assert!(!resolution.configured_missing);
+    }
+
+    /// 失效的非托管 codex 路径（如包管理器升级删掉旧版本目录）回退到自动查找（含 PATH）。
+    #[test]
+    fn stale_non_managed_codex_path_falls_back_to_auto_detect() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = temp
+            .path()
+            .join("cellar")
+            .join("0.1.0")
+            .join("bin")
+            .join("codex");
+        let on_path = temp.path().join("path-bin").join("codex");
+        let expected = on_path.clone();
+        let resolution = resolve_executable_with(
+            &codex_agent(&stale.to_string_lossy()),
+            None,
+            move |provider| {
+                assert_eq!(provider, Provider::Codex);
+                Some(on_path)
+            },
+        );
+        assert_eq!(resolution.path, Some(expected));
+        assert!(resolution.recovered());
+    }
+
+    /// 失效的自定义文件名不替用户换 CLI，只报告路径失效；其他 Agent 也不回退。
+    #[test]
+    fn stale_custom_or_non_codex_paths_report_missing_without_fallback() {
+        let (temp, _old, _new) = managed_bin_with_updated_hash();
+        let custom = temp.path().join("tools").join("codex-nightly");
+        let resolution = resolve_executable_with(
+            &codex_agent(&custom.to_string_lossy()),
+            Some(temp.path()),
+            |_| panic!("自定义文件名失效时不应回退"),
+        );
+        assert_eq!(resolution.path, None);
+        assert!(resolution.configured_missing);
+        assert!(!resolution.recovered());
+
+        let mut claude = codex_agent(&temp.path().join("old").join("claude").to_string_lossy());
+        claude.id = "claude".to_owned();
+        let resolution = resolve_executable_with(&claude, Some(temp.path()), |_| {
+            panic!("非 Codex Agent 不做回退")
+        });
+        assert_eq!(resolution.path, None);
+        assert!(resolution.configured_missing);
+    }
+
+    /// 托管目录里已经没有任何 CLI 时，再按自动查找顺序兜底。
+    #[test]
+    fn stale_managed_path_without_new_install_uses_auto_detect() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp
+            .path()
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")
+            .join("08d187884f2330d1")
+            .join("codex.exe");
+        let fallback = temp.path().join("npm").join("codex.exe");
+        let expected = fallback.clone();
+        let resolution = resolve_executable_with(
+            &codex_agent(&old.to_string_lossy()),
+            Some(temp.path()),
+            move |_| Some(fallback),
+        );
+        assert_eq!(resolution.path, Some(expected));
+        assert!(resolution.recovered());
+
+        let none = resolve_executable_with(
+            &codex_agent(&old.to_string_lossy()),
+            Some(temp.path()),
+            |_| None,
+        );
+        assert_eq!(none.path, None);
+        assert!(none.configured_missing);
     }
 }

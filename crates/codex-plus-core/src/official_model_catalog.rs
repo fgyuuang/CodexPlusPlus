@@ -975,7 +975,7 @@ fn normalize_client_version(value: &str) -> Option<String> {
     Some(format!("{major}.{minor}.{patch}"))
 }
 
-fn latest_client_version(versions: Vec<String>) -> Option<String> {
+pub(crate) fn latest_client_version(versions: Vec<String>) -> Option<String> {
     versions
         .into_iter()
         .filter_map(|version| {

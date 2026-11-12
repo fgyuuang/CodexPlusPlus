@@ -159,6 +159,7 @@
   margin-left: auto;
 }
 
+/* 能点的文字比旁边灰色的说明文字稍亮一点，好区分；悬停变成正文色。 */
 .gw-text-button {
   display: inline-flex;
   align-items: center;
@@ -166,7 +167,7 @@
   padding: 0;
   border: 0;
   background: none;
-  color: var(--gw-mute);
+  color: color-mix(in srgb, var(--gw-mute) 60%, var(--gw-ink));
   font: inherit;
   font-size: 13px;
   white-space: nowrap;
@@ -230,7 +231,7 @@
   background: hsl(var(--gw-hue) 70% 55%);
 }
 
-/* 字母头像 */
+/* 字母头像：统一中性灰，不再按名字配色（五颜六色太花）；品牌图标见 .gw-avatar-brand。 */
 .gw-avatar {
   display: inline-flex;
   flex-shrink: 0;
@@ -239,10 +240,10 @@
   width: 30px;
   height: 30px;
   border-radius: 8px;
-  background: hsl(var(--gw-hue, 230) 70% 55% / 0.14);
-  color: hsl(var(--gw-hue, 230) 60% 46%);
+  background: var(--gw-soft);
+  color: var(--gw-mute);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
   letter-spacing: -0.02em;
 }
 
@@ -1518,8 +1519,12 @@ span.gw-popover-check {
   cursor: pointer;
 }
 
-.gw-catalog-item:hover:not(:disabled) {
-  background: var(--gw-soft);
+/* 悬停 / 键盘焦点：主题色底 + 描边，深色主题下也一眼能看出指着哪一项。 */
+.gw-portal .gw-catalog-item:hover:not(:disabled),
+.gw-portal .gw-catalog-item:focus-visible {
+  background: hsl(var(--primary) / 0.16);
+  box-shadow: inset 0 0 0 1px hsl(var(--primary) / 0.55);
+  outline: none;
 }
 
 .gw-catalog-item > span {
@@ -1867,6 +1872,11 @@ span.gw-popover-check {
   font-weight: 500;
 }
 
+.gw-session-main strong .gw-pill {
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
 .gw-session-main small {
   color: var(--gw-mute);
   font-family: var(--font-mono, ui-monospace, monospace);
@@ -1936,6 +1946,19 @@ span.gw-avatar[data-size] {
   background: currentColor;
   -webkit-mask: var(--gw-agent-icon) center / contain no-repeat;
   mask: var(--gw-agent-icon) center / contain no-repeat;
+}
+
+/* 通用 Agent 没有打包图标：圆角方块里放名字首字母，大小跟着图标位的宽高。 */
+.gw-agent-letter {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  border-radius: 6px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  font-size: 0.68em;
+  font-style: normal;
+  font-weight: 650;
+  line-height: 1;
 }
 
 .gw-node-agent .gw-node-agent-icon {
@@ -2106,6 +2129,9 @@ span.gw-avatar[data-size] {
 
 .gw-portal .gw-mp-top {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  flex: none;
+  min-width: 0;
   gap: 8px;
   padding: 10px 10px 8px;
   border-bottom: 1px solid var(--gw-line);
@@ -2149,12 +2175,26 @@ span.gw-avatar[data-size] {
 .gw-portal .gw-mp-filters {
   display: flex;
   gap: 6px;
+  min-width: 0;
   overflow-x: auto;
-  scrollbar-width: none;
+  padding-bottom: 6px;
+  scrollbar-width: auto;
+  scrollbar-color: auto;
 }
 
+/* 显式绘制轨道和滑块，让普通鼠标也能发现并拖到后面的供应商。 */
 .gw-portal .gw-mp-filters::-webkit-scrollbar {
-  display: none;
+  height: 8px;
+}
+
+.gw-portal .gw-mp-filters::-webkit-scrollbar-track {
+  border-radius: 999px;
+  background: var(--gw-soft);
+}
+
+.gw-portal .gw-mp-filters::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: var(--gw-mute);
 }
 
 .gw-portal .gw-mp-filters button {
@@ -2314,6 +2354,22 @@ span.gw-avatar[data-size] {
   fill: currentColor;
 }
 
+/* Agent 自带的模型：直连厂商、不经 Codex++，和池里的模型一眼区分开。 */
+.gw-portal .gw-mp-direct {
+  flex: none;
+  max-width: 50%;
+  overflow: hidden;
+  padding: 0 6px;
+  border: 1px solid var(--gw-line);
+  border-radius: 5px;
+  color: var(--gw-mute);
+  font-size: 11px;
+  font-style: normal;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .gw-portal .gw-mp-check {
   flex: none;
   color: hsl(var(--primary));
@@ -2471,6 +2527,85 @@ body.gw-sorting * {
   height: 13px;
   flex: none;
   opacity: 0.75;
+}
+
+/* 供应商标题栏右侧：编辑（铅笔）+ 开关放在同一格里，不改整行的列宽（#2782）。
+   订阅账号没有编辑按钮，留同宽的空位让各行开关对齐。 */
+.shell .gw-pool-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shell .gw-pool-actions .gw-pool-edit,
+.shell .gw-pool-actions .gw-pool-edit-slot {
+  width: 26px;
+  height: 26px;
+  flex: none;
+}
+
+/* 详情各行的「编辑」等小图标按钮：比标题栏的再小一号，跟在文字后面。 */
+.shell .gw-pool-detail .gw-inline-icon {
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border-radius: 6px;
+}
+
+.shell .gw-pool-detail .gw-inline-icon:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.shell .gw-pool-detail .gw-inline-icon:disabled:hover {
+  background: transparent;
+  color: var(--gw-mute);
+}
+
+.shell .gw-pool-detail .gw-inline-danger:not(:disabled):hover {
+  color: var(--gw-err);
+}
+
+/* 已保存的 Key：打码后的 Key + 替换 / 删除，后面是「添加 Key」或正在填写的输入框。 */
+.shell .gw-key-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  min-width: 0;
+}
+
+.shell .gw-key-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.shell .gw-key-item[data-editing="true"] .gw-chip {
+  color: var(--gw-ink);
+  box-shadow: 0 0 0 1px var(--gw-line);
+}
+
+/* 详情底栏左侧：「测试」与订阅账号的「重新登录」并排，「删除」仍靠右。 */
+.shell .gw-detail-foot .gw-detail-foot-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+}
+
+.shell .gw-key-editor {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.shell .gw-key-editor .gw-key-input {
+  width: 260px;
+  max-width: 100%;
+  height: 28px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
 }
 
 .shell .gw-status {
@@ -2709,6 +2844,30 @@ body.gw-sorting * {
 
 .shell .gw-quota-window b {
   font-weight: 500;
+}
+
+.shell .gw-quota-window[data-tone="unknown"] {
+  color: var(--gw-mute);
+}
+
+.shell .gw-quota-windows[data-compact] {
+  gap: 5px 16px;
+  margin-top: 4px;
+  min-width: 0;
+}
+
+.shell .gw-quota-windows[data-compact] .gw-quota-window {
+  gap: 6px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.shell .gw-quota-windows[data-compact] .gw-quota-window b {
+  min-width: 19px;
+}
+
+.shell .gw-quota-windows[data-compact] .gw-quota-window i {
+  width: 48px;
 }
 
 .shell .gw-quota-window i {
@@ -3878,4 +4037,243 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
 .shell .gw-detail-value .app-select.gw-image-select {
   flex: none;
   width: 320px;
+}
+
+/* 订阅登录弹窗里粘贴 token / Cookie 的输入框 */
+.gw-textarea {
+  width: 100%;
+  min-height: 84px;
+  padding: 8px 10px;
+  border: 1px solid var(--gw-border, rgba(127, 127, 127, 0.3));
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: vertical;
+}
+
+/* Agent 接入证据与断开前的文件差异。 */
+.shell .gw-agent-badge[data-tone="pending"] {
+  color: var(--gw-warn);
+}
+
+.shell .gw-agent-badge[data-tone="pending"]::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+
+.shell .gw-agent-diagnostics {
+  display: grid;
+  gap: 8px;
+}
+
+.shell .gw-agent-diagnostic-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  font-size: 12px;
+}
+
+.shell .gw-agent-diagnostics p {
+  margin: 0;
+  color: var(--gw-mute);
+  line-height: 1.6;
+}
+
+.shell .gw-agent-diagnostics .gw-agent-diagnostic-error {
+  color: var(--gw-err);
+}
+
+.shell .gw-agent-diagnostic-evidence {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  margin: 0;
+}
+
+.shell .gw-agent-diagnostic-evidence > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 16px;
+  padding-top: 7px;
+  border-top: 1px solid var(--gw-line);
+}
+
+.shell .gw-agent-diagnostic-evidence dt {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.shell .gw-agent-diagnostic-evidence dt span,
+.shell .gw-agent-diagnostic-evidence dd {
+  margin: 0;
+  color: var(--gw-mute);
+  font-size: 12px;
+}
+
+.gw-portal .gw-disconnect-modal {
+  width: min(820px, 100%);
+  border-radius: 8px;
+}
+
+.gw-portal .gw-disconnect-modal header strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.gw-portal .gw-disconnect-body {
+  gap: 16px;
+  min-height: 100px;
+}
+
+.gw-portal .gw-disconnect-note,
+.gw-portal .gw-disconnect-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  color: var(--gw-mute);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.gw-portal .gw-disconnect-note > svg {
+  flex: none;
+  margin-top: 3px;
+}
+
+.gw-portal .gw-disconnect-error {
+  color: var(--gw-err);
+}
+
+.gw-portal .gw-disconnect-warnings {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--gw-warn);
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.gw-portal .gw-disconnect-file {
+  min-width: 0;
+}
+
+.gw-portal .gw-disconnect-file-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.gw-portal .gw-disconnect-file-head > svg {
+  flex: none;
+}
+
+.gw-portal .gw-disconnect-file-head code {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.gw-portal .gw-disconnect-file-head > span {
+  flex: none;
+  color: var(--gw-mute);
+}
+
+.gw-portal .gw-disconnect-redacted {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 0 8px;
+  color: var(--gw-mute);
+  font-size: 11px;
+}
+
+.gw-portal .gw-disconnect-diff {
+  max-height: 340px;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid var(--gw-line);
+  border-radius: 4px;
+  background: var(--gw-soft);
+  color: var(--gw-ink);
+  font-size: 11px;
+  line-height: 1.65;
+  tab-size: 2;
+}
+
+.gw-portal .gw-disconnect-diff [data-kind="add"] {
+  color: var(--gw-ok);
+}
+
+.gw-portal .gw-disconnect-diff [data-kind="remove"] {
+  color: var(--gw-err);
+}
+
+.gw-portal .gw-disconnect-foot-space {
+  flex: 1;
+}
+
+@media (max-width: 560px) {
+  .gw-portal:has(.gw-disconnect-modal) {
+    padding: 12px;
+  }
+  .gw-portal .gw-disconnect-modal footer {
+    flex-wrap: wrap;
+  }
+  .gw-portal .gw-disconnect-foot-space {
+    display: none;
+  }
+}
+
+.shell .gw-agent-diagnostic-endpoints {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.shell .gw-agent-diagnostic-endpoints p {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 12px;
+}
+
+.shell .gw-agent-diagnostic-endpoints code,
+.shell .gw-agent-diagnostic-evidence dd code {
+  min-width: 0;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.shell .gw-agent-diagnostic-evidence dd {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.gw-portal .gw-disconnect-confirm {
+  background: var(--gw-err);
+  color: white;
+}
+
+.gw-portal .gw-disconnect-confirm:hover {
+  background: color-mix(in srgb, var(--gw-err) 88%, black);
 }

@@ -56,6 +56,8 @@ const VOICE_INPUT = String(argOf('--voice-input', process.env.CODEX_PLUS_CLAUDE_
  * 与「准备副本」无关——副本是所有增强共同的前置条件。
  */
 const LOCALIZATION = String(argOf('--localization', process.env.CODEX_PLUS_CLAUDE_LOCALIZATION ?? '1')) !== '0';
+const BASH_TIMEOUT_JSON = process.env.CODEX_PLUS_CLAUDE_BASH_TIMEOUT || 'null';
+const BASH_TIMEOUT_REPORT = { file: process.env.CODEX_PLUS_CLAUDE_BASH_REPORT_FILE, launchId: process.env.CODEX_PLUS_CLAUDE_BASH_LAUNCH_ID };
 if (!/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(LOCALE)) throw new Error('无效的语言代码');
 
 const EXEC = process.platform === 'win32'
@@ -216,10 +218,16 @@ async function evaluate(c, expression) {
         detached: true,
         stdio: 'ignore',
         windowsHide: false,
+        env: process.env,
       });
       child.unref();
     } else {
-      const openArgs = ['-n', '-a', APP, '--args', `--inspect=127.0.0.1:${port}`];
+      const openArgs = ['-n', '-a', APP];
+      // LaunchServices 不保证继承脚本环境；只给这次受管副本启动传入插件目录。
+      if (process.env.CLAUDE_CODE_PLUGIN_DIRS) {
+        openArgs.push('--env', `CLAUDE_CODE_PLUGIN_DIRS=${process.env.CLAUDE_CODE_PLUGIN_DIRS}`);
+      }
+      openArgs.push('--args', `--inspect=127.0.0.1:${port}`);
       if (PROFILE) openArgs.push(`--user-data-dir=${PROFILE}`); // 必须用 = 形式，空格分隔 Chromium 不认
       const r = spawnSync('open', openArgs, { encoding: 'utf8' });
       if (r.status !== 0) {
@@ -249,6 +257,17 @@ async function evaluate(c, expression) {
       console.error(`✗ 目标进程不是这个副本（${execPath}），放弃注入。`);
       process.exit(1);
     }
+    // 独立启动可选适配；未知结构、加载过晚或设置损坏均不阻止其他增强。
+    await evaluate(c, `(() => {
+      try {
+        globalThis.__claudeCnBashTimeout = JSON.parse(${JSON.stringify(BASH_TIMEOUT_JSON)});
+        require(${JSON.stringify(path.join(path.dirname(HOOK), 'bash-timeout.js'))}).beginTimeoutOverrides(globalThis.__claudeCnBashTimeout, process.resourcesPath, ${JSON.stringify(BASH_TIMEOUT_REPORT)});
+      } catch (error) {
+        globalThis.__claudeCnBashTimeoutResult = { enabled: true, prepared: false, error: String(error.message || error) };
+        globalThis.__claudeCnBashTimeoutReady = Promise.resolve(globalThis.__claudeCnBashTimeoutResult);
+      }
+      return true;
+    })()`);
     const version = await evaluateRetry(c, "require('electron').app.getVersion()");
     log(`→ 已连上主进程（Claude ${version}, pid ${await evaluateRetry(c, 'process.pid')}）`);
 
@@ -259,6 +278,18 @@ async function evaluate(c, expression) {
       process.exit(1);
     }
     log('→ 主进程 hook 已装载，页面注入就绪');
+
+    try {
+      const response = await c.send('Runtime.evaluate', {
+        expression: 'globalThis.__claudeCnBashTimeoutReady', returnByValue: true, awaitPromise: true,
+      });
+      if (response.exceptionDetails || !response.result?.value) throw new Error('未收到 Cowork Bash 适配结果');
+      const result = response.result.value;
+      log('CODEX_PLUS_CLAUDE_BASH_RESULT=' + JSON.stringify(result));
+      if (result.error) log('提示：Cowork Bash 时限增强未生效，其他增强继续启动：' + result.error);
+    } catch (error) {
+      log('提示：Cowork Bash 适配结果不可用，其他增强继续启动：' + error.message);
+    }
 
     try {
       // 这一句会把 inspector 和当前连接一起关掉，所以大概率等不到返回值，属正常

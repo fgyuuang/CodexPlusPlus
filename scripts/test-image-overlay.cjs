@@ -134,11 +134,11 @@ check("Codex home project bar retains its existing composer paint", async page =
   assert.equal(await page.locator('#actions[data-codex-plus-image-paint]').count(), 0);
 });
 
-check("native header backing follows its top inset and live theme without seams", async page => {
+for (const shell of ["_shell_test", "shell-yWQKe6"]) check(`native header backing follows its top inset and live theme without seams ${shell}`, async page => {
   await html(page, ':root{--surface:#303030}.light{--surface:#e0e0e0}body{background:var(--surface)}' +
     '#header{position:sticky;top:-16px;z-index:30;height:80px;padding-top:16px;container-type:inline-size}' +
     '#header::before{content:"";position:absolute;z-index:-1;inset:var(--top-inset) 0 0;background:var(--surface)}',
-    '<div id="header" class="_shell_test" data-sticky style="--top-inset:8px">Plugins</div>');
+    `<div id="header" class="${shell}" data-sticky style="--top-inset:8px">Plugins</div>`);
   await configure(page, { dataUrl: assets.pattern });
   for (const [width, base] of [[800, 48], [900, 224]]) {
     if (base === 224) {
@@ -298,6 +298,34 @@ check("native footer occludes transcript below the composer", async page => {
   zero(work, ["composerReads", "filterNodes", "layerWrites"]);
 });
 
+// #2813：侧栏打开时原生 footer 带 translate:-154px；transform 祖先会让 fixed 背景退化为元素局部坐标。
+for (const transform of ["translate:-154px", "translate:0", "transform:translateX(0)"])
+check(`footer wallpaper stays viewport aligned under ${transform}`, async page => {
+  await html(page, '#frame{position:relative;width:600px;height:500px;margin-left:154px}' +
+    '#thread{height:500px;overflow:auto}#transcript{height:1000px;background:#dc2832}' +
+    '#footer{position:absolute;bottom:0;left:20px;right:20px;height:150px;z-index:20;pointer-events:none}' +
+    '#surface{position:absolute;inset:0;background:#303030}',
+    '<div id="frame"><div id="thread" class="thread-scroll-container"><div id="transcript"></div>' +
+    `<div id="footer" data-thread-scroll-footer style="${transform}"><div id="surface" aria-hidden="true"></div></div></div></div>`);
+  await configure(page, { dataUrl: assets.pattern });
+  const attachment = () => page.$eval("#surface", node => getComputedStyle(node, "::after").backgroundAttachment);
+  // 视口里图案左半在 x<400；按 footer 自身盒子拉伸时，380/420 两点至少一处会翻色。
+  const aligned = async label => {
+    const frame = await shot(page);
+    near(pixel(frame, 380, 430), [78, 56, 46], label + " left half");
+    near(pixel(frame, 420, 430), [46, 54, 78], label + " right half");
+  };
+  assert.equal(await attachment(), "scroll");
+  await aligned(transform);
+  await page.$eval("#footer", node => { node.style.cssText = ""; }); await settle(page);
+  assert.equal(await attachment(), "fixed", "untransformed footer keeps the fixed wallpaper path");
+  await aligned("restored");
+  await page.$eval("#footer", node => { node.style.cssText = "transition:translate .1s linear;translate:-154px"; });
+  await page.waitForTimeout(300);
+  assert.equal(await attachment(), "scroll", "sidebar translate transition refreshes after it ends");
+  await aligned("after sidebar transition");
+});
+
 check("bottom aligned submenu retains its native placement transform", async page => {
   await html(page, '#wrapper{position:fixed;top:530px;left:20px;transform:translateX(10px)}' +
     '#submenu{width:240px;height:240px;background:#303030;transform:translateY(calc(32px + 8px - 100%))}',
@@ -353,6 +381,100 @@ async function popup(page, kind, opacity = .2) {
   await configure(page, { opacity });
   assert.deepEqual(await rect(page, "#surface"), geometry);
 }
+
+for (const tooltip of ["_Tooltip_test", "Tooltip-IBN1Wh"])
+for (const anchor of ["composer", "header"]) check(`native shared tooltip portal clears ${anchor} ${tooltip}`, async page => {
+  await html(page, `
+    .fixed{position:fixed}.inset-0{inset:0}.pointer-events-none{pointer-events:none}.contain-layout{contain:layout}
+    #anchor{position:fixed;left:0;top:0;width:600px;height:200px;background:#303030;z-index:20}
+    #portal{z-index:60}#portal>*{pointer-events:auto}
+    #boundary{position:fixed;left:20px;top:20px;z-index:50;transform:translate(7px,11px)}
+    #tooltip{width:280px;height:120px;background:rgb(240,240,240)}
+    #tooltip button{margin:20px;width:100px;height:30px;background:#00ff00}
+    #sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+  `, `<div id="anchor" ${anchor === "composer" ? 'class="_ComposerLayoutRoot_test"' : 'data-app-shell-header-layout="thread"'}>Native anchor</div>
+    <div id="portal" class="pointer-events-none fixed inset-0 zoom-adjusted-viewport contain-layout">
+      <div id="boundary" data-radix-popper-content-wrapper>
+        <div id="tooltip" class="${tooltip}"><button id="tooltip-action">Usage</button><span id="sr" role="tooltip">Usage</span></div>
+      </div>
+    </div>`);
+  const geometry = await rect(page, "#boundary");
+  await configure(page);
+  assert.deepEqual(await rect(page, "#boundary"), geometry);
+  assert.equal(await page.$eval("#tooltip", (node, attr) => node.hasAttribute(attr), material), true,
+    "the visible tooltip receives material instead of only its screen-reader description");
+  near(pixel(await shot(page), 200, 110), [201, 203, 208], "tooltip is above the painted native anchor");
+  await click(page, "#tooltip-action");
+  const work = await delta(page, () => page.evaluate(async () => {
+    for (let i = 0; i < 8; i++) {
+      document.getElementById("boundary").style.transform = `translate(${7 + i}px,11px)`;
+      await new Promise(requestAnimationFrame);
+    }
+  }));
+  zero(work, ["rectReads", "layerWrites", "filterNodes"]);
+  await page.evaluate(() => {
+    const wrapper = document.createElement("div");
+    wrapper.id = "second"; wrapper.setAttribute("data-radix-popper-content-wrapper", "");
+    wrapper.style.cssText = "position:fixed;left:400px;top:250px";
+    wrapper.innerHTML = '<div role="menu" style="background:#eee"><button>Second</button></div>';
+    document.getElementById("portal").append(wrapper);
+  });
+  await settle(page);
+  await page.$eval("#boundary", node => node.remove()); await settle(page);
+  assert.equal(await page.$eval("#portal", node => getComputedStyle(node).zIndex), "1002");
+  await page.$eval("#second", node => node.remove()); await settle(page);
+  assert.equal(await page.$eval("#portal", node => getComputedStyle(node).zIndex), "60",
+    "the shared portal returns to its native layer after its last popup closes");
+});
+
+check("native toast area clears the titlebar without repainting or tracking notifications", async page => {
+  await html(page, '#header{position:fixed;inset:0 0 auto;height:120px;background:#303030;z-index:20}' +
+    '.codex-toast-area{position:fixed;inset:0;z-index:60;pointer-events:none}' +
+    '[data-sonner-toaster]{position:fixed;left:30px;top:20px;z-index:999999999;margin:0;padding:0}' +
+    '[data-sonner-toast]{position:relative;list-style:none;width:220px;height:80px;background:#60141c;pointer-events:auto}' +
+    '[data-sonner-toast] button{margin:10px;width:60px;height:30px;background:#00ff00;border:0}',
+    '<div id="header" data-app-shell-header-layout="thread">Native title</div>');
+  await configure(page);
+  await page.evaluate(() => {
+    const area = document.createElement("div");
+    area.id = "toasts"; area.className = "codex-toast-area pointer-events-none fixed inset-0";
+    area.innerHTML = '<div class="relative w-full"><ol data-sonner-toaster class="codex-sonner-toaster">' +
+      '<li data-sonner-toast><button id="dismiss">Close</button></li></ol></div>';
+    document.body.append(area);
+  });
+  await settle(page);
+  near(pixel(await shot(page), 200, 80), [96, 20, 28], "the toast, not the titlebar, owns the overlapping pixels");
+  await click(page, "#dismiss");
+  assert.equal(await page.locator("[data-sonner-toast][" + material + "]").count(), 0,
+    "notification surfaces retain native colors");
+  assert.equal(await page.locator("filter").count(), 0);
+  const work = await delta(page, () => page.evaluate(async () => {
+    for (let i = 0; i < 8; i++) {
+      document.querySelector("[data-sonner-toast]").style.transform = `translateY(${i}px)`;
+      await new Promise(requestAnimationFrame);
+    }
+  }));
+  zero(work, ["rectReads", "styleReads", "layerWrites", "filterNodes", "styleCommits"]);
+  await page.evaluate(() => window.__codexPlusImageOverlayCleanup()); await settle(page);
+  assert.equal(await page.$eval("#toasts", node => getComputedStyle(node).zIndex), "60",
+    "disabling the overlay restores the original toast context");
+});
+
+check("archive sticky controls do not leave a dark gradient over wallpaper", async page => {
+  await html(page, `
+    body{background:#303030}
+    #header{position:sticky;top:0;height:80px;z-index:30;background:#303030}
+    #header::after{content:"";position:absolute;top:100%;left:0;right:0;height:32px;pointer-events:none;background:linear-gradient(#303030,transparent)}
+  `, '<div id="header" class="sticky z-30 bg-surface after:bg-linear-to-b after:from-surface after:to-transparent">Archived chats</div>');
+  await configure(page);
+  const frame = await shot(page);
+  for (const y of [81, 90, 105]) near(pixel(frame, 400, y), pixel(frame, 400, 140),
+    "the native sticky fade reveals one continuous wallpaper");
+  assert.deepEqual(await css(page, "#header", ["filter", "backdropFilter"]), ["none", "none"]);
+  await page.evaluate(() => window.__codexPlusImageOverlayCleanup()); await settle(page);
+  assert.match(await page.$eval("#header", node => getComputedStyle(node, "::after").backgroundImage), /linear-gradient/,
+    "disabling the overlay restores the native gradient");
+});
 
 check("popup batches commit one stylesheet before paint", async page => {
   await html(page, '.menu{position:fixed;left:20px;top:20px;width:160px;height:100px;background:rgb(240,240,240)}',

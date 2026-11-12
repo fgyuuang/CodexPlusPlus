@@ -2,7 +2,35 @@
 
 本文记录 CodexPlusPlus fork 的认证、请求路由和本地会话归属规则。这三类状态必须独立维护，不能再通过同一个 API Key 或 provider 字段互相覆盖。
 
+## 2026-11-11：网关选路改用上游
+
+用户明确要求撤下本地网关选路。Responses 和 compact 采用正式 v2.4.0 的子代理模型继承、`route::resolve_plan` 和 pipeline，不再使用本地 `codex_routing` 的原生谱系查询、UUID 相等断言、根账号亲和表或专用顺序组强制规则。记忆任务中的 thread/session/root-turn 可以不同，不因该本地断言中止。
+
+裸模型按上游自动组及配置选账号；子代理继承完整模型身份（包括组），不再额外固定为亲和表中的根账号。错误重试、冷却与候选切换采用上游规则，因此不能继续承诺旧网关“只在额度耗尽时切号”的行为。显式供应商/模型仍由上游解析；失效前缀的恢复同样按上游策略处理，不添加另一层本地派发。
+
+账号库引用只是存量凭据读取适配，保留唯一刷新所有者、加密存储及旧供应商 ID，避免复制 refresh token。live auth、config 与历史元数据无需因本次替换而改写。官方图片继续使用显式官方目标选择；无可确认目标则报错，不自动改派第三方。直连旧 provider 的恢复逻辑保留。本节覆盖下文描述旧网关谱系/调度路径的历史规则；交付与验收分别记录于[本轮报告](reports/2026-11-11-upstream-codex-routing.md)。
+
+## 2026-11-09：v2.4.0 整合边界
+
+上游 `native_auth` 的原生登录选择、完整身份和凭据 CAS 框架已采用。只有用户显式选择/取消原生登录才执行对应凭据事务；普通网关接入、刷新、停用、断开不借用、清除或覆盖 live auth。不能按共享的 workspace/account_id 认领另一个成员的登录。旧本地账号引用仍委托原加密账号库刷新，不能再创建第二个刷新所有者。
+
+Codex 26.1103.4239.0 的数字 Rspack 入口不再直接导出旧 ESM 传输。补充读取当前页面已执行模块缓存，只发现现有 broker/HTTP 类，不执行未加载工厂或创建实例。旧会话恢复若原生 Thread 不含模型，读取同一 thread 的已保存模型后再精确映射；找不到记录、来源不唯一或原生未卸载时停止，不改用全局默认账号。会话迁移的单 ID、备份及 CAS 边界保持。
+
+当前账号对 Terra 的独立官方探针成功，不等于原聊天恢复验收。实机主窗口发现传输已获只读验证，分离窗口尚未发现对应读取入口；无法确认原临时线程身份时继续拒绝猜测来源。构建、文件替换、重新加载及原对话实测分开记录，详见[本轮报告](reports/2026-11-09-v2.4.0-provider-recovery.md)。
+
 ## v2.0.0 网关边界
+
+### 2026-11-04 原生恢复校验变化
+
+Codex 26.1029.7803.0 对应原生源码 `7ce5fa7` 的 `ConfigManager::load_for_resume` 在应用请求覆盖前，要求保存的 provider 和请求 provider 都与当前配置相同。因此下文旧版的同 ID `unsubscribe/resume` 覆写方式不能跨越该校验；保留 provider 定义只解决配置可加载，不足以恢复旧来源聊天。
+
+当前网关使用实际的 `openai` 或 `custom` 传输，模型名负责选择来源。新普通分支通过只读 `thread/read` 确认父来源，把精确旧别名转换为当前网关的同账号模型或官方专用顺序组，在 `thread/fork` 时设置当前传输，父记录保持原样。预测分支不附加覆盖。
+
+恢复旧 `codex_plus_official_*` 会话时，前端与 helper 都独立确认原生状态为 `notLoaded`；单会话迁移复用 provider-sync 锁、原始元数据/SQLite 备份、CAS 和恢复日志，只更新该 thread ID 的 session_meta 及索引 provider。活动会话、其他订阅者、未知来源或未接入原账号时停止，不创建聊天副本，不默认挑选第三方，也不变更全局 provider、config 或 auth。迁移后再调用原生 resume，权限与 cwd 优先沿用原生保存配置。
+
+Claudian 新增网关接入使用每个笔记库的独立 `.claudian/codex-plus`，地址为 `/gw/claudian/v1`、Responses 协议；下文 `/v1/responses` 仍是历史直连模式。Claudian 的 Claude/其他后端不受影响，接入后需重载插件并新建 Codex 对话；旧会话不自动改写。
+
+v2.1.1 本地整合保留旧聊天 provider：写新配置时只补回地址与 ID 一致的本地 `codex_plus_*` routes 定义，不改变根 provider、网关地址和登录。网关模式隐藏旧菜单，但显式旧路由仍使用原账号库校验；配置能加载不表示被停用或删除的来源重新获得权限。账号引用池与原账号库共享同一刷新所有者，不是复制 refresh token 给第二个独立登录。请求状态以本次选定的账号名称显示来源，未选定时等待，不能用全局当前账号代替。
 
 网关模式与下文直连/本地混合模式并存，只有显式接入才改 Agent 的受管配置。网关自己的 ChatGPT 登录独立保存和刷新，不能复制到 Codex live auth 或与本地账号库共用刷新令牌。普通启用、重写、模型/来源切换、断开必须保留 live auth 原字节（包括不存在）。旧借用记录无法证明当前归属时停止，不删除双方凭据或按 account_id 认领同 Team 用户。
 
@@ -172,3 +200,17 @@ Content-Type: application/json
 - 模型 catalog、聚合 alias 或 dispatch mapping。
 
 合并后至少验证：官方登录切换到聚合时 `auth.json` 不变；聚合启动后会话归一到 `custom`；纯官方启动后会话归一到 `openai`；Manager 能同时显示 provider 统计并手动选择同步目标。
+
+### 2026-11-10：独立 app-server 的明确用户主回合
+
+默认官方模型名（例如gpt-6.1-terra）沿用既有自动官方组，不要求用户添加local-official前缀。当前网关必须开启自动建组，存在提供该精确官方模型的账号引用，并满足原顺序组与额度失败策略。
+
+线程身份可只存在于x-codex-turn-metadata。仅接受完整、一致的thread_source=user、agent_name=/root、request_kind=turn及thread/session/turn/root_turn UUID主回合声明；任何父关系或子代理标记使其退回原谱系确认，持久化subagent/父关系/非网关provider冲突则拒绝。这使明确用户主线程可在未被桌面app-server加载时进入原路由，不把“找不到线程”当成选账号依据。
+
+其余元数据中的原生UUID也必须进入谱系确认，metadata-only子代理不能变成无身份普通请求。旧独立CLI的非UUID缓存键继续不作为原生身份；明确原生thread_source中的无效UUID拒绝。子代理确认根账号、已移除来源拒绝、额度耗尽按序换号、图片账号隔离与无第三方API兜底均保持，回归见codex_routing同模块14项测试。实机重新启动后的原失败聊天验收另记发布报告。
+
+### 2026-11-10：记忆整理与压缩索引兼容补充
+
+明确的 `thread_source=memory_consolidation` 独立任务与用户主聊天区别处理：仍要求 turn、完整一致的 UUID 和无父关系；允许自身记忆整理标记，不接受 collab_spawn 或线程父关系。后台记忆整理不依赖桌面加载临时线程，沿用原自动官方组及账号失败策略；普通子代理不因此获得独立选择账号的资格。
+
+历史恢复中的 `.jsonl.zst` 可只读验证其来源。只有历史原本已是目标 provider 时才修残留索引；需要重写压缩来源则停止并说明。当前传输经本机 `/v1` 或 `/v1/routes/openai` 时，必须额外验证管理器的实际活动网关 profile 与同一监听地址，再沿用原迁移事务。此逻辑不修改 config/auth，不批量迁移子代理。见[修复与验证报告](reports/2026-11-10-memory-task-and-compressed-provider-repair.md)。

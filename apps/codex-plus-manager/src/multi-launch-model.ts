@@ -38,7 +38,20 @@ export function multiLaunchInstanceStatus(instance: MultiLaunchInstance): string
 
 export function multiLaunchInstanceRunning(instance: MultiLaunchInstance): boolean {
   if (typeof instance.running === "boolean") return instance.running;
-  return ["running", "running_degraded", "starting", "ready", "connected", "ok"].includes(multiLaunchInstanceStatus(instance));
+  return ["running", "running_degraded", "ready", "connected", "ok"].includes(multiLaunchInstanceStatus(instance));
+}
+
+export function multiLaunchInstanceVisible(instance: MultiLaunchInstance): boolean {
+  return multiLaunchInstanceRunning(instance) || multiLaunchInstanceStatus(instance) !== "stopped";
+}
+
+export function multiLaunchInstanceCanStop(instance: MultiLaunchInstance): boolean {
+  const status = multiLaunchInstanceStatus(instance);
+  return status !== "starting" && (multiLaunchInstanceRunning(instance) || status === "unknown" || status === "failed");
+}
+
+export function multiLaunchInstanceCanRestart(instance: MultiLaunchInstance): boolean {
+  return multiLaunchInstanceStatus(instance) !== "starting";
 }
 
 /**
@@ -50,6 +63,20 @@ export function multiLaunchInstanceRunning(instance: MultiLaunchInstance): boole
 export function multiLaunchInstanceFailure(instance: MultiLaunchInstance): string {
   if (multiLaunchInstanceRunning(instance)) return "";
   const result = instance.launchResult;
-  if (!result || result.status !== "failed") return "";
+  if (!result || !["failed", "cleanup_failed"].includes(result.status ?? "")) return "";
   return result.message?.trim() || "Codex 实例启动失败，原因未记录。";
+}
+
+/**
+ * 正在用某个供应商跑着的多开实例（不含主 Codex）。
+ *
+ * 多开页删除供应商前用它提醒：实例拿着自己的配置目录在跑，删掉供应商不会结束它，
+ * 但之后就不能再从这里用这个供应商启动（#2801）。
+ */
+export function runningInstancesForProfile(instances: MultiLaunchInstance[], profileId: string): MultiLaunchInstance[] {
+  const id = profileId.trim();
+  if (!id) return [];
+  return instances.filter((instance) => !instance.isMain
+    && instance.profileId?.trim() === id
+    && multiLaunchInstanceRunning(instance));
 }

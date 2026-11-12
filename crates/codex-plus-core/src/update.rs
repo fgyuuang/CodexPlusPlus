@@ -234,8 +234,15 @@ pub async fn perform_update_with_progress<F>(
 where
     F: FnMut(UpdateProgress) + Send,
 {
+    // 后台已经下好（「有可用更新时自动下载」）就直接用，不再下载一遍。
     let (installer_path, downloaded_bytes, total_bytes) =
-        download_release_asset_with_progress(release, download_dir, &mut on_progress).await?;
+        match downloaded_installer(release, download_dir) {
+            Some((path, bytes)) => (path, bytes, Some(bytes)),
+            None => {
+                download_release_asset_with_progress(release, download_dir, &mut on_progress)
+                    .await?
+            }
+        };
 
     let launch_started = Instant::now();
     on_progress(UpdateProgress {
@@ -282,6 +289,48 @@ where
         installer_path,
         launched: true,
     })
+}
+
+/// 只下载、不安装：「有可用更新时自动下载」在后台调用，用户点「安装」时 [perform_update_with_progress]
+/// 直接用下好的安装包。已经下好的不再下载。返回安装包路径。
+pub async fn download_update_with_progress<F>(
+    release: &Release,
+    download_dir: &Path,
+    mut on_progress: F,
+) -> anyhow::Result<PathBuf>
+where
+    F: FnMut(UpdateProgress) + Send,
+{
+    if let Some((path, _)) = downloaded_installer(release, download_dir) {
+        return Ok(path);
+    }
+    let (path, _, _) =
+        download_release_asset_with_progress(release, download_dir, &mut on_progress).await?;
+    Ok(path)
+}
+
+/// 下载完成的标记文件：安装包旁边的 `<安装包>.complete`，内容是安装包字节数。
+/// 只有标记在、且字节数和安装包一致，才算下好了（下到一半退出、或文件被改过都不算）。
+fn completion_marker(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".complete");
+    path.with_file_name(name)
+}
+
+/// 这个版本的安装包是否已经完整下载：返回路径和字节数。
+pub fn downloaded_installer(release: &Release, download_dir: &Path) -> Option<(PathBuf, u64)> {
+    let name = release.asset_name.as_ref()?;
+    let path = download_dir.join(safe_asset_name(name).ok()?);
+    let expected: u64 = std::fs::read_to_string(completion_marker(&path))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let actual = std::fs::metadata(&path).ok()?.len();
+    (expected > 0 && expected == actual).then_some((path, actual))
 }
 
 async fn download_release_asset_with_progress<F>(
@@ -458,7 +507,18 @@ pub fn download_asset_to(
     let safe = safe_asset_name(name)?;
     std::fs::create_dir_all(download_dir)?;
     let path = download_dir.join(safe);
-    std::fs::write(&path, bytes)?;
+    // 先写临时文件再改名，最后写完成标记：中途退出不会留下一个看着完整的半截安装包。
+    let marker = completion_marker(&path);
+    let _ = std::fs::remove_file(&marker);
+    let mut partial_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    partial_name.push(".part");
+    let partial = path.with_file_name(partial_name);
+    std::fs::write(&partial, bytes)?;
+    std::fs::rename(&partial, &path)?;
+    std::fs::write(&marker, bytes.len().to_string())?;
     // 历史安装包会一直留在 updates/ 里占磁盘（#2544）：每次下载成功后只保留
     // 最近 `UPDATE_KEEP_INSTALLERS` 个安装包（含本次），其余删除。清理失败
     // 不影响本次更新。
@@ -489,6 +549,7 @@ fn prune_old_installers(download_dir: &Path, current: &Path) {
         .into_iter()
         .skip(UPDATE_KEEP_INSTALLERS.saturating_sub(1))
     {
+        let _ = std::fs::remove_file(completion_marker(&stale));
         let _ = std::fs::remove_file(stale);
     }
 }
@@ -538,6 +599,15 @@ fn platform_asset_rank(name: &str) -> u8 {
     if cfg!(windows) && is_windows_installer_asset(name) {
         return 0;
     }
+    if cfg!(target_os = "linux") {
+        if !is_linux_installer_asset(name) {
+            return 2;
+        }
+        if is_linux_native_arch_asset(name) {
+            return 0;
+        }
+        return 1;
+    }
     2
 }
 
@@ -567,6 +637,23 @@ fn is_macos_native_arch_asset(name: &str) -> bool {
     }
     // No arch token at all — assume it matches the current arch.
     true
+}
+
+fn is_linux_installer_asset(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("codex")
+        && lower.contains("plus")
+        && (lower.ends_with(".deb") || lower.ends_with(".appimage") || lower.ends_with(".tar.gz"))
+}
+
+fn is_linux_native_arch_asset(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let native_tokens: &[&str] = match std::env::consts::ARCH {
+        "x86_64" => &["amd64", "x86_64", "x64"],
+        "aarch64" => &["arm64", "aarch64"],
+        _ => return true,
+    };
+    native_tokens.iter().any(|token| lower.contains(token))
 }
 
 fn is_windows_installer_asset(name: &str) -> bool {
@@ -605,7 +692,16 @@ pub fn launch_installer(path: &Path) -> anyhow::Result<()> {
             .map_err(|error| anyhow::anyhow!("打开 DMG 失败：{error}"))
     }
 
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("打开安装包失败：{error}"))
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
     {
         let _ = path;
         anyhow::bail!("当前平台不支持启动安装包")

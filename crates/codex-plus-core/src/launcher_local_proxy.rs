@@ -3,6 +3,89 @@
 use super::*;
 use std::time::Duration;
 
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn protected_handler_records_usage_once_without_gateway_or_user_state() {
+        let _logs = crate::request_log::request_log_test_guard();
+        let _settings = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("request-log.jsonl");
+        let settings = temp.path().join("settings.json");
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        std::fs::write(
+            &settings,
+            serde_json::to_vec(&serde_json::json!({
+                "relayProfilesEnabled":true, "activeRelayId":"test", "relayProfiles":[{
+                    "id":"test", "name":"isolated", "relayMode":"pureApi", "protocol":"responses",
+                    "baseUrl":format!("http://{address}/v1"), "apiKey":"test-key"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let previous = crate::paths::set_settings_path_for_tests(Some(settings));
+        crate::request_log::set_request_log_path_for_tests(Some(log.clone()));
+        let producer = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut bytes = [0u8; 8192];
+            let _ = socket.read(&mut bytes).await.unwrap();
+            let body = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1200,\"output_tokens\":100}}}\n\n";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handler = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            handle_protocol_proxy_connection(
+                &mut socket,
+                r#"{"model":"gpt-6.1-sol","stream":true,"input":"isolated test"}"#,
+                None,
+                None,
+                Default::default(),
+                "POST",
+                "/v1/responses",
+                None,
+            )
+            .await
+            .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut body = Vec::new();
+        client.read_to_end(&mut body).await.unwrap();
+        handler.await.unwrap();
+        producer.await.unwrap();
+        let entries = crate::request_log::read_request_logs_at(&log, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].success);
+        assert_eq!(entries[0].usage.as_ref().unwrap().input_tokens, 1200);
+        assert_eq!(entries[0].usage.as_ref().unwrap().output_tokens, 100);
+        let usage = temp.path().join("gateway-usage.json");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !usage.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&usage).unwrap()).unwrap();
+        assert_eq!(
+            value["days"].as_object().unwrap().values().next().unwrap()[0]["inputTokens"],
+            1200
+        );
+        crate::request_log::set_request_log_path_for_tests(None);
+        crate::paths::set_settings_path_for_tests(previous);
+    }
+}
+
 pub(super) async fn handle_official_images_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
@@ -159,6 +242,16 @@ pub(super) async fn handle_protocol_proxy_connection(
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
+    // 受保护的官方路径过去提前分流，绕过了主代理的用量日志。
+    let mut request_log = ProxyRequestLog::begin(
+        method,
+        path,
+        request_json.as_ref(),
+        session_headers
+            .thread_id
+            .or(session_headers.session_id)
+            .map(str::to_string),
+    );
 
     let request_is_stream = request_json
         .as_ref()
@@ -168,13 +261,13 @@ pub(super) async fn handle_protocol_proxy_connection(
     let mut capacity_retry_round = 0u8;
     let mut capacity_retry_notice_sequence = None;
     let upstream = loop {
-        let upstream = match crate::protocol_proxy::protected_local::open_responses_proxy_request_with_capacity_retries_for_path_and_session_headers(
+        let upstream = match crate::request_log::LIVE_REQUEST_ID.scope(request_log.entry.id.clone(), Box::pin(crate::protocol_proxy::protected_local::open_responses_proxy_request_with_capacity_retries_for_path_and_session_headers(
             request_body,
             request_user_agent,
             path,
             request_beta_features,
             session_headers,
-            )
+            )))
             .await
             {
                 Ok(upstream) => upstream,
@@ -378,6 +471,17 @@ pub(super) async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     };
+    request_log.entry.status_code = upstream.status_code;
+    request_log.entry.stream = upstream.is_stream;
+    if let Some(trace) = &upstream.request_trace {
+        request_log.entry.relay_id = trace.relay_id.clone();
+        request_log.entry.relay_name = trace.relay_name.clone();
+        request_log.entry.upstream_model = trace.upstream_model.clone();
+        request_log.entry.wire_api = trace.wire_api.clone();
+        request_log.entry.attempts = trace.attempts;
+    }
+    request_log.update_running();
+    // 读取或写入中断时 Drop 保持失败，不把仅收到响应头当作成功。
     if upstream.wire_api
         == crate::protocol_proxy::protected_local::UpstreamWireApi::AnthropicMessages
     {
@@ -385,7 +489,7 @@ pub(super) async fn handle_protocol_proxy_connection(
         if upstream.is_stream {
             write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
             let wire = crate::protocol_proxy::UpstreamWireApi::AnthropicMessages;
-            let (failure, _, _, _) = super::forward_protocol_proxy_stream(
+            let (failure, usage, detail, _) = super::forward_protocol_proxy_stream(
                 stream,
                 &upstream.prefetched_chunk,
                 upstream.response,
@@ -394,6 +498,7 @@ pub(super) async fn handle_protocol_proxy_connection(
                 session_headers.thread_id,
             )
             .await?;
+            request_log.record_stream(failure.as_deref(), usage, detail);
             log_helper_response(
                 if failure.is_some() {
                     "helper.protocol_proxy_stream_failed"
@@ -421,6 +526,7 @@ pub(super) async fn handle_protocol_proxy_connection(
                 crate::protocol_proxy::chat_completion_to_response(chat)?
             };
             crate::anthropic_bridge::attach_thinking_to_responses(&mut response, &thinking);
+            request_log.record_usage_json(&serde_json::to_vec(&response)?);
             write_http_response(
                 stream,
                 "200 OK",
@@ -428,6 +534,7 @@ pub(super) async fn handle_protocol_proxy_connection(
                 &serde_json::to_vec(&response)?,
             )
             .await?;
+            request_log.entry.success = true;
             log_helper_response(
                 "helper.protocol_proxy_ok",
                 method,
@@ -492,6 +599,11 @@ pub(super) async fn handle_protocol_proxy_connection(
                 crate::protocol_proxy::protected_local::ResponsesSseTerminalTracker::default();
             terminal.observe(&payload);
             stream.write_all(&payload).await?;
+            request_log.record_stream(
+                terminal.has_failed().then_some("compaction_failed"),
+                terminal.usage.take(),
+                None,
+            );
             log_helper_response(
                 if terminal.has_failed() {
                     "helper.protocol_proxy_stream_failed"
@@ -581,6 +693,11 @@ pub(super) async fn handle_protocol_proxy_connection(
                 }
             }
             stream_failed |= terminal.has_failed();
+            request_log.record_stream(
+                stream_failed.then_some("stream_failed"),
+                terminal.usage.take(),
+                None,
+            );
             if let (Some(account_id), Some(until)) = (scheduled_account_id, terminal.quota_reset) {
                 crate::official_account_schedule::mark_exhausted(&account_id, until);
                 let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -672,6 +789,7 @@ pub(super) async fn handle_protocol_proxy_connection(
             }
         }
         stream_failed |= converter.has_failed();
+        request_log.record_stream(stream_failed.then_some("stream_failed"), None, None);
         log_helper_response(
             if stream_failed {
                 "helper.protocol_proxy_stream_failed"
@@ -691,6 +809,7 @@ pub(super) async fn handle_protocol_proxy_connection(
         crate::protocol_proxy::protected_local::upstream_body_timeout(),
     )
     .await?;
+    request_log.record_usage_json(&upstream_body);
     if upstream.compaction {
         let body = crate::protocol_proxy::protected_local::wrap_non_stream_response_as_compaction(
             &upstream_body,
@@ -701,6 +820,7 @@ pub(super) async fn handle_protocol_proxy_connection(
                 .unwrap_or(""),
         )?;
         write_http_response(stream, "200 OK", "text/event-stream; charset=utf-8", &body).await?;
+        request_log.entry.success = true;
         log_helper_response(
             "helper.protocol_proxy_compaction_ok",
             method,
@@ -731,6 +851,7 @@ pub(super) async fn handle_protocol_proxy_connection(
             "200 OK",
             remote_addr_text,
         );
+        request_log.entry.success = true;
         stream.shutdown().await?;
         return Ok(());
     }
@@ -745,6 +866,7 @@ pub(super) async fn handle_protocol_proxy_connection(
     };
     let body = serde_json::to_vec(&response_json)?;
     write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
+    request_log.entry.success = true;
     log_helper_response(
         "helper.protocol_proxy_ok",
         method,

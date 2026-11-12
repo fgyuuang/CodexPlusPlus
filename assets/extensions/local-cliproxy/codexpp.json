@@ -1,0 +1,9 @@
+{
+  "id": "local-cliproxy",
+  "name": "CLIProxyAPI 本地服务",
+  "version": "1.0.0",
+  "description": "管理独立 CLIProxyAPI 服务、加密凭据与专用供应商连接。停用插件不停止服务、不删除供应商。",
+  "engines": { "codexpp": ">=2.2.0" },
+  "manager": { "page": "manager.html", "title": "CLIProxyAPI", "nav": "tools", "icon": "server" },
+  "permissions": { "routes": ["/local-integrations/cliproxy"] }
+}

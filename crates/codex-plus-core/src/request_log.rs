@@ -11,6 +11,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const REQUEST_LOG_FILE: &str = "request-log.jsonl";
+tokio::task_local! {
+    pub(crate) static LIVE_REQUEST_ID: String;
+}
+
+pub(crate) fn update_running_source(id: &str, relay_id: &str, relay_name: &str, model: &str) {
+    if let Ok(mut requests) = live_requests().lock()
+        && let Some(entry) = requests.get_mut(id)
+    {
+        entry.relay_id = relay_id.to_string();
+        entry.relay_name = relay_name.to_string();
+        entry.upstream_model = model.to_string();
+    }
+}
+
+pub(crate) fn report_current_source(relay_id: &str, relay_name: &str, model: &str) {
+    let _ = LIVE_REQUEST_ID.try_with(|id| update_running_source(id, relay_id, relay_name, model));
+}
+pub const FINAL_RESPONSE_EVIDENCE_V1: &str = "final-response-v1";
 /// 日志文件达到该大小后裁剪到约一半，避免无限增长。
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 const KEEP_LOG_BYTES: u64 = 1024 * 1024;
@@ -65,6 +83,9 @@ pub struct RequestTrace {
     pub model: String,
     /// 真正发给上游的模型名。
     pub upstream_model: String,
+    /// 仅由当前内置发送链绑定；反序列化的旧 trace 不能取得此资格。
+    #[serde(skip)]
+    pub upstream_model_bound: bool,
     pub wire_api: String,
     /// 上游请求总次数（含失败切换与自动重试）。
     pub attempts: u32,
@@ -128,9 +149,25 @@ pub struct RequestLogEntry {
     pub usage: Option<RequestUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_ratio: Option<f64>,
+    /// `final-response-v1`：内置原生 Responses 链路已写出完整成功响应，
+    /// input/output/cached 均显式存在，路由与模型绑定最后一次 middleware 后发送。
+    /// 未验证的响应改写、转换/压缩链路不发此标记；不证明失败尝试的计费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response_evidence: Option<String>,
     /// 网关模式下发起请求的 Agent（claude / grok）；Codex 直连代理的旧记录为空。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+}
+
+impl RequestTrace {
+    pub(crate) fn bind_upstream_model(&mut self, body: &Value) {
+        self.upstream_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.upstream_model_bound = !self.upstream_model.trim().is_empty();
+    }
 }
 
 impl RequestLogEntry {
@@ -171,7 +208,7 @@ impl RequestLogEntry {
     }
 }
 
-fn log_path_override() -> Option<PathBuf> {
+pub(crate) fn log_path_override() -> Option<PathBuf> {
     LOG_PATH_OVERRIDE
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
@@ -223,9 +260,31 @@ pub fn finish_request(entry: &RequestLogEntry) {
 /// 更新进行中请求的快照（例如上游地址/首字耗时在请求结束前就已知）。
 pub fn update_running(entry: &RequestLogEntry) {
     if let Ok(mut live) = live_requests().lock()
-        && live.contains_key(&entry.id)
+        && let Some(current) = live.get_mut(&entry.id)
     {
-        live.insert(entry.id.clone(), entry.clone());
+        let mut updated = entry.clone();
+        // 预读/转发会直接发布进度，调用方持有的快照可能尚未同步，不能将其清掉。
+        updated.first_token_ms = current.first_token_ms.or(updated.first_token_ms);
+        updated.estimated_output_tokens = current
+            .estimated_output_tokens
+            .or(updated.estimated_output_tokens);
+        if current.first_token_ms.is_some() {
+            updated.phase = current.phase.clone();
+        }
+        *current = updated;
+    }
+}
+
+/// 选定真实上游后只更新路由；不触碰预读/转发已发布的首字、阶段和输出估算。
+pub(crate) fn update_running_route(id: &str, trace: &RequestTrace, stream: bool) {
+    if let Ok(mut live) = live_requests().lock()
+        && let Some(entry) = live.get_mut(id)
+    {
+        entry.relay_id = trace.relay_id.clone();
+        entry.relay_name = trace.relay_name.clone();
+        entry.upstream_model = trace.upstream_model.clone();
+        entry.wire_api = trace.wire_api.clone();
+        entry.stream = stream;
     }
 }
 
@@ -495,6 +554,59 @@ pub fn read_request_logs_at(path: &Path, limit: usize) -> std::io::Result<Vec<Re
     Ok(entries.into_iter().rev().collect())
 }
 
+/// 实时请求流只读日志末尾这么多字节，够放几百条记录。
+const RECENT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// 读取最近 `limit` 条请求日志（含正在进行的请求），按开始时间倒序返回。
+/// 给托盘、总览这种每秒轮询的实时请求流用：只读文件末尾，不每次解析整个日志。
+pub fn read_recent_request_logs(limit: usize) -> std::io::Result<Vec<RequestLogEntry>> {
+    let mut entries = read_recent_request_logs_at(&request_log_path(), limit)?;
+    entries.extend(running_requests());
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+/// 只读日志文件末尾一段；末尾凑不够 `limit` 条时退回整文件读取。
+pub fn read_recent_request_logs_at(
+    path: &Path,
+    limit: usize,
+) -> std::io::Result<Vec<RequestLogEntry>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let start = file.metadata()?.len().saturating_sub(RECENT_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines();
+    // 从文件中间开始读时，第一行多半被截断，丢掉。
+    if start > 0 {
+        lines.next();
+    }
+    let mut entries = VecDeque::with_capacity(limit.min(1024));
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<RequestLogEntry>(line) {
+            entries.push_back(entry);
+            if entries.len() > limit {
+                entries.pop_front();
+            }
+        }
+    }
+    if start > 0 && entries.len() < limit {
+        return read_request_logs_at(path, limit);
+    }
+    Ok(entries.into_iter().rev().collect())
+}
+
 pub fn clear_request_logs() -> std::io::Result<()> {
     clear_request_logs_at(&request_log_path())
 }
@@ -507,12 +619,37 @@ pub fn clear_request_logs_at(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// 强证据不使用旧解析器的 cached=0 回退，也不把 HTTP 200 当作完成。
+pub(crate) fn final_response_usage(value: &Value) -> Option<RequestUsage> {
+    let response = value.get("response").unwrap_or(value);
+    if response.get("status").and_then(Value::as_str) != Some("completed")
+        || response.get("error").is_some_and(|error| !error.is_null())
+        || response
+            .get("incomplete_details")
+            .is_some_and(|details| !details.is_null())
+    {
+        return None;
+    }
+    let usage = response.get("usage")?;
+    let cached = usage
+        .pointer("/input_tokens_details/cached_tokens")?
+        .as_u64()?;
+    let parsed = usage_from_responses_usage(usage)?;
+    (cached <= parsed.input_tokens && parsed.reasoning_tokens <= parsed.output_tokens)
+        .then_some(parsed)
+}
+
 /// 从非流式 Responses JSON（或 `response.completed` 的 data）里提取 usage。
 pub fn usage_from_response_json(value: &Value) -> Option<RequestUsage> {
     let usage = value
         .get("response")
         .and_then(|response| response.get("usage"))
         .or_else(|| value.get("usage"))?;
+    usage_from_responses_usage(usage)
+}
+
+/// Responses / Anthropic 形状的 usage 对象（input_tokens / output_tokens）。
+fn usage_from_responses_usage(usage: &Value) -> Option<RequestUsage> {
     let input_tokens = usage.get("input_tokens").and_then(Value::as_u64)?;
     let output_tokens = usage.get("output_tokens").and_then(Value::as_u64)?;
     let cached_tokens = usage
@@ -538,7 +675,15 @@ pub fn usage_from_body_bytes(body: &[u8]) -> Option<RequestUsage> {
     if let Some(usage) = usage_from_response_json(&value) {
         return Some(usage);
     }
-    let usage = value.get("usage")?;
+    usage_from_usage_value(value.get("usage")?)
+}
+
+/// 从单个 usage 对象里提取用量：Responses / Anthropic 的 input/output 字段与
+/// chat completions 的 prompt/completion 字段都认。流式转换器收尾时用它记账（#2803）。
+pub fn usage_from_usage_value(usage: &Value) -> Option<RequestUsage> {
+    if let Some(parsed) = usage_from_responses_usage(usage) {
+        return Some(parsed);
+    }
     let input_tokens = usage
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))
@@ -556,11 +701,15 @@ pub fn usage_from_body_bytes(body: &[u8]) -> Option<RequestUsage> {
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0);
+    let reasoning_tokens = usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Some(RequestUsage {
         input_tokens,
         output_tokens,
         cached_tokens,
-        reasoning_tokens: 0,
+        reasoning_tokens,
     })
 }
 
@@ -568,6 +717,46 @@ pub fn usage_from_body_bytes(body: &[u8]) -> Option<RequestUsage> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn account_status_follows_only_its_own_request_scope() {
+        let _guard = request_log_test_guard();
+        let one = entry("one");
+        let two = entry("two");
+        start_request(&one);
+        start_request(&two);
+        LIVE_REQUEST_ID
+            .scope("one".into(), async {
+                report_current_source("account-1", "Account One", "gpt-native");
+                LIVE_REQUEST_ID
+                    .scope("two".into(), async {
+                        report_current_source("account-2", "Account Two", "gpt-native");
+                    })
+                    .await;
+                report_current_source("account-3", "Account Three", "gpt-native");
+            })
+            .await;
+        report_current_source("unknown", "Outside Request", "unknown");
+        let requests = running_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .find(|entry| entry.id == "one")
+                .unwrap()
+                .relay_name,
+            "Account Three"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .find(|entry| entry.id == "two")
+                .unwrap()
+                .relay_name,
+            "Account Two"
+        );
+        finish_request(&one);
+        finish_request(&two);
+    }
 
     fn entry(id: &str) -> RequestLogEntry {
         RequestLogEntry {
@@ -603,8 +792,78 @@ mod tests {
                 reasoning_tokens: 50,
             }),
             cache_hit_ratio: None,
+            final_response_evidence: None,
             agent: None,
         }
+    }
+
+    #[test]
+    fn final_response_evidence_round_trip_and_legacy_absence() {
+        let legacy = serde_json::to_value(entry("legacy")).unwrap();
+        assert!(legacy.get("finalResponseEvidence").is_none());
+        let mut row: RequestLogEntry = serde_json::from_value(legacy).unwrap();
+        assert!(row.final_response_evidence.is_none());
+        row.final_response_evidence = Some(FINAL_RESPONSE_EVIDENCE_V1.to_string());
+        let raw = serde_json::to_value(row).unwrap();
+        assert_eq!(raw["finalResponseEvidence"], "final-response-v1");
+        let parsed: RequestLogEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            parsed.final_response_evidence.as_deref(),
+            Some("final-response-v1")
+        );
+    }
+
+    #[test]
+    fn final_response_usage_requires_explicit_complete_counts_and_success() {
+        let complete = json!({"status":"completed","usage":{
+            "input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}
+        }});
+        assert_eq!(final_response_usage(&complete).unwrap().cached_tokens, 0);
+        for pointer in [
+            "/status",
+            "/usage/input_tokens",
+            "/usage/output_tokens",
+            "/usage/input_tokens_details/cached_tokens",
+        ] {
+            let mut missing = complete.clone();
+            *missing.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(final_response_usage(&missing).is_none(), "{pointer}");
+        }
+        for status in ["in_progress", "incomplete", "failed"] {
+            let mut failed = complete.clone();
+            failed["status"] = json!(status);
+            assert!(final_response_usage(&failed).is_none());
+        }
+        for (pointer, invalid) in [
+            ("/usage/input_tokens_details/cached_tokens", json!(13)),
+            ("/usage/input_tokens", json!(-1)),
+            ("/usage/output_tokens", json!("3")),
+        ] {
+            let mut failed = complete.clone();
+            *failed.pointer_mut(pointer).unwrap() = invalid;
+            assert!(final_response_usage(&failed).is_none());
+        }
+        let mut failed = complete;
+        failed["error"] = json!({"code":"server_error"});
+        assert!(final_response_usage(&failed).is_none());
+    }
+
+    #[test]
+    fn upstream_model_binding_uses_mutated_body_and_is_not_deserialized() {
+        let mut trace = RequestTrace::default();
+        let mut body = json!({"model":"before-middleware"});
+        body["model"] = json!("after-middleware");
+        trace.bind_upstream_model(&body);
+        assert_eq!(trace.upstream_model, "after-middleware");
+        assert!(trace.upstream_model_bound);
+        let mut raw = serde_json::to_value(&trace).unwrap();
+        assert!(raw.get("upstreamModelBound").is_none());
+        raw["upstreamModelBound"] = json!(true);
+        let restored: RequestTrace = serde_json::from_value(raw).unwrap();
+        assert!(!restored.upstream_model_bound);
+        trace.bind_upstream_model(&json!({}));
+        assert!(!trace.upstream_model_bound);
+        assert!(trace.upstream_model.is_empty());
     }
 
     #[test]
@@ -774,6 +1033,115 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].state.as_deref(), Some("success"));
 
+        set_request_log_path_for_tests(None);
+    }
+
+    #[test]
+    fn live_route_and_snapshot_updates_preserve_stream_progress() {
+        let _guard = request_log_test_guard();
+        let mut running = entry("live-route-progress");
+        running.first_token_ms = None;
+        running.phase = Some("requesting".to_string());
+        start_request(&running);
+        let mut trace = RequestTrace {
+            relay_id: "selected-relay".to_string(),
+            relay_name: "Selected relay".to_string(),
+            upstream_model: "real-model".to_string(),
+            wire_api: "responses".to_string(),
+            ..Default::default()
+        };
+        update_running_route(&running.id, &trace, true);
+        let selected = running_requests()
+            .into_iter()
+            .find(|row| row.id == running.id)
+            .unwrap();
+        assert_eq!(selected.relay_id, trace.relay_id);
+        assert_eq!(selected.relay_name, trace.relay_name);
+        assert_eq!(selected.upstream_model, trace.upstream_model);
+        assert_eq!(selected.wire_api, trace.wire_api);
+        assert!(selected.stream);
+        assert!(selected.first_token_ms.is_none());
+        assert_eq!(selected.phase.as_deref(), Some("requesting"));
+
+        update_running_first_token(&running.id);
+        update_running_output_estimate(&running.id, 42);
+        update_running_retry(&running.id, 2, 1, vec!["overload".to_string()]);
+        trace.relay_id = "fallback-relay".to_string();
+        update_running_route(&running.id, &trace, true);
+        let generating = running_requests()
+            .into_iter()
+            .find(|row| row.id == running.id)
+            .unwrap();
+        assert_eq!(generating.relay_id, "fallback-relay");
+        assert_eq!(generating.phase.as_deref(), Some("generating"));
+        assert_eq!(generating.estimated_output_tokens, Some(42));
+        assert_eq!(generating.attempts, 2);
+        assert_eq!(generating.auto_retries, 1);
+        assert_eq!(generating.retry_reasons, vec!["overload"]);
+
+        // record_upstream 的本地快照仍没有预读期间的生成进度。
+        running.relay_id = trace.relay_id;
+        update_running(&running);
+        let updated = running_requests()
+            .into_iter()
+            .find(|row| row.id == running.id)
+            .unwrap();
+        assert_eq!(updated.first_token_ms, generating.first_token_ms);
+        assert!(updated.first_token_ms.is_some());
+        assert_eq!(updated.phase.as_deref(), Some("generating"));
+        assert_eq!(updated.estimated_output_tokens, Some(42));
+        live_requests().lock().unwrap().remove(&running.id);
+        update_running_route(&running.id, &RequestTrace::default(), false);
+        assert!(!running_requests().iter().any(|row| row.id == running.id));
+    }
+
+    #[test]
+    fn recent_logs_read_only_the_tail_and_match_full_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REQUEST_LOG_FILE);
+        assert!(read_recent_request_logs_at(&path, 5).unwrap().is_empty());
+
+        // 每条约 8KB，60 条超过末尾窗口（256KB），走「从中间开始读」的分支。
+        let padding = "x".repeat(8 * 1024);
+        for index in 0..60 {
+            let mut item = entry(&format!("tail-{index}"));
+            item.relay_name = format!("{padding}-{index}");
+            append_request_log_at(&path, &item).unwrap();
+        }
+        let recent = read_recent_request_logs_at(&path, 5).unwrap();
+        let ids: Vec<&str> = recent.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["tail-59", "tail-58", "tail-57", "tail-56", "tail-55"]);
+
+        // 末尾窗口凑不够时退回整文件读取，结果和完整读取一致。
+        let many = read_recent_request_logs_at(&path, 50).unwrap();
+        let full = read_request_logs_at(&path, 50).unwrap();
+        assert_eq!(
+            many.iter().map(|item| &item.id).collect::<Vec<_>>(),
+            full.iter().map(|item| &item.id).collect::<Vec<_>>()
+        );
+        assert_eq!(many.len(), 50);
+    }
+
+    #[test]
+    fn recent_logs_include_running_requests() {
+        let _guard = request_log_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(REQUEST_LOG_FILE);
+        set_request_log_path_for_tests(Some(path.clone()));
+
+        let mut done = entry("flow-done");
+        done.started_at_ms = 100;
+        append_request_log_at(&path, &done).unwrap();
+        let mut running = entry("flow-live");
+        running.started_at_ms = 200;
+        running.state = Some("running".to_string());
+        start_request(&running);
+
+        let recent = read_recent_request_logs(10).unwrap();
+        assert_eq!(recent[0].id, "flow-live");
+        assert_eq!(recent[1].id, "flow-done");
+
+        finish_request(&running);
         set_request_log_path_for_tests(None);
     }
 

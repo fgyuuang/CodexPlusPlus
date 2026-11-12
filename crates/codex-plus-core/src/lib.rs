@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod ads;
 pub mod agent_cache;
 pub mod agent_collaboration;
@@ -11,10 +13,14 @@ pub mod assets;
 pub mod auto_takeover;
 pub mod bridge;
 pub mod browser_use;
+pub mod builtin_takeover;
+pub mod bundled_extensions;
 pub mod ccs_import;
 pub mod cdp;
 pub mod channel_protection;
 pub mod claude_hooks;
+#[cfg(any(target_os = "windows", test))]
+mod claude_ion_asar;
 pub mod claude_localization;
 pub mod codex_app_state;
 pub mod codex_app_tools_compat;
@@ -38,13 +44,21 @@ pub mod dream_skin_library;
 pub mod dream_skin_market;
 pub mod dream_skin_package;
 pub mod dream_skin_runtime;
+pub mod dsh_plugins;
 pub mod env_conflicts;
+pub mod extension_curation;
+pub mod extension_discovery;
+pub mod extension_launch;
+pub mod foreign_reasoning;
 pub mod gateway;
 pub mod global_dictation;
 pub mod grok_config;
+pub mod history_turn_recovery;
 pub mod http_client;
 pub mod install;
 pub mod launcher;
+pub mod macos_window;
+pub mod managed_mcp;
 pub mod manager_navigation;
 pub mod mcp_config;
 pub mod model_catalog;
@@ -52,10 +66,13 @@ pub mod model_pricing;
 pub mod model_suffix;
 pub mod models;
 pub mod multi_worker;
+pub mod native_auth;
 pub mod native_browser;
 pub mod native_browser_connection;
 pub(crate) mod native_fast;
 pub mod native_menu;
+pub(crate) mod native_predictions;
+pub mod native_thread_goal;
 pub mod official_account_schedule;
 pub mod official_accounts;
 pub mod official_child_routing;
@@ -67,11 +84,25 @@ pub mod paths;
 pub mod ports;
 pub mod window_capture;
 // 独立插件市场按需下载安装，不调用原生授权安装流程。
+pub mod extension_backend;
+pub mod extension_claude;
+pub mod extension_codex;
+pub mod extension_creator;
+pub mod extension_gateway;
+pub mod extension_history;
+pub mod extension_hooks;
+pub mod extension_llm;
+pub mod extension_manager_data;
+pub mod extension_node;
+pub mod extension_publish;
+pub mod extension_semver;
+pub mod newapi;
 pub mod plugin_market;
 pub mod plugin_marketplace;
 pub mod protocol_proxy;
 pub mod provider_import;
 pub mod proxy;
+pub mod relay_billing;
 pub mod relay_config;
 pub mod relay_environment;
 pub mod relay_features;
@@ -85,25 +116,30 @@ pub mod resident_helper;
 pub(crate) mod responses_exec;
 pub(crate) mod responses_exec_sse;
 pub(crate) mod responses_exec_transport;
+pub(crate) mod rollout_file;
 pub mod routes;
 pub mod script_market;
-pub mod session_share;
 pub mod settings;
 pub mod settings_catalog;
-pub mod share;
 pub mod side_chat;
 pub mod skills;
+pub mod ssh_remote_loopback;
 pub mod status;
 pub mod stepwise;
 pub mod sub2api;
 pub mod tools;
 pub mod update;
+pub mod upstream_model_meta;
 pub mod upstream_worktree;
 pub mod user_scripts;
 pub mod version;
 pub mod vision;
 pub mod watcher;
+pub mod whale;
+pub mod whale_full;
 pub mod work_view;
+pub mod wsl_network;
+pub(crate) mod xai_responses;
 pub mod zed_remote;
 // 不加 `#[cfg(windows)]`：模块内部各项已各自标注平台门控，在非 Windows 平台上
 // 是一个只含少数无平台依赖项（如 current_process_is_elevated 的桩实现）的空模块。
@@ -128,6 +164,7 @@ pub fn windows_activate_process_window(process_id: u32) -> bool {
 }
 
 /// 设置 Codex++ 任务栏分组、名称和重启入口，保留 Codex 自己的图标。
+/// 启动器不再对打包版 Codex 调用：改写包应用的 AppUserModelID 会让任务栏丢失官方图标并单独分组（#2499、#2668）。
 #[cfg(windows)]
 pub fn windows_apply_codexplusplus_taskbar_to_process_window(process_id: u32) -> bool {
     windows_integration::apply_codexplusplus_taskbar_to_process_window(process_id)

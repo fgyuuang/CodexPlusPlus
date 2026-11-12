@@ -4,10 +4,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { KeyRound, Shuffle, Waypoints } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
+  agentName,
   formatRemaining,
   maskAccountName,
   maskAccountText,
   quotaRemaining,
+  quotaWindowFresh,
   quotaWindowLabel,
   type GatewayResult,
   type MemberStatus,
@@ -65,6 +67,47 @@ export const AGENT_ICONS: Record<string, string> = {
   codexApp: new URL("./assets/agents/codex.svg", import.meta.url).href,
 };
 
+/** 通用 Agent → 打包的品牌图标（assets/providers，来源见该目录的 LICENSE.txt）；没有的用名字首字母。 */
+const AGENT_BRANDS: Record<string, string> = {
+  opencode: "opencode",
+  openchamber: "opencode",
+  "mimo-code": "xiaomimimo",
+  "deveco-code": "huawei-color",
+  stepcode: "stepfun-color",
+  goose: "goose",
+  "copilot-cli": "githubcopilot",
+  "copilot-jetbrains": "githubcopilot",
+  dsh: "deepseek-color",
+  "command-code": "commandcode",
+  hermes: "hermesagent",
+  "kimi-code": "kimi-color",
+  "qwen-code": "qwen-color",
+  "minimax-code": "minimax-color",
+  cline: "cline",
+  qoder: "qoder-color",
+  "qoder-cn": "qoder-color",
+  "grok-app": "grok",
+  zcode: "zai",
+  workbuddy: "workbuddy-color",
+  "workbuddy-ai": "workbuddy-color",
+  codebuddy: "codebuddy-color",
+  openclaw: "openclaw-color",
+  "claude-desktop": "claude-color",
+  "gemini-cli": "geminicli-color",
+  zed: "zed",
+  vscodium: "vscodium",
+  "jetbrains-air": "jetbrains",
+  raycast: "raycast",
+};
+for (const [agent, key] of Object.entries(AGENT_BRANDS)) {
+  if (!AGENT_ICONS[agent] && BRAND_ICON_URLS[key]) AGENT_ICONS[agent] = BRAND_ICON_URLS[key];
+}
+
+/** 彩色图标原样显示；单色图标用遮罩跟随文字颜色。 */
+export function agentIconIsColor(agent: string): boolean {
+  return Boolean(AGENT_BRANDS[agent]?.endsWith("-color"));
+}
+
 /**
  * 网关里 Agent 的图标。Codex 用 Codex 应用自己的彩色图标；Claude Code、Grok 只有黑色单色图，
  * 直接当 <img> 在深色主题里看不见，所以用遮罩按当前文字颜色绘制，跟随主题。
@@ -72,6 +115,9 @@ export const AGENT_ICONS: Record<string, string> = {
 export function AgentIcon({ agent, className = "" }: { agent: string; className?: string }) {
   if (agent === "codex") return <img alt="" className={className} src={AGENT_ICONS.codexApp} />;
   const url = AGENT_ICONS[agent];
+  if (url && agentIconIsColor(agent)) return <img alt="" className={className} src={url} />;
+  // 通用 Agent 没有打包图标：用名字首字母。
+  if (!url) return <i aria-hidden="true" className={`${className} gw-agent-letter`.trim()}>{(agentName(agent).trim()[0] ?? "?").toUpperCase()}</i>;
   return <i aria-hidden="true" className={`${className} gw-agent-mono`.trim()} style={url ? ({ "--gw-agent-icon": `url("${url}")` } as CSSProperties) : undefined} />;
 }
 
@@ -82,17 +128,11 @@ export function agentIcon(agent: string): string | undefined {
 
 export const APP_LOGO_URL = new URL("./assets/codex-plus-logo.png", import.meta.url).href;
 
-function hueOf(name: string): number {
-  let hash = 0;
-  for (const char of name) hash = (hash * 31 + (char.codePointAt(0) ?? 0)) % 360;
-  return hash;
-}
-
 export function avatarOf(name: string): string {
   return providerAvatarText(name, "P");
 }
 
-/** 已知厂商用打包的图标（按名字、再按地址识别），其它供应商用按名字固定配色的字母头像。
+/** 已知厂商用打包的图标（按名字、再按地址识别），其它供应商用中性灰的字母头像。
  * 悬停提示里的名字打码（订阅账号名里带邮箱 / 用户名）。 */
 export function Avatar({ name, baseUrl = "", size = "md", plain = false }: { name: string; baseUrl?: string; size?: "sm" | "md" | "lg"; plain?: boolean }) {
   const key = plain ? null : brandIconKey(name, baseUrl);
@@ -105,7 +145,7 @@ export function Avatar({ name, baseUrl = "", size = "md", plain = false }: { nam
     );
   }
   return (
-    <span className="gw-avatar" data-size={size} style={{ "--gw-hue": hueOf(name) } as CSSProperties} title={maskAccountName(name)}>
+    <span className="gw-avatar" data-size={size} title={maskAccountName(name)}>
       {avatarOf(name)}
     </span>
   );
@@ -160,6 +200,9 @@ export function KeyCount({ count }: { count: number }) {
 
 /** 订阅额度的剩余量：一根细条 + 百分比，取最紧的窗口。 */
 export function QuotaBadge({ quota }: { quota: ProviderQuota }) {
+  if (quota.officialAllowed === false) return <span className="gw-muted">{t("订阅额度受限")}</span>;
+  if (!quota.windows.length) return <span className="gw-muted">{quota.windowsComplete && quota.officialAllowed === true ? t("官方未返回时间窗口") : t("额度待刷新")}</span>;
+  if (quota.windows.some(window => !quotaWindowFresh(quota, window, Date.now()))) return <span className="gw-muted">{t("额度待刷新")}</span>;
   const left = Math.round(quotaRemaining(quota, Date.now()) * 100);
   const tone = left <= 10 ? "low" : left <= 30 ? "mid" : "ok";
   return (
@@ -170,21 +213,25 @@ export function QuotaBadge({ quota }: { quota: ProviderQuota }) {
   );
 }
 
-/** 订阅额度的明细：每个窗口一行，已用比例和重置时间。 */
-export function QuotaWindows({ quota }: { quota: ProviderQuota }) {
+/** 官方实际返回的窗口；卡片与详情共用，未知读数不显示为恢复。 */
+export function QuotaWindows({ quota, compact = false, maxAgeSeconds = 600 }: { quota: ProviderQuota; compact?: boolean; maxAgeSeconds?: number }) {
   const now = Date.now();
+  const fresh = quota.updatedAtMs <= now && now - quota.updatedAtMs <= maxAgeSeconds * 1000;
+  if (!quota.windows.length) return <span className="gw-muted">{fresh && quota.officialAllowed === false ? t("订阅额度受限") : fresh && quota.windowsComplete && quota.officialAllowed === true ? t("官方未返回时间窗口") : t("额度待刷新")}</span>;
   return (
-    <span className="gw-quota-windows">
+    <span className="gw-quota-windows" data-compact={compact || undefined}>
       {quota.windows.map((window, index) => {
         const reset = window.resetsAtMs !== null && window.resetsAtMs > now ? formatRemaining(window.resetsAtMs - now) : "";
         const label = quotaWindowLabel(window);
-        const used = window.resetsAtMs !== null && window.resetsAtMs <= now ? 0 : Math.round(window.usedPercent);
+        const known = quotaWindowFresh(quota, window, now, maxAgeSeconds);
+        const used = Math.round(window.usedPercent);
+        const name = window.windowMinutes === 300 ? "5h" : window.windowMinutes === 10080 ? "7d" : label.args.length ? tf(label.text, label.args) : t(label.text);
         return (
-          <span className="gw-quota-window" data-tone={used >= 90 ? "low" : used >= 70 ? "mid" : "ok"} key={index}>
-            <b>{label.args.length ? tf(label.text, label.args) : t(label.text)}</b>
-            <i style={{ "--gw-quota": `${Math.max(0, 100 - used)}%` } as CSSProperties} />
-            <span>{tf("已用 {0}%", [used])}</span>
-            {reset ? <small>{tf("{0} 后重置", [reset])}</small> : null}
+          <span className="gw-quota-window" data-tone={!known ? "unknown" : used >= 90 ? "low" : used >= 70 ? "mid" : "ok"} key={index} title={reset ? tf("{0} 后重置", [reset]) : undefined}>
+            <b>{name}</b>
+            <i aria-hidden="true" style={{ "--gw-quota": known ? `${Math.max(0, Math.min(100, used))}%` : "0%" } as CSSProperties} />
+            <span>{known ? tf("已用 {0}%", [used]) : t("待刷新")}</span>
+            {!compact && reset ? <small>{tf("{0} 后重置", [reset])}</small> : null}
           </span>
         );
       })}

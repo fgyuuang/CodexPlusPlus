@@ -1,4 +1,4 @@
-//! 网关模式端到端：真实 helper + 模拟上游，覆盖 Claude Code / Grok 经网关的完整链路。
+//! 网关模式端到端：真实 helper + 模拟上游，覆盖 Claude Code / Grok / 通用 Agent（Chat、Gemini 入站）经网关的完整链路。
 //!
 //! 常驻 helper 是进程级单例、状态目录靠进程级环境变量覆盖，所以全部场景放在一个测试里顺序执行。
 
@@ -143,9 +143,14 @@ fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
             model_windows: Default::default(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
+            newapi_access: None,
+            subscription_policy: None,
+            upstream_meta: Default::default(),
             relay,
             extra: Default::default(),
         })
@@ -189,15 +194,167 @@ fn claude_request(stream: bool) -> Value {
     })
 }
 
+async fn native_auth_compatibility(home: &std::path::Path) {
+    use base64::Engine;
+    use codex_plus_core::native_auth;
+    use codex_plus_core::official_login;
+    use codex_plus_core::settings::{BackendSettings, RelayMode, SettingsStore};
+
+    let auth = |subject: &str| {
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(json!({"iss": "https://auth.openai.com", "sub": subject}).to_string());
+        json!({
+            "auth_mode": "chatgpt",
+            official_login::GATEWAY_OWNED_MARKER: true,
+            "tokens": {
+                "id_token": format!("header.{claims}.signature"),
+                "account_id": "native-test-workspace",
+                "access_token": format!("access-{subject}"),
+                "refresh_token": format!("refresh-{subject}")
+            }
+        })
+        .to_string()
+    };
+    let store = GatewayStore::default();
+    let settings = SettingsStore::default();
+    let settings_path = codex_plus_core::paths::default_settings_path();
+    assert_eq!(settings_path.parent(), home.parent());
+    assert!(!settings_path.exists() && !store.path.exists());
+    settings.save(&BackendSettings::default()).unwrap();
+    let independent_auth = auth("native-a");
+    std::fs::write(home.join("auth.json"), &independent_auth).unwrap();
+    assert!(native_auth::preserve_live_auth(home).unwrap().is_none());
+    assert_eq!(native_auth::project_native_auth(home, "{}").unwrap(), "{}");
+    assert!(
+        !store.path.exists(),
+        "legacy apply must not materialize a native gateway copy"
+    );
+    codex_plus_core::relay_config::apply_pure_api_config_to_home(
+        home,
+        "http://127.0.0.1:9/v1",
+        "synthetic-api",
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(home.join("auth.json")).unwrap(),
+        independent_auth
+    );
+    assert!(!store.path.exists());
+
+    let mut gateway = GatewaySettings {
+        providers: providers(vec![RelayProfile {
+            id: "native-test-b".into(),
+            name: "Account B".into(),
+            relay_mode: RelayMode::Official,
+            auth_contents: auth("native-b"),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    gateway.providers[0].source = "login:chatgpt".into();
+    store.save(&gateway).unwrap();
+    std::fs::write(home.join("auth.json"), auth("native-a")).unwrap();
+    native_auth::set_native_auth_selection(Some("native-test-b")).unwrap();
+    let gateway = store.load().unwrap();
+    let backup = gateway
+        .providers
+        .iter()
+        .find(|provider| provider.source == "native:external")
+        .unwrap();
+    assert!(!backup.enabled);
+    assert!(official_login::is_native_owned_login(&backup.relay));
+    assert!(native_auth::same_account(
+        &std::fs::read_to_string(home.join("auth.json")).unwrap(),
+        &auth("native-b"),
+    ));
+    let mut old_lent = gateway.providers[0].relay.clone();
+    old_lent.id = "old-lent-session".into();
+    let mut old_auth: Value = serde_json::from_str(&old_lent.auth_contents).unwrap();
+    old_auth[official_login::LENT_TO_CODEX_MARKER] = json!(true);
+    old_auth["tokens"]["access_token"] = json!("old-independent-access");
+    old_auth["tokens"]["refresh_token"] = json!("old-independent-refresh");
+    old_lent.auth_contents = old_auth.to_string();
+    let native_before = std::fs::read_to_string(home.join("auth.json")).unwrap();
+    assert!(
+        official_login::resolve_official_credential(&old_lent, false)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("旧版借用")
+    );
+    let credential = official_login::resolve_official_credential_for_quota(&old_lent)
+        .await
+        .unwrap();
+    assert_eq!(
+        credential.access_token, "old-independent-access",
+        "a read-only quota probe must not merge an independently selected session"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("auth.json")).unwrap(),
+        native_before
+    );
+    codex_plus_core::relay_config::apply_pure_api_config_to_home(
+        home,
+        "http://127.0.0.1:9/v1",
+        "synthetic-api-2",
+    )
+    .unwrap();
+    assert!(native_auth::same_account(
+        &std::fs::read_to_string(home.join("auth.json")).unwrap(),
+        &auth("native-b"),
+    ));
+    native_auth::set_native_auth_selection(None).unwrap();
+    let live: Value =
+        serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
+    assert!(live.get("tokens").is_none());
+    assert_eq!(store.load().unwrap().providers.len(), 2);
+
+    // Old native backups without the new marker are also read-only.
+    let mut legacy = backup.relay.clone();
+    let mut legacy_auth: Value = serde_json::from_str(&legacy.auth_contents).unwrap();
+    legacy_auth
+        .as_object_mut()
+        .unwrap()
+        .remove(official_login::NATIVE_OWNED_MARKER);
+    legacy.auth_contents = legacy_auth.to_string();
+    let mut gateway = store.load().unwrap();
+    gateway
+        .providers
+        .iter_mut()
+        .find(|provider| provider.relay.id == legacy.id)
+        .unwrap()
+        .relay = legacy.clone();
+    store.save(&gateway).unwrap();
+    assert!(
+        official_login::resolve_official_credential(&legacy, true)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("不会轮换")
+    );
+
+    std::fs::remove_file(settings_path).unwrap();
+    std::fs::remove_file(&store.path).unwrap();
+    std::fs::remove_file(home.join("auth.json")).unwrap();
+    std::fs::remove_file(home.join("config.toml")).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_end_to_end() {
     let state_dir = tempfile::tempdir().unwrap();
+    let codex_home = state_dir.path().join("codex-home");
+    let sqlite_home = state_dir.path().join("codex-sqlite");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::create_dir_all(&sqlite_home).unwrap();
     unsafe {
         std::env::set_var(
             codex_plus_core::paths::STATE_DIR_ENV,
             state_dir.path().to_str().unwrap(),
         );
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("CODEX_SQLITE_HOME", &sqlite_home);
     }
+    native_auth_compatibility(&codex_home).await;
     let port = {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.local_addr().unwrap().port()
@@ -393,6 +550,49 @@ async fn gateway_end_to_end() {
         assert_eq!(body["store"], false);
     }
 
+    // —— 3b. Claude 系请求的档位套到上游模型实有的档位 ——
+    let fit_body = json!({
+        "id": "resp_fit", "object": "response", "status": "completed", "model": "gpt-up",
+        "output": [{ "id": "msg_fit", "type": "message", "role": "assistant", "status": "completed",
+                     "content": [{ "type": "output_text", "text": "档位", "annotations": [] }] }],
+        "usage": { "input_tokens": 5, "output_tokens": 1 }
+    })
+    .to_string();
+    for (levels, expected) in [
+        (
+            r#"[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]"#,
+            "high",
+        ),
+        (
+            r#"[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]"#,
+            "xhigh",
+        ),
+    ] {
+        let (fit_base, fit_seen) =
+            mock_upstream(vec![(200, "application/json", fit_body.clone())]).await;
+        let mut fit_relay = relay(
+            "fit",
+            &fit_base,
+            "sk-fit",
+            RelayProtocol::Responses,
+            "gpt-up",
+        );
+        fit_relay.model_metadata =
+            format!(r#"{{"gpt-up":{{"supported_reasoning_levels":{levels}}}}}"#);
+        gateway.providers = providers(vec![fit_relay]);
+        save(&gateway);
+        let mut request = claude_request(false);
+        request["thinking"] = json!({ "type": "adaptive" });
+        request["output_config"] = json!({ "effort": "max" });
+        let (status, text) = post(port, "/gw/claude/v1/messages", token, &request).await;
+        assert_eq!(status, 200, "{text}");
+        let seen = fit_seen.lock().unwrap();
+        assert_eq!(
+            seen[0].1["reasoning"]["effort"], expected,
+            "levels: {levels}"
+        );
+    }
+
     // —— 4. Anthropic 上游原样转发 ——
     let anthropic_sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-up\",\"content\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string();
     let (anth_base, anth_seen) =
@@ -560,7 +760,25 @@ async fn gateway_end_to_end() {
     );
     // 路由动态：最近一次请求先试 bad（502）再由 good 回答，计数里有换过上游和 Agent 收到的错误。
     {
-        let activity = codex_plus_core::gateway::activity::snapshot();
+        // 客户端读到 EOF 时，服务端可能尚未返回并 drop InFlight；等待清理完成，
+        // 不把客户端收完响应当作服务端清理完成的同步信号。超时仍报错，防止漏清理被掩盖。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let activity = loop {
+            let activity = codex_plus_core::gateway::activity::snapshot();
+            let claude = activity
+                .agents
+                .iter()
+                .find(|agent| agent.agent == "claude")
+                .expect("claude 有路由动态");
+            if claude.in_flight.is_empty() {
+                break activity;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "响应转发完后应清空正在回答状态，等待 5 秒后仍未清理：{claude:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
         let claude = activity
             .agents
             .iter()
@@ -636,6 +854,51 @@ async fn gateway_end_to_end() {
         .map(|model| model["id"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["group/group", "deepseek-v4-pro", "glm-5.3"]);
+
+    // Claude Desktop：非 Claude 模型换成数字别名，真实名字在 display_name 里。
+    gateway.bindings.insert(
+        "claude-desktop".into(),
+        binding("deepseek-v4-pro", "cpx-gw-desktop-e2e"),
+    );
+    save(&gateway);
+    let models = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{port}/gw/claude-desktop/v1/models"
+        ))
+        .bearer_auth("cpx-gw-desktop-e2e")
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let rows = models["data"].as_array().unwrap();
+    let names = rows
+        .iter()
+        .map(|row| row["display_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["deepseek-v4-pro", "glm-5.3", "group/group"]);
+    for row in rows {
+        let real = row["display_name"].as_str().unwrap();
+        let id = row["id"].as_str().unwrap();
+        // 有思考档位的模型用 mythos-gw- 别名（Desktop 才出思考等级菜单），其余仍是 claude-gw-；
+        // 数字部分与旧别名一致，旧会话选中的模型照样能还原。
+        let old = codex_plus_core::gateway::route::claude_alias(real);
+        let digits = old.strip_prefix("claude-gw-").unwrap();
+        assert!(
+            id == old || id == format!("mythos-gw-{digits}"),
+            "{real}: {id}"
+        );
+        assert_eq!(
+            id,
+            codex_plus_core::gateway::route::claude_desktop_alias(
+                real,
+                id.starts_with("mythos-gw-")
+            )
+        );
+    }
+    gateway.bindings.remove("claude-desktop");
+    save(&gateway);
 
     // —— 8. Grok：Responses 客户端 → Chat 上游，输出 Responses 事件流 ——
     let (grok_base, grok_seen) =
@@ -783,6 +1046,115 @@ async fn gateway_end_to_end() {
     assert!(text.contains("response.completed"), "{text}");
     assert!(!text.contains("response.metadata"), "{text}");
     assert!(!text.contains("codex.rate_limits"), "{text}");
+
+    // Native memory tasks may use distinct thread, session and root-turn identities.
+    // Upstream routing must reach the selected model without the retired local lineage gate.
+    let terra_completed = json!({"type":"response.completed","response":{
+        "id":"resp_terra", "object":"response", "status":"completed",
+        "model":"gpt-6.1-terra", "output":[]
+    }});
+    let mut terra_compacted = terra_completed.clone();
+    terra_compacted["response"]["output"] = json!([{
+        "type":"compaction", "id":"cmp_terra", "encrypted_content":"opaque-checkpoint"
+    }]);
+    let checkpoint = json!({"type":"response.output_item.done", "output_index":0,
+        "item":terra_compacted["response"]["output"][0]});
+    let (terra_base, terra_seen) = mock_upstream(vec![
+        (
+            429,
+            "application/json",
+            json!({"error":{"type":"usage_limit_reached"}}).to_string(),
+        ),
+        (
+            200,
+            "text/event-stream",
+            format!("event: response.completed\ndata: {terra_completed}\n\n"),
+        ),
+        (
+            200,
+            "text/event-stream",
+            format!("event: response.output_item.done\ndata: {checkpoint}\n\nevent: response.completed\ndata: {terra_compacted}\n\n"),
+        ),
+    ])
+    .await;
+    unsafe {
+        std::env::set_var(
+            "CODEX_PLUS_OFFICIAL_BASE_URL",
+            terra_base.trim_end_matches("/v1"),
+        );
+    }
+    let mut terra_first = gateway.providers[0].relay.clone();
+    terra_first.id = "local-official-terra-first".into();
+    terra_first.model = "gpt-6.1-terra".into();
+    terra_first.model_list = "gpt-6.1-terra".into();
+    let mut terra_second = terra_first.clone();
+    terra_second.id = "local-official-terra-second".into();
+    let mut second_auth: Value = serde_json::from_str(&terra_second.auth_contents).unwrap();
+    second_auth["tokens"]["access_token"] = json!("at-terra-second");
+    second_auth["tokens"]["account_id"] = json!("acc-terra-second");
+    terra_second.auth_contents = second_auth.to_string();
+    gateway.providers = providers(vec![terra_first, terra_second]);
+    gateway
+        .bindings
+        .insert("codex".into(), binding("gpt-6.1-terra", "cpx-gw-terra"));
+    save(&gateway);
+    let memory_thread = "01a1c9a2-d754-7122-afb6-c5bebd32e4fe";
+    let memory_session = "01a1c9a2-d754-7122-afb6-c5bebd32e4ff";
+    let metadata = json!({
+        "thread_id":memory_thread, "session_id":memory_session,
+        "turn_id":"01a1c9a2-d754-7122-afb6-c5bebd32e401",
+        "root_turn_id":"01a1c9a2-d754-7122-afb6-c5bebd32e402",
+        "thread_source":"memory_consolidation", "subagent_kind":"memory_consolidation",
+        "request_kind":"turn", "agent_name":"/root"
+    })
+    .to_string();
+    for (path, model) in [
+        ("/gw/codex/v1/responses", "gpt-6.1-terra"),
+        (
+            "/gw/codex/v1/responses/compact",
+            "local-official-terra-second/gpt-6.1-terra",
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}{path}"))
+            .bearer_auth("cpx-gw-terra")
+            .header("thread-id", memory_thread)
+            .header("session-id", memory_session)
+            .header("x-codex-turn-metadata", &metadata)
+            .json(&json!({"model":model,"stream":true,"input":[]}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{path}: {body}");
+        assert!(body.contains("response.completed"), "{path}: {body}");
+    }
+    {
+        let seen = terra_seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            3,
+            "one quota fallback, then one compact request"
+        );
+        assert!(
+            seen[0]
+                .0
+                .to_ascii_lowercase()
+                .contains("chatgpt-account-id: acc-1")
+        );
+        assert!(
+            seen[1]
+                .0
+                .to_ascii_lowercase()
+                .contains("chatgpt-account-id: acc-terra-second")
+        );
+        assert!(seen[2].0.contains("/responses/compact"));
+        assert!(
+            seen.iter()
+                .all(|(_, body)| body["model"] == "gpt-6.1-terra")
+        );
+    }
     unsafe {
         std::env::remove_var("CODEX_PLUS_OFFICIAL_BASE_URL");
     }
@@ -941,6 +1313,232 @@ async fn gateway_end_to_end() {
     assert_eq!(codex_entries.len(), 1, "{codex_entries:?}");
     assert_eq!(codex_entries[0].agent.as_deref(), Some("codex"));
 
+    // —— 8d2. #2783：Codex 的客户端标识（UA、originator、x-codex-*）经网关原样带给 Responses 上游，
+    //         直接访问网关、以 ChatGPT 身份经本地代理转进网关两条路都一样 ——
+    let codex_ua = "codex_cli_rs/0.165.0 (Windows 10.0.26100; x86_64) WindowsTerminal";
+    let responses_json = json!({
+        "id": "resp_e2e", "object": "response", "status": "completed", "model": "gpt-up",
+        "output": [{ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "ok" }] }]
+    })
+    .to_string();
+    let (identity_base, identity_seen) =
+        mock_upstream(vec![(200, "application/json", responses_json)]).await;
+    gateway.providers = providers(vec![relay(
+        "sub2api",
+        &identity_base,
+        "sk-sub2api",
+        RelayProtocol::Responses,
+        "glm-5.3",
+    )]);
+    save(&gateway);
+    let codex_body = json!({
+        "model": "glm-5.3",
+        "instructions": "You are Codex.",
+        "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]
+    });
+    for (url, auth) in [
+        (
+            format!("http://127.0.0.1:{port}/gw/codex/v1/responses"),
+            "cpx-gw-codex-e2e",
+        ),
+        (
+            format!("http://127.0.0.1:{port}/v1/responses"),
+            "chatgpt-access-token",
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(auth)
+            .header("user-agent", codex_ua)
+            .header("originator", "codex_cli_rs")
+            .header("x-codex-window-id", "win-2783:0")
+            .header("x-codex-turn-metadata", "{\"turn_id\":\"t-2783\"}")
+            .header("x-codex-beta-features", "remote_compaction_v2")
+            .header("x-codex-turn-state", "sticky-from-elsewhere")
+            .header("cookie", "secret=1")
+            .header("session-id", "codex-session-2783")
+            .json(&codex_body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let response_body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{url}: {response_body}");
+        let seen = identity_seen.lock().unwrap();
+        let (head, _) = seen.last().unwrap();
+        let head = head.to_ascii_lowercase();
+        for expected in [
+            format!("user-agent: {}", codex_ua.to_ascii_lowercase()),
+            "originator: codex_cli_rs".to_string(),
+            "x-codex-window-id: win-2783:0".to_string(),
+            "x-codex-turn-metadata: {\"turn_id\":\"t-2783\"}".to_string(),
+            "x-codex-beta-features: remote_compaction_v2".to_string(),
+            "session-id: codex-session-2783".to_string(),
+            "authorization: bearer sk-sub2api".to_string(),
+        ] {
+            assert!(head.contains(&expected), "{url} 缺 {expected}：{head}");
+        }
+        for leaked in [
+            "x-codex-turn-state",
+            "cookie:",
+            "cpx-gw-codex-e2e",
+            "chatgpt-access-token",
+        ] {
+            assert!(!head.contains(leaked), "{url} 不该带 {leaked}：{head}");
+        }
+        assert_eq!(head.matches("originator:").count(), 1, "{head}");
+    }
+    assert_eq!(identity_seen.lock().unwrap().len(), 2);
+    assert!(
+        state_dir
+            .path()
+            .join("gateway-subagent-models.sqlite")
+            .is_file()
+    );
+
+    let saved_gateway = gateway.clone();
+    let fake_response = json!({
+        "id": "resp_inheritance", "object": "response", "status": "completed",
+        "model": "gpt-6.1-sol", "output": []
+    })
+    .to_string();
+    let (first_base, first_seen) =
+        mock_upstream(vec![(200, "application/json", fake_response.clone())]).await;
+    let (second_base, second_seen) =
+        mock_upstream(vec![(200, "application/json", fake_response)]).await;
+    gateway.providers = providers(vec![
+        relay(
+            "inherit-a",
+            &first_base,
+            "fake-a",
+            RelayProtocol::Responses,
+            "gpt-6.1-sol\ngpt-6.1-terra",
+        ),
+        relay(
+            "inherit-b",
+            &second_base,
+            "fake-b",
+            RelayProtocol::Responses,
+            "gpt-6.1-sol\ngpt-6.1-terra",
+        ),
+    ]);
+    gateway.bindings.get_mut("codex").unwrap().model = "inherit-a/gpt-6.1-sol".into();
+    save(&gateway);
+    for (index, (url, auth)) in [
+        (
+            format!("http://127.0.0.1:{port}/gw/codex/v1/responses"),
+            "cpx-gw-codex-e2e",
+        ),
+        (
+            format!("http://127.0.0.1:{port}/v1/responses"),
+            "chatgpt-access-token",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parent = format!("inherit-parent-{index}");
+        let child = format!("inherit-child-{index}");
+        for (thread, model, parent_thread) in [
+            (parent.as_str(), "inherit-b/gpt-6.1-terra", None),
+            (child.as_str(), "gpt-6.1-sol", Some(parent.as_str())),
+        ] {
+            let metadata = json!({"thread_id":thread,"turn_id":"turn", "parent_thread_id":parent_thread.unwrap_or(""), "parent_turn_id":if parent_thread.is_some() { "turn" } else { "" }});
+            let mut request = reqwest::Client::new()
+                .post(&url)
+                .bearer_auth(auth)
+                .header("session-id", thread)
+                .header("x-codex-turn-metadata", metadata.to_string())
+                .json(&json!({"model":model,"input":[]}));
+            if let Some(parent_thread) = parent_thread {
+                request = request
+                    .header("x-codex-parent-thread-id", parent_thread)
+                    .header("x-openai-subagent", "collab_spawn");
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert_eq!(status.as_u16(), 200, "{url}: {body}");
+        }
+    }
+    assert!(first_seen.lock().unwrap().is_empty());
+    {
+        let seen = second_seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(
+            seen.iter()
+                .all(|(_, body)| body["model"] == "gpt-6.1-terra")
+        );
+    }
+    let explicit_response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/gw/codex/v1/responses"))
+        .bearer_auth("cpx-gw-codex-e2e")
+        .header("session-id", "explicit-child")
+        .header("x-codex-parent-thread-id", "inherit-parent-0")
+        .header("x-codex-turn-metadata", json!({"thread_id":"explicit-child","turn_id":"turn","parent_thread_id":"inherit-parent-0","parent_turn_id":"turn"}).to_string())
+        .json(&json!({"model":"inherit-a/gpt-6.1-sol","input":[]}))
+        .send().await.unwrap();
+    assert_eq!(explicit_response.status().as_u16(), 200);
+    assert_eq!(
+        first_seen.lock().unwrap().last().unwrap().1["model"],
+        "gpt-6.1-sol"
+    );
+    gateway.groups = vec![GatewayGroup {
+        id: "inherit-group".into(),
+        name: "inherit-group".into(),
+        mode: GroupMode::Manual,
+        members: vec![
+            GroupMember {
+                model: "inherit-a/gpt-6.1-sol".into(),
+                weight: 1,
+            },
+            GroupMember {
+                model: "inherit-b/gpt-6.1-terra".into(),
+                weight: 1,
+            },
+        ],
+        pick: "inherit-b/gpt-6.1-terra".into(),
+        ..Default::default()
+    }];
+    save(&gateway);
+    for (thread, model, parent) in [
+        ("group-parent", "group/inherit-group", None),
+        ("group-child", "gpt-6.1-sol", Some("group-parent")),
+    ] {
+        if parent.is_some() {
+            gateway.groups[0].pick = "inherit-a/gpt-6.1-sol".into();
+            save(&gateway);
+        }
+        let metadata = json!({"thread_id":thread,"turn_id":"turn", "parent_thread_id":parent.unwrap_or(""), "parent_turn_id":if parent.is_some() { "turn" } else { "" }});
+        let mut request = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/gw/codex/v1/responses"))
+            .bearer_auth("cpx-gw-codex-e2e")
+            .header("session-id", thread)
+            .header("x-codex-turn-metadata", metadata.to_string())
+            .json(&json!({"model":model,"input":[]}));
+        if let Some(parent) = parent {
+            request = request
+                .header("x-codex-parent-thread-id", parent)
+                .header("x-openai-subagent", "collab_spawn");
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status.as_u16(), 200, "{thread}: {body}");
+    }
+    assert_eq!(first_seen.lock().unwrap().len(), 2);
+    assert_eq!(second_seen.lock().unwrap().len(), 5);
+    assert_eq!(
+        first_seen.lock().unwrap().last().unwrap().1["model"],
+        "gpt-6.1-sol"
+    );
+    assert_eq!(
+        second_seen.lock().unwrap().last().unwrap().1["model"],
+        "gpt-6.1-terra"
+    );
+    gateway = saved_gateway;
+    save(&gateway);
+
     // —— 8e. 生图：自动选池里的生图模型，第一家 5xx 换下一家，请求里的模型名换成那一家的 ——
     let (bad_base, _) = mock_upstream(vec![(
         500,
@@ -1084,6 +1682,163 @@ async fn gateway_end_to_end() {
         codex_image_seen.lock().unwrap().is_empty(),
         "Codex 内置官方生图缺少官方登录来源时不得请求同名第三方模型"
     );
+
+    // —— 8f. 通用 Agent（OpenCode）：Chat Completions 与 Gemini 入站都经网关转给 Chat 上游 ——
+    let (generic_base, generic_seen) = mock_upstream(vec![
+        (200, "text/event-stream", chat_sse("通用流式")),
+        (
+            200,
+            "application/json",
+            json!({
+                "id": "c9", "object": "chat.completion", "model": "up",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "通用整段" }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12 }
+            })
+            .to_string(),
+        ),
+        (200, "text/event-stream", chat_tool_sse()),
+        (200, "text/event-stream", chat_sse("双子座")),
+    ])
+    .await;
+    gateway.providers = providers(vec![relay(
+        "generic",
+        &generic_base,
+        "sk-generic",
+        RelayProtocol::ChatCompletions,
+        "deepseek-v4-pro",
+    )]);
+    let generic_token = "cpx-gw-opencode-e2e";
+    gateway
+        .bindings
+        .insert("opencode".into(), binding("deepseek-v4-pro", generic_token));
+    save(&gateway);
+    let chat_body = |stream: bool| {
+        json!({
+            "model": "generic/deepseek-v4-pro",
+            "stream": stream,
+            "stream_options": { "include_usage": true },
+            "messages": [
+                { "role": "system", "content": "你是助手" },
+                { "role": "user", "content": "你好" }
+            ],
+            "tools": [{ "type": "function", "function": { "name": "Bash", "parameters": { "type": "object", "properties": { "command": { "type": "string" } } } } }]
+        })
+    };
+    // 流式：标准 chat.completion.chunk，带 usage 块和 [DONE]。
+    let (status, text) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        generic_token,
+        &chat_body(true),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    let chunks = sse_events(&text);
+    let streamed: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(streamed, "通用流式");
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["usage"]["total_tokens"].as_u64() == Some(25)),
+        "{text}"
+    );
+    {
+        let seen = generic_seen.lock().unwrap();
+        let (_, body) = &seen[0];
+        assert_eq!(body["model"], "deepseek-v4-pro");
+        assert_eq!(body["tools"][0]["function"]["name"], "Bash");
+    }
+    // 非流式：完整 chat.completion。
+    let (status, text) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        generic_token,
+        &chat_body(false),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let completion: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(completion["object"], "chat.completion");
+    assert_eq!(completion["choices"][0]["message"]["content"], "通用整段");
+    // 工具调用：tool_calls 增量、finish_reason = tool_calls。
+    let (status, text) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        generic_token,
+        &chat_body(true),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let chunks = sse_events(&text);
+    assert!(
+        chunks.iter().any(
+            |chunk| chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Bash"
+        ),
+        "{text}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls"),
+        "{text}"
+    );
+    // Gemini：模型名带 `/`，Key 放在查询串里，流式回 GenerateContentResponse。
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/gw/opencode/v1beta/models/generic/deepseek-v4-pro:streamGenerateContent?alt=sse&key={generic_token}"
+        ))
+        .json(&json!({
+            "systemInstruction": { "parts": [{ "text": "你是助手" }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "你好" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let text = response.text().await.unwrap();
+    let gemini_text: String = text
+        .split("\r\n\r\n")
+        .flat_map(|block| block.split("\n\n"))
+        .filter_map(|block| block.trim().strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .filter_map(|event| {
+            event["candidates"][0]["content"]["parts"][0]["text"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(gemini_text, "双子座", "{text}");
+    // Gemini 本地计数，不发上游。
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/gw/opencode/v1beta/models/generic/deepseek-v4-pro:countTokens"
+        ))
+        .header("x-goog-api-key", generic_token)
+        .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "你好" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let counted: Value = response.json().await.unwrap();
+    assert!(counted["totalTokens"].as_u64().unwrap() > 0);
+    assert_eq!(
+        generic_seen.lock().unwrap().len(),
+        4,
+        "countTokens 不该发给上游"
+    );
+    // token 不对：401，OpenAI 风格的错误。
+    let (status, _) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        "wrong",
+        &chat_body(true),
+    )
+    .await;
+    assert_eq!(status, 401);
 
     // —— 9. 关闭绑定后返回 503，旧的 Codex 代理路径不受影响 ——
     gateway.bindings.get_mut("claude").unwrap().enabled = false;

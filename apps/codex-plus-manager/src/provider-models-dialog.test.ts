@@ -11,6 +11,11 @@ test("模型列表可以手动编辑、从上游刷新，后台发现的新模�
   const providers = read("GatewayProviders.tsx");
   assert.match(providers, /"save_gateway_provider_models", \{ id: entry\.id, models, defaultModel \}/);
   assert.match(providers, /setModelsOpen\(true\)/);
+  // 详情里「编辑」旁的「从上游同步」先打开预览弹窗，勾选后才写入（#2785）。
+  assert.match(providers, /onClick=\{\(\) => setSyncOpen\(true\)\}/);
+  assert.match(providers, /"apply_gateway_provider_models_sync", \{ id: entry\.id, remove, add \}, t\("从上游同步"\)\)/);
+  assert.match(providers, /\{t\("从上游同步"\)\}/);
+  assert.doesNotMatch(providers, /fetch_gateway_provider_models/);
   assert.doesNotMatch(providers, /只属于网关，直连模式里看不到/);
 });
 
@@ -20,6 +25,6 @@ test("供应商池顶栏的搜索框和按钮同高、不带按钮自己的上�
 
 test("Agent 接入的开关在模型下拉之后", () => {
   const agents = read("GatewayAgents.tsx");
-  const row = agents.slice(agents.indexOf('className="gw-agent-row"'));
+  const row = agents.slice(agents.indexOf('className="gw-agent-row cx-row"'));
   assert.ok(row.indexOf("<ModelPicker") < row.indexOf("<Switch"));
 });

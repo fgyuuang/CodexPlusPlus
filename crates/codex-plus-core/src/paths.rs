@@ -8,7 +8,6 @@ const SETTINGS_PATH_POINTER_FILE: &str = "settings.path";
 const LATEST_STATUS_FILE: &str = "latest-status.json";
 const DIAGNOSTIC_LOG_FILE: &str = "codex-plus.log";
 const PENDING_PROVIDER_IMPORT_FILE: &str = "pending-provider-import.json";
-const PENDING_SESSION_SHARE_FILE: &str = "pending-session-share.txt";
 const PENDING_REMOTE_CONTROL_RECOVERY_FILE: &str = "pending-remote-control-recovery.json";
 const SKILLS_STATE_FILE: &str = "skills.json";
 const SKILLS_DIR: &str = "skills";
@@ -29,6 +28,20 @@ const PENDING_MANAGER_NAVIGATION_FILE: &str = "pending-manager-navigation.json";
 /// 因此这里提供平台无关的显式覆盖：设置后该进程（及其子进程）的状态目录整体
 /// 挪到指定位置，不依赖任何平台特有的家目录语义。
 pub const STATE_DIR_ENV: &str = "CODEX_PLUS_STATE_DIR";
+
+/// 去掉 Windows canonicalize 带上的 `\\?\` verbatim 前缀（`\\?\UNC\` 换回 `\\`）。
+/// 用于交给外部进程或显示给用户的路径，内部比较仍可用 canonicalize 的原始结果。
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        // 只处理盘符路径；`\\?\Volume{...}` 之类去掉前缀就不是合法路径了。
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
 
 /// 解析显式状态目录覆盖；未设置或设置为空时返回 `None`。
 pub fn state_dir_override_from(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
@@ -117,10 +130,6 @@ pub fn default_diagnostic_log_path() -> PathBuf {
 
 pub fn default_pending_provider_import_path() -> PathBuf {
     default_app_state_dir().join(PENDING_PROVIDER_IMPORT_FILE)
-}
-
-pub fn default_pending_session_share_path() -> PathBuf {
-    default_app_state_dir().join(PENDING_SESSION_SHARE_FILE)
 }
 
 pub fn default_pending_remote_control_recovery_path() -> PathBuf {
@@ -274,6 +283,7 @@ mod tests {
 
     #[test]
     fn default_latest_status_path_uses_app_state_directory() {
+        let _guard = settings_path_test_guard();
         let path = default_latest_status_path();
 
         assert!(path.ends_with(".codex-session-delete/latest-status.json"));
@@ -281,6 +291,7 @@ mod tests {
 
     #[test]
     fn default_diagnostic_log_path_uses_app_state_directory() {
+        let _guard = settings_path_test_guard();
         let path = default_diagnostic_log_path();
 
         assert!(path.ends_with(".codex-session-delete/codex-plus.log"));
@@ -288,20 +299,15 @@ mod tests {
 
     #[test]
     fn default_pending_provider_import_path_uses_app_state_directory() {
+        let _guard = settings_path_test_guard();
         let path = default_pending_provider_import_path();
 
         assert!(path.ends_with(".codex-session-delete/pending-provider-import.json"));
     }
 
     #[test]
-    fn default_pending_session_share_path_uses_app_state_directory() {
-        let path = default_pending_session_share_path();
-
-        assert!(path.ends_with(".codex-session-delete/pending-session-share.txt"));
-    }
-
-    #[test]
     fn default_pending_remote_control_recovery_path_uses_app_state_directory() {
+        let _guard = settings_path_test_guard();
         let path = default_pending_remote_control_recovery_path();
 
         assert!(path.ends_with(".codex-session-delete/pending-remote-control-recovery.json"));
@@ -328,6 +334,7 @@ mod tests {
 
     #[test]
     fn default_pending_manager_navigation_path_uses_app_state_directory() {
+        let _guard = settings_path_test_guard();
         let path = default_pending_manager_navigation_path();
 
         assert!(path.ends_with(".codex-session-delete/pending-manager-navigation.json"));

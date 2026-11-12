@@ -4,8 +4,10 @@
  * 模型名三种写法：裸模型名（池里提供它的供应商依次尝试）、`<供应商 id>/<模型>`、`group/<组 id>`。
  */
 import { PRESETS } from "./presets.ts";
+import { normalizeSubscriptionPolicy, type SubscriptionPolicy, type SubscriptionPolicyInput } from "./subscription-policy.ts";
 
-export type GatewayAgentId = "codex" | "claude" | "grok";
+/** 内置三个之外，通用 Agent 的 id 由后端的规格表决定（如 "opencode"）。 */
+export type GatewayAgentId = "codex" | "claude" | "grok" | (string & {});
 export type UnknownModelPolicy = "mapToDefault" | "passthrough";
 export type KeyRotationMode = "sticky" | "roundRobin";
 export type GroupMode = "inOrder" | "rotate" | "weighted" | "usage" | "fast" | "manual";
@@ -20,6 +22,10 @@ export type AgentBinding = {
   extraModels: string[];
   claudeRoles: ClaudeRoleModels;
   unknownModel: UnknownModelPolicy;
+  /** 审批模型（#2703，Codex 用）：codex-auto-review 改发到这个模型；空或没有是不单独指定（旧版后端没有）。 */
+  autoReviewModel?: string;
+  /** 起名模型（Codex 用）：Codex 给会话起名的请求改发到这个模型；空或没有是不改（旧版后端没有）。 */
+  titleModel?: string;
   contextWindow?: number | null;
   claudeEnableEffort: boolean;
   /** 这个 Agent 不用的池内供应商（「挑选」里取消勾选的）。 */
@@ -41,12 +47,16 @@ export type GatewaySettings = {
   autoModels?: boolean;
   /** 多家都有的模型在 Codex 里名字后面带不带「（供应商）」（旧版后端没有，视为带）。 */
   modelSuffix?: boolean;
+  /** 发现本机已登录的订阅账号，供应商页提示导入（旧版后端没有，视为关）。 */
+  localLoginDiscovery?: boolean;
   /** 模型收藏（管理器模型下拉里的星标），Codex 的选择器里也显示。 */
   favoriteModels?: string[];
   /** 各 Agent 的生图模型（键是 Agent id）：没有或空是自动，`off` 是关闭，其余是 `<供应商 id>/<模型>`。 */
   imageModels?: Record<string, string>;
   /** 生图结果只给链接时原样转发、不下载成图片数据的 Agent（默认都转）。 */
   imageKeepUrls?: string[];
+  /** 模型下拉里不列自带模型的 Agent（默认都列）。 */
+  hideOwnModels?: string[];
 };
 
 export type GatewayPoolEntry = {
@@ -74,8 +84,21 @@ export type GatewayPoolEntry = {
   contextWindow?: number | null;
   /** 网关供应商单独走的 HTTP 代理，空串表示不单独走代理。 */
   proxy?: string;
+  /** 主动限速：每个 Key 每分钟最多请求数；没有或 null 表示不限。旧版后端没有。 */
+  keyRpm?: number | null;
+  /** 主动限速：每个 Key 同时进行的最多请求数；没有或 null 表示不限。旧版后端没有。 */
+  keyConcurrency?: number | null;
+  /** 转发前移除托管生图工具（image_generation，#228）。旧版后端没有。 */
+  stripImageGenerationTool?: boolean;
+  /** 转发前移除 Responses 图片 `detail`（#2870）。旧版后端没有。 */
+  stripResponsesImageDetail?: boolean;
+  /** 不向该上游发送 `tool_search`（#2868）。旧版后端没有。 */
+  disableToolSearch?: boolean;
   /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */
   account?: string;
+  subscriptionPolicy?: SubscriptionPolicyInput | null;
+  /** 后端合并同账号所有别名策略后的准入结果。 */
+  subscriptionBlockReason?: string | null;
   /** 订阅账号的套餐，如「ChatGPT Pro」「Copilot Pro+」。 */
   plan?: string;
   /** 后台检查时上游有、列表里没有的模型。 */
@@ -86,7 +109,26 @@ export type GatewayPoolEntry = {
   lentToCodex?: boolean;
   /** 订阅账号的剩余额度；查不到或普通供应商为空。 */
   quota?: ProviderQuota | null;
+  /** 已保存的 Key（打码，#2782）：订阅账号等不用 Key 的为空。旧版后端没有。 */
+  keys?: ProviderKeyView[];
+  /** 有余额接口的厂商（DeepSeek、Kimi 等，#2793）：卡片用「用量」页同一份余额。旧版后端没有。 */
+  balanceApi?: boolean;
+  /** new-api 访问令牌（打码，#2793）：只用来查账户余额；没配置为空。令牌原文不出后端。 */
+  newapiAccess?: NewApiAccessView | null;
 };
+
+/** 已保存的 new-api 访问令牌：只有打码后的样子和用户 ID。 */
+export type NewApiAccessView = { masked: string; userId: string };
+
+/** 供应商已保存的一个 Key：后端只给标识和打码后的样子，原文不出后端。删除 / 替换按 `id`。 */
+export type ProviderKeyView = { id: string; masked: string };
+
+/** Key 池健康状态里的 Key 标识换成打码后的 Key 显示；只剩一个 Key 时 Key 池按 `primary` 记。找不到就原样显示标识。 */
+export function keyLabel(keys: ProviderKeyView[] | undefined, keyId: string): string {
+  const list = keys ?? [];
+  const found = list.find((key) => key.id === keyId) ?? (keyId === "primary" && list.length === 1 ? list[0] : undefined);
+  return found ? found.masked : keyId;
+}
 
 export type ProviderPrice = { currency: string; input: number; cachedInput: number; output: number };
 
@@ -107,9 +149,53 @@ export type GatewayGroupEntry = {
 export type AutoGroupEntry = GatewayGroupEntry & { hidden: boolean; customized: boolean };
 
 /** 订阅账号的一个额度窗口：windowMinutes 300 是 5 小时、10080 是每周，null 是按月（Copilot 高级请求）。 */
-export type QuotaWindow = { windowMinutes: number | null; usedPercent: number; resetsAtMs: number | null };
-export type ProviderQuota = { windows: QuotaWindow[]; updatedAtMs: number };
+export type QuotaWindow = { windowMinutes: number | null; usedPercent: number; resetsAtMs: number | null; observedAtMs?: number | null };
+export type ProviderQuota = {
+  windows: QuotaWindow[];
+  updatedAtMs: number;
+  windowsComplete?: boolean;
+  officialAllowed?: boolean | null;
+  officialLimitReached?: boolean | null;
+  creditsAvailable?: boolean | null;
+};
 export type SpeedView = { relayId: string; model: string; ms: number; samples: number };
+
+/** 私有接口订阅的登录方式。 */
+export type SubscriptionLoginMethod = "browser" | "deviceCode" | "importLocal" | "paste";
+export type SubscriptionView = { id: string; name: string; methods: SubscriptionLoginMethod[]; note: string };
+/** 本机官方客户端已登录、还没进池的订阅账号（`scan_gateway_local_logins`）；`account` 登录文件里没有时为空。 */
+export type LocalLogin = { id: string; name: string; account: string };
+/** 开始登录的结果：要打开的网址、验证码、说明，以及原样传回去的状态。 */
+export type SubscriptionLoginStart = { openUrl?: string; userCode?: string; message: string; state: unknown };
+
+export type GatewayAgentDiagnostics = {
+  state: "disabled" | "configChanged" | "configMissing" | "configUnreadable" | "configUnverified" | "gatewayStopped" | "awaitingTraffic" | "active" | "upstreamError";
+  endpoint: string | null;
+  expectedEndpoint: string;
+  configEvidence: Array<{ path: string; field: string; code: string; endpoint: string | null; expectedEndpoint: string | null }>;
+  requests: number;
+  errors: number;
+  inFlight: number;
+  lastSeenMs: number | null;
+  recentError: { kind: string; status: number | null; atMs: number } | null;
+};
+
+export type GatewayDisconnectFile = {
+  path: string;
+  kind: "modify" | "remove" | "create";
+  diff: string;
+  redacted: boolean;
+};
+
+export type GatewayDisconnectPreview = {
+  agent: string;
+  previewToken: string;
+  files: GatewayDisconnectFile[];
+  warnings: string[];
+  canDisconnect: boolean;
+  /** 没法逐项预览时（Codex 接入前没留下实时存档等）：断开会完整切换到这个直连供应商，确认后走「完整切换并断开」。 */
+  fullSwitch?: { relayId: string; name: string } | null;
+};
 
 export type GatewayAgentView = {
   agent: GatewayAgentId;
@@ -118,13 +204,25 @@ export type GatewayAgentView = {
   version?: string | null;
   /** 网关改写的配置文件。 */
   configPath?: string;
+  /** 通用 Agent：在 Agent 里怎么切模型、接入后要不要重启等提示。 */
+  hint?: string;
   enabled: boolean;
+  /** 原生配置可能仍由网关管理，即使绑定记录已经关闭。 */
+  requiresDisconnectPreview?: boolean;
   baseUrl: string;
   defaultModel: string;
   models: string[];
   /** 开着网关、但配置已被别的工具改掉：认得出的工具名与现在连的地址。 */
   drift?: { by?: string | null; endpoint: string } | null;
+  /** 配置与最近实际请求的联合诊断；旧版后端没有。 */
+  diagnostics?: GatewayAgentDiagnostics | null;
+  /** Agent 自带的模型：用它自己的登录或 Key 直连厂商，不经 Codex++；选中即断开网关。 */
+  ownModels?: OwnModels | null;
 };
+
+export type OwnModel = { id: string; label: string };
+/** `vendor`：直连的对象（OpenAI、Anthropic、直连模式的供应商名）；`current`：没接入时 Agent 现在用的模型。 */
+export type OwnModels = { vendor: string; models: OwnModel[]; current: string };
 
 export type KeyHealthView = {
   relayId: string;
@@ -179,6 +277,8 @@ export type GatewayPayload = {
   gateway: GatewaySettings;
   port: number;
   helperRunning: boolean;
+  /** Codex 旧版供应商配置总开关；旧版后端没有这个字段。 */
+  relayProfilesEnabled?: boolean;
   /** 网关自己的供应商池（不含 Key）。 */
   pool: GatewayPoolEntry[];
   groups: GatewayGroupEntry[];
@@ -190,6 +290,8 @@ export type GatewayPayload = {
   speeds?: SpeedView[];
   /** 可复制进网关的直连模式供应商。 */
   codexProviders: GatewayPoolEntry[];
+  /** 能在网关里登录的私有接口订阅（Cursor、Kiro 等）；旧版后端没有。 */
+  subscriptions?: SubscriptionView[];
   claudeProviders: Array<{ id: string; name: string }>;
   grokProfiles: Array<{ id: string; name: string }>;
   /** OpenCode 里保存的 OpenCode Go / Zen Key。 */
@@ -227,6 +329,8 @@ export type BindingDraft = {
   haiku: string;
   subagent: string;
   unknownModel: UnknownModelPolicy;
+  autoReviewModel: string;
+  titleModel: string;
   contextWindow: string;
   claudeEnableEffort: boolean;
   poolExclude: string[];
@@ -256,6 +360,8 @@ export function draftFromBinding(binding: AgentBinding | undefined): BindingDraf
     haiku: source.claudeRoles.haiku,
     subagent: source.claudeRoles.subagent,
     unknownModel: source.unknownModel,
+    autoReviewModel: source.autoReviewModel ?? "",
+    titleModel: source.titleModel ?? "",
     contextWindow: source.contextWindow ? String(source.contextWindow) : "",
     claudeEnableEffort: source.claudeEnableEffort,
     poolExclude: [...(source.poolExclude ?? [])],
@@ -265,14 +371,14 @@ export function draftFromBinding(binding: AgentBinding | undefined): BindingDraf
 
 /** 添加供应商时默认勾选的 Agent：没关掉「添加供应商时自动加入」的。 */
 export function defaultProviderAgents(payload: GatewayPayload | null): GatewayAgentId[] {
-  return (payload?.agents ?? [])
+  return glanceAgents(payload?.agents)
     .map((agent) => agent.agent)
     .filter((agent) => payload?.gateway.bindings[agent]?.autoJoinProviders !== false);
 }
 
-/** 添加命令带上的 `skipAgents`：没勾选的 Agent。 */
+/** 添加命令带上的 `skipAgents`：列出来但没勾选的 Agent。没列出来的（装了没接入的）不跳过，以后接入时照常能用。 */
 export function skippedAgents(payload: GatewayPayload | null, picked: GatewayAgentId[]): GatewayAgentId[] {
-  return (payload?.agents ?? []).map((agent) => agent.agent).filter((agent) => !picked.includes(agent));
+  return glanceAgents(payload?.agents).map((agent) => agent.agent).filter((agent) => !picked.includes(agent));
 }
 
 /** 窗口支持纯数字和 `200k` / `1M` 写法。无效时返回 NaN。 */
@@ -284,6 +390,42 @@ export function parseContextWindow(value: string): number | null {
   const base = Number(match[1]);
   const scale = match[2] === "m" ? 1_000_000 : match[2] === "k" ? 1_000 : 1;
   return Math.round(base * scale);
+}
+
+/** 主动限速的上限：留空是不限（null），正整数是上限；0、小数、负数或别的写法无效（NaN）。 */
+export function parseKeyLimit(value: string): number | null {
+  const text = value.trim();
+  if (!text) return null;
+  if (!/^\d+$/.test(text)) return Number.NaN;
+  const limit = Number(text);
+  return limit > 0 && limit <= 1_000_000 ? limit : Number.NaN;
+}
+
+/** 请求日志「重试原因」里网关记的限速排队：`local_rate_limit_wait_ms:<毫秒>`。 */
+export const QUEUE_REASON_PREFIX = "local_rate_limit_wait_ms:";
+
+/**
+ * 请求日志「重试原因」里的说明：换上游后被拒收，去掉了别家签发的压缩上下文（compaction），
+ * 较早的对话内容上游已经看不到。只是说明，不算一次重试。
+ */
+export const FOREIGN_COMPACTION_DROPPED_REASON = "foreign_compaction_dropped";
+
+/** 这次请求是否去掉过别家签发的压缩上下文。 */
+export function foreignCompactionDropped(reasons: string[] | null | undefined): boolean {
+  return (reasons ?? []).includes(FOREIGN_COMPACTION_DROPPED_REASON);
+}
+
+/** 这次请求因 Codex++ 本地限速排队了多久（毫秒）；没排过队返回 null。 */
+export function queueWaitMs(reasons: string[] | null | undefined): number | null {
+  const reason = (reasons ?? []).find((item) => item.startsWith(QUEUE_REASON_PREFIX));
+  if (reason === undefined) return null;
+  const ms = Number(reason.slice(QUEUE_REASON_PREFIX.length));
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
+}
+
+/** 排队时长的写法：10 秒内保留一位小数（0.4s、3.2s），再长取整（45s）。 */
+export function formatQueueWait(ms: number): string {
+  return ms < 10_000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 1000)}s`;
 }
 
 export function splitModels(text: string): string[] {
@@ -313,6 +455,8 @@ export function bindingFromDraft(draft: BindingDraft, previous: AgentBinding | u
       subagent: draft.subagent.trim(),
     },
     unknownModel: draft.unknownModel,
+    autoReviewModel: draft.autoReviewModel.trim(),
+    titleModel: draft.titleModel.trim(),
     contextWindow: window && Number.isFinite(window) ? window : null,
     claudeEnableEffort: draft.claudeEnableEffort,
     poolExclude: [...draft.poolExclude],
@@ -439,8 +583,24 @@ export const GATEWAY_CLAUDE_PROVIDER_ID = "codex-plus-gateway";
 
 export const GATEWAY_AGENT_NAMES: Record<string, string> = { claude: "Claude Code", grok: "Grok", codex: "Codex" };
 
+/** 内置的三个 Agent：总览、托盘里总是列出。 */
+export const BUILTIN_GATEWAY_AGENTS = ["codex", "claude", "grok"];
+
+/** 总览、托盘这类一屏看全的地方：内置的三个，加上已经接入网关的通用 Agent；
+ * 本机装了但没接入的只在「Agent 接入」页里列出。 */
+export function glanceAgents<T extends { agent: string; enabled: boolean }>(agents: T[] | undefined): T[] {
+  return (agents ?? []).filter((agent) => agent.enabled || BUILTIN_GATEWAY_AGENTS.includes(agent.agent));
+}
+
 export function agentName(agent: string): string {
   return GATEWAY_AGENT_NAMES[agent] ?? agent;
+}
+
+/** 记下后端给的 Agent 名字（通用 Agent 的名字只在网关数据里有），会话、用量等页面按 id 取名时用。 */
+export function rememberAgentNames(agents: Array<{ agent: string; name: string }> | undefined) {
+  for (const item of agents ?? []) {
+    if (item.name && !GATEWAY_AGENT_NAMES[item.agent]) GATEWAY_AGENT_NAMES[item.agent] = item.name;
+  }
 }
 
 export type PickerItem = {
@@ -450,6 +610,8 @@ export type PickerItem = {
   sub: string;
   avatar: string;
   custom?: boolean;
+  /** Agent 自带的模型：直连的对象（不经 Codex++）。 */
+  direct?: string;
 };
 
 export type PickerSection = { key: string; title: string; avatar: string; items: PickerItem[] };
@@ -521,6 +683,27 @@ export function pickerSections(
     });
   }
   return sections;
+}
+
+/** 下拉里要列的自带模型：关掉开关后只留 Agent 现在用着的那一个（没有就不列）。 */
+export function visibleOwnModels(agent: GatewayAgentView, payload: GatewayPayload | null): OwnModels | null {
+  const own = agent.ownModels;
+  if (!own) return null;
+  if (!(payload?.gateway.hideOwnModels ?? []).includes(agent.agent)) return own;
+  const current = own.current.trim().toLowerCase();
+  const models = current ? own.models.filter((model) => model.id.toLowerCase() === current) : [];
+  return models.length ? { ...own, models } : null;
+}
+
+/** 模型下拉里 Agent 自带模型那一组（排在池里的模型后面）：按查询词筛，没有时为 null。 */
+export function ownPickerSection(own: OwnModels | null | undefined, rawQuery: string, avatar: (name: string) => string): PickerSection | null {
+  if (!own || !own.models.length) return null;
+  const query = rawQuery.trim().toLowerCase();
+  const vendorHit = matches(query, own.vendor);
+  const items = own.models
+    .filter((model) => vendorHit || matches(query, model.id, model.label))
+    .map((model) => ({ model: model.id, label: model.label, sub: model.label === model.id ? "" : model.id, avatar: avatar(own.vendor), direct: own.vendor }));
+  return items.length ? { key: "own", title: own.vendor, avatar: avatar(own.vendor), items } : null;
 }
 
 /** `auto`：多家都有的模型的裸名，按池顺序在这几家之间自动切换（`sub` 是这几家，按尝试顺序）。 */
@@ -702,12 +885,46 @@ export function quotaWindowLabel(window: QuotaWindow): { text: string; args: num
   return { text: "{0} 分钟", args: [minutes] };
 }
 
-/** 剩余比例（0–1），取最紧的窗口；过了重置时间的窗口按满额。与后端 `quota::remaining_at` 一致。 */
+/** 已重置但未重新查询的窗口不假定恢复。 */
 export function quotaRemaining(quota: ProviderQuota, nowMs: number): number {
+  if (quota.officialAllowed === false) return 0;
   return quota.windows.reduce((least, window) => {
-    const left = window.resetsAtMs !== null && window.resetsAtMs <= nowMs ? 1 : Math.min(1, Math.max(0, 1 - window.usedPercent / 100));
+    const left = window.resetsAtMs !== null && window.resetsAtMs <= nowMs ? 0 : Math.min(1, Math.max(0, 1 - window.usedPercent / 100));
     return Math.min(least, left);
   }, 1);
+}
+
+export function quotaWindowFresh(quota: ProviderQuota, window: QuotaWindow, nowMs: number, maxAgeSeconds = 600): boolean {
+  const observed = window.observedAtMs ?? quota.updatedAtMs;
+  return observed <= nowMs && nowMs - observed <= maxAgeSeconds * 1000
+    && Number.isFinite(window.usedPercent) && window.usedPercent >= 0 && window.usedPercent <= 100
+    && (window.resetsAtMs === null || window.resetsAtMs > nowMs);
+}
+
+/** 与后端相同的本地预检；后端返回值还包含同账号别名的更严格策略。 */
+export function subscriptionBlockReason(entry: GatewayPoolEntry, nowMs = Date.now()): string | null {
+  if (entry.account !== "chatgpt" || !entry.subscriptionPolicy) return null;
+  const policy = normalizeSubscriptionPolicy(entry.subscriptionPolicy);
+  if (policy.defaultUsedPercentLimit === 0) return "订阅额度已用上限设为 0%，已停止新请求";
+  const unknown = (text: string) => policy.unknownUsage === "allow" ? null : text;
+  const quota = entry.quota;
+  if (!quota) return entry.subscriptionBlockReason || unknown("官方额度未知，请刷新额度");
+  const fresh = quota.updatedAtMs <= nowMs && nowMs - quota.updatedAtMs <= policy.maxAgeSeconds * 1000;
+  if (fresh && (quota.officialAllowed === false || (quota.officialLimitReached === true && quota.officialAllowed !== true))) return "官方订阅额度受限，请等待重置或刷新额度";
+  let uncertain = !fresh || (!quota.windowsComplete && Object.keys(policy.windowUsedPercentLimits).some(key => !quota.windows.some(window => String(window.windowMinutes) === key)))
+    || (!quota.windows.length && !(quota.windowsComplete && quota.officialAllowed === true));
+  for (const window of quota.windows) {
+    if (!quotaWindowFresh(quota, window, nowMs, policy.maxAgeSeconds)) {
+      uncertain = true;
+      continue;
+    }
+    const cap = policy.windowUsedPercentLimits[String(window.windowMinutes)] ?? policy.defaultUsedPercentLimit ?? 100;
+    if (window.usedPercent >= cap) {
+      const label = window.windowMinutes === 300 ? "5h" : window.windowMinutes === 10080 ? "7d" : `${window.windowMinutes ?? ""} 分钟`;
+      return `${label} 已用 ${window.usedPercent}%，达到 ${cap}% 上限`;
+    }
+  }
+  return entry.subscriptionBlockReason || (uncertain ? unknown("官方额度待刷新，请先刷新额度") : null);
 }
 
 /** 模型组成员在列表里的显示：「供应商 · 模型」「组名」，通配符原样显示。 */
@@ -947,6 +1164,7 @@ export const SPONSORS: Array<{ id: string; expiresAt: string }> = [
   { id: "jojocode-max", expiresAt: "2029-06-15" },
   { id: "runapi", expiresAt: "2026-11-07" },
   { id: "apikeyfun", expiresAt: "2026-11-22" },
+  { id: "cccccc-api", expiresAt: "2026-12-01" },
 ];
 
 /** 本地日期（YYYY-MM-DD），与到期日按天比较。 */
@@ -1019,9 +1237,16 @@ export type ProviderDraft = {
   proxy: string;
   /** 按模型的价格：新添加时按公开价格表自动查；不带表示不改。 */
   modelPrices?: Record<string, ProviderPrice> | null;
+  /** 转发前移除托管生图工具（image_generation）：不支持生图的 Responses 中转用（#228）。 */
+  stripImageGenerationTool?: boolean;
+  subscriptionPolicy?: SubscriptionPolicy | null;
+  /** 转发前移除 Responses 图片 `detail`：不认 OpenAI detail 扩展的上游用（#2870）。 */
+  stripResponsesImageDetail?: boolean;
+  /** 不向上游发送 `tool_search`：上游 400 时开启（#2868）。 */
+  disableToolSearch?: boolean;
 };
 
-const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "" };
+const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false, stripResponsesImageDetail: false, disableToolSearch: false };
 
 export function providerDraftFromPreset(preset: GatewayPreset | null): ProviderDraft {
   if (!preset) return { name: "", baseUrl: "", keys: "", protocol: "chatCompletions", model: "", modelList: "", ...NO_PRICE };
@@ -1050,6 +1275,10 @@ export function providerDraftFromEntry(entry: GatewayPoolEntry): ProviderDraft {
     priceCached: entry.price ? String(entry.price.cachedInput) : "",
     priceOutput: entry.price ? String(entry.price.output) : "",
     proxy: entry.proxy ?? "",
+    stripImageGenerationTool: entry.stripImageGenerationTool === true,
+    subscriptionPolicy: entry.subscriptionPolicy == null ? entry.subscriptionPolicy : normalizeSubscriptionPolicy(entry.subscriptionPolicy),
+    stripResponsesImageDetail: entry.stripResponsesImageDetail === true,
+    disableToolSearch: entry.disableToolSearch === true,
   };
 }
 
@@ -1065,6 +1294,10 @@ export function providerInput(draft: ProviderDraft) {
     price: priceFromDraft(draft),
     modelPrices: draft.modelPrices ?? null,
     proxy: draft.proxy.trim(),
+    stripImageGenerationTool: draft.stripImageGenerationTool === true,
+    ...(draft.subscriptionPolicy !== undefined ? { subscriptionPolicy: draft.subscriptionPolicy } : {}),
+    stripResponsesImageDetail: draft.stripResponsesImageDetail === true,
+    disableToolSearch: draft.disableToolSearch === true,
   };
 }
 
@@ -1079,14 +1312,27 @@ export function priceFromDraft(draft: ProviderDraft): ProviderPrice | null {
   return price.input || price.cachedInput || price.output ? price : null;
 }
 
+/** 供应商代理设成这个值：不走任何代理，直接连上游（与后端 `relay_proxy::DIRECT_PROXY` 一致，#2760）。 */
+export const DIRECT_PROXY = "direct";
+
+export function isDirectProxy(proxy: string | undefined): boolean {
+  return (proxy ?? "").trim().toLowerCase() === DIRECT_PROXY;
+}
+
+/** 代理地址格式错误时返回中文错误原文；留空或直连都合法。 */
+export function proxyAddressError(proxy: string): string | null {
+  const value = proxy.trim();
+  if (!value || isDirectProxy(value)) return null;
+  return /^(https?|socks5h?):\/\/\S+$/i.test(value) ? null : "代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）";
+}
+
 /** 表单校验：返回中文错误原文，没问题返回 null。编辑时可以不填 Key。 */
 export function validateProviderDraft(draft: ProviderDraft, editing = false): string | null {
   if (!draft.name.trim()) return "请填写名称";
   if (!/^https?:\/\/\S+$/i.test(draft.baseUrl.trim())) return "地址要以 http:// 或 https:// 开头";
   if (!editing && !draft.keys.trim()) return "请填写 API Key";
   if (!draft.model.trim() && splitModels(draft.modelList).length === 0) return "至少填一个模型";
-  if (draft.proxy.trim() && !/^(https?|socks5h?):\/\/\S+$/i.test(draft.proxy.trim())) return "代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）";
-  return null;
+  return proxyAddressError(draft.proxy);
 }
 
 /* —————————————— 用量 —————————————— */
@@ -1116,7 +1362,7 @@ export type UsageSummary = {
   byModel: UsageGroup[];
   costs: UsageCost[];
 };
-export type ProviderBalance = { providerId: string; provider: string; baseUrl: string; amount?: number | null; currency: string; error?: string | null };
+export type ProviderBalance = { providerId: string; provider: string; baseUrl: string; amount?: number | null; currency: string; error?: string | null; note?: string | null };
 export type UsageRange = "today" | "7d" | "30d" | "all";
 
 /** 统计范围从哪一刻开始（本地时间当天零点往前推）；「全部」没有起点。 */
@@ -1217,7 +1463,8 @@ export function shortDate(date: string, english = false): string {
 /* —————————————— 会话 —————————————— */
 
 export type SessionAgent = "codex" | "claude" | "grok";
-export type AgentSessionView = { agent: SessionAgent; id: string; title: string; cwd: string; updatedAtMs: number };
+/** `surface: "desktop"` 是 Claude Desktop 里的会话；`resumeId` 是在终端恢复时用的 id（Desktop 会话与列表 id 不同）。 */
+export type AgentSessionView = { agent: SessionAgent; id: string; title: string; cwd: string; updatedAtMs: number; surface?: "desktop"; archived?: boolean; resumeId?: string };
 
 /** 合并各 Agent 的会话：按更新时间倒序，按 Agent 和关键词（标题、目录、id）过滤。 */
 export function filterSessions(sessions: AgentSessionView[], agent: SessionAgent | "all", query: string): AgentSessionView[] {
@@ -1249,15 +1496,23 @@ export function relativeTime(ms: number, now: number): { text: string; args: Arr
   return { text: "{0}", args: [`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`] };
 }
 
-/** 名字里的邮箱。前面紧挨着 `*` 等字符的不算（那是已经打过码的邮箱尾巴），保证打码可以重复调用。 */
-const EMAIL_PATTERN = /(?<![A-Za-z0-9._%+*-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+/**
+ * 名字里的邮箱。前面紧挨着 `*` 等字符的不算（那是已经打过码的邮箱尾巴），保证打码可以重复调用。
+ * 不用后行断言 `(?<!…)`：旧版系统 WebKit（16.4 以前的版本）不支持，模块一加载就抛 SyntaxError，
+ * 整个管理器白屏 / 黑屏（#2753）。改成把前一个字符（或行首）捕获进第 1 组，替换时原样放回。
+ */
+const EMAIL_PATTERN = /(^|[^A-Za-z0-9._%+*-])([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
+
+function maskEmailsIn(text: string): string {
+  return text.replace(EMAIL_PATTERN, (_match, lead: string, email: string) => lead + maskEmail(email));
+}
 
 /**
  * 订阅账号的显示名打码：「ChatGPT Pro · me@example.com」「Copilot · octocat」这类名字里的账号部分只露头尾，
  * 名字里出现的邮箱也一样。只在显示时处理，存储的名字不变；普通供应商名不受影响。
  */
 export function maskAccountName(name: string): string {
-  const masked = name.replace(EMAIL_PATTERN, maskEmail);
+  const masked = maskEmailsIn(name);
   const match = /^((?:ChatGPT|Copilot|SuperGrok|GitHub Copilot)[^·]*·\s*)(.+)$/.exec(masked);
   // 已经打过码的（带 *）原样返回：名字可能先打码再传给头像等组件，再打一次会变形。
   if (!match || match[2].includes("@") || match[2].includes("*")) return masked;
@@ -1274,7 +1529,7 @@ export function maskAccountText(text: string): string {
     .split(/(「[^」]+」)/)
     .map((part) => (part.startsWith("「") && part.endsWith("」")
       ? `「${maskAccountName(part.slice(1, -1))}」`
-      : part.replace(EMAIL_PATTERN, maskEmail)))
+      : maskEmailsIn(part)))
     .join("");
 }
 

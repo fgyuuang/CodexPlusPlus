@@ -214,6 +214,17 @@ fn model_route_descriptors_with_store(
     if !settings.official_experience_active() {
         return Vec::new();
     }
+    saved_route_descriptors_with_store(settings, store)
+}
+
+// 网关停用直连菜单，但已保存的显式 provider 路由仍需按原账号与模型验证。
+fn saved_route_descriptors_with_store(
+    settings: &BackendSettings,
+    store: &crate::official_accounts::OfficialAccountStore,
+) -> Vec<ModelRouteDescriptor> {
+    if !settings.official_experience.enabled {
+        return Vec::new();
+    }
     let trusted =
         crate::official_model_catalog::trusted_official_model_slugs_for_settings(settings);
     let trusted_lower = trusted
@@ -558,15 +569,18 @@ pub fn descriptor_for_provider_and_model(
     provider_id: &str,
     routing_slug: &str,
 ) -> Option<ModelRouteDescriptor> {
-    model_route_descriptors(settings)
-        .into_iter()
-        .find(|descriptor| {
-            descriptor.provider_id.eq_ignore_ascii_case(provider_id)
-                && (descriptor.routing_slug.eq_ignore_ascii_case(routing_slug)
-                    || (provider_id == crate::official_account_schedule::PROVIDER_ID
-                        && descriptor.upstream_model.eq_ignore_ascii_case(routing_slug)))
-        })
-        .or_else(|| historical_official_descriptor(settings, provider_id, routing_slug))
+    saved_route_descriptors_with_store(
+        settings,
+        &crate::official_accounts::OfficialAccountStore::default(),
+    )
+    .into_iter()
+    .find(|descriptor| {
+        descriptor.provider_id.eq_ignore_ascii_case(provider_id)
+            && (descriptor.routing_slug.eq_ignore_ascii_case(routing_slug)
+                || (provider_id == crate::official_account_schedule::PROVIDER_ID
+                    && descriptor.upstream_model.eq_ignore_ascii_case(routing_slug)))
+    })
+    .or_else(|| historical_official_descriptor(settings, provider_id, routing_slug))
 }
 
 // 当前主账号在菜单中使用 openai，但旧会话的账号专用 ID 仍绑定原账号。
@@ -788,6 +802,35 @@ mod direct_official_tests {
         ));
         let provider = direct_official_provider_id(&account.id);
         let slug = direct_official_routing_slug(&account.id, "gpt-6-luna");
+        // 接入网关后隐藏直连菜单，但旧对话的调度 provider 必须继续可解析。
+        let mut gateway_settings = settings.clone();
+        gateway_settings
+            .official_experience
+            .account_schedule_enabled = true;
+        gateway_settings.official_experience.account_schedule_order = vec![account.id.clone()];
+        let profile = crate::gateway::apply::codex_gateway_profile(
+            &crate::gateway::store::GatewaySettings::default(),
+            &crate::gateway::store::AgentBinding {
+                model: "gpt-6-luna".into(),
+                token: "cpx-gw-test-fixture".into(),
+                ..Default::default()
+            },
+            57321,
+            true,
+        )
+        .unwrap();
+        gateway_settings.active_relay_id = profile.id.clone();
+        gateway_settings.relay_profiles.push(profile);
+        assert!(gateway_settings.managed_codex_gateway_active());
+        assert!(model_route_descriptors_with_store(&gateway_settings, &store).is_empty());
+        assert!(
+            saved_route_descriptors_with_store(&gateway_settings, &store)
+                .iter()
+                .any(
+                    |route| route.provider_id == crate::official_account_schedule::PROVIDER_ID
+                        && route.upstream_model == "gpt-6-luna"
+                )
+        );
         let route =
             historical_official_descriptor_from_store(&settings, &provider, &slug, &store).unwrap();
         assert_eq!(route.source_id, account.id);

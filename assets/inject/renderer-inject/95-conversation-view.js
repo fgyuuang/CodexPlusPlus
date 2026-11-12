@@ -1,5 +1,7 @@
   function ensureConversationViewRuntime() {
     if (conversationViewState.runtimeStarted) return;
+    document.addEventListener("compositionstart", onConversationViewCompositionStart, true);
+    document.addEventListener("compositionend", onConversationViewCompositionEnd, true);
     conversationViewState.ro = conversationViewState.ro || new ResizeObserver(() => scheduleConversationViewAlign());
     conversationViewState.mo = conversationViewState.mo || new MutationObserver(() => scheduleConversationViewAlign());
     if (document.body && !conversationViewState.moObserved) {
@@ -186,7 +188,8 @@
   }
 
   function scanLightweight() {
-    if (typeof syncCodexPlusTurnRewind === "function") runScanStep(syncCodexPlusTurnRewind);
+    // 轻量扫描里的拓展步骤（轮次回退、滚动位置恢复……），同样经 ctx.onScan 登记。
+    runCodexPlusScanSteps("light");
     installStyle();
     localizeCodexMenus();
     refreshCodexUsageLimitUnblock();
@@ -207,27 +210,56 @@
         "existing-renderer"
       );
     }
+    // 拓展注册的图标栏入口也在这里补（见 installCodexPlusNavigationEntries）。
     installCodexPlusNavigationEntries();
-    // 拓展注册的图标栏入口与内置入口走同一条刷新路径：rail 渲染晚于注入，
-    // 所以要每轮扫描都补一次（内部靠 id 幂等，不会重复插入）。
-    refreshCodexPlusRailNavigation();
+    // 输入区 footer 会随会话切换、首页与对话页切换而重建，拓展的输入区按钮每轮补一次（按指纹幂等）。
+    refreshCodexPlusComposerActions();
+    // 消息插槽与侧边面板：消息、顶栏都会重建，按指纹幂等补齐；对话内容变化由插槽自己的观察器跟。
+    refreshCodexPlusMessageSlots();
+    refreshCodexPlusSidePanels();
+    refreshCodexPlusUiSlots();
     installCodexPlusPageNavigationCloseHandler();
     scheduleBackendHeartbeat();
-    installDeleteButtonEventDelegation();
-    updateThreadScrollHandlers();
-    installThreadScrollProgrammaticScrollGuard();
-    installThreadScrollNavigationCapture();
-    installThreadScrollUserIntentCapture();
-    installThreadScrollRouteHooks();
-    scheduleThreadScrollSync(true);
+  }
+
+  // 当前供应商是模型聚合时，按成员判断是否等同于「官登混入 Key」（#2704）：
+  // 成员里既有官方登录、又至少有一个走 API Key 的成员，官方额度用完时仍能经 API 成员发送。
+  // 与后端 active_aggregate_relay_profile 一致：activeAggregateRelayId 为空时取当前供应商 id，
+  // 不一致则视为没有生效的聚合。
+  function officialUsageAggregateMembers(profile) {
+    if (String(profile?.relayMode || "") !== "aggregate") return null;
+    const activeId = String(profile.id || "");
+    const aggregateId = String(codexPlusBackendSettings.activeAggregateRelayId || "").trim() || activeId;
+    if (!aggregateId || aggregateId !== activeId) return null;
+    const aggregates = Array.isArray(codexPlusBackendSettings.aggregateRelayProfiles)
+      ? codexPlusBackendSettings.aggregateRelayProfiles
+      : [];
+    const aggregate = aggregates.find((item) => String(item?.id || "") === aggregateId);
+    if (!aggregate || !Array.isArray(aggregate.members)) return null;
+    const relays = Array.isArray(codexPlusBackendSettings.relayProfiles) ? codexPlusBackendSettings.relayProfiles : [];
+    return aggregate.members
+      .map((member) => relays.find((item) => String(item?.id || "") === String(member?.relayId || "")))
+      .filter((member) => member && String(member.relayMode || "") !== "aggregate");
+  }
+
+  function officialUsageAggregateMixed(profile) {
+    const members = officialUsageAggregateMembers(profile);
+    if (!members) return false;
+    const hasOfficialLogin = members.some((member) => String(member.relayMode || "") === "official");
+    // 官登混入 Key 的成员本身也带 API Key；其余非官方成员都走 API Key。
+    const hasApiKey = members.some((member) => String(member.relayMode || "") !== "official"
+      || member.officialMixApiKey === true);
+    return hasOfficialLogin && hasApiKey;
   }
 
   function officialUsagePolicy() {
     // 新一代设置尚未返回时沿用最后一次真实配置，避免重新注入短暂恢复额度锁。
     if (!codexPlusBackendSettingsLoaded && officialUsageRuntime.lastPolicy) return officialUsageRuntime.lastPolicy;
     const profile = codexRemoteSessionActiveProfile();
-    const official = String(profile?.relayMode || "") === "official";
-    const mixed = official && profile?.officialMixApiKey === true;
+    const aggregateMixed = officialUsageAggregateMixed(profile);
+    const gateway = String(profile?.id || "") === "codex-plus-gateway";
+    const official = String(profile?.relayMode || "") === "official" || aggregateMixed || gateway;
+    const mixed = aggregateMixed || gateway || (official && profile?.officialMixApiKey === true);
     const policy = {
       official,
       hideAlerts: mixed,
@@ -275,7 +307,7 @@
     return changed ? next : null;
   }
 
-  // 低额度提示和发送锁都只看当前是不是官登混入 Key。纯官登不改这份用量。
+  // 低额度提示和发送锁都只看当前是不是官登混入 Key（含官登 + API 成员的模型聚合）。纯官登不改这份用量。
   // 桌面端发送按钮读 rate_limit.allowed；limit_reached 为 true 也会被当成已用完。
   // 混入时在查询发布前把 allowed 写成 true，并清掉 limit_reached。
   // 百分比、重置时间、账号、积分和消费上限不动。图片额度横幅单独留下。
@@ -1585,12 +1617,9 @@
     });
   }
 
-  function scanDeferred() {
-    installCodexCapacityRetry();
-    installCodexModelRequestBridgePatch();
-    if (pluginPatchDisabledInRelayMode()) {
-      clearPluginPatchArtifacts();
-    } else {
+  /** 插件市场解锁的补丁（内置拓展「插件市场解锁」登记成扫描步骤；补丁撤不掉，停用后刷新页面才完全恢复）。 */
+  function installCodexPluginMarketplacePatches() {
+    if (codexPluginMarketplacePatchEnabled()) {
       const pluginUnlockStrategy = codexPluginUnlockStrategy();
       const settings = codexPlusSettings();
       logCodexPluginUnlockStrategy(pluginUnlockStrategy);
@@ -1608,9 +1637,15 @@
         }
       }
     }
-    if (typeof syncCodexPlusAgentPet === "function") runScanStep(syncCodexPlusAgentPet);
-    refreshDreamSkin();
-    refreshThreadIdBadges();
+  }
+
+  function scanDeferred() {
+    installCodexCapacityRetry();
+    installCodexModelRequestBridgePatch();
+    // 内置拓展登记的扫描步骤（桌宠与大肥鱼、梦皮、侧聊保存……）：拓展卸下时步骤跟着撤掉，不再由扫描循环直接点名调用。
+    // 已删会话的行过滤（会话删除）、对话宽度、滚动位置恢复也都是内置拓展经公开的 ctx.onScan 登记的步骤。
+    runCodexPlusScanSteps();
+    // 会话行的操作按钮组、归档页的行按钮是删除、导出与第三方拓展 rowAction 共用的宿主，留在内核里扫描。
     sessionRows().forEach(tryAttachButton);
     updateDeleteButtonOffsets();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
@@ -1618,10 +1653,39 @@
     if (codexPlusSettings().nativeFastUnlock) removeLegacyCodexServiceTierBadges();
     else installCodexServiceTierBadge();
     installCodexQuotaResumeButton();
-    installSessionShareButton();
     refreshSideChatSaveButtons();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
+  }
+
+  /**
+   * 扫描步骤登记处：登记号 → { step, phase, owner }。拓展经公开的 ctx.onScan 登记（内置拓展也一样），卸下时撤销；
+   * owner 是登记它的拓展（scriptKey，如 builtin:dictation），runCodexPlusScanStep 按 owner 点名跑。
+   */
+  function codexPlusScanSteps() {
+    globalThis.__codexPlusScanSteps ??= new Map();
+    return globalThis.__codexPlusScanSteps;
+  }
+
+  /** phase：deferred（默认，跟着完整扫描）或 light（跟着轻量扫描）。返回撤销函数。 */
+  function registerCodexPlusScanStep(owner, step, phase = "deferred") {
+    const steps = codexPlusScanSteps();
+    globalThis.__codexPlusScanStepSeq = (globalThis.__codexPlusScanStepSeq || 0) + 1;
+    const id = `${owner}#${globalThis.__codexPlusScanStepSeq}`;
+    const entry = { step, phase: phase === "light" ? "light" : "deferred", owner: String(owner) };
+    steps.set(id, entry);
+    return () => {
+      if (steps.get(id) === entry) steps.delete(id);
+    };
+  }
+
+  function runCodexPlusScanSteps(phase = "deferred") {
+    for (const entry of [...codexPlusScanSteps().values()]) if (entry.phase === phase) runScanStep(entry.step);
+  }
+
+  /** 只跑某个拓展登记的步骤（它没装上时什么也不做）。 */
+  function runCodexPlusScanStep(owner) {
+    for (const entry of [...codexPlusScanSteps().values()]) if (entry.owner === owner) runScanStep(entry.step);
   }
 
   function runScanStep(step) {

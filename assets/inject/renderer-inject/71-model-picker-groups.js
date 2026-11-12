@@ -1,5 +1,5 @@
   /**
-   * 模型选择器按供应商分组折叠。
+   * 模型选择器：保留供应商图标导航，并提供可切换的折叠列表。
    *
    * 背景：按模型聚合（`RelayMode::Aggregate`）后，一份 catalog 里会混进多个成员
    * 供应商的模型。原生选择器是一维列表，聚合目录只能用 `display_name` 尾部的
@@ -11,24 +11,27 @@
    *      的 `modelMetadata[slug]`（聚合目录发布的 `codex_plus_group`，或 `description`
    *      里的 `上游 · 供应商`）取权威归属。已知归属会在会话内累积，目录快照被整体替换
    *      也不会把默认成员那一组变成空标题。
-   *   2. 在每组第一行前插一个自己的分组标题按钮，点它只折叠/展开这一组；
+   *   2. 先显示供应商图标网格，点进去只显示这一家的模型，顶部按钮返回网格；
    *      行本身的选中逻辑完全交给原生（这里不监听行的点击）。行内原生的
    *      `xxx（供应商）` 标签隐藏并退出无障碍树，由我们插入的裸模型名顶替。
    *   3. 行没有被搬动，React 的 child 对账不受影响；折叠用 CSS 类隐藏，
    *      不增删原生节点，所以不会把原生列表搞崩。
    *
-   * 只在"确实有多个供应商分组"时接管；单供应商（直连供应商）时完全不动原生列表。
+   * 图标模式仅在多供应商时接管导航；单供应商保留原生列表，也能切换视图。
    * 分组标题带 `data-codex-plus-ext`，扫描调度器会把它排除在自喂循环之外
-   * （issue #1960）。折叠状态与供应商归属存 localStorage。
+   * （issue #1960）。供应商归属存 localStorage，导航状态只在本次菜单内保留。
    */
   registerCodexPlusExtensionSelector('[data-codex-plus-ext="builtin-model-picker-groups"]');
   // 重注入时先与上一个实例交接：停掉它的轮询与观察器，但**不**让它清理 DOM 补丁。
   // 旧实例的清理会先把标题/标签拆掉、再等自己下一轮扫描重建，而它已经被 dispose，
   // 结果是"标题一闪一闪"。DOM 由下面这个新实例在同一个 list 上重建，幂等。
+  const codexPlusModelPickerDomState = window.__codexPlusModelPickerGroupsRuntime?.domState?.() || new WeakMap();
+  const codexPlusModelPickerPreviousView = window.__codexPlusModelPickerGroupsRuntime?.viewState?.();
   window.__codexPlusModelPickerGroupsRuntime?.dispose?.();
 
-  /** 折叠状态存储键，改结构要换版本号。 */
+  /** 沿用旧键中的供应商归属缓存，不再读取旧折叠状态。 */
   const codexPlusModelPickerGroupsStoreKey = "codexPlus.modelPicker.collapsedGroups.v1";
+  const codexPlusModelPickerViewStoreKey = "codexPlus.modelPicker.viewMode.v1";
   /** 分组标题与工具条节点上的归属标记。 */
   const codexPlusModelPickerGroupsExtMark = "builtin-model-picker-groups";
   /** 样式表节点 id。 */
@@ -69,16 +72,17 @@
     timer: 0,
     rescanTimer: 0,
     observer: null,
-    /** 本次菜单打开期间是否已经做过"自动只留当前分组展开"。 */
-    autoCollapsed: false,
-    /** 用户手动点过标题的分组 id。 */
-    touched: new Set(),
-    /** 已折叠的分组 id。 */
-    collapsed: new Set(),
+    /** 空串表示供应商网格；每次重新打开菜单都从网格开始。 */
+    activeGroupId: "",
+    viewMode: codexPlusModelPickerPreviousView?.mode === "list" ? "list" : "icons",
+    viewLoaded: false,
+    collapsed: new Set(codexPlusModelPickerPreviousView?.collapsed || []),
     /** 会话内累积的"归一化模型名 -> 供应商"。目录快照会被整体替换，这里做加法不丢已知归属。 */
     providerNames: new Map(),
     /** 默认成员的分组 id（聚合的"默认供应商"），用于打「默认」标志。 */
     defaultGroupId: "",
+    /** 上次从目录算出的默认供应商名：快照暂缺元数据时沿用（#2860）。 */
+    defaultProviderName: "",
     /** 目录快照的单飞标记与冷却时间。 */
     catalogPending: false,
     catalogRetryAt: 0,
@@ -91,20 +95,36 @@
       ? {
           defaultBadge: "默认",
           defaultTitle: "默认供应商：未指定模型时走这一家",
-          expandAll: "全部展开",
-          collapseAll: "全部折叠",
-          groupAria: (name, count, expanded, isDefault) => `${name}${isDefault ? "（默认供应商）" : ""}，${count} 个模型，${expanded ? "已展开" : "已折叠"}`,
+          providers: "供应商",
+          back: "返回供应商列表",
+          unnamed: "其他供应商",
+          current: "当前使用",
+          modelCount: (count) => `${count} 个模型`,
+          groupAria: (name, count, current, isDefault) => `${name}${isDefault ? "（默认供应商）" : ""}，${count} 个模型${current ? "，当前使用" : ""}`,
           groupTitle: (name, count) => `${name} · ${count}`,
           favorite: "已收藏（在 Codex++ 里收藏的模型）",
+          listView: "切换为列表视图",
+          iconsView: "切换为图标视图",
+          expandAll: "全部展开",
+          collapseAll: "全部折叠",
+          defaultUnavailable: "未获取到默认模型",
         }
       : {
           defaultBadge: "Default",
           defaultTitle: "Default provider: used when no model is pinned",
-          expandAll: "Expand all",
-          collapseAll: "Collapse all",
-          groupAria: (name, count, expanded, isDefault) => `${name}${isDefault ? " (default provider)" : ""}, ${count} models, ${expanded ? "expanded" : "collapsed"}`,
+          providers: "Providers",
+          back: "Back to providers",
+          unnamed: "Other providers",
+          current: "Currently selected",
+          modelCount: (count) => `${count} models`,
+          groupAria: (name, count, current, isDefault) => `${name}${isDefault ? " (default provider)" : ""}, ${count} models${current ? ", currently selected" : ""}`,
           groupTitle: (name, count) => `${name} · ${count}`,
           favorite: "Favorite (starred in Codex++)",
+          listView: "Switch to list view",
+          iconsView: "Switch to icon view",
+          expandAll: "Expand all",
+          collapseAll: "Collapse all",
+          defaultUnavailable: "Default model unavailable",
         };
   }
 
@@ -114,19 +134,19 @@
     try {
       const raw = window.localStorage?.getItem(codexPlusModelPickerGroupsStoreKey);
       const parsed = raw ? JSON.parse(raw) : null;
-      if (Array.isArray(parsed?.collapsed)) {
-        parsed.collapsed.filter((id) => typeof id === "string").forEach((id) => codexPlusModelPickerGroupsState.collapsed.add(id));
-      }
-      if (Array.isArray(parsed?.touched)) {
-        parsed.touched.filter((id) => typeof id === "string").forEach((id) => codexPlusModelPickerGroupsState.touched.add(id));
-      }
       if (typeof parsed?.defaultGroupId === "string") {
         codexPlusModelPickerGroupsState.defaultGroupId = parsed.defaultGroupId;
       }
       if (parsed?.providers && typeof parsed.providers === "object") {
         for (const [key, value] of Object.entries(parsed.providers)) {
           if (typeof key === "string" && typeof value === "string" && key && value) {
-            codexPlusModelPickerGroupsState.providerNames.set(key, value);
+            codexPlusModelPickerGroupsState.providerNames.set(key, { name: value, parsed: false });
+          } else if (key && typeof value?.name === "string" && value.name) {
+            codexPlusModelPickerGroupsState.providerNames.set(key, {
+              name: value.name,
+              parsed: value.parsed === true,
+              groupId: typeof value.groupId === "string" ? value.groupId : "",
+            });
           }
         }
       }
@@ -142,13 +162,231 @@
       window.localStorage?.setItem(
         codexPlusModelPickerGroupsStoreKey,
         JSON.stringify({
-          collapsed: [...codexPlusModelPickerGroupsState.collapsed],
-          touched: [...codexPlusModelPickerGroupsState.touched],
           providers,
           defaultGroupId: codexPlusModelPickerGroupsState.defaultGroupId || "",
         }),
       );
     } catch {}
+  }
+
+  function codexPlusModelPickerLoadView() {
+    const state = codexPlusModelPickerGroupsState;
+    if (state.viewLoaded) return;
+    state.viewLoaded = true;
+    try {
+      const mode = window.localStorage?.getItem(codexPlusModelPickerViewStoreKey);
+      if (mode === "icons" || mode === "list") state.viewMode = mode;
+    } catch {}
+  }
+
+  /** 只保存自己覆盖的属性；WeakMap 随重注入交接，不保留已关闭菜单。 */
+  function codexPlusModelPickerRememberAttribute(node, name, value) {
+    let saved = codexPlusModelPickerDomState.get(node);
+    if (!saved) {
+      saved = new Map();
+      codexPlusModelPickerDomState.set(node, saved);
+    }
+    if (!saved.has(name)) saved.set(name, node.getAttribute(name));
+    if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+  }
+
+  function codexPlusModelPickerRestoreAttribute(node, name) {
+    const saved = codexPlusModelPickerDomState.get(node);
+    if (!saved?.has(name)) return;
+    const value = saved.get(name);
+    if (value === null) node.removeAttribute(name);
+    else node.setAttribute(name, value);
+    saved.delete(name);
+  }
+
+  /** 完整默认身份只读有效配置字段；缺失时不按供应商或目录顺序猜测。 */
+  function codexPlusModelPickerDefaultModelName() {
+    const model = typeof codexModelCatalog?.effective_config_model === "string"
+      ? codexModelCatalog.effective_config_model.trim() : "";
+    if (!model) return codexPlusModelPickerText().defaultUnavailable;
+    const metadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
+    const entry = metadata?.[model];
+    const display = entry?.displayName || entry?.display_name;
+    return typeof display === "string" && display.trim() ? display.trim() : model;
+  }
+
+  function codexPlusModelPickerDefaultRows(list) {
+    return [...list.querySelectorAll('[role="menuitemradio"]')].filter((row) => {
+      const identity = codexPlusModelPickerRowIdentity(row);
+      return identity?.spanCount > 1 && /^(默认|default)$/iu.test(identity.text);
+    });
+  }
+
+  function codexPlusModelPickerSyncDefaultRow(list) {
+    const name = codexPlusModelPickerDefaultModelName();
+    codexPlusModelPickerDefaultRows(list).forEach((row) => {
+      const identity = codexPlusModelPickerRowIdentity(row);
+      const inner = identity?.inner;
+      if (!inner) return;
+      row.setAttribute("data-codex-plus-model-default-row", "true");
+      inner.setAttribute("data-codex-plus-model-default-content", "true");
+      [...inner.children].forEach((node) => {
+        if (node === identity.labelElement || node.getAttribute("data-codex-plus-ext") === codexPlusModelPickerGroupsExtMark) return;
+        node.setAttribute("data-codex-plus-model-default-note", "true");
+        codexPlusModelPickerRememberAttribute(node, "aria-hidden", "true");
+      });
+      let label = inner.querySelector(".codex-plus-model-default-name");
+      if (!label) {
+        label = codexPlusModelPickerElement("span", "codex-plus-model-default-name");
+        inner.appendChild(label);
+      }
+      if (label.textContent !== name) label.textContent = name;
+      label.title = name;
+    });
+  }
+
+  function codexPlusModelPickerRestoreDefaultRow(list) {
+    list.querySelectorAll(".codex-plus-model-default-name").forEach((node) => node.remove());
+    list.querySelectorAll("[data-codex-plus-model-default-note]").forEach((node) => {
+      codexPlusModelPickerRestoreAttribute(node, "aria-hidden");
+      node.removeAttribute("data-codex-plus-model-default-note");
+    });
+    list.querySelectorAll("[data-codex-plus-model-default-content]").forEach((node) => node.removeAttribute("data-codex-plus-model-default-content"));
+    list.querySelectorAll("[data-codex-plus-model-default-row]").forEach((node) => node.removeAttribute("data-codex-plus-model-default-row"));
+  }
+
+  function codexPlusModelPickerHeading(list) {
+    return [...list.querySelectorAll('[data-menu-section-label], [class*="_sectionLabel_"], [class^="sectionLabel-"], [class*=" sectionLabel-"]')]
+      .find((node) => !node.closest('[role="menuitemradio"], [data-codex-plus-ext]')) || null;
+  }
+
+  /** Lucide 的标准路径；注入环境没有模块加载器，不额外下载图标包。 */
+  function codexPlusModelPickerActionIcon(action) {
+    const paths = {
+      list: ["M8 6h13", "M8 12h13", "M8 18h13", "M3 6h.01", "M3 12h.01", "M3 18h.01"],
+      icons: ["M3 3h7v7H3z", "M14 3h7v7h-7z", "M3 14h7v7H3z", "M14 14h7v7h-7z"],
+      expand: ["m7 10 5-5 5 5", "m7 14 5 5 5-5"],
+      collapse: ["m7 5 5 5 5-5", "m7 19 5-5 5 5"],
+      chevron: ["m9 6 6 6-6 6"],
+    };
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", "16");
+    svg.setAttribute("height", "16");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.75");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("data-codex-plus-ext", codexPlusModelPickerGroupsExtMark);
+    for (const value of paths[action] || []) {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", value);
+      svg.appendChild(path);
+    }
+    return svg;
+  }
+
+  function codexPlusModelPickerViewAction(list, action) {
+    const state = codexPlusModelPickerGroupsState;
+    if (!list?.isConnected) return;
+    if (action === "list" || action === "icons") {
+      state.viewMode = action;
+      try { window.localStorage?.setItem(codexPlusModelPickerViewStoreKey, action); } catch {}
+      codexPlusModelPickerClear(list);
+    } else {
+      const groups = codexPlusModelPickerUniqueGroupIds(
+        codexPlusModelPickerGroups(codexPlusModelPickerRows(list), codexPlusModelPickerDefaultProviderName()),
+      );
+      groups.forEach((group) => {
+        if (action === "collapse") state.collapsed.add(group.id);
+        else state.collapsed.delete(group.id);
+      });
+    }
+    codexPlusModelPickerPatch(list);
+    list.querySelector(`[data-codex-plus-model-action="${action === "list" ? "icons" : action === "icons" ? "list" : action}"]`)?.focus({ preventScroll: true });
+  }
+
+  function codexPlusModelPickerViewControls(list) {
+    const heading = codexPlusModelPickerHeading(list);
+    if (!heading) return;
+    const state = codexPlusModelPickerGroupsState;
+    const text = codexPlusModelPickerText();
+    heading.setAttribute("data-codex-plus-model-heading", "true");
+    const controls = codexPlusModelPickerElement("span", "codex-plus-model-view-controls");
+    const actions = state.viewMode === "list"
+      ? [["expand", text.expandAll], ["collapse", text.collapseAll], ["icons", text.iconsView]]
+      : [["list", text.listView]];
+    for (const [action, label] of actions) {
+      const button = codexPlusModelPickerElement("button", "codex-plus-model-view-button");
+      button.type = "button";
+      button.title = label;
+      button.setAttribute("aria-label", label);
+      button.setAttribute("data-codex-plus-model-action", action);
+      button.appendChild(codexPlusModelPickerActionIcon(action));
+      button.addEventListener("pointerdown", (event) => event.stopPropagation());
+      button.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+      });
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        codexPlusModelPickerViewAction(event.currentTarget.closest("[data-codex-plus-model-groups]"), action);
+      });
+      controls.appendChild(button);
+    }
+    heading.appendChild(controls);
+  }
+
+  /** 所有直接子项共享连续顺序；只写 CSS，不搬动 React 管理的行。 */
+  function codexPlusModelPickerOrderPlan(list, groups) {
+    const members = new Set(groups.flatMap((group) => group.entries.map((entry) => entry.row)));
+    const plan = [...list.children].filter((node) => !members.has(node)
+      && node.getAttribute("data-codex-plus-ext") !== codexPlusModelPickerGroupsExtMark);
+    for (const group of groups) {
+      const header = list.querySelector(`[${codexPlusModelPickerGroupIdAttr}="${cssEscapeValue(group.id)}"]`);
+      if (header) plan.push(header);
+      group.entries.forEach((entry) => plan.push(entry.row));
+    }
+    return plan;
+  }
+
+  function codexPlusModelPickerApplyOrder(list, groups) {
+    list.setAttribute("data-codex-plus-model-ordering", "true");
+    codexPlusModelPickerOrderPlan(list, groups).forEach((node, index) => {
+      let saved = codexPlusModelPickerDomState.get(node);
+      if (!saved) {
+        saved = new Map();
+        codexPlusModelPickerDomState.set(node, saved);
+      }
+      const property = "--codex-plus-model-order";
+      if (!saved.has(property)) saved.set(property, {
+        value: node.style.getPropertyValue(property),
+        priority: node.style.getPropertyPriority(property),
+        hadStyle: node.hasAttribute("style"),
+      });
+      const order = String(index + 1);
+      node.setAttribute("data-codex-plus-model-order", order);
+      if (node.style.getPropertyValue(property) !== order) node.style.setProperty(property, order);
+    });
+  }
+
+  function codexPlusModelPickerRestoreOrder(list) {
+    list.querySelectorAll('[data-codex-plus-model-order], [style*="--codex-plus-model-order"]').forEach((node) => {
+      const saved = codexPlusModelPickerDomState.get(node);
+      const property = "--codex-plus-model-order";
+      const original = saved?.get(property);
+      if (original) {
+        if (original.value) node.style.setProperty(property, original.value, original.priority);
+        else node.style.removeProperty(property);
+        if (!original.hadStyle && !node.getAttribute("style")) node.removeAttribute("style");
+        saved.delete(property);
+      }
+      node.removeAttribute("data-codex-plus-model-order");
+    });
+    list.removeAttribute("data-codex-plus-model-ordering");
+  }
+
+  function codexPlusModelPickerSyncList(list, groups) {
+    codexPlusModelPickerApplyOrder(list, groups);
+    groups.forEach((group) => codexPlusModelPickerSyncGroup(list, group));
+    codexPlusModelPickerSyncDefaultRow(list);
   }
 
   /**
@@ -157,13 +395,14 @@
    * `parsed` 表示这条是从行末尾 `（供应商）` 猜出来的；权威来源（目录侧
    * `codex_plus_group` / `description`）可以覆盖它，反过来不行。
    */
-  function codexPlusModelPickerRememberProvider(displayName, provider, parsed) {
+  function codexPlusModelPickerRememberProvider(displayName, provider, parsed, groupId = "") {
     const key = codexPlusModelPickerNormalize(displayName);
     if (!key || !provider) return;
     const existing = codexPlusModelPickerGroupsState.providerNames.get(key);
     if (existing && !existing.parsed && parsed) return;
-    if (existing && existing.name === provider && existing.parsed === !!parsed) return;
-    codexPlusModelPickerGroupsState.providerNames.set(key, { name: provider, parsed: !!parsed });
+    const id = groupId || (existing?.name === provider ? existing.groupId || "" : "");
+    if (existing && existing.name === provider && existing.parsed === !!parsed && (existing.groupId || "") === id) return;
+    codexPlusModelPickerGroupsState.providerNames.set(key, { name: provider, parsed: !!parsed, groupId: id });
     codexPlusModelPickerGroupsState.providerDirty = true;
   }
 
@@ -219,7 +458,7 @@
         const groupId = typeof entry.codex_plus_group_id === "string" ? entry.codex_plus_group_id.trim() : "";
         if (!groupId) continue;
         const displayName = entry.displayName || entry.display_name || "";
-        codexPlusModelPickerRememberProvider(displayName, providerNameOf(entry), false);
+        codexPlusModelPickerRememberProvider(displayName, providerNameOf(entry), false, groupId);
         if (state.defaultGroupId !== groupId) {
           state.defaultGroupId = groupId;
           state.providerDirty = true;
@@ -255,19 +494,34 @@
       // （display:none），仍然连着 —— 那种情况不能当成关闭，否则回来时补丁已经
       // 被拆掉、要等一轮才重建，看上去就是"分组闪一下没了"。
       if (!root.isConnected) continue;
-      if (!root.querySelector('[class*="_ModelList_"]')) continue;
+      if (!codexPlusModelPickerListIn(root)) continue;
       return root;
     }
     return null;
   }
 
+  /**
+   * 面板根里的模型列表。按结构找、不认类名（#2893）：模型行（`role="menuitemradio"`）的共同父节点
+   * 就是列表。实测 26.1029：菜单里 41 个模型行都直接挂在列表下，列表外（含推理强度子面板）没有别的
+   * 模型行；按结构找到的和按类名找到的是同一个节点。`role` 是 Codex 做菜单交互和无障碍要用的，
+   * 比 CSS Modules 的哈希类名稳定——26.1029 就把 `_ModelList_哈希` 改成了 `ModelList-哈希`。
+   *
+   * 还没有模型行时（列表加载中）回落到类名，新旧两种格式都认；新格式按类名开头匹配，不会误中
+   * `ModelListMotion-`。共同父节点退到面板根本身时（行分散在几个面板里）说明结构变了，同样回落。
+   */
+  function codexPlusModelPickerListIn(root) {
+    const rows = [...root.querySelectorAll('[role="menuitemradio"]')];
+    let list = rows[0]?.parentElement || null;
+    while (list && list !== root && !rows.every((row) => list.contains(row))) list = list.parentElement;
+    if (list && list !== root) return list;
+    return root.querySelector('[class*="_ModelList_"], [class^="ModelList-"], [class*=" ModelList-"]');
+  }
+
   function codexPlusModelPickerList(menu) {
     const root = menu?.matches?.("[data-model-picker-view]") ? menu : menu?.querySelector?.("[data-model-picker-view]");
     if (!root) return null;
-    const list = root.querySelector('[class*="_ModelList_"]');
-    if (!list) return null;
     if (root.getAttribute("data-model-picker-view") === "grid") return null;
-    return list;
+    return codexPlusModelPickerListIn(root);
   }
 
   /**
@@ -341,10 +595,19 @@
    */
   function codexPlusModelPickerCatalogProviderMap() {
     const modelMetadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
-    // 会话内已记下的归属先铺一层：目录快照可能被整体替换（重连 / 重新生成），
-    // 只认当前快照会让默认供应商的分组名在某一刻变空。
-    const map = new Map(codexPlusModelPickerGroupsState.providerNames);
-    if (!modelMetadata || typeof modelMetadata !== "object") return map;
+    const map = new Map();
+    // 记下的归属只补当前快照缺的键：目录快照会被整体替换（重连 / 拉取超时返回空元数据），
+    // 只认当前快照会让裸名模型在某一刻全部失去归属，落进一串空名分组（#2860）。
+    // 缓存里的形状是 `{ name, parsed, groupId }`，这里换成读取方要的 `{ provider, groupId }`；
+    // 从行尾后缀猜的（parsed）不补：那是别家同名模型的归属，套给裸名行会串组。
+    const fillFromMemory = () => {
+      codexPlusModelPickerGroupsState.providerNames.forEach((value, key) => {
+        if (map.has(key) || !value?.name || value.parsed) return;
+        map.set(key, { provider: value.name, groupId: value.groupId || "", parsed: false });
+      });
+      return map;
+    };
+    if (!modelMetadata || typeof modelMetadata !== "object") return fillFromMemory();
     const slugList = Array.isArray(codexModelCatalog?.models)
       ? codexModelCatalog.models.filter((slug) => typeof slug === "string" && slug)
       : [];
@@ -365,12 +628,12 @@
         // 权威来源可以覆盖行文本猜出来的；已经有权威值就不动。
         if (!remembered || remembered.parsed) map.set(key, { provider, groupId, parsed: false });
       }
-      codexPlusModelPickerRememberProvider(displayName, provider, false);
+      codexPlusModelPickerRememberProvider(displayName, provider, false, groupId);
     };
     const bySlug = new Map(entries);
     for (const slug of slugList) registerEntry(bySlug.get(slug), slug);
     for (const [key, entry] of entries) registerEntry(entry, key);
-    return map;
+    return fillFromMemory();
   }
 
   /**
@@ -429,8 +692,9 @@
     if (!content) return null;
     const native = content.querySelector(`.${codexPlusModelPickerNativeLabelClass}`);
     const own = content.querySelector(`.${codexPlusModelPickerOwnLabelClass}`);
-    const outer = content.querySelector("span.flex-1, span[class*='flex-1']");
-    const inner = outer?.firstElementChild;
+    const outer = content.querySelector("span.flex-1, span[class*='flex-1'], div.flex-1, div[class*='flex-1']");
+    // 原生副标题行使用 div.flex-1，普通单行及旧版骨架使用 span.flex-1。
+    const inner = outer?.tagName === "DIV" ? outer : outer?.firstElementChild;
     // 原始标签优先；没打过补丁时就是 inner 里的第一个 span。
     const labelElement = native || own || inner?.firstElementChild || inner;
     const text = (labelElement?.textContent || "").replace(/\s+/g, " ").trim();
@@ -465,6 +729,8 @@
     const providers = codexPlusModelPickerCatalogProviderMap();
     const exact = codexPlusModelPickerCatalogExactMap();
     const defaultGroupId = codexPlusModelPickerDefaultGroupId();
+    // 每轮算一次：逐行调用在目录失效时会退化成「行数 × 目录条目数」。
+    const defaultProviderName = codexPlusModelPickerDefaultProviderName();
     const rows = [];
     const items = list.querySelectorAll('[role="menuitemradio"]');
     items.forEach((row) => {
@@ -491,7 +757,7 @@
         || (split.provider ? `provider:${split.provider}` : defaultGroupId);
       // 显示名：整行精确命中目录时用目录里的分组名（网关写的是打过码的完整账号名，后缀可能只是
       // 供应商 id）；否则有后缀就是那一家；裸名（默认成员的模型）用默认供应商的名字。
-      const provider = exactKnown?.provider || split.provider || known?.provider || codexPlusModelPickerDefaultProviderName();
+      const provider = exactKnown?.provider || split.provider || known?.provider || defaultProviderName;
       const authoritativeGroupId = !!known?.groupId
         || (split.provider ? true : !!defaultGroupId);
       rows.push({ row, label: identity.text, name: split.name, provider, groupId, authoritativeGroupId, favorite: exactKnown?.favorite === true });
@@ -508,7 +774,8 @@
    */
   function codexPlusModelPickerDefaultProviderName() {
     const modelMetadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
-    if (!modelMetadata || typeof modelMetadata !== "object") return "";
+    // 快照暂时没有元数据（拉取超时 / 重连）时沿用上次算出的名字，裸名行不至于变成无名分组（#2860）。
+    if (!modelMetadata || typeof modelMetadata !== "object") return codexPlusModelPickerGroupsState.defaultProviderName || "";
     // 取"裸名模型里出现最多的那个分组"：聚合的默认成员可能有几百个模型，
     // 偶尔混进一两个别的成员的裸名条目也不该把整组改姓。
     const counts = new Map();
@@ -526,7 +793,8 @@
       }
       if (!provider) continue;
       counts.set(provider, (counts.get(provider) || 0) + 1);
-      codexPlusModelPickerRememberProvider(displayName, provider, false);
+      const groupId = typeof entry.codex_plus_group_id === "string" ? entry.codex_plus_group_id.trim() : "";
+      codexPlusModelPickerRememberProvider(displayName, provider, false, groupId);
     }
     let best = "";
     let bestCount = 0;
@@ -536,7 +804,8 @@
         bestCount = count;
       }
     });
-    return best;
+    if (best) codexPlusModelPickerGroupsState.defaultProviderName = best;
+    return best || codexPlusModelPickerGroupsState.defaultProviderName || "";
   }
 
   /** 权威 groupId 全局合组；无 ID 的旧行只做相邻回退，避免同名误合并。 */
@@ -544,6 +813,9 @@
     const groups = [];
     const identified = new Map();
     let legacy = null;
+    // 归属认不出的行（没有后缀、目录也查不到）全部收进同一个「其他供应商」组。
+    // 按相邻切段会被有名分组隔成好几段，几段共用一个 id：只有第一段有标题、点哪段都展开全部（#2860）。
+    let unnamed = null;
     for (const entry of rows) {
       const key = entry.provider || "";
       const id = entry.authoritativeGroupId !== false && typeof entry.groupId === "string" ? entry.groupId.trim() : "";
@@ -556,6 +828,13 @@
           identified.set(id, group);
           groups.push(group);
         }
+      } else if (!(entry.provider || defaultProviderName)) {
+        legacy = null;
+        if (!unnamed) {
+          unnamed = { key: "", id: "", name: "", entries: [] };
+          groups.push(unnamed);
+        }
+        group = unnamed;
       } else {
         if (!legacy || legacy.key !== key) {
           legacy = { key, id: `legacy:${groups.length}:${key}`, name: entry.provider || defaultProviderName, entries: [] };
@@ -595,50 +874,32 @@
 
   function codexPlusModelPickerFingerprint(groups) {
     return groups
-      .map((group) => `${group.id}:${group.entries.map((entry) => entry.label).join("|")}`)
+      .map((group) => `${group.id}:${group.name}:${group.entries.map((entry) => entry.label).join("|")}`)
       .join("||");
   }
 
-  /**
-   * 首次打开时的默认形态：永远**至少有一组是展开的**。
-   *
-   *   - 用户在这之前存过折叠状态（`touched` 非空）：完全尊重，不再自动决策，
-   *     否则每次打开都会把用户特意展开的组又收回去。
-   *   - 当前有选中模型，且能定位到它属于哪个分组：只展开那一组，其余收起——
-   *     用户下次打开选择器，看到的就是自己正在用的供应商。
-   *   - 其他情况（还没有选中模型 / 定位不到）：全部保持展开。信息完整比"整齐"重要，
-   *     看不到模型比看到一长串更糟。
-   */
-  function codexPlusModelPickerAutoCollapse(list, groups) {
-    const state = codexPlusModelPickerGroupsState;
-    if (state.autoCollapsed) return;
-    state.autoCollapsed = true;
-    if (groups.length < 2) return;
-    if (state.touched.size > 0) return;
-    let keep = "";
-    const selected = list.querySelector("[data-model-selected]");
-    if (selected) {
-      const split = codexPlusModelPickerSplitLabel(codexPlusModelPickerRowLabel(selected));
-      const desired = split.provider || "";
-      const found = groups.find((group) => (group.name || "") === desired);
-      if (found) keep = found.id;
-    }
-    // 没有选中模型（或定位不到所属分组）时展开默认供应商：目录里裸名发布的那些
-    // 模型本来就归它，用户最可能找的就是它。
-    if (!keep) keep = groups.find((group) => group.isDefault)?.id || "";
-    if (!keep) return;
-    let changed = false;
-    for (const group of groups) {
-      if (group.id === keep) {
-        if (state.collapsed.delete(group.id)) changed = true;
-      } else if (!state.collapsed.has(group.id)) {
-        // 默认成员那一组（裸名、没有供应商后缀）跟着一起收，避免"默认 7 个 + 当前供应商"
-        // 两段都散着；它有 7 个模型，收起来不影响选型。
-        state.collapsed.add(group.id);
-        changed = true;
-      }
-    }
-    if (changed) codexPlusModelPickerPersist();
+  function codexPlusModelPickerSelectedRow(group) {
+    return group.entries.find((entry) => entry.row.matches('[data-model-selected], [aria-checked="true"], [data-state="checked"]'))?.row;
+  }
+
+  /** 自定义供应商没有品牌资源时，用稳定的名称头像区分不同账号。 */
+  function codexPlusModelPickerProviderIcon(group) {
+    const name = (group.name || codexPlusModelPickerText().unnamed).split(/[·（(]/u)[0].trim();
+    const words = name.match(/[\p{L}\p{N}]+/gu) || [];
+    const letters = words.length > 1
+      ? [Array.from(words[0])[0], Array.from(words[1])[0]]
+      : Array.from(words[0] || "?").slice(0, 2);
+    let hash = 0;
+    for (const character of group.id) hash = (Math.imul(hash, 31) + character.codePointAt(0)) | 0;
+    const colors = ["#64ad94", "#809cdb", "#c78e63", "#c681a5", "#9baa5e", "#6ba5b8"];
+    return { label: letters.join("").toLocaleUpperCase(), color: colors[(hash >>> 0) % colors.length] };
+  }
+
+  function codexPlusModelPickerElement(tag, className) {
+    const node = document.createElement(tag);
+    node.className = className;
+    node.setAttribute("data-codex-plus-ext", codexPlusModelPickerGroupsExtMark);
+    return node;
   }
 
   /**
@@ -652,8 +913,7 @@
       return;
     }
     if (!badge) {
-      badge = document.createElement("span");
-      badge.className = "codex-plus-model-group-default";
+      badge = codexPlusModelPickerElement("span", "codex-plus-model-group-default");
       const count = header.querySelector(".codex-plus-model-group-count");
       header.insertBefore(badge, count || null);
     }
@@ -661,26 +921,28 @@
     badge.title = text.defaultTitle;
   }
 
-  function codexPlusModelPickerGroupExpanded(group) {
-    return !codexPlusModelPickerGroupsState.collapsed.has(group.id);
-  }
-
   function codexPlusModelPickerSyncGroup(list, group) {
     const text = codexPlusModelPickerText();
-    const expanded = codexPlusModelPickerGroupExpanded(group);
+    const state = codexPlusModelPickerGroupsState;
+    const expanded = state.viewMode === "list" ? !state.collapsed.has(group.id) : state.activeGroupId === group.id;
     const header = list.querySelector(`[${codexPlusModelPickerGroupIdAttr}="${cssEscapeValue(group.id)}"]`);
     group.entries.forEach((entry) => {
       entry.row.setAttribute(codexPlusModelPickerGroupAttr, group.id);
       entry.row.classList.toggle("codex-plus-model-group-collapsed", !expanded);
     });
     if (header) {
-      header.setAttribute("aria-expanded", expanded ? "true" : "false");
-      header.classList.toggle("codex-plus-model-group-header-collapsed", !expanded);
+      if (state.viewMode === "list") header.setAttribute("aria-expanded", String(expanded));
+      const current = !!codexPlusModelPickerSelectedRow(group);
+      header.setAttribute("data-current", current ? "true" : "false");
       const label = header.querySelector(".codex-plus-model-group-title");
-      // 标题只放名字：数量右边有徽标，标题里再来一次就是重复。
-      if (label) label.textContent = group.name;
+      const name = group.name || text.unnamed;
+      if (label && label.textContent !== name) label.textContent = name;
+      const count = header.querySelector(".codex-plus-model-group-count");
+      const countText = text.modelCount(group.entries.length);
+      if (count && count.textContent !== countText) count.textContent = countText;
       codexPlusModelPickerSyncDefaultBadge(header, group, text);
-      header.setAttribute("aria-label", text.groupAria(group.name, group.entries.length, expanded, group.isDefault));
+      header.setAttribute("aria-label", text.groupAria(name, group.entries.length, current, group.isDefault));
+      header.title = `${text.groupTitle(name, group.entries.length)}${current ? ` · ${text.current}` : ""}`;
     }
   }
 
@@ -746,115 +1008,184 @@
     }
   }
 
-  function codexPlusModelPickerToggleGroup(list, group) {
+  function codexPlusModelPickerNavigate(list, groupId) {
+    if (!list?.isConnected) return;
     const state = codexPlusModelPickerGroupsState;
-    const expanded = codexPlusModelPickerGroupExpanded(group);
-    if (expanded) state.collapsed.add(group.id);
-    else state.collapsed.delete(group.id);
-    state.touched.add(group.id);
-    codexPlusModelPickerPersist();
-    codexPlusModelPickerSyncGroup(list, group);
-    codexPlusModelPickerSyncToolbar(list);
+    const previous = state.activeGroupId;
+    // React 可能刚换过行，点击时必须重新读取，不能使用创建按钮时的 DOM 快照。
+    const groups = codexPlusModelPickerUniqueGroupIds(
+      codexPlusModelPickerGroups(codexPlusModelPickerRows(list), codexPlusModelPickerDefaultProviderName()),
+    );
+    const group = groups.find((item) => item.id === groupId);
+    state.activeGroupId = group?.id || "";
+    codexPlusModelPickerSyncNavigation(list, groups);
+    const focus = group
+      ? codexPlusModelPickerSelectedRow(group) || group.entries[0]?.row
+      : list.querySelector(`[${codexPlusModelPickerGroupIdAttr}="${cssEscapeValue(previous)}"]`)
+        || list.querySelector(".codex-plus-model-group-header");
+    list.scrollTop = 0;
+    focus?.focus({ preventScroll: true });
   }
 
-  function codexPlusModelPickerSetAll(list, groups, collapsed) {
+  function codexPlusModelPickerSyncNavigation(list, groups) {
     const state = codexPlusModelPickerGroupsState;
-    for (const group of groups) {
-      if (collapsed) state.collapsed.add(group.id);
-      else state.collapsed.delete(group.id);
-      state.touched.add(group.id);
+    const active = groups.find((group) => group.id === state.activeGroupId);
+    const lostGroup = !!state.activeGroupId && !active;
+    if (!active) state.activeGroupId = "";
+    list.setAttribute("data-codex-plus-model-provider-view", active ? "models" : "providers");
+    const grid = list.querySelector(".codex-plus-model-provider-grid");
+    const toolbar = list.querySelector(".codex-plus-model-group-toolbar");
+    if (grid) grid.hidden = !!active;
+    if (toolbar) {
+      toolbar.hidden = !active;
+      if (active) {
+        const text = codexPlusModelPickerText();
+        const label = toolbar.querySelector(".codex-plus-model-group-toolbar-label");
+        const name = active.name || text.unnamed;
+        if (label && label.textContent !== name) label.textContent = name;
+        if (label) label.title = name;
+        const count = toolbar.querySelector(".codex-plus-model-group-count");
+        const countText = text.modelCount(active.entries.length);
+        if (count && count.textContent !== countText) count.textContent = countText;
+        codexPlusModelPickerSyncDefaultBadge(toolbar, active, text);
+      }
     }
-    codexPlusModelPickerPersist();
+    const controls = list.querySelector(".codex-plus-model-view-controls");
+    const heading = list.querySelector("[data-codex-plus-model-heading]");
+    const controlsParent = active ? toolbar : heading;
+    if (controls && controlsParent && controls.parentElement !== controlsParent) controlsParent.appendChild(controls);
     groups.forEach((group) => codexPlusModelPickerSyncGroup(list, group));
-    codexPlusModelPickerSyncToolbar(list);
+    if (lostGroup) grid?.querySelector("button")?.focus({ preventScroll: true });
   }
 
-  function codexPlusModelPickerGroupHeader(list, group, groups) {
-    const text = codexPlusModelPickerText();
-    const header = document.createElement("button");
-    header.type = "button";
-    header.className = "codex-plus-model-group-header";
-    header.setAttribute("data-codex-plus-ext", codexPlusModelPickerGroupsExtMark);
-    header.setAttribute(codexPlusModelPickerGroupIdAttr, group.id);
-    header.setAttribute("aria-expanded", "true");
-    const chevron = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    chevron.setAttribute("viewBox", "0 0 12 12");
-    chevron.setAttribute("aria-hidden", "true");
-    chevron.setAttribute("class", "codex-plus-model-group-chevron");
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", "M4 2.5 8 6 4 9.5");
-    path.setAttribute("fill", "none");
-    path.setAttribute("stroke", "currentColor");
-    path.setAttribute("stroke-width", "1.4");
-    path.setAttribute("stroke-linecap", "round");
-    path.setAttribute("stroke-linejoin", "round");
-    chevron.appendChild(path);
-    const title = document.createElement("span");
-    title.className = "codex-plus-model-group-title";
-    header.append(chevron, title);
-    if (group.isDefault) {
-      const badge = document.createElement("span");
-      badge.className = "codex-plus-model-group-default";
-      badge.textContent = text.defaultBadge;
-      badge.title = text.defaultTitle;
-      header.appendChild(badge);
+  function codexPlusModelPickerNavigationKeydown(event) {
+    const list = event.currentTarget;
+    if (event.isComposing) return;
+    if (codexPlusModelPickerGroupsState.viewMode === "list") {
+      const header = event.target.closest?.(".codex-plus-model-group-header");
+      if (header && (event.key === "Enter" || event.key === " ")) {
+        event.stopPropagation();
+        return;
+      }
+      if (header && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+        event.preventDefault();
+        event.stopPropagation();
+        const id = header.getAttribute(codexPlusModelPickerGroupIdAttr);
+        if (event.key === "ArrowLeft") codexPlusModelPickerGroupsState.collapsed.add(id);
+        else codexPlusModelPickerGroupsState.collapsed.delete(id);
+        codexPlusModelPickerPatch(list);
+        return;
+      }
+      const target = event.target.closest?.('[role="menuitemradio"], .codex-plus-model-group-header');
+      if (!target || !["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+      const items = [...list.querySelectorAll('[role="menuitemradio"], .codex-plus-model-group-header')]
+        .filter((node) => node.getClientRects().length && !node.classList.contains("codex-plus-model-group-collapsed"))
+        .sort((a, b) => Number(a.getAttribute("data-codex-plus-model-order")) - Number(b.getAttribute("data-codex-plus-model-order")));
+      const index = items.indexOf(target);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1
+        : Math.max(0, Math.min(items.length - 1, index + (event.key === "ArrowUp" ? -1 : 1)));
+      event.preventDefault();
+      event.stopPropagation();
+      items[next]?.focus({ preventScroll: true });
+      return;
     }
-    const count = document.createElement("span");
-    count.className = "codex-plus-model-group-count";
-    count.textContent = String(group.entries.length);
-    header.appendChild(count);
+    if (codexPlusModelPickerGroupsState.activeGroupId) {
+      if (event.key === "ArrowLeft" || event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        codexPlusModelPickerNavigate(list, "");
+      }
+      return;
+    }
+    const buttons = [...list.querySelectorAll(".codex-plus-model-group-header")];
+    if (!buttons.length) return;
+    const button = event.target.closest?.(".codex-plus-model-group-header");
+    const index = buttons.indexOf(button);
+    const arrows = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"];
+    if (!arrows.includes(event.key)) {
+      if (button && (event.key === "Enter" || event.key === " ")) event.stopPropagation();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const columns = Math.max(1, getComputedStyle(buttons[0].parentElement).gridTemplateColumns.split(" ").length);
+    const step = event.key === "ArrowUp" ? -columns : event.key === "ArrowDown" ? columns : event.key === "ArrowLeft" ? -1 : 1;
+    const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1
+      : index < 0 ? (step < 0 ? buttons.length - 1 : 0) : Math.max(0, Math.min(buttons.length - 1, index + step));
+    buttons[next].focus();
+  }
+
+  /** 原生弹层在 document 捕获 Escape，供应商子页要在更早的 window 阶段返回。 */
+  function codexPlusModelPickerEscapeKeydown(event) {
+    const state = codexPlusModelPickerGroupsState;
+    const list = state.activeList;
+    if (event.key !== "Escape" || event.isComposing || !state.activeGroupId || !list?.isConnected || !list.contains(event.target)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    codexPlusModelPickerNavigate(list, "");
+  }
+
+  function codexPlusModelPickerGroupHeader(list, group) {
+    const header = codexPlusModelPickerElement("button", "codex-plus-model-group-header");
+    header.type = "button";
+    header.setAttribute(codexPlusModelPickerGroupIdAttr, group.id);
+    const avatar = codexPlusModelPickerProviderIcon(group);
+    const icon = codexPlusModelPickerElement("span", "codex-plus-model-provider-icon");
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = avatar.label;
+    icon.style.setProperty("--codex-plus-provider-color", avatar.color);
+    const title = codexPlusModelPickerElement("span", "codex-plus-model-group-title");
+    const count = codexPlusModelPickerElement("span", "codex-plus-model-group-count");
+    header.append(icon, title, count);
+    const groupId = group.id;
+    if (codexPlusModelPickerGroupsState.viewMode === "list") {
+      const chevron = codexPlusModelPickerElement("span", "codex-plus-model-group-chevron");
+      chevron.appendChild(codexPlusModelPickerActionIcon("chevron"));
+      header.insertBefore(chevron, icon);
+    }
     header.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      const current = groups.find((item) => item.id === group.id);
-      if (current) codexPlusModelPickerToggleGroup(list, current);
+      const currentList = event.currentTarget.closest("[data-codex-plus-model-groups]");
+      if (codexPlusModelPickerGroupsState.viewMode === "list") {
+        const collapsed = codexPlusModelPickerGroupsState.collapsed;
+        if (collapsed.has(groupId)) collapsed.delete(groupId);
+        else collapsed.add(groupId);
+        codexPlusModelPickerPatch(currentList);
+      } else {
+        codexPlusModelPickerNavigate(currentList, groupId);
+      }
     });
     header.addEventListener("pointerdown", (event) => {
       // 别让指针事件冒到菜单外，否则菜单会被关掉。
       event.stopPropagation();
     });
-    header.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") event.stopPropagation();
-    });
-    // 悬浮提示保留数量：表头文字只有名字，数量用右侧徽标表示。
-    header.title = text.groupTitle(group.name, group.entries.length);
     return header;
   }
 
-  function codexPlusModelPickerSyncToolbar(list) {
-    const toolbar = list.querySelector(".codex-plus-model-group-toolbar");
-    if (!toolbar) return;
-    const groups = [...list.querySelectorAll(`[${codexPlusModelPickerGroupIdAttr}]`)]
-      .map((node) => node.getAttribute(codexPlusModelPickerGroupIdAttr));
-    const anyExpanded = groups.some((id) => !codexPlusModelPickerGroupsState.collapsed.has(id));
-    toolbar.querySelector("button")?.setAttribute("data-all-expanded", anyExpanded ? "true" : "false");
-    const label = toolbar.querySelector(".codex-plus-model-group-toolbar-label");
-    if (label) label.textContent = anyExpanded ? codexPlusModelPickerText().collapseAll : codexPlusModelPickerText().expandAll;
-  }
-
-  function codexPlusModelPickerToolbar(list, groups) {
+  function codexPlusModelPickerToolbar() {
     const text = codexPlusModelPickerText();
-    const toolbar = document.createElement("div");
-    toolbar.className = "codex-plus-model-group-toolbar";
-    toolbar.setAttribute("data-codex-plus-ext", codexPlusModelPickerGroupsExtMark);
-    const spacer = document.createElement("span");
-    spacer.className = "codex-plus-model-group-toolbar-title";
-    spacer.textContent = "";
-    const button = document.createElement("button");
+    const toolbar = codexPlusModelPickerElement("div", "codex-plus-model-group-toolbar");
+    const button = codexPlusModelPickerElement("button", "codex-plus-model-group-toolbar-button");
     button.type = "button";
-    button.className = "codex-plus-model-group-toolbar-button";
-    button.setAttribute("data-all-expanded", "true");
-    const label = document.createElement("span");
-    label.className = "codex-plus-model-group-toolbar-label";
-    label.textContent = text.collapseAll;
-    button.appendChild(label);
+    button.title = text.back;
+    button.setAttribute("aria-label", text.back);
+    const arrow = codexPlusModelPickerElement("span", "codex-plus-model-group-back-icon");
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.textContent = "←";
+    button.appendChild(arrow);
+    const label = codexPlusModelPickerElement("span", "codex-plus-model-group-toolbar-label");
+    const count = codexPlusModelPickerElement("span", "codex-plus-model-group-count");
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      codexPlusModelPickerSetAll(list, groups, button.getAttribute("data-all-expanded") === "true");
+      codexPlusModelPickerNavigate(event.currentTarget.closest("[data-codex-plus-model-groups]"), "");
     });
     button.addEventListener("pointerdown", (event) => event.stopPropagation());
-    toolbar.append(spacer, button);
+    button.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+    });
+    toolbar.append(button, label, count);
     return toolbar;
   }
 
@@ -867,9 +1198,18 @@
 
   function codexPlusModelPickerClear(list) {
     if (!list) return;
+    codexPlusModelPickerRestoreOrder(list);
+    codexPlusModelPickerRestoreDefaultRow(list);
     codexPlusModelPickerRemoveOwnNodes(list);
     list.querySelectorAll('[role="menuitemradio"]').forEach((row) => codexPlusModelPickerRestoreLabel(row));
+    list.querySelectorAll(".codex-plus-model-provider-overview-only").forEach((node) => node.classList.remove("codex-plus-model-provider-overview-only"));
+    list.removeEventListener("keydown", codexPlusModelPickerNavigationKeydown, true);
+    window.removeEventListener("keydown", codexPlusModelPickerEscapeKeydown, true);
     list.removeAttribute("data-codex-plus-model-groups");
+    list.removeAttribute("data-codex-plus-model-provider-view");
+    list.removeAttribute("data-codex-plus-model-view-mode");
+    list.querySelectorAll("[data-codex-plus-model-heading]").forEach((node) => node.removeAttribute("data-codex-plus-model-heading"));
+    codexPlusModelPickerGroupsState.activeGroupId = "";
     codexPlusModelPickerGroupsState.signature = "";
     codexPlusModelPickerGroupsState.patchedLists.delete(list);
   }
@@ -881,12 +1221,40 @@
    * 此时指纹没变、但标题已经没了，只靠指纹判等会留下一个"点了没用"的死状态。
    */
   function codexPlusModelPickerHeadersIntact(list, groups) {
+    const mode = codexPlusModelPickerGroupsState.viewMode;
+    if (list.getAttribute("data-codex-plus-model-view-mode") !== mode) return false;
+    const heading = codexPlusModelPickerHeading(list);
+    const controls = list.querySelector(".codex-plus-model-view-controls");
+    const actions = mode === "list" ? ["expand", "collapse", "icons"] : ["list"];
+    if (heading) {
+      if (!heading.hasAttribute("data-codex-plus-model-heading") || !controls || controls.children.length !== actions.length) return false;
+      if (!actions.every((action, index) => {
+        const button = controls.children[index];
+        return button.getAttribute("data-codex-plus-model-action") === action
+          && button.hasAttribute("aria-label") && button.hasAttribute("title") && !!button.querySelector("svg");
+      })) return false;
+    }
+    if (mode === "list") {
+      if (controls && controls.parentElement !== heading) return false;
+      if (list.getAttribute("data-codex-plus-model-ordering") !== "true") return false;
+      if (!groups.every((group) => {
+        const header = list.querySelector(`[${codexPlusModelPickerGroupIdAttr}="${cssEscapeValue(group.id)}"]`);
+        return header?.parentElement === list && header.hasAttribute("aria-expanded") && !!header.querySelector(".codex-plus-model-group-chevron");
+      })) return false;
+      return codexPlusModelPickerOrderPlan(list, groups).every((node, index) => {
+        const order = String(index + 1);
+        return node.getAttribute("data-codex-plus-model-order") === order
+          && node.style.getPropertyValue("--codex-plus-model-order") === order;
+      });
+    }
+    if (groups.length < 2) return !list.querySelector(".codex-plus-model-provider-grid, .codex-plus-model-group-header");
     const toolbar = list.querySelector(".codex-plus-model-group-toolbar");
-    if (!toolbar) return false;
+    const grid = list.querySelector(".codex-plus-model-provider-grid");
+    if (!toolbar || !grid || grid.children.length !== groups.length) return false;
+    if (controls && controls.parentElement !== (codexPlusModelPickerGroupsState.activeGroupId ? toolbar : heading)) return false;
     return groups.every((group) => {
       const header = list.querySelector(`[${codexPlusModelPickerGroupIdAttr}="${cssEscapeValue(group.id)}"]`);
-      const first = group.entries[0]?.row;
-      return !!header && !!first && header.nextElementSibling === first;
+      return !!header && header.parentElement === grid;
     });
   }
 
@@ -896,17 +1264,19 @@
   function codexPlusModelPickerPatch(list) {
     if (codexPlusModelPickerGroupsState.disposed) return false;
     codexPlusModelPickerStore();
+    codexPlusModelPickerLoadView();
     const rows = codexPlusModelPickerRows(list);
     const groups = codexPlusModelPickerUniqueGroupIds(
       codexPlusModelPickerGroups(rows, codexPlusModelPickerDefaultProviderName()),
     );
-    // 只有一个供应商时不折叠：直连供应商本来就是一组，插标题只是多一层噪音。
-    if (groups.length < 2) {
-      if (codexPlusModelPickerGroupsState.patchedLists.has(list)) codexPlusModelPickerClear(list);
+    if (!groups.length) {
+      if (codexPlusModelPickerGroupsState.patchedLists.has(list) || list.hasAttribute("data-codex-plus-model-groups")) codexPlusModelPickerClear(list);
       else codexPlusModelPickerRemoveOwnNodes(list);
       return false;
     }
-    const signature = codexPlusModelPickerFingerprint(groups);
+    const mode = codexPlusModelPickerGroupsState.viewMode;
+    const grouped = mode === "list" || groups.length >= 2;
+    const signature = `${mode}:${codexPlusModelPickerFingerprint(groups)}`;
     const patched = codexPlusModelPickerGroupsState.patchedLists.has(list);
     if (
       patched
@@ -914,26 +1284,53 @@
       && list.isConnected
       && codexPlusModelPickerHeadersIntact(list, groups)
     ) {
-      groups.forEach((group) => codexPlusModelPickerSyncGroup(list, group));
+      if (grouped) groups.forEach((group) => group.entries.forEach((entry) => codexPlusModelPickerInstallLabel(entry)));
+      if (mode === "list") codexPlusModelPickerSyncList(list, groups);
+      else if (grouped) codexPlusModelPickerSyncNavigation(list, groups);
       return false;
     }
     codexPlusModelPickerGroupsState.patchedLists.add(list);
     codexPlusModelPickerGroupsState.signature = signature;
     list.setAttribute("data-codex-plus-model-groups", "true");
+    list.setAttribute("data-codex-plus-model-view-mode", mode);
+    const focusedGroupId = document.activeElement?.closest?.(`[${codexPlusModelPickerGroupIdAttr}]`)?.getAttribute(codexPlusModelPickerGroupIdAttr)
+      || groups.find((group) => group.entries.some((entry) => entry.row.contains(document.activeElement)))?.id;
+    codexPlusModelPickerRestoreOrder(list);
     codexPlusModelPickerRemoveOwnNodes(list);
-    groups.forEach((group) => group.entries.forEach((entry) => codexPlusModelPickerInstallLabel(entry)));
-    groups.forEach((group) => {
-      const first = group.entries[0]?.row;
-      if (!first?.parentElement) return;
-      first.parentElement.insertBefore(codexPlusModelPickerGroupHeader(list, group, groups), first);
-    });
-    codexPlusModelPickerAutoCollapse(list, groups);
-    groups.forEach((group) => codexPlusModelPickerSyncGroup(list, group));
-    const anchor = groups[0]?.entries[0]?.row;
-    if (anchor?.parentElement && !list.querySelector(".codex-plus-model-group-toolbar")) {
-      anchor.parentElement.insertBefore(codexPlusModelPickerToolbar(list, groups), anchor.parentElement.firstChild);
+    if (!grouped) {
+      list.querySelectorAll('[role="menuitemradio"]').forEach((row) => codexPlusModelPickerRestoreLabel(row));
+      list.removeAttribute("data-codex-plus-model-provider-view");
+      codexPlusModelPickerGroupsState.activeGroupId = "";
     }
-    codexPlusModelPickerSyncToolbar(list);
+    if (mode === "icons") codexPlusModelPickerRestoreDefaultRow(list);
+    if (grouped) groups.forEach((group) => group.entries.forEach((entry) => codexPlusModelPickerInstallLabel(entry)));
+    codexPlusModelPickerViewControls(list);
+    const groupedRows = new Set(rows.map((entry) => entry.row));
+    list.querySelectorAll('[role="menuitemradio"], [class*="_sectionLabel_"], [class^="sectionLabel-"], [class*=" sectionLabel-"]').forEach((node) => {
+      node.classList.toggle("codex-plus-model-provider-overview-only", mode === "icons" && grouped && !groupedRows.has(node));
+    });
+    if (mode === "list") {
+      list.removeAttribute("data-codex-plus-model-provider-view");
+      groups.forEach((group) => {
+        const anchor = group.entries[0]?.row;
+        anchor?.parentElement?.insertBefore(codexPlusModelPickerGroupHeader(list, group), anchor);
+      });
+      codexPlusModelPickerSyncList(list, groups);
+    } else if (grouped) {
+      const grid = codexPlusModelPickerElement("div", "codex-plus-model-provider-grid");
+      grid.setAttribute("role", "group");
+      grid.setAttribute("aria-label", codexPlusModelPickerText().providers);
+      groups.forEach((group) => grid.appendChild(codexPlusModelPickerGroupHeader(list, group)));
+      const anchor = groups[0]?.entries[0]?.row;
+      if (anchor?.parentElement) anchor.parentElement.insertBefore(grid, anchor);
+      list.insertBefore(codexPlusModelPickerToolbar(), list.firstChild);
+      codexPlusModelPickerSyncNavigation(list, groups);
+    }
+    list.addEventListener("keydown", codexPlusModelPickerNavigationKeydown, true);
+    window.addEventListener("keydown", codexPlusModelPickerEscapeKeydown, true);
+    if (focusedGroupId && (mode === "list" || !codexPlusModelPickerGroupsState.activeGroupId)) {
+      list.querySelector(`[${codexPlusModelPickerGroupIdAttr}="${cssEscapeValue(focusedGroupId)}"]`)?.focus({ preventScroll: true });
+    }
     if (codexPlusModelPickerGroupsState.providerDirty) {
       codexPlusModelPickerGroupsState.providerDirty = false;
       codexPlusModelPickerPersist();
@@ -948,40 +1345,65 @@
   }
 
   function codexPlusModelPickerInstallStyle() {
-    if (document.getElementById(codexPlusModelPickerGroupsStyleId)) return;
-    const style = document.createElement("style");
+    const style = document.getElementById(codexPlusModelPickerGroupsStyleId) || document.createElement("style");
     style.id = codexPlusModelPickerGroupsStyleId;
     style.setAttribute("data-codex-plus-ext", codexPlusModelPickerGroupsExtMark);
     style.textContent = `
-      /* 分组标题贴着原生行的左右内边距，视觉上属于同一列。 */
-      .codex-plus-model-group-header{display:flex;align-items:center;gap:6px;width:100%;box-sizing:border-box;margin:2px 0 0;padding:4px 8px;border:0;border-radius:8px;background:none;color:var(--color-token-text-secondary,rgba(205,205,215,.8));font:inherit;font-size:11px;line-height:16px;font-weight:600;letter-spacing:.02em;text-align:left;cursor:pointer;user-select:none;appearance:none}
+      .codex-plus-model-provider-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;padding:6px 4px;min-width:0}
+      .codex-plus-model-group-header{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:4px;min-width:0;width:100%;box-sizing:border-box;margin:0;padding:10px 4px 8px;border:1px solid transparent;border-radius:8px;background:none;color:var(--color-token-text-primary,#dfdfdf);font:inherit;font-size:11px;line-height:16px;font-weight:500;letter-spacing:0;text-align:center;cursor:pointer;user-select:none;appearance:none}
       .codex-plus-model-group-header:hover{background:var(--color-token-bg-secondary,rgba(255,255,255,.04));color:var(--color-token-text-primary,#dfdfdf)}
       .codex-plus-model-group-header:focus-visible{outline:1px solid color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 35%,transparent);outline-offset:1px}
-      .codex-plus-model-group-chevron{flex:0 0 auto;width:12px;height:12px;opacity:.75;transform:rotate(90deg);transition:transform .15s ease}
-      .codex-plus-model-group-header-collapsed .codex-plus-model-group-chevron{transform:rotate(0deg)}
-      /* 标题撑满剩余空间，把「默认」徽标与计数挤到右端。不要用 margin-left:auto 推计数：
-         那一行多出徽标时 auto 外边距会被吃掉，数字就跟在徽标后面，与其它行不对齐。 */
-      .codex-plus-model-group-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-      .codex-plus-model-group-count{flex:0 0 auto;padding:0 6px;border-radius:999px;background:var(--color-token-bg-secondary,rgba(255,255,255,.06));color:var(--color-token-text-secondary,rgba(205,205,215,.75));font-size:10px;font-weight:500;font-variant-numeric:tabular-nums}
-      /* 「默认」标志：默认成员的模型是裸名发布的，跟"另一家没起名的成员"看名字分不出来。
-         用主题强调色描边小标签，比再加一句解释文字省地方。 */
-      .codex-plus-model-group-default{flex:0 0 auto;padding:0 5px;border:1px solid color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 26%,transparent);border-radius:999px;color:var(--color-token-text-primary,#dfdfdf);font-size:10px;line-height:14px;font-weight:500;letter-spacing:.02em}
-      /* 徽标紧贴计数左侧时留一点缝（默认 gap 是 6px，这里收紧一点看起来更像一组）。 */
-      .codex-plus-model-group-default + .codex-plus-model-group-count{margin-left:-2px}
-      .codex-plus-model-group-toolbar{display:flex;align-items:center;gap:8px;box-sizing:border-box;padding:2px 8px 4px}
-      .codex-plus-model-group-toolbar-button{margin-left:auto;border:0;border-radius:6px;background:none;padding:2px 6px;color:var(--color-token-text-secondary,rgba(205,205,215,.8));font:inherit;font-size:11px;cursor:pointer;appearance:none}
+      .codex-plus-model-provider-icon{display:grid;place-items:center;flex:none;width:40px;height:40px;margin-bottom:2px;border:1px solid color-mix(in srgb,var(--codex-plus-provider-color) 38%,transparent);border-radius:8px;background:color-mix(in srgb,var(--codex-plus-provider-color) 18%,transparent);color:var(--color-token-text-primary,#dfdfdf);font-size:16px;font-weight:600;line-height:1}
+      .codex-plus-model-group-header[data-current="true"] .codex-plus-model-provider-icon{outline:2px solid var(--codex-plus-provider-color);outline-offset:2px}
+      .codex-plus-model-group-header[data-current="true"]::after{content:"";position:absolute;top:10px;left:calc(50% + 14px);width:7px;height:7px;border:2px solid var(--color-token-bg-primary,#292929);border-radius:50%;background:var(--color-token-text-primary,#dfdfdf)}
+      .codex-plus-model-group-title{flex:1 1 auto;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .codex-plus-model-group-count{flex:0 0 auto;color:var(--color-token-text-secondary,rgba(205,205,215,.75));font-size:10px;font-weight:400;line-height:14px;font-variant-numeric:tabular-nums;white-space:nowrap}
+      .codex-plus-model-group-default{flex:0 0 auto;padding:0 4px;border:1px solid color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 20%,transparent);border-radius:4px;color:var(--color-token-text-secondary,#aaa);font-size:9px;line-height:13px;font-weight:500;letter-spacing:0}
+      .codex-plus-model-group-header .codex-plus-model-group-default{position:absolute;top:42px;left:50%;transform:translateX(-50%);background:var(--color-token-bg-primary,#292929)}
+      .codex-plus-model-group-toolbar{display:flex;align-items:center;gap:6px;min-width:0;box-sizing:border-box;padding:4px 4px 8px;margin-bottom:4px;border-bottom:1px solid color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 10%,transparent)}
+      .codex-plus-model-group-toolbar-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600}
+      .codex-plus-model-group-toolbar-button{display:grid;place-items:center;flex:none;width:28px;height:28px;border:0;border-radius:6px;background:none;padding:0;color:var(--color-token-text-secondary,rgba(205,205,215,.8));font:inherit;font-size:20px;line-height:1;cursor:pointer;appearance:none}
       .codex-plus-model-group-toolbar-button:hover{background:var(--color-token-bg-secondary,rgba(255,255,255,.04));color:var(--color-token-text-primary,#dfdfdf)}
-      /* 折叠：只隐藏行，不移动行，React 的 child 对账不受影响。 */
+      .codex-plus-model-group-toolbar-button:focus-visible{outline:1px solid currentColor;outline-offset:1px}
+      .codex-plus-model-provider-grid[hidden],.codex-plus-model-group-toolbar[hidden],[data-codex-plus-model-provider-view="models"] .codex-plus-model-provider-overview-only{display:none!important}
+      /* 只隐藏行，不移动行，React 的 child 对账不受影响。 */
       [role="menuitemradio"].codex-plus-model-group-collapsed{display:none!important}
       .${codexPlusModelPickerNativeLabelClass}{display:none!important}
       .${codexPlusModelPickerOwnLabelClass}{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .${codexPlusModelPickerFavoriteClass}{flex:none;margin-left:6px;color:#f5b94a;font-size:12px;line-height:1}
+      [data-codex-plus-model-heading]{position:relative;padding-inline-end:40px!important}
+      [data-codex-plus-model-view-mode="list"] [data-codex-plus-model-heading]{padding-inline-end:100px!important}
+      .codex-plus-model-view-controls{position:absolute;inset-inline-end:4px;top:50%;transform:translateY(-50%);display:flex;align-items:center;gap:2px}
+      .codex-plus-model-view-button{display:grid;place-items:center;flex:none;width:28px;height:28px;box-sizing:border-box;border:0;border-radius:5px;background:none;padding:0;color:var(--color-token-text-secondary,#aaa);cursor:pointer;appearance:none}
+      .codex-plus-model-view-button:hover{background:var(--color-token-bg-secondary,rgba(255,255,255,.04));color:var(--color-token-text-primary,#dfdfdf)}
+      .codex-plus-model-view-button:focus-visible{outline:1px solid currentColor;outline-offset:1px}
+      .codex-plus-model-group-toolbar:has(>.codex-plus-model-view-controls){position:relative;padding-inline-end:40px}
+      [data-codex-plus-model-ordering="true"]{display:flex!important;flex-direction:column!important}
+      [data-codex-plus-model-ordering="true"]>[data-codex-plus-model-order]{order:var(--codex-plus-model-order)!important;flex-shrink:0}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-group-header{flex-direction:row;align-items:center;justify-content:flex-start;gap:6px;padding:8px;border:0;border-radius:4px;font-size:12px;line-height:18px;text-align:start}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-provider-icon{display:none}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-group-header::after{display:none}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-group-title{order:1;flex:0 1 auto}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-group-header[data-current="true"]::after{display:block;position:static;order:2;flex:none;width:6px;height:6px;border:0;background:var(--color-token-text-primary,#dfdfdf)}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-group-header .codex-plus-model-group-default{position:static;order:3;margin-inline-start:auto;transform:none;background:none}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-group-count{order:4}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-group-header:not(:has(.codex-plus-model-group-default)) .codex-plus-model-group-count{margin-inline-start:auto}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-group-item{padding-inline-start:28px!important}
+      .codex-plus-model-group-chevron{display:grid;place-items:center;flex:none;width:14px;height:16px;color:var(--color-token-text-secondary,#aaa)}
+      .codex-plus-model-group-header[aria-expanded="true"] .codex-plus-model-group-chevron{transform:rotate(90deg)}
+      [data-codex-plus-model-default-content]{display:flex!important;flex-direction:row!important;align-items:center!important;gap:8px;width:100%;min-width:0}
+      [data-codex-plus-model-default-note]{display:none!important}
+      .codex-plus-model-default-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:end;color:var(--color-token-text-secondary,#aaa);font-size:12px}
     `;
-    document.head?.appendChild(style);
+    if (!style.isConnected) document.head?.appendChild(style);
   }
 
   function codexPlusModelPickerNeedsRescan(records) {
+    if (records.some((record) => record.type === "attributes"
+      && ["aria-checked", "data-state", "data-model-selected"].includes(record.attributeName)
+      && record.target.matches?.('[role="menuitemradio"]'))) return true;
     const changed = records.some((record) => {
+      if (record.type === "attributes") return true;
       const nodes = [...record.addedNodes, ...record.removedNodes];
       return nodes.some((node) => node.nodeType === 1 && !node.closest?.(`[data-codex-plus-ext="${codexPlusModelPickerGroupsExtMark}"]`));
     });
@@ -992,8 +1414,9 @@
     const groups = codexPlusModelPickerUniqueGroupIds(
       codexPlusModelPickerGroups(rows, codexPlusModelPickerDefaultProviderName()),
     );
-    if (groups.length < 2) return codexPlusModelPickerGroupsState.patchedLists.has(list);
-    return codexPlusModelPickerFingerprint(groups) !== codexPlusModelPickerGroupsState.signature;
+    if (!groups.length) return codexPlusModelPickerGroupsState.patchedLists.has(list);
+    return `${codexPlusModelPickerGroupsState.viewMode}:${codexPlusModelPickerFingerprint(groups)}` !== codexPlusModelPickerGroupsState.signature
+      || !codexPlusModelPickerHeadersIntact(list, groups);
   }
 
   function codexPlusModelPickerScheduleRescan() {
@@ -1007,37 +1430,112 @@
   function codexPlusModelPickerObserveList(list) {
     const state = codexPlusModelPickerGroupsState;
     if (state.activeList === list) return;
+    if (state.activeList) {
+      codexPlusModelPickerClear(state.activeList);
+      state.collapsed?.clear();
+    }
+    state.activeGroupId = "";
     state.activeList = list;
     state.observer?.disconnect();
     state.observer = new MutationObserver((records) => {
       if (!codexPlusModelPickerNeedsRescan(records)) return;
       codexPlusModelPickerScheduleRescan();
     });
-    state.observer.observe(list, { childList: true, subtree: true });
+    state.observer.observe(list, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ["aria-checked", "data-state", "data-model-selected"],
+    });
   }
 
   /**
    * 一次扫描：菜单开着就确保分组已打好；关了就清理并停止轮询。
    *
    * 为什么还要轮询：React 复用行节点时不会产生 childList 变更，只靠 MutationObserver
-   * 会漏掉"标签变了"这种情况。600ms 一次、且只在菜单开着时跑，开销可以忽略。
+   * 会漏掉"标签变了"这种情况。250ms 一次、且只在菜单开着时跑。
    */
+  /**
+   * 模型菜单开着却认不出来时（#2753：旧版 Codex 上分组不出现），记一次结构快照，
+   * 好据此补上旧版的识别规则。只在页面上真有一个装着目录里模型的原生单选菜单时记，
+   * 每个页面最多一次；只记标记数量和结构特征，不记模型名等文本。
+   */
+  function codexPlusModelPickerReportUnrecognized() {
+    const state = codexPlusModelPickerGroupsState;
+    if (state.unrecognizedReported) return;
+    // #2883：诊断也节流到每 2 秒最多一次——菜单关着时每 250ms 的扫描轮
+    // 都会走到这里，对每个 [role=menu] 读布局是白做工。
+    const now = Date.now();
+    if (state.lastUnrecognizedProbe && now - state.lastUnrecognizedProbe < 2000) return;
+    state.lastUnrecognizedProbe = now;
+    let exact = null;
+    for (const menu of document.querySelectorAll('[role="menu"]')) {
+      // 先过廉价的 DOM 过滤，通过了才碰 visibleElement 的强制布局。
+      if (menu.closest("[data-codex-plus-ext]")) continue;
+      const radios = [...menu.querySelectorAll('[role="menuitemradio"]')];
+      if (radios.length < 2 || !visibleElement(menu)) continue;
+      // 先过廉价的 DOM 条件，真有候选菜单时才建目录映射。
+      exact ||= codexPlusModelPickerCatalogExactMap();
+      if (!exact.size) return;
+      const known = radios.filter((row) => {
+        const text = (row.textContent || "").replace(/\s+/g, " ").trim();
+        return exact.has(`raw\u0000${text}`) || exact.has(codexPlusModelPickerNormalizeLoose(text));
+      }).length;
+      if (!known) continue;
+      state.unrecognizedReported = true;
+      const count = (selector) => {
+        try { return menu.querySelectorAll(selector).length; } catch (_) { return -1; }
+      };
+      const modulePrefixes = new Set();
+      for (const node of [menu, ...menu.querySelectorAll("[class]")].slice(0, 400)) {
+        for (const token of String(node.getAttribute("class") || "").split(/\s+/)) {
+          const match = /^_([A-Za-z]+)_/.exec(token);
+          if (match) modulePrefixes.add(match[1]);
+        }
+      }
+      const dataAttributes = (node) => (node ? [...node.attributes].map((item) => item.name).filter((name) => name.startsWith("data-")) : []);
+      try {
+        Promise.resolve(sendCodexPlusDiagnostic("model_picker_groups_menu_unrecognized", {
+          radios: radios.length,
+          catalogMatches: known,
+          pickerView: document.querySelectorAll("[data-model-picker-view]").length,
+          modelList: count('[class*="_ModelList_"], [class^="ModelList-"], [class*=" ModelList-"]'),
+          rowContent: count("[data-menu-row-content]"),
+          flex1: count("span.flex-1, span[class*='flex-1']"),
+          menuData: dataAttributes(menu),
+          rowData: dataAttributes(radios[0]),
+          modulePrefixes: [...modulePrefixes].slice(0, 16),
+        })).catch(() => {});
+      } catch (_) {
+        // 诊断失败不能影响原生菜单。
+      }
+      return;
+    }
+  }
+
   function codexPlusModelPickerScan() {
     const state = codexPlusModelPickerGroupsState;
     if (state.disposed) return;
+    if (globalThis.__codexPlusBuiltinInactive?.has("model-picker-groups")) {
+      if (state.activeList) codexPlusModelPickerClear(state.activeList);
+      document.querySelectorAll("[data-codex-plus-model-groups]").forEach((list) => codexPlusModelPickerClear(list));
+      state.activeList = null;
+      state.observer?.disconnect();
+      state.observer = null;
+      return;
+    }
     const menu = codexPlusModelPickerMenu();
-    const list = codexPlusModelPickerList(menu);
+    const list = menu ? codexPlusModelPickerList(menu) : null;
     if (!list) {
+      codexPlusModelPickerReportUnrecognized();
       if (state.activeList) {
         codexPlusModelPickerClear(state.activeList);
         state.activeList = null;
         state.observer?.disconnect();
         state.observer = null;
-        state.autoCollapsed = false;
       }
       return;
     }
     codexPlusModelPickerEnsureCatalog();
+    if (!document.getElementById(codexPlusModelPickerGroupsStyleId)) codexPlusModelPickerInstallStyle();
     codexPlusModelPickerObserveList(list);
     // 列表被隐藏（用户在推理强度子面板里）时不动结构，只让轮询继续跑；
     // 回到列表立即是分组后的样子。
@@ -1051,14 +1549,20 @@
     clearTimeout(state.timer);
     state.timer = setTimeout(() => {
       codexPlusModelPickerScan();
-      codexPlusModelPickerSchedule(codexPlusModelPickerWatchIntervalMs);
+      // 内置拓展「模型分组」停用 / 被顶替时，扫描清理完就停下轮询；装回来时由它重新开始。
+      if (!globalThis?.__codexPlusBuiltinInactive?.has("model-picker-groups")) codexPlusModelPickerSchedule(codexPlusModelPickerWatchIntervalMs);
     }, delay);
   }
 
   codexPlusModelPickerInstallStyle();
-  codexPlusModelPickerSchedule(300);
+  // 轮询由内置拓展「模型分组」装上时启动（96-builtin-extensions.js），这里不再自启。
   window.__codexPlusModelPickerGroupsRuntime = {
-    version: 1,
+    version: 3,
+    domState: () => codexPlusModelPickerDomState,
+    viewState: () => ({
+      mode: codexPlusModelPickerGroupsState.viewMode,
+      collapsed: [...codexPlusModelPickerGroupsState.collapsed],
+    }),
     sync: () => codexPlusModelPickerSchedule(0),
     scan: () => codexPlusModelPickerScan(),
     /** 测试与调试用：不打开菜单也能验证分组解析。 */
@@ -1067,9 +1571,8 @@
     state: () => ({
       signature: codexPlusModelPickerGroupsState.signature,
       hasActiveList: !!codexPlusModelPickerGroupsState.activeList,
-      autoCollapsed: codexPlusModelPickerGroupsState.autoCollapsed,
-      collapsed: [...codexPlusModelPickerGroupsState.collapsed],
-      touched: [...codexPlusModelPickerGroupsState.touched],
+      activeGroupId: codexPlusModelPickerGroupsState.activeGroupId,
+      viewMode: codexPlusModelPickerGroupsState.viewMode,
       disposed: codexPlusModelPickerGroupsState.disposed,
     }),
     /** 测试与调试用：默认身份解析结果（徽标取决于它）。 */
@@ -1108,6 +1611,8 @@
       clearTimeout(state.timer);
       clearTimeout(state.rescanTimer);
       state.observer?.disconnect();
+      state.activeList?.removeEventListener("keydown", codexPlusModelPickerNavigationKeydown, true);
+      window.removeEventListener("keydown", codexPlusModelPickerEscapeKeydown, true);
       state.observer = null;
       state.activeList = null;
       state.timer = 0;
@@ -1118,7 +1623,9 @@
     releaseDom() {
       const state = codexPlusModelPickerGroupsState;
       if (state.activeList) codexPlusModelPickerClear(state.activeList);
+      document.querySelectorAll("[data-codex-plus-model-groups]").forEach((list) => codexPlusModelPickerClear(list));
       state.activeList = null;
       document.getElementById(codexPlusModelPickerGroupsStyleId)?.remove();
     },
   };
+  if (globalThis.__codexPlusBuiltinInactive?.has("model-picker-groups")) codexPlusModelPickerScan();

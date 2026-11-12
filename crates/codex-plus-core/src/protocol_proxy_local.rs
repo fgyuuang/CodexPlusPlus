@@ -1521,6 +1521,7 @@ pub struct ResponsesSseTerminalTracker {
     terminal: bool,
     failed: bool,
     pub quota_reset: Option<i64>,
+    pub usage: Option<crate::request_log::RequestUsage>,
 }
 
 impl ResponsesSseTerminalTracker {
@@ -1577,12 +1578,17 @@ impl ResponsesSseTerminalTracker {
                 data_parts.push(data);
             }
         }
+        let data = data_parts.join("\n");
+        if let Ok(value) = serde_json::from_str::<Value>(&data)
+            && let Some(usage) = crate::request_log::usage_from_response_json(&value)
+        {
+            self.usage = Some(usage);
+        }
         if event_name.is_some_and(is_terminal_responses_event) {
             self.terminal = true;
             self.failed = event_name != Some("response.completed");
             return;
         }
-        let data = data_parts.join("\n");
         if data.trim() == "[DONE]" {
             self.terminal = true;
             return;
@@ -2356,6 +2362,7 @@ async fn open_selected_vendor_compaction(
             session_id: session_headers.session_id,
             thread_id: session_headers.thread_id,
             opencode_session: session_headers.opencode_session,
+            client_identity: &[],
         },
         None,
         Some(super::ForcedRelay {
@@ -2521,7 +2528,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
             Some(descriptor)
         }
     };
-    let model_route = if let Some(descriptor) = route_descriptor.as_ref() {
+    let review_route =
+        crate::aggregate_catalog::resolve_auto_review_member(&settings, &source_model)?;
+    let model_route = if let Some(review) = review_route {
+        anyhow::ensure!(
+            !crate::official_login::member_uses_official_login_transport(&review.relay),
+            "聚合审批成员必须使用独立 API 来源"
+        );
+        Some(ModelRouteSelection {
+            relay: review.relay,
+            source_relay_id: review.relay_id,
+            source_model: source_model.clone(),
+            upstream_model: review.upstream_model,
+        })
+    } else if let Some(descriptor) = route_descriptor.as_ref() {
         if descriptor.source_kind == crate::settings::OfficialExperienceSourceKind::Aggregate
             || descriptor.source_kind
                 == crate::settings::OfficialExperienceSourceKind::DirectOfficial
@@ -2570,7 +2590,15 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
             .await;
         }
         let auth = resolve_stored_official_account_auth(&descriptor.source_id).await?;
-        let response = open_official_chatgpt_responses_request(
+        let account_name = crate::official_accounts::OfficialAccountStore::default()
+            .get(&descriptor.source_id)?
+            .name;
+        crate::request_log::report_current_source(
+            &descriptor.source_id,
+            &account_name,
+            &descriptor.upstream_model,
+        );
+        let mut response = open_official_chatgpt_responses_request(
             &settings,
             request_json,
             is_stream,
@@ -2580,6 +2608,14 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
             session_headers,
         )
         .await?;
+        response.request_trace = Some(crate::request_log::RequestTrace {
+            relay_id: descriptor.source_id.clone(),
+            relay_name: account_name,
+            upstream_model: descriptor.upstream_model.clone(),
+            wire_api: "Responses".to_string(),
+            attempts: 1,
+            ..Default::default()
+        });
         // 已验证凭据身份且收到响应头；此事件不表示流已成功完成。
         let audit_uuid = |value: Option<&str>| {
             value.and_then(|id| {
@@ -2681,8 +2717,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
             validate_upstream(&relay)?;
             let channel_key = crate::channel_protection::key_for_relay(&relay);
             let channel_permit = crate::channel_protection::acquire(&channel_key, &relay).await;
-            let model_override =
-                aggregate_upstream_model_override(&settings, &relay, requested_model);
+            let model_override = model_route
+                .as_ref()
+                .map(|route| route.upstream_model.clone())
+                .or_else(|| aggregate_upstream_model_override(&settings, &relay, requested_model))
+                .or_else(|| {
+                    super::auto_review_model_rewrite(&relay, &source_model).map(str::to_string)
+                });
             if is_responses_compact_proxy_path(request_path)
                 || request_has_compaction_trigger(&request_json)
                 || super::input_has_native_compaction(&request_json)
@@ -2987,7 +3028,19 @@ async fn open_responses_proxy_request_with_settings_and_user_agent_and_official_
                     response: upstream,
                     scheduled_account_id: None,
                     native_compaction_passthrough: false,
-                    request_trace: None,
+                    request_trace: Some(crate::request_log::RequestTrace {
+                        relay_id: relay.id.clone(),
+                        relay_name: relay.name.clone(),
+                        upstream_model: upstream_body
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        upstream_model_bound: model_override.is_some(),
+                        wire_api: format!("{wire_api:?}"),
+                        attempts: (attempt + 1) as u32,
+                        ..Default::default()
+                    }),
                     exec_adapted: false,
                     exec_outcome: None,
                     _channel_permit: Some(channel_permit),
@@ -3113,6 +3166,22 @@ mod direct_official_auth_tests {
     use super::*;
     use base64::Engine;
 
+    #[test]
+    fn protected_official_usage_survives_every_sse_chunk_boundary() {
+        let bytes = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1200,\"output_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":1100}}}}\n\n";
+        for split in 0..=bytes.len() {
+            let mut tracker = ResponsesSseTerminalTracker::default();
+            tracker.observe(&bytes[..split]);
+            tracker.observe(&bytes[split..]);
+            tracker.finish();
+            assert!(tracker.is_terminal() && !tracker.has_failed());
+            let usage = tracker.usage.unwrap();
+            assert_eq!(usage.input_tokens, 1200);
+            assert_eq!(usage.output_tokens, 100);
+            assert_eq!(usage.cached_tokens, 1100);
+        }
+    }
+
     fn jwt(value: Value) -> String {
         let encoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         format!(
@@ -3194,9 +3263,14 @@ mod direct_official_auth_tests {
         settings.active_official_account_id = first.id.clone();
         settings.official_experience.primary_official_account_id = first.id.clone();
         std::fs::write(&catalog_path, serde_json::to_vec(&json!({"version":1,"accounts":{
-            &first.id:{"accountId":first.id,"fetchedAt":1,"clientVersion":"test","models":[{"slug":"gpt-6.1-sol","visibility":"list"}]},
-            &second.id:{"accountId":second.id,"fetchedAt":1,"clientVersion":"test","models":[{"slug":"gpt-6.1-sol","visibility":"list"}]}
+            &first.id:{"accountId":first.id,"fetchedAt":1,"source":"account_snapshot","clientVersion":"0.166.0","models":[{"slug":"gpt-6.1-sol","visibility":"list"}]},
+            &second.id:{"accountId":second.id,"fetchedAt":1,"source":"account_snapshot","clientVersion":"0.166.0","models":[{"slug":"gpt-6.1-sol","visibility":"list"}]}
         }})).unwrap()).unwrap();
+        std::fs::write(
+            temp.path().join("models_cache.json"),
+            json!({"client_version":"0.157.1"}).to_string(),
+        )
+        .unwrap();
         let thread = "01a11443-b035-7e73-bb3e-be5e9ecd30a7";
         let session = "01a11ace-65f5-7913-a794-56db911459f9";
         let headers = ProxySessionHeaders {
@@ -3398,6 +3472,11 @@ mod direct_official_auth_tests {
                 assert_eq!(dispatch["detail"]["upstreamModel"], "gpt-6.1-sol");
                 assert!(!events.contains(expected_token));
                 assert!(request.contains("\"model\":\"gpt-6.1-sol\""));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("\r\nversion: 0.166.0\r\n")
+                );
             } else {
                 assert!(request.contains("\"model\":\"gpt-image-2\""));
                 let events = std::fs::read_to_string(&log_path).unwrap();
@@ -3795,6 +3874,7 @@ async fn open_scheduled_official_request(
             }
         }
         let auth = resolve_stored_official_account_auth(&account.id).await?;
+        crate::request_log::report_current_source(&account.id, &account.name, model);
         let mut response = open_official_chatgpt_responses_request(
             settings,
             request_json.clone(),
@@ -3806,6 +3886,14 @@ async fn open_scheduled_official_request(
         )
         .await?;
         let now = chrono::Utc::now().timestamp();
+        response.request_trace = Some(crate::request_log::RequestTrace {
+            relay_id: account.id.clone(),
+            relay_name: account.name.clone(),
+            upstream_model: model.to_string(),
+            wire_api: "Responses".to_string(),
+            attempts: attempted.len() as u32,
+            ..Default::default()
+        });
         // 非流式拒绝和首段 SSE 额度错误可以安全重试；首段以外的输出不缓冲、不重放。
         if response.status_code == 429 || (response.is_success() && response.is_stream) {
             let limit = if response.status_code == 429 {
@@ -3886,6 +3974,9 @@ async fn open_official_chatgpt_responses_request(
         .official_login_relay_profile()
         .map(|profile| profile.user_agent.as_str())
         .unwrap_or("");
+    let client_version = crate::gateway::chatgpt_backend::codex_version(
+        &crate::codex_home::default_codex_home_dir(),
+    );
     let client = crate::http_client::proxied_client(&effective_user_agent(
         configured_user_agent,
         original_user_agent,
@@ -3895,6 +3986,7 @@ async fn open_official_chatgpt_responses_request(
         .bearer_auth(&auth.access_token)
         .header("ChatGPT-Account-Id", &auth.account_id)
         .header("originator", "codex_cli_rs")
+        .header("version", &client_version)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
     builder = session_headers.apply(builder, None);
     if is_stream {

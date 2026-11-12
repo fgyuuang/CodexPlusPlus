@@ -136,50 +136,402 @@ fn parse_tools_index(param: &str) -> Option<usize> {
         .flatten()
 }
 
-pub(crate) fn adapt_request(mut request: Value) -> Result<Value> {
-    let Some(tools) = request.get("tools").and_then(Value::as_array).cloned() else {
-        return Ok(request);
-    };
-    let exec_indexes = tools
-        .iter()
-        .enumerate()
-        .filter_map(|(index, tool)| is_custom_exec_tool(tool).then_some(index))
-        .collect::<Vec<_>>();
-    if exec_indexes.is_empty() {
-        return Ok(request);
-    }
-    ensure!(
-        exec_indexes.len() == 1,
-        "ambiguous custom exec declarations"
-    );
-    ensure!(
-        !tools
-            .iter()
-            .any(|tool| is_named_function_tool(tool, EXEC_TOOL_NAME)),
-        "custom exec conflicts with a function named exec"
-    );
-    let exec_index = exec_indexes[0];
-    let mut translated_tools = tools;
-    translated_tools[exec_index] = function_exec_tool(&translated_tools[exec_index]);
-    request["tools"] = Value::Array(translated_tools);
+/// 一次请求里做过的工具改写，响应按它还原。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolAdaptation {
+    /// 转成 function 的 custom 工具名。
+    pub(crate) custom: BTreeSet<String>,
+    /// 展开到顶层的 namespace 子工具：扁平名 → (namespace, 子工具名)。
+    pub(crate) namespaced: BTreeMap<String, (String, String)>,
+    /// 客户端执行的 tool_search 以名为 `tool_search` 的 function 发出，调用要还原成 tool_search_call。
+    pub(crate) tool_search: bool,
+}
 
-    if let Some(tool_choice) = request.get_mut("tool_choice") {
-        if is_custom_exec_tool_choice(tool_choice) {
-            *tool_choice = json!({"type": "function", "name": EXEC_TOOL_NAME});
-        } else if tool_choice_references_exec(tool_choice) {
-            bail!("unsupported tool_choice shape references exec");
+impl ToolAdaptation {
+    /// 兼容重试只把 custom `exec` 转成 function。
+    pub(crate) fn exec() -> Self {
+        Self {
+            custom: BTreeSet::from([EXEC_TOOL_NAME.to_string()]),
+            ..Self::default()
         }
     }
-    adapt_request_history(&mut request)?;
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.custom.is_empty() && self.namespaced.is_empty() && !self.tool_search
+    }
+}
+
+/// Codex 把自己的内置函数放在这个 namespace 里，客户端当作没有 namespace 处理，展开时不加前缀。
+pub(crate) const LITE_NAMESPACE: &str = "functions";
+pub(crate) const TOOL_SEARCH_NAME: &str = "tool_search";
+/// 函数名长度上限（多数上游按 64 字符校验）。
+const MAX_TOOL_NAME_LEN: usize = 64;
+
+/// namespace 子工具展开后的名字：`namespace__name`，超长时截断并缀上整体哈希保证唯一。
+pub(crate) fn flat_tool_name(namespace: &str, name: &str) -> String {
+    if namespace == LITE_NAMESPACE {
+        return name.to_owned();
+    }
+    let flat = crate::protocol_proxy::flatten_namespace_tool_name(namespace, name);
+    if flat.len() <= MAX_TOOL_NAME_LEN {
+        return flat;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{namespace}\0{name}").as_bytes());
+    let mut cut = MAX_TOOL_NAME_LEN - 9;
+    while !flat.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let hash = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{}_{hash}", &flat[..cut])
+}
+
+/// 只认 function 等内置工具类型的上游（xAI）：custom 工具转 function，
+/// namespace（MCP 工具分组）展开成顶层 function，历史里带 namespace 的调用也按扁平名还原。
+pub(crate) fn tool_adaptation_without_custom_types(request: &Value) -> ToolAdaptation {
+    let custom = custom_tool_names(request);
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // 与顶层工具重名的子工具不展开：响应里分不清调的是哪个。
+    let taken = |flat: &str| {
+        custom.contains(flat)
+            || tools.iter().any(|tool| {
+                tool.get("type").and_then(Value::as_str) != Some("namespace")
+                    && tool.get("name").and_then(Value::as_str) == Some(flat)
+            })
+    };
+    let mut namespaced = BTreeMap::new();
+    let mut add = |namespace: &str, name: &str| {
+        if namespace.is_empty() || namespace == LITE_NAMESPACE || name.is_empty() {
+            return;
+        }
+        let flat = flat_tool_name(namespace, name);
+        if !taken(&flat) {
+            namespaced
+                .entry(flat)
+                .or_insert_with(|| (namespace.to_owned(), name.to_owned()));
+        }
+    };
+    for tool in tools {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let namespace = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+        for child in namespace_function_children(tool) {
+            add(
+                namespace,
+                child
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    for item in request
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+    {
+        if let Some(namespace) = item.get("namespace").and_then(Value::as_str) {
+            add(
+                namespace,
+                item.get("name").and_then(Value::as_str).unwrap_or_default(),
+            );
+        }
+    }
+    ToolAdaptation {
+        custom,
+        namespaced,
+        tool_search: false,
+    }
+}
+
+fn namespace_function_children(tool: &Value) -> impl Iterator<Item = &Value> {
+    tool.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|child| {
+            child.get("type").and_then(Value::as_str) == Some("function")
+                && child
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.is_empty())
+        })
+}
+
+/// 请求里出现的全部 custom 工具名（声明 + 历史调用），给完全不认 custom 类型的上游用。
+/// 与 function 工具同名的跳过：响应里同名的 function_call 分不清该还原成哪种。
+fn custom_tool_names(request: &Value) -> BTreeSet<String> {
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let declared = tools
+        .iter()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("custom"));
+    let history = request
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("custom_tool_call"));
+    declared
+        .chain(history)
+        .filter_map(|value| value.get("name").and_then(Value::as_str))
+        .filter(|name| !name.is_empty())
+        .filter(|name| !tools.iter().any(|tool| is_named_function_tool(tool, name)))
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn adapt_request(request: Value) -> Result<Value> {
+    let declares_exec = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(is_custom_exec_tool));
+    if !declares_exec {
+        return Ok(request);
+    }
+    adapt_request_for(request, &ToolAdaptation::exec())
+}
+
+/// 按 `adaptation` 改写工具声明、tool_choice 和历史调用。
+pub(crate) fn adapt_request_for(request: Value, adaptation: &ToolAdaptation) -> Result<Value> {
+    let mut request = adapt_custom_request(request, &adaptation.custom)?;
+    flatten_namespace_request(&mut request, &adaptation.namespaced);
     Ok(request)
 }
 
-fn function_exec_tool(tool: &Value) -> Value {
+/// namespace 声明展开成顶层 function，tool_choice 与历史里带 namespace 的调用改用扁平名。
+/// 没有 namespace 的请求原样不动。
+fn flatten_namespace_request(request: &mut Value, namespaced: &BTreeMap<String, (String, String)>) {
+    if let Some(tools) = request.get("tools").and_then(Value::as_array).cloned()
+        && tools
+            .iter()
+            .any(|tool| tool.get("type").and_then(Value::as_str) == Some("namespace"))
+    {
+        let mut translated: Vec<Value> = Vec::with_capacity(tools.len());
+        let top_level = tools
+            .iter()
+            .filter(|tool| tool.get("type").and_then(Value::as_str) != Some("namespace"))
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        for tool in tools {
+            if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+                translated.push(tool);
+                continue;
+            }
+            let namespace = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+            let namespace_description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            for child in namespace_function_children(&tool) {
+                let name = child
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let flat = flat_tool_name(namespace, name);
+                // `functions` 里的内置函数按原名上；其余只展开登记过的（未与顶层工具重名）。
+                let offered = if namespace == LITE_NAMESPACE {
+                    !top_level.contains(&flat)
+                } else {
+                    namespaced.get(&flat) == Some(&(namespace.to_owned(), name.to_owned()))
+                };
+                if !offered
+                    || translated
+                        .iter()
+                        .any(|tool| tool.get("name").and_then(Value::as_str) == Some(flat.as_str()))
+                {
+                    continue;
+                }
+                let mut function = child.clone();
+                function["name"] = json!(flat);
+                let description = crate::protocol_proxy::combine_namespace_description(
+                    namespace_description,
+                    child
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                );
+                if let Some(object) = function.as_object_mut() {
+                    object.remove("defer_loading");
+                    if description.is_empty() {
+                        object.remove("description");
+                    } else {
+                        object.insert("description".to_string(), json!(description));
+                    }
+                }
+                translated.push(function);
+            }
+        }
+        request["tools"] = Value::Array(translated);
+    }
+    if let Some(choice) = request.get_mut("tool_choice") {
+        flatten_namespaced_call(choice);
+    }
+    if let Some(Value::Array(items)) = request.get_mut("input") {
+        for item in items
+            .iter_mut()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        {
+            flatten_namespaced_call(item);
+        }
+    }
+}
+
+/// `{name, namespace}` → `{name: 扁平名}`；没有 namespace 的原样不动。
+fn flatten_namespaced_call(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let Some(namespace) = object
+        .get("namespace")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !namespace.is_empty() && !name.is_empty() {
+        let flat = flat_tool_name(&namespace, name);
+        object.insert("name".to_string(), json!(flat));
+    }
+    object.remove("namespace");
+}
+
+/// 把上游的调用还原成 Codex 认的形式：namespace 子工具回到 `name` + `namespace`，
+/// `tool_search` 函数回到客户端执行的 tool_search_call。
+pub(crate) fn restore_adapted_item(item: &mut Value, adaptation: &ToolAdaptation) {
+    if item.get("type").and_then(Value::as_str) != Some("function_call")
+        || item.get("namespace").is_some()
+    {
+        return;
+    }
+    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+    if adaptation.tool_search && name == TOOL_SEARCH_NAME {
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .map(tool_search_arguments)
+            .unwrap_or_else(|| json!({}));
+        let Some(object) = item.as_object_mut() else {
+            return;
+        };
+        object.remove("name");
+        object.insert("type".to_string(), json!("tool_search_call"));
+        object.insert("execution".to_string(), json!("client"));
+        object.insert("arguments".to_string(), arguments);
+        return;
+    }
+    let Some((namespace, name)) = adaptation.namespaced.get(name).cloned() else {
+        return;
+    };
+    item["name"] = json!(name);
+    item["namespace"] = json!(namespace);
+    // 客户端把不带这个列表的 namespace 调用当作参数加密过（如 spawn_agent 的 message），
+    // 上游从不加密参数，必须显式声明为空。
+    item["encrypted_function_args"] = json!([]);
+}
+
+/// tool_search_call 的参数是 JSON 对象；上游给的不是对象时按原文放进 `input`。
+fn tool_search_arguments(arguments: &str) -> Value {
+    let arguments = arguments.trim();
+    if arguments.is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value @ Value::Object(_)) => value,
+        _ => json!({ "input": arguments }),
+    }
+}
+
+/// SSE 事件里的 `item` 与终态 `response.output` 都要还原。
+pub(crate) fn restore_adapted_event(event: &mut Value, adaptation: &ToolAdaptation) {
+    if adaptation.namespaced.is_empty() && !adaptation.tool_search {
+        return;
+    }
+    if let Some(item) = event.get_mut("item") {
+        restore_adapted_item(item, adaptation);
+    }
+    if let Some(items) = event
+        .pointer_mut("/response/output")
+        .and_then(Value::as_array_mut)
+    {
+        for item in items {
+            restore_adapted_item(item, adaptation);
+        }
+    }
+}
+
+/// 把 `names` 里的 custom 工具声明、tool_choice 和历史调用都改写成 function 形式。
+fn adapt_custom_request(mut request: Value, names: &BTreeSet<String>) -> Result<Value> {
+    if names.is_empty() {
+        return Ok(request);
+    }
+    if let Some(tools) = request.get("tools").and_then(Value::as_array).cloned() {
+        let mut declared = BTreeSet::new();
+        let mut translated_tools = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+            if tool.get("type").and_then(Value::as_str) == Some("custom") && names.contains(name) {
+                ensure!(
+                    declared.insert(name.to_owned()),
+                    "ambiguous custom {name} declarations"
+                );
+                translated_tools.push(function_custom_tool(&tool));
+            } else {
+                ensure!(
+                    !(names.contains(name) && is_named_function_tool(&tool, name)),
+                    "custom {name} conflicts with a function of the same name"
+                );
+                translated_tools.push(tool);
+            }
+        }
+        request["tools"] = Value::Array(translated_tools);
+    }
+
+    if let Some(tool_choice) = request.get_mut("tool_choice") {
+        if let Some(name) =
+            custom_tool_choice_name(tool_choice).filter(|name| names.contains(*name))
+        {
+            *tool_choice = json!({"type": "function", "name": name});
+        } else if tool_choice_references_any(tool_choice, names) {
+            bail!("unsupported tool_choice shape references an adapted custom tool");
+        }
+    }
+    adapt_request_history(&mut request, names)?;
+    Ok(request)
+}
+
+fn function_custom_tool(tool: &Value) -> Value {
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
     let mut translated = Map::new();
     translated.insert("type".to_string(), json!("function"));
-    translated.insert("name".to_string(), json!(EXEC_TOOL_NAME));
-    if let Some(description) = tool.get("description") {
-        translated.insert("description".to_string(), description.clone());
+    translated.insert("name".to_string(), json!(name));
+    if name == EXEC_TOOL_NAME {
+        if let Some(description) = tool.get("description") {
+            translated.insert("description".to_string(), description.clone());
+        }
+    } else {
+        translated.insert(
+            "description".to_string(),
+            json!(freeform_tool_description(tool, name)),
+        );
     }
     translated.insert(
         "parameters".to_string(),
@@ -194,30 +546,57 @@ fn function_exec_tool(tool: &Value) -> Value {
     Value::Object(translated)
 }
 
-fn is_custom_exec_tool_choice(choice: &Value) -> bool {
-    let Some(object) = choice.as_object() else {
-        return false;
+/// 原工具是 freeform 文本输入，改成 function 后要告诉模型把原文整段放进 `input`，
+/// 有语法定义（如 apply_patch 的 lark 文法）就一并带上。
+fn freeform_tool_description(tool: &Value, name: &str) -> String {
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let mut text = if description.is_empty() {
+        format!("Custom tool `{name}`.")
+    } else {
+        description.to_owned()
     };
-    object.len() == 2
-        && choice.get("type").and_then(Value::as_str) == Some("custom")
-        && choice.get("name").and_then(Value::as_str) == Some(EXEC_TOOL_NAME)
+    text.push_str(
+        "\n\nThis tool takes raw text. Put the complete raw input in the `input` string \
+         argument exactly as the original tool expects; do not add any other fields.",
+    );
+    if let Some(format) = tool.get("format").filter(|format| !format.is_null()) {
+        text.push_str("\n\nThe `input` text must follow this format:\n```json\n");
+        text.push_str(&format.to_string());
+        text.push_str("\n```");
+    }
+    text
 }
 
-fn tool_choice_references_exec(choice: &Value) -> bool {
+fn custom_tool_choice_name(choice: &Value) -> Option<&str> {
+    let object = choice.as_object()?;
+    (object.len() == 2 && choice.get("type").and_then(Value::as_str) == Some("custom"))
+        .then(|| choice.get("name").and_then(Value::as_str))
+        .flatten()
+}
+
+fn tool_choice_references_any(choice: &Value, names: &BTreeSet<String>) -> bool {
     match choice {
         Value::Object(object) => {
             object
                 .get("name")
                 .and_then(Value::as_str)
-                .is_some_and(|name| name == EXEC_TOOL_NAME)
-                || object.values().any(tool_choice_references_exec)
+                .is_some_and(|name| names.contains(name))
+                || object
+                    .values()
+                    .any(|value| tool_choice_references_any(value, names))
         }
-        Value::Array(items) => items.iter().any(tool_choice_references_exec),
+        Value::Array(items) => items
+            .iter()
+            .any(|value| tool_choice_references_any(value, names)),
         _ => false,
     }
 }
 
-fn adapt_request_history(request: &mut Value) -> Result<()> {
+fn adapt_request_history(request: &mut Value, names: &BTreeSet<String>) -> Result<()> {
     let Some(Value::Array(items)) = request.get_mut("input") else {
         return Ok(());
     };
@@ -239,7 +618,10 @@ fn adapt_request_history(request: &mut Value) -> Result<()> {
                     "duplicate tool call_id"
                 );
                 if item.get("type").and_then(Value::as_str) == Some("custom_tool_call")
-                    && item.get("name").and_then(Value::as_str) == Some(EXEC_TOOL_NAME)
+                    && item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| names.contains(name))
                 {
                     ensure!(
                         exec_calls.insert(call_id.to_owned()),
@@ -264,7 +646,10 @@ fn adapt_request_history(request: &mut Value) -> Result<()> {
     for item in items.iter_mut() {
         match item.get("type").and_then(Value::as_str) {
             Some("custom_tool_call")
-                if item.get("name").and_then(Value::as_str) == Some(EXEC_TOOL_NAME) =>
+                if item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| names.contains(name)) =>
             {
                 let input = item
                     .get("input")
@@ -278,7 +663,6 @@ fn adapt_request_history(request: &mut Value) -> Result<()> {
                 );
                 translate_history_item_id(item, FUNCTION_CALL_PREFIX)?;
                 item["type"] = json!("function_call");
-                item["name"] = json!(EXEC_TOOL_NAME);
                 item["arguments"] = json!(serde_json::to_string(&json!({"input": input}))?);
                 item.as_object_mut()
                     .expect("history item remains object")
@@ -299,7 +683,30 @@ fn adapt_request_history(request: &mut Value) -> Result<()> {
     remap_item_references(items, &original_ids)
 }
 
-pub(crate) fn adapt_response(mut response: Value) -> Result<Value> {
+pub(crate) fn adapt_response(response: Value) -> Result<Value> {
+    adapt_response_for(response, &ToolAdaptation::exec())
+}
+
+/// 按 `adaptation` 把响应里的调用还原成 Codex 认的形式。
+pub(crate) fn adapt_response_for(response: Value, adaptation: &ToolAdaptation) -> Result<Value> {
+    let mut response = restore_custom_response(response, &adaptation.custom)?;
+    if let Some(items) = response.get_mut("output").and_then(Value::as_array_mut) {
+        for item in items {
+            restore_adapted_item(item, adaptation);
+        }
+    }
+    Ok(response)
+}
+
+/// 把 `names` 里工具的 function_call 还原成 Codex 认的 custom_tool_call。
+fn restore_custom_response(mut response: Value, names: &BTreeSet<String>) -> Result<Value> {
+    let adapted_name = |item: &Value, item_type: &str| {
+        item.get("type").and_then(Value::as_str) == Some(item_type)
+            && item
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| names.contains(name))
+    };
     let response_status = response
         .get("status")
         .and_then(Value::as_str)
@@ -308,18 +715,14 @@ pub(crate) fn adapt_response(mut response: Value) -> Result<Value> {
         return Ok(response);
     };
     ensure!(
-        !items.iter().any(|item| {
-            item.get("type").and_then(Value::as_str) == Some("custom_tool_call")
-                && item.get("name").and_then(Value::as_str) == Some(EXEC_TOOL_NAME)
-        }),
+        !items
+            .iter()
+            .any(|item| adapted_name(item, "custom_tool_call")),
         "adapted response contains unvalidated native exec input"
     );
     let matching_call_ids = items
         .iter()
-        .filter(|item| {
-            item.get("type").and_then(Value::as_str) == Some("function_call")
-                && item.get("name").and_then(Value::as_str) == Some(EXEC_TOOL_NAME)
-        })
+        .filter(|item| adapted_name(item, "function_call"))
         .map(|item| {
             item.get("call_id")
                 .and_then(Value::as_str)
@@ -379,9 +782,7 @@ pub(crate) fn adapt_response(mut response: Value) -> Result<Value> {
     }
     for item in items.iter_mut() {
         match item.get("type").and_then(Value::as_str) {
-            Some("function_call")
-                if item.get("name").and_then(Value::as_str) == Some(EXEC_TOOL_NAME) =>
-            {
+            Some("function_call") if adapted_name(item, "function_call") => {
                 let arguments = item
                     .get("arguments")
                     .and_then(Value::as_str)
@@ -390,7 +791,6 @@ pub(crate) fn adapt_response(mut response: Value) -> Result<Value> {
                 let id = translated_item_id(item, CUSTOM_CALL_PREFIX)?;
                 item["type"] = json!("custom_tool_call");
                 item["id"] = json!(id);
-                item["name"] = json!(EXEC_TOOL_NAME);
                 item["input"] = json!(input);
                 item.as_object_mut()
                     .expect("response item remains object")
@@ -554,6 +954,154 @@ fn translate_history_item_id(item: &mut Value, target_prefix: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_tools_are_flattened_and_restored() {
+        let request = json!({
+            "input": [
+                {"type": "function_call", "id": "fc_1", "call_id": "c1",
+                 "namespace": "mcp__fs", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+            ],
+            "tools": [
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                {"type": "function", "name": "mcp__x__y", "parameters": {"type": "object"}},
+                {"type": "namespace", "name": "mcp__fs", "description": "Filesystem", "tools": [
+                    {"type": "function", "name": "read", "description": "read file",
+                     "defer_loading": true, "parameters": {"type": "object"}}
+                ]},
+                {"type": "namespace", "name": "mcp__x", "tools": [
+                    {"type": "function", "name": "y", "parameters": {"type": "object"}}
+                ]}
+            ],
+            "tool_choice": {"type": "function", "namespace": "mcp__fs", "name": "read"}
+        });
+        let adaptation = tool_adaptation_without_custom_types(&request);
+        assert!(adaptation.custom.is_empty());
+        assert_eq!(
+            adaptation.namespaced,
+            BTreeMap::from([(
+                "mcp__fs__read".to_string(),
+                ("mcp__fs".to_string(), "read".to_string())
+            )]),
+            "与顶层 function 重名的子工具不展开"
+        );
+
+        let adapted = adapt_request_for(request, &adaptation).unwrap();
+        let tools = adapted["tools"].as_array().unwrap();
+        assert!(tools.iter().all(|tool| tool["type"] == "function"));
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["shell", "mcp__x__y", "mcp__fs__read"]
+        );
+        assert_eq!(tools[2]["description"], "Filesystem\n\nread file");
+        assert!(tools[2].get("defer_loading").is_none());
+        assert_eq!(
+            adapted["tool_choice"],
+            json!({"type": "function", "name": "mcp__fs__read"})
+        );
+        assert_eq!(adapted["input"][0]["name"], "mcp__fs__read");
+        assert!(adapted["input"][0].get("namespace").is_none());
+
+        let response = adapt_response_for(
+            json!({"status": "completed", "output": [
+                {"type": "function_call", "id": "fc_2", "call_id": "c2",
+                 "name": "mcp__fs__read", "arguments": "{}"},
+                {"type": "function_call", "id": "fc_3", "call_id": "c3",
+                 "name": "shell", "arguments": "{}"}
+            ]}),
+            &adaptation,
+        )
+        .unwrap();
+        assert_eq!(response["output"][0]["name"], "read");
+        assert_eq!(response["output"][0]["namespace"], "mcp__fs");
+        assert_eq!(response["output"][1]["name"], "shell");
+        assert!(response["output"][1].get("namespace").is_none());
+    }
+
+    #[test]
+    fn all_custom_tools_are_adapted_for_upstreams_without_custom_support() {
+        let request = json!({
+            "input": [
+                {"type": "message", "id": "msg_1", "role": "user", "content": "hi"},
+                {"type": "custom_tool_call", "id": "ctc_1", "call_id": "c1",
+                 "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"},
+                {"type": "custom_tool_call_output", "id": "ctco_1",
+                 "call_id": "c1", "output": "done"},
+                {"type": "custom_tool_call", "id": "ctc_2", "call_id": "c2",
+                 "name": "dup", "input": "x"},
+                {"type": "function_call_output", "call_id": "c2", "output": "x"}
+            ],
+            "tools": [
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                {"type": "function", "name": "dup", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "apply_patch", "description": "patch",
+                 "format": {"type": "grammar", "syntax": "lark", "definition": "start: begin_patch"}},
+                {"type": "custom", "name": "exec", "description": "run"}
+            ],
+            "tool_choice": "auto"
+        });
+        let adaptation = tool_adaptation_without_custom_types(&request);
+        assert!(adaptation.namespaced.is_empty());
+        let names = adaptation.custom.clone();
+        assert_eq!(
+            names,
+            BTreeSet::from(["apply_patch".to_string(), "exec".to_string()]),
+            "与 function 同名的不转，免得响应里分不清"
+        );
+
+        let adapted = adapt_request_for(request, &adaptation).unwrap();
+        let tools = adapted["tools"].as_array().unwrap();
+        assert!(tools.iter().all(|tool| tool["type"] == "function"));
+        let patch = tools
+            .iter()
+            .find(|tool| tool["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(patch["parameters"]["required"], json!(["input"]));
+        let description = patch["description"].as_str().unwrap();
+        assert!(description.starts_with("patch"));
+        assert!(
+            description.contains("start: begin_patch"),
+            "文法定义要带给模型"
+        );
+        assert_eq!(
+            tools.iter().find(|tool| tool["name"] == "exec").unwrap()["description"],
+            "run",
+            "exec 沿用兼容重试的原样描述"
+        );
+        assert_eq!(adapted["tool_choice"], "auto");
+
+        let input = adapted["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["id"], "fc_1");
+        assert_eq!(input[1]["name"], "apply_patch");
+        assert_eq!(
+            input[1]["arguments"],
+            serde_json::to_string(&json!({"input": "*** Begin Patch\n*** End Patch"})).unwrap()
+        );
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["id"], "fco_1");
+        assert_eq!(input[3]["type"], "custom_tool_call", "不在名单里的保持原样");
+
+        let response = adapt_response_for(
+            json!({"status": "completed", "output": [
+                {"type": "function_call", "id": "fc_9", "call_id": "c9",
+                 "name": "apply_patch", "arguments": "{\"input\":\"*** Begin Patch\"}"},
+                {"type": "function_call", "id": "fc_8", "call_id": "c8",
+                 "name": "shell", "arguments": "{}"}
+            ]}),
+            &adaptation,
+        )
+        .unwrap();
+        assert_eq!(response["output"][0]["type"], "custom_tool_call");
+        assert_eq!(response["output"][0]["id"], "ctc_9");
+        assert_eq!(response["output"][0]["name"], "apply_patch");
+        assert_eq!(response["output"][0]["input"], "*** Begin Patch");
+        assert_eq!(response["output"][1]["type"], "function_call");
+    }
 
     fn request() -> Value {
         json!({

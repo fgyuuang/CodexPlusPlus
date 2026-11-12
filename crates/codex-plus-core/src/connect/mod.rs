@@ -1,4 +1,10 @@
 pub mod app_server;
+pub mod controls;
+pub mod desktop_sync;
+mod inbox;
+pub mod media;
+pub mod outbound;
+pub mod projects;
 pub mod session_store;
 pub mod weixin;
 
@@ -14,7 +20,9 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use self::app_server::{AppServerConfig, AppServerTurnResult, CodexAppServer};
+use self::app_server::{
+    AppServerConfig, AppServerTurnResult, CodexAppServer, SessionControlChannel,
+};
 use self::session_store::{ConnectSessionStore, ConnectState, PairingRequest, ReplyOutbox};
 use self::weixin::{
     WeixinClient, WeixinLongPollErrorKind, WeixinMessage, classify_weixin_long_poll_error,
@@ -23,6 +31,10 @@ use self::weixin::{
 
 pub const DEFAULT_WEIXIN_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const MAX_INBOUND_MESSAGE_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+use self::inbox::Inbox;
+use self::media::{AttachmentKind, DownloadedAttachments};
+const FALLBACK_WORKSPACE_NOTICE: &str =
+    " 原项目目录不可用，当前为状态目录中的备用空目录，无法访问原项目文件。";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -36,11 +48,17 @@ pub struct WeixinConnectConfig {
     #[serde(default)]
     pub allow_from: String,
     #[serde(default)]
+    pub allow_outbound_attachments: bool,
+    #[serde(default)]
     pub route_tag: String,
     #[serde(default)]
     pub work_dir: String,
     #[serde(default)]
     pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub project_id: String,
     #[serde(default = "default_sandbox")]
     pub sandbox: String,
     #[serde(default)]
@@ -54,9 +72,12 @@ impl Default for WeixinConnectConfig {
             token: String::new(),
             account_id: String::new(),
             allow_from: String::new(),
+            allow_outbound_attachments: false,
             route_tag: String::new(),
             work_dir: String::new(),
             model: String::new(),
+            reasoning_effort: String::new(),
+            project_id: String::new(),
             sandbox: default_sandbox(),
             codex_path: String::new(),
         }
@@ -75,6 +96,8 @@ impl WeixinConnectConfig {
         self.route_tag = self.route_tag.trim().to_string();
         self.work_dir = self.work_dir.trim().to_string();
         self.model = self.model.trim().to_string();
+        self.reasoning_effort = self.reasoning_effort.trim().to_string();
+        self.project_id = self.project_id.trim().to_string();
         self.sandbox = normalize_sandbox(&self.sandbox);
         self.codex_path = self.codex_path.trim().to_string();
         self
@@ -169,23 +192,49 @@ pub fn notify_weixin_state_changed() {
 
 /// 只让新消息切换 CLI，不中断已经执行的回合。
 #[derive(Clone)]
-pub struct WeixinCodexPath(Arc<Mutex<String>>);
+pub struct WeixinCodexPath(Arc<Mutex<(String, Option<SessionDefaults>)>>);
+
+#[derive(Clone)]
+pub struct SessionDefaults {
+    pub model: String,
+    pub reasoning_effort: String,
+    pub project_id: String,
+    pub work_dir: String,
+    pub sandbox: String,
+}
 
 impl WeixinCodexPath {
     pub fn new(path: &str) -> Self {
-        Self(Arc::new(Mutex::new(path.trim().to_string())))
+        Self(Arc::new(Mutex::new((path.trim().to_string(), None))))
     }
 
     pub fn set(&self, path: &str) {
-        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = path.trim().to_string();
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).0 = path.trim().to_string();
+    }
+
+    pub fn set_defaults(&self, defaults: SessionDefaults) {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).1 = Some(defaults);
+    }
+
+    fn apply_defaults(&self, config: &mut WeixinConnectConfig) {
+        let saved = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(defaults) = &saved.1 {
+            config.model.clone_from(&defaults.model);
+            config
+                .reasoning_effort
+                .clone_from(&defaults.reasoning_effort);
+            config.project_id.clone_from(&defaults.project_id);
+            config.work_dir.clone_from(&defaults.work_dir);
+            config.sandbox = normalize_sandbox(&defaults.sandbox);
+        }
     }
 
     fn apply(&self, config: &mut AppServerConfig) -> bool {
         let path = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if config.executable == *path {
+        if config.executable == path.0 {
             return false;
         }
-        config.executable.clone_from(&path);
+        config.executable.clone_from(&path.0);
         true
     }
 
@@ -193,6 +242,7 @@ impl WeixinCodexPath {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .0
             .as_str()
             == path
     }
@@ -213,20 +263,28 @@ pub async fn run_weixin_connect_with_codex_path(
     status: SharedWeixinConnectStatus,
     codex_path: WeixinCodexPath,
 ) -> anyhow::Result<()> {
-    let config = config.normalized();
+    let outbound = outbound::OutboundPolicy::new(
+        config.allow_outbound_attachments,
+        &config.allow_from,
+        &config.work_dir,
+    );
+    run_weixin_connect_with_outbound(config, stop, status, codex_path, outbound).await
+}
+
+pub async fn run_weixin_connect_with_outbound(
+    config: WeixinConnectConfig,
+    stop: Arc<AtomicBool>,
+    status: SharedWeixinConnectStatus,
+    codex_path: WeixinCodexPath,
+    outbound: outbound::OutboundPolicy,
+) -> anyhow::Result<()> {
+    let mut config = config.normalized();
     if config.token.is_empty() {
         bail!("请先扫码登录微信");
     }
-    let work_dir = if config.work_dir.is_empty() {
-        std::env::current_dir().context("无法读取当前工作目录")?
-    } else {
-        PathBuf::from(&config.work_dir)
-    };
-    if !work_dir.is_dir() {
-        bail!("工作目录不存在：{}", work_dir.display());
-    }
+    let work_dir = connection_work_dir(&config, &crate::paths::default_app_state_dir())?;
 
-    update_status(&status, |current| {
+    update_status(&status, &config, |current| {
         current.state = "starting".to_string();
         current.weixin_state = "connecting".to_string();
         current.codex_state = "checking".to_string();
@@ -245,10 +303,11 @@ pub async fn run_weixin_connect_with_codex_path(
         executable: config.codex_path.clone(),
         work_dir,
         model: config.model.clone(),
+        reasoning_effort: config.reasoning_effort.clone(),
         sandbox: config.sandbox.clone(),
     };
     let server_pool = Arc::new(tokio::sync::Mutex::new(Vec::<CodexAppServer>::new()));
-    update_status(&status, |current| {
+    update_status(&status, &config, |current| {
         current.codex_state = "ready".to_string();
         current.message = "Codex 已就绪，正在连接微信...".to_string();
     });
@@ -265,12 +324,24 @@ pub async fn run_weixin_connect_with_codex_path(
                 state.expire_old_pending_messages(now_ms(), MAX_INBOUND_MESSAGE_AGE_MS);
                 state.claim_next(&active_peers)
             })?;
-            let Some((key, message, prior_thread, existing_outbox)) = next else {
+            let Some((key, message, _prior_thread, existing_outbox)) = next else {
                 break;
             };
             let peer = message.from_user_id.clone();
             active_peers.insert(peer.clone());
-            if codex_path.apply(&mut app_config) {
+            codex_path.apply_defaults(&mut config);
+            let next_dir = connection_work_dir(&config, &crate::paths::default_app_state_dir())?;
+            let defaults_changed = app_config.model != config.model
+                || app_config.reasoning_effort != config.reasoning_effort
+                || app_config.sandbox != config.sandbox
+                || app_config.work_dir != next_dir;
+            app_config.model.clone_from(&config.model);
+            app_config
+                .reasoning_effort
+                .clone_from(&config.reasoning_effort);
+            app_config.sandbox.clone_from(&config.sandbox);
+            app_config.work_dir = next_dir;
+            if codex_path.apply(&mut app_config) || defaults_changed {
                 let mut pooled = server_pool.lock().await;
                 for mut server in pooled.drain(..) {
                     server.close().await;
@@ -278,6 +349,8 @@ pub async fn run_weixin_connect_with_codex_path(
             }
             let client = client.clone();
             let app_config = app_config.clone();
+            let task_config = config.clone();
+            let task_outbound = outbound.clone();
             let server_pool = Arc::clone(&server_pool);
             let task_stop = Arc::clone(&stop);
             let task_store = store.clone();
@@ -290,25 +363,31 @@ pub async fn run_weixin_connect_with_codex_path(
                         .await
                 } else {
                     let server = server_pool.lock().await.pop();
-                    let mut server = match server {
+                    let mut server = Some(match server {
                         Some(server) => server,
                         None => match CodexAppServer::start(app_config.clone()).await {
                             Ok(server) => server,
                             Err(error) => return (key, peer, Err(error)),
                         },
-                    };
+                    });
                     let result = async {
-                        let Some(outbox) = create_weixin_reply_outbox(
+                        let mut state = task_store.load()?;
+                        let Some(outbox) = prepare_weixin_reply(
                             &client,
                             &app_config,
                             &mut server,
+                            &mut state,
                             &message,
-                            prior_thread.as_deref(),
+                            &message.text().unwrap_or_default(),
                             &task_stop,
+                            &task_outbound,
+                            &task_config.account_id,
+                            &task_config.project_id,
+                            !task_config.work_dir.is_empty(),
                         )
                         .await?
                         else {
-                            return Ok(prior_thread.clone().unwrap_or_default());
+                            return Ok(state.thread_ids.get(&peer).cloned().unwrap_or_default());
                         };
                         let saved =
                             task_store.update(|state| state.save_reply_outbox(&key, outbox))?;
@@ -323,14 +402,16 @@ pub async fn run_weixin_connect_with_codex_path(
                         .await
                     }
                     .await;
-                    if result.is_ok()
-                        && server.is_running()
-                        && !task_stop.load(Ordering::SeqCst)
-                        && task_codex_path.matches(&app_config.executable)
-                    {
-                        server_pool.lock().await.push(server);
-                    } else {
-                        server.close().await;
+                    if let Some(mut server) = server {
+                        if result.is_ok()
+                            && server.is_running()
+                            && !task_stop.load(Ordering::SeqCst)
+                            && task_codex_path.matches(&app_config.executable)
+                        {
+                            server_pool.lock().await.push(server);
+                        } else {
+                            server.close().await;
+                        }
                     }
                     result
                 };
@@ -344,7 +425,7 @@ pub async fn run_weixin_connect_with_codex_path(
             active_jobs.insert(job.id(), (job_key, job_peer));
         }
         let state = store.load()?;
-        update_status(&status, |current| {
+        update_status(&status, &config, |current| {
             current.pending_messages = state.pending_count();
             current.failed_messages = state.failed_count();
         });
@@ -376,7 +457,7 @@ pub async fn run_weixin_connect_with_codex_path(
                             }
                             (state.pending_count(), state.failed_count())
                         })?;
-                        update_status(&status, |current| {
+                        update_status(&status, &config, |current| {
                             current.pending_messages = pending;
                             current.failed_messages = failed;
                             current.last_peer_id = peer;
@@ -410,7 +491,7 @@ pub async fn run_weixin_connect_with_codex_path(
                                 }
                                 (state.pending_count(), state.failed_count())
                             })?;
-                            update_status(&status, |current| {
+                            update_status(&status, &config, |current| {
                                 current.pending_messages = pending;
                                 current.failed_messages = failed;
                                 current.last_peer_id = peer;
@@ -469,7 +550,7 @@ pub async fn run_weixin_connect_with_codex_path(
                             }
                             (state.pending_count(), state.failed_count())
                         })?;
-                        update_status(&status, |current| {
+                        update_status(&status, &config, |current| {
                             current.weixin_state = "connected".to_string();
                             current.state = "running".to_string();
                             current.pending_messages = pending;
@@ -499,7 +580,7 @@ pub async fn run_weixin_connect_with_codex_path(
                             WeixinLongPollErrorKind::CursorRejected if !cursor_reset_attempted => {
                                 cursor_reset_attempted = true;
                                 store.update(|state| state.get_updates_buf.clear())?;
-                                update_status(&status, |current| {
+                                update_status(&status, &config, |current| {
                                     current.state = "retrying".to_string();
                                     current.weixin_state = "retrying".to_string();
                                     current.recent_error =
@@ -510,7 +591,7 @@ pub async fn run_weixin_connect_with_codex_path(
                             }
                             WeixinLongPollErrorKind::CursorRejected
                             | WeixinLongPollErrorKind::AuthenticationRejected => {
-                                update_status(&status, |current| {
+                                update_status(&status, &config, |current| {
                                     current.state = "error".to_string();
                                     current.weixin_state = "needs_login".to_string();
                                     current.recent_error = "微信登录已失效，请重新扫码。".to_string();
@@ -520,7 +601,7 @@ pub async fn run_weixin_connect_with_codex_path(
                                 bail!("微信登录已失效，请重新扫码：{error}");
                             }
                             WeixinLongPollErrorKind::Terminal => {
-                                update_status(&status, |current| {
+                                update_status(&status, &config, |current| {
                                     current.state = "error".to_string();
                                     current.weixin_state = "error".to_string();
                                     current.recent_error = format!("微信长轮询遇到不可恢复错误：{error}");
@@ -531,7 +612,7 @@ pub async fn run_weixin_connect_with_codex_path(
                             }
                             WeixinLongPollErrorKind::Retryable => {
                                 consecutive_errors = consecutive_errors.saturating_add(1);
-                                update_status(&status, |current| {
+                                update_status(&status, &config, |current| {
                                     current.state = "retrying".to_string();
                                     current.weixin_state = "retrying".to_string();
                                     current.recent_error = format!("微信长轮询失败：{error}");
@@ -550,7 +631,7 @@ pub async fn run_weixin_connect_with_codex_path(
         }
     }
     jobs.abort_all();
-    update_status(&status, |current| {
+    update_status(&status, &config, |current| {
         current.state = "stopped".to_string();
         current.weixin_state = "stopped".to_string();
         current.codex_state = "stopped".to_string();
@@ -558,6 +639,102 @@ pub async fn run_weixin_connect_with_codex_path(
         current.message = "微信连接已停止。".to_string();
     });
     Ok(())
+}
+
+fn connection_work_dir(
+    config: &WeixinConnectConfig,
+    state_dir: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let work_dir = if config.work_dir.is_empty() {
+        std::env::current_dir().context("无法读取当前工作目录")?
+    } else {
+        PathBuf::from(&config.work_dir)
+    };
+    if work_dir.is_dir() {
+        return Ok(work_dir);
+    }
+    // 设置可能在连接启动后开启回传；目录降级不能依赖启动时的开关快照。
+    let fallback = state_dir.join("weixin-text-workspace");
+    std::fs::create_dir_all(&fallback).context("无法创建微信文字连接的临时工作目录")?;
+    Ok(fallback)
+}
+
+struct PreparedWeixinInput {
+    prompt: String,
+    image_paths: Vec<PathBuf>,
+    warnings: Vec<String>,
+    _inbox: Option<Inbox>,
+}
+
+fn attachment_turn_input(
+    text: &str,
+    downloaded: &DownloadedAttachments,
+) -> anyhow::Result<(String, Vec<PathBuf>)> {
+    if downloaded.attachments.is_empty() {
+        if text.trim().is_empty() {
+            bail!(
+                "微信附件接收失败：{}",
+                downloaded
+                    .warnings
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("没有可用附件")
+            );
+        }
+        return Ok((text.to_owned(), Vec::new()));
+    }
+    let mut prompt = if text.trim().is_empty() {
+        "请查看本条微信消息中的附件。".to_string()
+    } else {
+        text.to_owned()
+    };
+    prompt.push_str("\n\n微信附件已保存到本地，附件路径如下：");
+    let mut image_paths = Vec::new();
+    for attachment in &downloaded.attachments {
+        let label = match attachment.kind {
+            AttachmentKind::Image => {
+                image_paths.push(attachment.path.clone());
+                "图片"
+            }
+            AttachmentKind::File => "文件",
+        };
+        // 引号和控制字符按 JSON 转义，文件名不能伪造额外的提示行。
+        let path = serde_json::to_string(&attachment.path.to_string_lossy())?;
+        prompt.push_str(&format!("\n- {label}：{path}"));
+    }
+    Ok((prompt, image_paths))
+}
+
+async fn prepare_weixin_input(
+    client: &WeixinClient,
+    work_dir: &std::path::Path,
+    message: &WeixinMessage,
+    text: &str,
+) -> anyhow::Result<PreparedWeixinInput> {
+    let (inbox, downloaded) = if message.has_attachments() {
+        match Inbox::create(work_dir) {
+            Ok(inbox) => {
+                let downloaded = client.download_attachments(message, &inbox).await;
+                (Some(inbox), downloaded)
+            }
+            Err(_) => (
+                None,
+                DownloadedAttachments {
+                    warnings: vec!["无法准备微信附件收件目录".into()],
+                    ..Default::default()
+                },
+            ),
+        }
+    } else {
+        (None, DownloadedAttachments::default())
+    };
+    let (prompt, image_paths) = attachment_turn_input(text, &downloaded)?;
+    Ok(PreparedWeixinInput {
+        prompt,
+        image_paths,
+        warnings: downloaded.warnings,
+        _inbox: inbox,
+    })
 }
 
 async fn wait_for_stop(stop: &AtomicBool) {
@@ -596,6 +773,7 @@ async fn resolve_app_server(
             executable,
             work_dir: work_dir.clone(),
             model: config.model.clone(),
+            reasoning_effort: config.reasoning_effort.clone(),
             sandbox: config.sandbox.clone(),
         };
         match tokio::time::timeout(
@@ -681,6 +859,7 @@ pub async fn validate_codex_cli(
         executable: executable.to_string(),
         work_dir: work_dir.to_path_buf(),
         model: String::new(),
+        reasoning_effort: String::new(),
         sandbox: "read-only".to_string(),
     };
     match tokio::time::timeout(
@@ -762,94 +941,204 @@ pub async fn probe_codex_model(
     result.context("模型实际回复测试超过 90 秒")?
 }
 
-async fn create_weixin_reply_outbox(
+async fn prepare_weixin_reply(
     client: &WeixinClient,
     app_config: &AppServerConfig,
-    server: &mut CodexAppServer,
+    app_server: &mut Option<CodexAppServer>,
+    state: &mut ConnectState,
     message: &WeixinMessage,
-    saved_thread_id: Option<&str>,
+    text: &str,
     stop: &AtomicBool,
+    outbound: &outbound::OutboundPolicy,
+    account_id: &str,
+    project_id: &str,
+    explicit_work_dir: bool,
 ) -> anyhow::Result<Option<ReplyOutbox>> {
-    let text = message.text().unwrap_or_default();
-    if message.item_list.iter().any(|item| item.item_type == 5) {
-        return Ok(Some(reply_outbox(
-            saved_thread_id.unwrap_or_default(),
-            "暂不支持视频，请发送图片、文件或文字。",
-            Vec::new(),
-        )));
-    }
-    if text.is_empty() && message.item_list.iter().any(|item| item.item_type == 3) {
-        return Ok(Some(reply_outbox(
-            saved_thread_id.unwrap_or_default(),
-            "这条语音没有可用的微信转写文字，请改用文字发送。",
-            Vec::new(),
-        )));
-    }
-    if text.is_empty()
-        && !message
-            .item_list
-            .iter()
-            .any(|item| item.item_type == 2 || item.item_type == 4)
-    {
+    let options_store = controls::SessionOptionsStore::for_peer(account_id, &message.from_user_id);
+    if matches!(text.trim(), "/reset" | "/reset-session") {
+        options_store.request_reset()?;
+        state.thread_ids.remove(&message.from_user_id);
+        state.completed_resets.remove(&message.from_user_id);
+        persist_peer_session(account_id, &message.from_user_id, state)?;
+        if let Some(mut server) = app_server.take() {
+            server.close().await;
+        }
+        client
+            .send_text_chunks(
+                &message.from_user_id,
+                "已重置当前微信会话并清除模型、推理强度覆盖值。下一条消息将按当前连接默认设置创建新会话，原会话历史保留。",
+                &message.context_token,
+            )
+            .await?;
         return Ok(None);
     }
+    let permit = outbound
+        .permit(&message.from_user_id)
+        .ok()
+        .filter(|permit| {
+            app_config.work_dir.canonicalize().ok().as_ref() == Some(&permit.workspace)
+        });
+    if text.trim() == "/reset-attachments" {
+        let reply = if permit.is_some() {
+            state.thread_ids.remove(&message.from_user_id);
+            persist_peer_session(account_id, &message.from_user_id, state)?;
+            "已重置当前联系人的微信会话。下一条消息将创建带附件工具的新会话；原会话历史保留。"
+        } else {
+            "请先开启附件回传并配置允许的微信用户和工作区，再发送 /reset-attachments。"
+        };
+        client
+            .send_text_chunks(&message.from_user_id, reply, &message.context_token)
+            .await?;
+        return Ok(None);
+    }
+    let options = options_store.load()?;
+    let mut app_config = app_config.clone();
     if let Some(reason) = local_model_endpoint_unreachable_reason().await {
         bail!("{reason}");
     }
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        client.send_typing(&message.from_user_id, &message.context_token, true),
-    )
-    .await;
-    let mut prompt = if text.is_empty() {
-        "请处理收到的微信附件。".to_string()
-    } else {
-        text
+    let input = tokio::select! {
+        input = prepare_weixin_input(client, &app_config.work_dir, message, text) => input?,
+        _ = wait_for_stop(stop) => bail!("微信连接已停止"),
     };
-    let mut input_images = Vec::new();
-    for item in &message.item_list {
-        let (media, image_key, suffix) = match item.item_type {
-            2 => (
-                item.image_item.as_ref(),
-                item.image_item
-                    .as_ref()
-                    .and_then(|value| value["aeskey"].as_str()),
-                ".jpg",
-            ),
-            4 => (item.file_item.as_ref(), None, ".bin"),
-            _ => continue,
-        };
-        let media = media.context("微信附件缺少媒体信息")?;
-        let bytes = client.download_media(media, image_key).await?;
-        let suffix = if item.item_type == 2 {
-            image_extension(&bytes)
-        } else {
-            media_file_extension(media["file_name"].as_str()).unwrap_or(suffix)
-        };
-        let path = save_inbound_media(&bytes, suffix)?;
-        if item.item_type == 2 {
-            input_images.push(json!({ "type": "localImage", "path": path.to_string_lossy() }));
-        } else {
-            let name = media["file_name"].as_str().unwrap_or("微信文件");
-            prompt.push_str(&format!(
-                "\n\n收到文件 {name}，本地路径：{}",
-                path.display()
-            ));
-        }
+    if app_server
+        .as_ref()
+        .map(|server| !server.is_running())
+        .unwrap_or(true)
+    {
+        *app_server = Some(CodexAppServer::start(app_config.clone()).await?);
     }
-    prompt.push_str("\n\n如果需要把已生成的工作目录内文件作为微信附件发送，请在回复中单独写一行 [[WEIXIN_FILE:相对路径]]。只在用户明确要求发送文件时使用。 ");
-    let thread_id = match server.prepare_thread(saved_thread_id).await {
-        Ok(thread_id) => thread_id,
-        Err(error) if saved_thread_id.is_some() => server
-            .prepare_thread(None)
+    let server = app_server.as_mut().context("Codex app-server 未启动")?;
+    let allow_attachments = permit.as_ref().is_some_and(|permit| permit.check().is_ok());
+    let reset_pending = options
+        .reset_request
+        .as_ref()
+        .is_some_and(|request| state.completed_resets.get(&message.from_user_id) != Some(request));
+    let saved_thread_id = (!reset_pending)
+        .then(|| saved_thread_id(state, &message.from_user_id))
+        .flatten();
+    let project = if saved_thread_id.is_none() {
+        projects::resolve_project(server, project_id)
             .await
-            .with_context(|| format!("恢复原会话失败（{error}），新建会话也失败"))?,
-        Err(error) => return Err(error),
+            .context("读取所选工作项目失败，未创建会话；请检查项目选择后重试")?
+    } else {
+        None
     };
+    if !explicit_work_dir
+        && let Some(path) = project.as_ref().and_then(|project| {
+            project["roots"]
+                .as_array()
+                .and_then(|roots| roots.first())
+                .and_then(|root| root["path"].as_str())
+        })
+        && std::path::Path::new(path).is_dir()
+    {
+        app_config.work_dir = PathBuf::from(path);
+    }
+    if !app_config.work_dir.is_dir() {
+        bail!("工作项目目录不可用");
+    }
+    app_config.work_dir = std::path::absolute(&app_config.work_dir)?;
+    let config_response = server
+        .api_request(
+            "config/read",
+            serde_json::json!({"includeLayers":false,"cwd":app_config.work_dir}),
+        )
+        .await
+        .unwrap_or_default();
+    let native = &config_response["config"];
+    let mut defaults = controls::SessionOptions {
+        model: if app_config.model.is_empty() {
+            native["model"].as_str().unwrap_or_default().to_string()
+        } else {
+            app_config.model.clone()
+        },
+        reasoning_effort: if app_config.reasoning_effort.is_empty() {
+            native["model_reasoning_effort"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            app_config.reasoning_effort.clone()
+        },
+        reset_request: None,
+    };
+    let mut catalog = crate::model_catalog::read_codex_model_catalog().await;
+    let unresolved = options.resolve(&defaults, &catalog);
+    if defaults.model.is_empty()
+        || unresolved.model.is_empty()
+        || unresolved.reasoning_effort.is_empty()
+    {
+        let models = server
+            .api_request("model/list", serde_json::json!({"includeHidden":true}))
+            .await
+            .unwrap_or_default();
+        controls::apply_native_model_defaults(&mut defaults, &mut catalog, &models);
+    }
+    let (effective, recovered_options) = options.resolve_for_turn(&defaults, &catalog);
+    if recovered_options {
+        client
+            .send_text_chunks(
+                &message.from_user_id,
+                "已保存的模型或推理强度在当前配置下不可用，本条消息改用连接默认设置。发送 /reset 可清除覆盖值并重置当前微信会话。",
+                &message.context_token,
+            )
+            .await?;
+    }
+    app_config.model = effective.model;
+    app_config.reasoning_effort = effective.reasoning_effort;
+    server.set_session_config(&app_config);
+    let thread_id = server
+        .prepare_thread_in_project_with_attachments(
+            saved_thread_id.as_deref(),
+            project.as_ref().and_then(|value| value["id"].as_str()),
+            allow_attachments,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "无法准备微信会话，原映射已保留：{error}；可发送 /reset 重置当前微信会话后重试"
+            )
+        })?;
+    state
+        .thread_ids
+        .insert(message.from_user_id.clone(), thread_id.clone());
+    if let Some(request) = &options.reset_request {
+        state
+            .completed_resets
+            .insert(message.from_user_id.clone(), request.clone());
+    }
+    persist_peer_session(account_id, &message.from_user_id, state)?;
+    if let Some(request) = &options.reset_request {
+        options_store.complete_reset(request)?;
+    }
+    if let Some(project) = &project {
+        let _ = server
+            .api_request(
+                "thread/metadata/update",
+                serde_json::json!({
+                    "threadId":thread_id,"projectId":project["id"]
+                }),
+            )
+            .await;
+    }
+    let _ = desktop_sync::record(&thread_id, project.as_ref());
+
     let turn_result = {
-        let mut inputs = vec![json!({ "type": "text", "text": prompt, "text_elements": [] })];
-        inputs.extend(input_images);
-        let turn = server.run_turn_items(&thread_id, inputs);
+        let turn = server.run_turn_with_images_and_release(
+            &thread_id,
+            &input.prompt,
+            &input.image_paths,
+            Some(app_server::WeixinReplyChannel {
+                client,
+                peer: &message.from_user_id,
+                context_token: &message.context_token,
+                permit,
+            }),
+            Some(SessionControlChannel {
+                options_store: &options_store,
+                defaults: &defaults,
+            }),
+        );
         tokio::pin!(turn);
         loop {
             tokio::select! {
@@ -862,21 +1151,82 @@ async fn create_weixin_reply_outbox(
             }
         }
     };
-    let (reply_text, attachments) = extract_attachments(&turn_result.reply, &app_config.work_dir)?;
-    let reply = if reply_text.trim().is_empty() {
+    let reply = if turn_result.reply.trim().is_empty() {
         "Codex 已完成处理，但没有返回文字内容。"
     } else {
-        reply_text.trim()
+        turn_result.reply.trim()
     };
-    let reply_with_footer = append_reply_footer(reply, &turn_result, &app_config.work_dir);
+    let _ = desktop_sync::record(&thread_id, project.as_ref());
+    let reply = if input.warnings.is_empty() {
+        reply.to_owned()
+    } else {
+        format!(
+            "微信附件接收提示：\n{}\n\n{reply}",
+            input.warnings.join("\n")
+        )
+    };
+    let reply_with_footer = append_reply_footer(&reply, &turn_result, &app_config.work_dir);
     Ok(Some(reply_outbox(
         &thread_id,
         &reply_with_footer,
-        attachments
-            .into_iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect(),
+        Vec::new(),
     )))
+}
+
+#[cfg(test)]
+async fn process_weixin_message(
+    client: &WeixinClient,
+    app_config: &AppServerConfig,
+    app_server: &mut Option<CodexAppServer>,
+    state: &mut ConnectState,
+    message: &WeixinMessage,
+    text: &str,
+    stop: &AtomicBool,
+    outbound: &outbound::OutboundPolicy,
+    account_id: &str,
+    project_id: &str,
+    explicit_work_dir: bool,
+) -> anyhow::Result<()> {
+    if let Some(reply) = prepare_weixin_reply(
+        client,
+        app_config,
+        app_server,
+        state,
+        message,
+        text,
+        stop,
+        outbound,
+        account_id,
+        project_id,
+        explicit_work_dir,
+    )
+    .await?
+    {
+        for text in reply.text_chunks {
+            client
+                .send_text_chunks(&message.from_user_id, &text, &message.context_token)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn persist_peer_session(account: &str, peer: &str, snapshot: &ConnectState) -> anyhow::Result<()> {
+    ConnectSessionStore::default_for_account(account).update(|state| {
+        if let Some(thread) = snapshot.thread_ids.get(peer) {
+            state.thread_ids.insert(peer.to_string(), thread.clone());
+        } else {
+            state.thread_ids.remove(peer);
+        }
+        if let Some(reset) = snapshot.completed_resets.get(peer) {
+            state
+                .completed_resets
+                .insert(peer.to_string(), reset.clone());
+        } else {
+            state.completed_resets.remove(peer);
+        }
+    })?;
+    Ok(())
 }
 
 fn reply_outbox(thread_id: &str, text: &str, attachments: Vec<String>) -> ReplyOutbox {
@@ -1025,6 +1375,10 @@ fn extract_attachments(
     Ok((text.join("\n"), attachments))
 }
 
+fn saved_thread_id(state: &ConnectState, peer: &str) -> Option<String> {
+    state.thread_ids.get(peer).cloned()
+}
+
 fn append_reply_footer(
     reply: &str,
     turn: &AppServerTurnResult,
@@ -1066,6 +1420,35 @@ fn compact_work_dir(work_dir: &std::path::Path) -> String {
         }
     }
     path.into_owned()
+}
+
+/// 微信端收到的失败回复要带上原因：过去只有一句「处理失败」，用户必须回到电脑上
+/// 打开管理器才知道是 CLI 路径、登录态还是上游错误（#2349）。
+/// 只取首行、隐去用户目录并截断，避免把长堆栈或本机路径整段发到聊天里。
+fn weixin_failure_reply(error: &str) -> String {
+    const MAX_REASON_CHARS: usize = 160;
+    let mut reason = error
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string();
+    for key in ["USERPROFILE", "HOME"] {
+        if let Some(home) = std::env::var_os(key) {
+            let home = home.to_string_lossy().to_string();
+            if home.len() > 1 {
+                reason = reason.replace(&home, "~");
+            }
+        }
+    }
+    if reason.chars().count() > MAX_REASON_CHARS {
+        reason = reason.chars().take(MAX_REASON_CHARS).collect::<String>() + "…";
+    }
+    if reason.is_empty() {
+        "Codex 处理失败，请在 Codex++ 管理器中查看连接状态。".to_string()
+    } else {
+        format!("Codex 处理失败：{reason}\n详情请在 Codex++ 管理器中查看连接状态。")
+    }
 }
 
 fn is_allowed_peer(allow_from: &str, peer: &str) -> bool {
@@ -1132,10 +1515,21 @@ fn default_sandbox() -> String {
 
 fn update_status(
     status: &SharedWeixinConnectStatus,
+    config: &WeixinConnectConfig,
     update: impl FnOnce(&mut WeixinConnectStatus),
 ) {
     if let Ok(mut current) = status.lock() {
         update(&mut current);
+        current.message = current
+            .message
+            .trim_end_matches(FALLBACK_WORKSPACE_NOTICE)
+            .to_string();
+        if current.state != "stopped"
+            && !config.work_dir.is_empty()
+            && !std::path::Path::new(&config.work_dir).is_dir()
+        {
+            current.message.push_str(FALLBACK_WORKSPACE_NOTICE);
+        }
     }
 }
 
@@ -1174,6 +1568,144 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attachment_input_keeps_caption_and_file_paths_with_only_images_in_local_image_input() {
+        let image = PathBuf::from("workspace/inbox/image.png");
+        let file = PathBuf::from("workspace/inbox/report.txt");
+        let downloaded = DownloadedAttachments {
+            attachments: vec![
+                media::LocalAttachment {
+                    path: image.clone(),
+                    kind: AttachmentKind::Image,
+                },
+                media::LocalAttachment {
+                    path: file.clone(),
+                    kind: AttachmentKind::File,
+                },
+            ],
+            warnings: vec!["one attachment failed".into()],
+        };
+        let (prompt, images) = attachment_turn_input("keep caption", &downloaded).unwrap();
+        assert!(prompt.starts_with("keep caption\n"));
+        assert!(prompt.contains(&serde_json::to_string(&file.to_string_lossy()).unwrap()));
+        assert!(prompt.contains(&serde_json::to_string(&image.to_string_lossy()).unwrap()));
+        assert!(!prompt.contains("one attachment failed"));
+        assert_eq!(images, [image]);
+        assert!(
+            attachment_turn_input("", &downloaded)
+                .unwrap()
+                .0
+                .contains("请查看")
+        );
+        let failed = DownloadedAttachments {
+            warnings: vec!["附件 1：下载失败".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            attachment_turn_input("original text", &failed).unwrap(),
+            ("original text".into(), vec![])
+        );
+        assert!(
+            attachment_turn_input("", &failed)
+                .unwrap_err()
+                .to_string()
+                .contains("下载失败")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_inbound_handles_media_only_partial_failure_and_text_without_starting_a_server()
+    {
+        use serde_json::json;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+        let cdn = MockServer::start().await;
+        Mock::given(path("/image"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\x89PNG\r\n\x1a\nfixture"))
+            .mount(&cdn)
+            .await;
+        let client = WeixinClient::new(&cdn.uri(), "test-token", "test-route")
+            .unwrap()
+            .with_media_base_url(&cdn.uri())
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let message: WeixinMessage = serde_json::from_value(json!({
+            "item_list":[{"type":2,"image_item":{"url":format!("{}/image",cdn.uri())}}]
+        }))
+        .unwrap();
+        assert!(message.text().is_none() && message.has_attachments());
+        let input = prepare_weixin_input(&client, root.path(), &message, "")
+            .await
+            .unwrap();
+        assert_eq!(input.image_paths.len(), 1);
+        assert_eq!(
+            std::fs::read(&input.image_paths[0]).unwrap(),
+            b"\x89PNG\r\n\x1a\nfixture"
+        );
+        assert!(input.warnings.is_empty());
+        assert!(input._inbox.is_some());
+
+        let message: WeixinMessage = serde_json::from_value(json!({
+            "item_list":[
+                {"type":2,"image_item":{"url":format!("{}/image",cdn.uri())}},
+                {"type":4,"file_item":{}}
+            ]
+        }))
+        .unwrap();
+        let partial = prepare_weixin_input(&client, root.path(), &message, "caption")
+            .await
+            .unwrap();
+        assert!(partial.prompt.starts_with("caption\n"));
+        assert_eq!(partial.image_paths.len(), 1);
+        assert_eq!(partial.warnings.len(), 1);
+
+        let invalid = root.path().join("not-a-directory");
+        std::fs::write(&invalid, b"keep").unwrap();
+        let failed = prepare_weixin_input(&client, &invalid, &message, "keep text")
+            .await
+            .unwrap();
+        assert_eq!(failed.prompt, "keep text");
+        assert_eq!(failed.warnings, ["无法准备微信附件收件目录"]);
+        assert!(failed.image_paths.is_empty());
+        assert!(
+            prepare_weixin_input(&client, &invalid, &message, "")
+                .await
+                .is_err()
+        );
+
+        let plain: WeixinMessage = serde_json::from_value(json!({"item_list":[]})).unwrap();
+        let text_only = prepare_weixin_input(&client, root.path(), &plain, "plain text")
+            .await
+            .unwrap();
+        assert_eq!(text_only.prompt, "plain text");
+        assert!(text_only._inbox.is_none());
+        assert!(text_only.image_paths.is_empty());
+    }
+
+    #[test]
+    fn defaults_are_reloaded_only_at_message_boundaries_and_original_thread_wins() {
+        let runtime = WeixinCodexPath::new("codex");
+        let mut config = WeixinConnectConfig::default();
+        runtime.set_defaults(SessionDefaults {
+            model: "next-model".into(),
+            reasoning_effort: "low".into(),
+            project_id: "project-2".into(),
+            work_dir: "next-workspace".into(),
+            sandbox: "workspace-write".into(),
+        });
+        assert!(config.model.is_empty());
+        runtime.apply_defaults(&mut config);
+        assert_eq!(config.model, "next-model");
+        assert_eq!(config.reasoning_effort, "low");
+        assert_eq!(config.project_id, "project-2");
+        assert_eq!(config.work_dir, "next-workspace");
+        assert_eq!(config.sandbox, "workspace-write");
+        let mut state = ConnectState::default();
+        state.thread_ids.insert("peer".into(), "original".into());
+        assert_eq!(saved_thread_id(&state, "peer").as_deref(), Some("original"));
+        assert_eq!(saved_thread_id(&state, "other"), None);
+    }
+
+    #[test]
     fn saved_cli_path_replaces_startup_path_at_next_message() {
         let path = WeixinCodexPath::new("missing-codex");
         let runtime_path = path.clone();
@@ -1181,6 +1713,7 @@ mod tests {
             executable: "missing-codex".to_string(),
             work_dir: PathBuf::from("."),
             model: "test-model".to_string(),
+            reasoning_effort: String::new(),
             sandbox: "read-only".to_string(),
         };
         assert!(!runtime_path.apply(&mut config));
@@ -1193,6 +1726,189 @@ mod tests {
         path.set("   ");
         assert!(runtime_path.apply(&mut config));
         assert_eq!(config.executable, "");
+    }
+
+    #[tokio::test]
+    async fn unavailable_attachment_workspace_keeps_text_input_and_recovers_when_restored() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let config = WeixinConnectConfig {
+            allow_outbound_attachments: false,
+            allow_from: "peer".into(),
+            work_dir: workspace.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        let state_dir = root.path().join("state");
+        assert_eq!(connection_work_dir(&config, &state_dir).unwrap(), workspace);
+        let policy = outbound::OutboundPolicy::new(false, "peer", &config.work_dir);
+        assert!(policy.permit("peer").is_err());
+        policy.set(true, "peer", &config.work_dir);
+        assert!(policy.permit("peer").is_ok());
+        std::fs::rename(&workspace, root.path().join("moved-workspace")).unwrap();
+        let fallback = connection_work_dir(&config, &state_dir).unwrap();
+        assert_eq!(fallback, state_dir.join("weixin-text-workspace"));
+        assert!(fallback.is_dir());
+        assert!(
+            !workspace.exists(),
+            "the unavailable workspace must not be recreated"
+        );
+        assert!(
+            !config.allow_outbound_attachments,
+            "runtime permission must not rewrite the startup snapshot"
+        );
+        assert!(policy.permit("peer").is_err());
+        assert!(
+            policy
+                .status_message("running")
+                .contains("附件回传暂不可用")
+        );
+        let client = WeixinClient::new("http://127.0.0.1:1", "test", "").unwrap();
+        let message: WeixinMessage =
+            serde_json::from_value(serde_json::json!({"item_list":[]})).unwrap();
+        let input = prepare_weixin_input(&client, &fallback, &message, "still text")
+            .await
+            .unwrap();
+        assert_eq!(input.prompt, "still text");
+        assert!(input._inbox.is_none());
+        std::fs::create_dir(&workspace).unwrap();
+        assert_eq!(connection_work_dir(&config, &state_dir).unwrap(), workspace);
+        assert!(policy.permit("peer").is_ok());
+        assert_eq!(policy.status_message("running"), "running");
+    }
+
+    #[test]
+    fn fallback_workspace_status_without_attachments_clears_when_directory_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("unavailable-workspace");
+        let config = WeixinConnectConfig {
+            work_dir: workspace.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        assert!(!config.allow_outbound_attachments);
+        let fallback = connection_work_dir(&config, &root.path().join("state")).unwrap();
+        assert!(fallback.is_dir());
+        assert!(!workspace.exists());
+        let status = Arc::new(Mutex::new(WeixinConnectStatus::default()));
+        for state in ["starting", "running", "retrying"] {
+            update_status(&status, &config, |current| {
+                current.state = state.into();
+                current.message = "text-ready".into();
+            });
+            let message = status.lock().unwrap().message.clone();
+            assert!(message.starts_with("text-ready"));
+            assert!(message.contains("原项目目录不可用"));
+            assert!(message.contains("备用空目录"));
+            update_status(&status, &config, |_| {});
+            assert_eq!(status.lock().unwrap().message, message);
+        }
+        std::fs::create_dir(&workspace).unwrap();
+        assert_eq!(
+            connection_work_dir(&config, &root.path().join("state")).unwrap(),
+            workspace,
+        );
+        update_status(&status, &config, |_| {});
+        assert_eq!(status.lock().unwrap().message, "text-ready");
+    }
+
+    #[tokio::test]
+    async fn outbound_reset_is_explicit_authorized_and_keeps_other_contact_history() {
+        use serde_json::json;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let api = MockServer::start().await;
+        Mock::given(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ret":0})))
+            .mount(&api)
+            .await;
+        let client = WeixinClient::new(&api.uri(), "fixture", "").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = AppServerConfig {
+            executable: "unused".into(),
+            work_dir: workspace.path().to_path_buf(),
+            model: String::new(),
+            reasoning_effort: String::new(),
+            sandbox: "read-only".into(),
+        };
+        let policy =
+            outbound::OutboundPolicy::new(false, "peer", workspace.path().to_str().unwrap());
+        let mut state = ConnectState::default();
+        state.thread_ids.insert("peer".into(), "original".into());
+        state
+            .thread_ids
+            .insert("other".into(), "other-history".into());
+        let message: WeixinMessage = serde_json::from_value(json!({
+            "from_user_id":"peer", "context_token":"context"
+        }))
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        let mut server = None;
+        process_weixin_message(
+            &client,
+            &config,
+            &mut server,
+            &mut state,
+            &message,
+            "/reset-attachments",
+            &stop,
+            &policy,
+            "fixture",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.thread_ids["peer"], "original");
+        policy.set(true, "peer", workspace.path().to_str().unwrap());
+        process_weixin_message(
+            &client,
+            &config,
+            &mut server,
+            &mut state,
+            &message,
+            "/reset-attachments",
+            &stop,
+            &policy,
+            "fixture",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(!state.thread_ids.contains_key("peer"));
+        assert_eq!(state.thread_ids["other"], "other-history");
+        assert!(server.is_none());
+        let requests = api.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let denied: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let accepted: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            denied["msg"]["item_list"][0]["text_item"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("请先开启")
+        );
+        assert!(
+            accepted["msg"]["item_list"][0]["text_item"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("原会话历史保留")
+        );
+    }
+
+    #[test]
+    fn weixin_failure_reply_carries_a_short_first_line_reason() {
+        let reply =
+            weixin_failure_reply("app-server 启动失败：拒绝访问\nstack line 1\nstack line 2");
+        assert!(reply.contains("app-server 启动失败：拒绝访问"), "{reply}");
+        assert!(!reply.contains("stack line"), "{reply}");
+        let long = "x".repeat(500);
+        let reply = weixin_failure_reply(&long);
+        assert!(reply.chars().count() < 260, "{reply}");
+        assert!(reply.contains('…'));
+        assert_eq!(
+            weixin_failure_reply("  \n "),
+            "Codex 处理失败，请在 Codex++ 管理器中查看连接状态。"
+        );
     }
 
     #[test]
@@ -1267,9 +1983,12 @@ mod tests {
             token: "tok".to_string(),
             account_id: "unit-test-ignore".to_string(),
             allow_from: "only-me@im.wechat".to_string(),
+            allow_outbound_attachments: false,
             route_tag: String::new(),
             work_dir: work_dir.path().display().to_string(),
             model: String::new(),
+            reasoning_effort: String::new(),
+            project_id: String::new(),
             sandbox: "read-only".to_string(),
             codex_path: String::new(),
         };

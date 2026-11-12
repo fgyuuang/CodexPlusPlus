@@ -46,7 +46,14 @@ pub(crate) fn cache_key(
             .as_bytes(),
     );
     field(user_agent.as_bytes());
-    let mut headers = request.headers().iter().collect::<Vec<_>>();
+    // Codex 透传的轮次级身份头每轮都变，算进键里协商结果就永远命不中（#2783）。
+    let mut headers = request
+        .headers()
+        .iter()
+        .filter(|(name, _)| {
+            !crate::protocol_proxy::is_volatile_client_identity_header(name.as_str())
+        })
+        .collect::<Vec<_>>();
     headers.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
     for (name, value) in headers {
         field(name.as_str().as_bytes());
@@ -73,18 +80,30 @@ pub(crate) fn evict(key: &CacheKey) {
 }
 
 pub(crate) struct ExecOutcome {
-    key: CacheKey,
+    /// 协商得来的适配才有缓存键；按上游类型直接适配的没有，也不进协商缓存。
+    key: Option<CacheKey>,
+    adaptation: crate::responses_exec::ToolAdaptation,
     settings: BackendSettings,
     finished: bool,
 }
 
 impl ExecOutcome {
-    pub(crate) fn new(key: CacheKey, settings: &BackendSettings) -> Self {
+    pub(crate) fn new(
+        key: Option<CacheKey>,
+        adaptation: crate::responses_exec::ToolAdaptation,
+        settings: &BackendSettings,
+    ) -> Self {
         Self {
             key,
+            adaptation,
             settings: settings.clone(),
             finished: false,
         }
+    }
+
+    /// 响应要按哪些工具改写还原。
+    pub(crate) fn adaptation(&self) -> &crate::responses_exec::ToolAdaptation {
+        &self.adaptation
     }
 
     // Dropping an unfinished outcome is cancellation, not capability evidence.
@@ -93,13 +112,15 @@ impl ExecOutcome {
             return;
         }
         self.finished = true;
-        evict(&self.key);
-        if success {
-            let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
-            entries.retain(|(_, created)| created.elapsed() < CACHE_TTL);
-            entries.push_back((self.key, Instant::now()));
-            while entries.len() > CACHE_CAPACITY {
-                entries.pop_front();
+        if let Some(key) = self.key {
+            evict(&key);
+            if success {
+                let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+                entries.retain(|(_, created)| created.elapsed() < CACHE_TTL);
+                entries.push_back((key, Instant::now()));
+                while entries.len() > CACHE_CAPACITY {
+                    entries.pop_front();
+                }
             }
         }
         crate::relay_rotation::record_relay_request_event(
@@ -116,8 +137,20 @@ impl ExecOutcome {
 /// Rebuilds the response with every inspected byte followed by its unread body.
 /// A timeout or size overflow therefore retains ordinary upstream error handling.
 pub(crate) async fn inspect_rejection(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     request: &Value,
+) -> anyhow::Result<(reqwest::Response, bool)> {
+    inspect_error_body(response, |status, content_type, body| {
+        crate::responses_exec::is_explicit_exec_rejection(status, content_type, body, request)
+    })
+    .await
+}
+
+/// 有上限地预读错误响应体交给 `matcher` 判断，再把读过的字节接回去重建响应；
+/// 没读完整（超时、超长）时一律判为不匹配，原响应照常交给后续处理。
+pub(crate) async fn inspect_error_body(
+    mut response: reqwest::Response,
+    matcher: impl FnOnce(u16, &str, &[u8]) -> bool,
 ) -> anyhow::Result<(reqwest::Response, bool)> {
     let status = response.status();
     let version = response.version();
@@ -154,13 +187,7 @@ pub(crate) async fn inspect_rejection(
             Err(_) => break,
         }
     }
-    let matches = complete
-        && crate::responses_exec::is_explicit_exec_rejection(
-            status.as_u16(),
-            content_type,
-            &inspected,
-            request,
-        );
+    let matches = complete && matcher(status.as_u16(), content_type, &inspected);
     let body = reqwest::Body::wrap_stream(
         futures_util::stream::iter(chunks).chain(response.bytes_stream()),
     );
@@ -172,7 +199,10 @@ pub(crate) async fn inspect_rejection(
     Ok((reqwest::Response::from(rebuilt), matches))
 }
 
-pub(crate) fn adapted_json(bytes: &[u8]) -> (Vec<u8>, bool) {
+pub(crate) fn adapted_json(
+    bytes: &[u8],
+    adaptation: &crate::responses_exec::ToolAdaptation,
+) -> (Vec<u8>, bool) {
     let result = (|| -> anyhow::Result<Value> {
         let value: Value = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
@@ -180,7 +210,7 @@ pub(crate) fn adapted_json(bytes: &[u8]) -> (Vec<u8>, bool) {
                 && value.get("output").is_some_and(Value::is_array),
             "adapted response is not complete"
         );
-        crate::responses_exec::adapt_response(value)
+        crate::responses_exec::adapt_response_for(value, adaptation)
     })();
     match result {
         Ok(value) => (
@@ -257,9 +287,39 @@ mod tests {
     }
 
     #[test]
+    fn identity_ignores_per_turn_codex_headers_but_keeps_originator() {
+        // #2783：轮次级的身份头每轮都变，不能让协商缓存每轮失效；originator 这类稳定头照常算进键。
+        let body = serde_json::json!({"model":"one","tools":[{"type":"custom","name":"exec"}]});
+        let client = reqwest::Client::new();
+        let request = |turn: &str, originator: &str| {
+            client
+                .post("http://localhost/v1/responses")
+                .header("authorization", "Bearer same")
+                .header("originator", originator)
+                .header(
+                    "x-codex-turn-metadata",
+                    format!("{{\"turn_id\":\"{turn}\"}}"),
+                )
+                .header("x-codex-window-id", format!("win:{turn}"))
+                .header("x-client-request-id", turn)
+                .build()
+                .unwrap()
+        };
+        assert_eq!(
+            cache_key("relay", &request("t1", "codex_cli_rs"), &body, "ua"),
+            cache_key("relay", &request("t2", "codex_cli_rs"), &body, "ua")
+        );
+        assert_ne!(
+            cache_key("relay", &request("t1", "codex_cli_rs"), &body, "ua"),
+            cache_key("relay", &request("t1", "codex_exec"), &body, "ua")
+        );
+    }
+
+    #[test]
     fn invalid_json_produces_no_executable_output() {
         for bytes in [b"{}".as_slice(), b"not JSON".as_slice()] {
-            let (output, valid) = adapted_json(bytes);
+            let (output, valid) =
+                adapted_json(bytes, &crate::responses_exec::ToolAdaptation::exec());
             assert!(!valid);
             let output: Value = serde_json::from_slice(&output).unwrap();
             assert_eq!(output["status"], "failed");
@@ -315,20 +375,37 @@ mod tests {
     fn only_completed_validated_outcomes_create_bounded_cache_evidence() {
         let settings = BackendSettings::default();
         let canceled_key = Sha256::digest(b"canceled-exec-outcome").into();
-        drop(ExecOutcome::new(canceled_key, &settings));
+        drop(ExecOutcome::new(
+            Some(canceled_key),
+            crate::responses_exec::ToolAdaptation::exec(),
+            &settings,
+        ));
         assert!(!cached(&canceled_key));
         let good_key = Sha256::digest(b"successful-exec-outcome").into();
-        let mut valid = ExecOutcome::new(good_key, &settings);
+        let mut valid = ExecOutcome::new(
+            Some(good_key),
+            crate::responses_exec::ToolAdaptation::exec(),
+            &settings,
+        );
         valid.finish(true);
         assert!(cached(&good_key));
         valid.finish(false);
         assert!(cached(&good_key), "outcomes are accounted exactly once");
-        let mut invalid = ExecOutcome::new(good_key, &settings);
+        let mut invalid = ExecOutcome::new(
+            Some(good_key),
+            crate::responses_exec::ToolAdaptation::exec(),
+            &settings,
+        );
         invalid.finish(false);
         assert!(!cached(&good_key));
         for index in 0..=CACHE_CAPACITY {
             let key = Sha256::digest(index.to_be_bytes()).into();
-            ExecOutcome::new(key, &settings).finish(true);
+            ExecOutcome::new(
+                Some(key),
+                crate::responses_exec::ToolAdaptation::exec(),
+                &settings,
+            )
+            .finish(true);
         }
         let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
         assert_eq!(entries.len(), CACHE_CAPACITY);

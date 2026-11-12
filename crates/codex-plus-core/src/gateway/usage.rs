@@ -368,8 +368,12 @@ pub fn shift_day(day: &str, delta: i64) -> String {
 /// 在后台线程里记：请求结束时在本地服务的单线程运行时里调用，整份文件重写加 fsync 会卡住别的流。
 pub fn record_entry(entry: &RequestLogEntry) {
     let entry = entry.clone();
+    // 覆盖日志路径的测试必须同样隔离用量文件；在线程启动前捕获，避免测试 guard 已恢复。
+    let store = crate::request_log::log_path_override()
+        .map(|path| UsageStore::at(path.with_file_name(USAGE_FILE)))
+        .unwrap_or_default();
     std::thread::spawn(move || {
-        let _ = record_entry_in(&UsageStore::default(), &entry);
+        let _ = record_entry_in(&store, &entry);
     });
 }
 
@@ -451,6 +455,7 @@ mod tests {
                 reasoning_tokens: 1,
             }),
             cache_hit_ratio: None,
+            final_response_evidence: None,
             agent: agent.map(str::to_string),
         }
     }
@@ -491,6 +496,8 @@ mod tests {
             model_windows: Default::default(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             price: Some(ProviderPrice {
                 currency: "cny".to_string(),
                 input: 2.0,
@@ -500,6 +507,9 @@ mod tests {
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
+            newapi_access: None,
+            subscription_policy: None,
+            upstream_meta: Default::default(),
             relay: RelayProfile {
                 id: "ds".to_string(),
                 ..RelayProfile::default()

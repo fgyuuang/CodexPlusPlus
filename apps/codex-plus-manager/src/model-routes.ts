@@ -14,7 +14,11 @@ export type RelayModelRouteProfile = {
   officialMixApiKey: boolean;
   noAuth?: boolean;
   webSearchHistoryCompat?: boolean;
+  localCompactionPromptAtEnd?: boolean;
   strictResponsesReasoning?: boolean;
+  stripImageGenerationTool?: boolean;
+  stripResponsesImageDetail?: boolean;
+  pureApiImageGeneration?: boolean;
   modelMetadata?: string;
   modelRoutes?: RelayModelRoute[];
 };
@@ -98,6 +102,42 @@ export function webSearchHistoryCompatEnabled(
     && (profile.relayMode !== "official" || profile.officialMixApiKey);
 }
 
+export function localCompactionPromptAtEndEnabled(
+  profile: Pick<RelayModelRouteProfile, "protocol" | "relayMode" | "officialMixApiKey" | "localCompactionPromptAtEnd">,
+): boolean {
+  return profile.localCompactionPromptAtEnd === true
+    && (profile.protocol === "responses" || profile.protocol === "chatCompletions")
+    && profile.relayMode !== "aggregate"
+    && (profile.relayMode !== "official" || profile.officialMixApiKey);
+}
+
+/** #228：转发前移除托管生图工具，只对第三方 Responses 上游生效，且要走本地代理。 */
+export function stripImageGenerationToolEnabled(
+  profile: Pick<RelayModelRouteProfile, "protocol" | "relayMode" | "officialMixApiKey" | "stripImageGenerationTool">,
+): boolean {
+  return profile.stripImageGenerationTool === true
+    && profile.protocol === "responses"
+    && profile.relayMode !== "aggregate"
+    && (profile.relayMode !== "official" || profile.officialMixApiKey);
+}
+
+/** #2870：转发前移除 Responses 图片 `detail`，只对第三方 Responses 上游生效，且要走本地代理。 */
+export function stripResponsesImageDetailEnabled(
+  profile: Pick<RelayModelRouteProfile, "protocol" | "relayMode" | "officialMixApiKey" | "stripResponsesImageDetail">,
+): boolean {
+  return profile.stripResponsesImageDetail === true
+    && profile.protocol === "responses"
+    && profile.relayMode !== "aggregate"
+    && (profile.relayMode !== "official" || profile.officialMixApiKey);
+}
+
+/** #1433：纯 API 下让 Codex 注册原生生图工具，生图请求要经本地代理转给供应商。 */
+export function pureApiImageGenerationEnabled(
+  profile: Pick<RelayModelRouteProfile, "relayMode" | "pureApiImageGeneration">,
+): boolean {
+  return profile.pureApiImageGeneration === true && profile.relayMode === "pureApi";
+}
+
 export function settingsRequireLocalHelper(settings: RelayModelRouteSettings): boolean {
   if (settings.enhancementsEnabled) return true;
   const active = settings.relayProfiles.find((profile) => profile.id === settings.activeRelayId)
@@ -109,7 +149,10 @@ export function settingsRequireLocalHelper(settings: RelayModelRouteSettings): b
     || (active.relayMode === "official" && active.officialMixApiKey)
     || independentProxyEnabled(active)
     || webSearchHistoryCompatEnabled(active)
+    || localCompactionPromptAtEndEnabled(active)
     || requestCompatibilityEnabled(active)
+    || stripImageGenerationToolEnabled(active)
+    || pureApiImageGenerationEnabled(active)
     || normalizeRelayModelRoutes(active.modelRoutes).some(
       (route) => Boolean(route.model.trim() && route.targetRelayId.trim()),
     );
