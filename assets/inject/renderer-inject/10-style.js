@@ -516,12 +516,11 @@
         letter-spacing: -0.15px;
         white-space: nowrap;
       }
-      /*
-       * 提升定位包装层，避免只改 tooltip/menu 子节点仍被父级堆叠上下文困住。
-       * 新版 Codex 还把弹出层挂在一个 z-60 的固定视口容器里（zoom-adjusted-viewport），
-       * 只提升里面的节点逃不出这个堆叠上下文，所以直接父容器也一起提升。
-       */
-      html[data-codex-plus-page-open] div:has(> [data-radix-popper-content-wrapper], > [role="tooltip"], > [role="menu"]):not(.${codexPlusPageClass} *),
+      ${codexPlusIsWindowsPlatform ? "" : `
+      html[data-codex-plus-page-open] div:has(> [data-radix-popper-content-wrapper], > [role="tooltip"], > [role="menu"]):not(.${codexPlusPageClass} *) {
+        z-index: 2147483645 !important;
+      }
+      `}
       html[data-codex-plus-page-open] [data-radix-popper-content-wrapper]:not(.${codexPlusPageClass} *),
       html[data-codex-plus-page-open] [role="tooltip"]:not(.${codexPlusPageClass} *),
       html[data-codex-plus-page-open] [role="menu"]:not(.${codexPlusPageClass} *),
@@ -1888,13 +1887,34 @@
     document.documentElement.appendChild(style);
   }
 
+  function syncCodexPlusPagePopupStyle(open) {
+    const id = `${styleId}-page-popups`;
+    const existing = document.getElementById(id);
+    if (!codexPlusIsWindowsPlatform || !open) {
+      existing?.remove();
+      return;
+    }
+    if (existing) return;
+    // Windows 仅在管理页打开时提升原生弹层的直接定位容器。即使根条件不命中，
+    // 常驻的 :has() 仍会增加聊天 DOM 变化时的样式失效开销。
+    const style = document.createElement("style");
+    style.id = id;
+    style.setAttribute("data-codex-plus-ext", "page-popup-style");
+    style.textContent = `
+      html[data-codex-plus-page-open] div:has(> [data-radix-popper-content-wrapper], > [role="tooltip"], > [role="menu"]):not(.${codexPlusPageClass} *) {
+        z-index: 2147483645 !important;
+      }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
   function defaultCodexPlusSettings() {
     // capacityAutoRetry* 必须写成字面量：多个测试（agent-pet、
     // backend-settings-sync…）把 defaultCodexPlusSettings 切片到不带 prelude 的沙箱里执行，
     // 引用 prelude 常量会直接 ReferenceError。与 00-prelude.js 里
     // capacityAutoRetryDefaultMaxAttempts / capacityAutoRetryDefaultIntervalSeconds 的一致性
     // 由 capacity-auto-retry.test.ts 的防漂移用例守住。
-    return { serviceTierControls: false, capacityRetry: false, quotaResume: true, capacityRetryMaxAttempts: 5, projectMove: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, sideChatSave: false, pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, sessionDeleteSkipConfirm: false, historyTurnRecovery: false, markdownExport: true, sessionShare: true, pasteFix: false, offlineAutoReview: false, typingEffect: "off", threadIdBadge: false, conversationView: false, whaleWidget: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, nativeMenuPlacement: true, nativeFastUnlock: false, petRealMouseLook: false, activityOverlayRight: false, stepwise: false, answerOutline: false, turnRewind: false, capacityAutoRetry: false, capacityAutoRetryMaxAttempts: 15, capacityAutoRetryIntervalSeconds: 0, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { serviceTierControls: false, capacityRetry: false, quotaResume: true, capacityRetryMaxAttempts: 5, projectMove: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, sideChatSave: false, pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, sessionDeleteSkipConfirm: false, historyTurnRecovery: false, markdownExport: true, sessionShare: true, pasteFix: false, offlineAutoReview: false, statsigOverrides: false, reportedUsageCompaction: false, typingEffect: "off", threadIdBadge: false, conversationView: false, whaleWidget: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, nativeMenuPlacement: true, nativeFastUnlock: false, petRealMouseLook: false, activityOverlayRight: false, stepwise: false, answerOutline: false, turnRewind: false, capacityAutoRetry: false, capacityAutoRetryMaxAttempts: 15, capacityAutoRetryIntervalSeconds: 0, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
@@ -1926,6 +1946,8 @@
     capacityRetryMaxAttempts: "codexAppCapacityRetryMaxAttempts",
     typingEffect: "codexAppTypingEffect",
     offlineAutoReview: "codexAppOfflineAutoReview",
+    statsigOverrides: "codexAppStatsigOverrides",
+    reportedUsageCompaction: "codexAppReportedUsageCompaction",
     dreamSkinEnabled: "codexAppDreamSkinEnabled",
     dreamSkinPaused: "codexAppDreamSkinPaused",
     dreamSkinThemeConfig: "codexAppDreamSkinThemeConfig",
@@ -1962,6 +1984,8 @@
         activityOverlayRight: "activity-overlay-right",
         pasteFix: "paste-fix",
         offlineAutoReview: "offline-auto-review",
+        statsigOverrides: "statsig-overrides",
+        reportedUsageCompaction: "reported-usage-compaction",
         stepwise: "stepwise",
         answerOutline: "answer-outline",
         petRealMouseLook: "pet-real-mouse",
@@ -1989,6 +2013,8 @@
         serviceTierControls: false,
         typingEffect: "off",
         offlineAutoReview: false,
+        statsigOverrides: false,
+        reportedUsageCompaction: false,
         threadIdBadge: false,
         conversationView: false,
         conversationViewMaxWidth: conversationViewDefaultWidth,
@@ -3520,6 +3546,7 @@
 
   /** 滚动位置恢复关掉时（设置关、或内置拓展停用）撤掉排着的保存 / 恢复定时器，作废进行中的轮次。 */
   function stopThreadScrollRestore() {
+    if (window.__codexThreadScrollRuntime?.activeScroller) bindThreadScrollListener(null);
     clearTimeout(window.__codexThreadScrollSaveTimer);
     window.__codexThreadScrollSaveTimer = null;
     window.__codexThreadScrollRestoreRevision = (window.__codexThreadScrollRestoreRevision || 0) + 1;

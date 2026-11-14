@@ -1897,6 +1897,8 @@ pub struct UpstreamProxyResponse {
     pub content_type: String,
     pub is_stream: bool,
     pub wire_api: UpstreamWireApi,
+    /// 仅反映最后一次真实上游响应是否带有 x-reasoning-included。
+    pub upstream_reasoning_included: bool,
     /// 仅标记需要代理重组的合成摘要兼容路径。
     pub compaction: bool,
     /// 原生上游已返回恰好一个 compaction 项或完整失败流时为真，
@@ -2053,6 +2055,14 @@ impl UpstreamProxyResponse {
     pub fn take_response(&mut self) -> anyhow::Result<reqwest::Response> {
         self.response.take().context("缺少上游响应")
     }
+}
+
+fn response_includes_upstream_reasoning(response: &reqwest::Response) -> bool {
+    response.headers().contains_key("x-reasoning-included")
+        && response
+            .headers()
+            .get("x-codexplus-compaction-usage")
+            .is_none_or(|value| value != "reported")
 }
 
 pub fn upstream_header_timeout() -> Duration {
@@ -3164,6 +3174,7 @@ fn native_compaction_unsupported_result(
             content_type: "application/json".to_string(),
             is_stream: false,
             wire_api: UpstreamWireApi::Responses,
+            upstream_reasoning_included: false,
             compaction: false,
             native_compaction_passthrough: false,
             buffered_body: Some(serde_json::to_vec(&body).unwrap_or_default()),
@@ -3727,6 +3738,7 @@ fn extension_rejected_response(reason: &str) -> anyhow::Result<UpstreamProxyResp
         content_type: "application/json".to_string(),
         is_stream: false,
         wire_api: UpstreamWireApi::Responses,
+        upstream_reasoning_included: false,
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: Some(serde_json::to_vec(&json!({
@@ -3797,6 +3809,7 @@ async fn open_vendor_responses_request(
                 content_type: "application/json".to_string(),
                 is_stream: false,
                 wire_api: UpstreamWireApi::Responses,
+                upstream_reasoning_included: false,
                 compaction: false,
                 native_compaction_passthrough: false,
                 buffered_body: Some(serde_json::to_vec(&json!({
@@ -4086,6 +4099,15 @@ async fn open_vendor_responses_request(
         } else {
             relay
         };
+        // Kimi 官方 Responses 只认 `reasoning.encrypted_content`：Codex 私有的
+        // `output.encrypted_content` 会让整包 400（issue #3026），发出前去掉。
+        // 经第三方中转调 Kimi 模型时地址认不出来，按模型名再判一次（#3068）。
+        if wire_api == UpstreamWireApi::Responses
+            && (crate::relay_config::upstream_is_kimi_official_responses(&relay)
+                || request_model_is_kimi(&upstream_body))
+        {
+            tidy_kimi_include(&mut upstream_body);
+        }
         if local_exec_adapted && wire_api == UpstreamWireApi::Responses && !xai_upstream {
             // 声明与当前全部历史同时转换，不能对已转换的声明再拼入原始新工具结果。
             upstream_body = crate::responses_exec::adapt_request(upstream_body)?;
@@ -4548,6 +4570,8 @@ async fn open_vendor_responses_request(
                 .to_string();
         }
 
+        let mut upstream_reasoning_included = wire_api == UpstreamWireApi::Responses
+            && response_includes_upstream_reasoning(&upstream);
         if legacy_native_compaction {
             let body =
                 read_limited_upstream_body(&mut upstream, MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES)
@@ -4583,6 +4607,7 @@ async fn open_vendor_responses_request(
                 content_type: response_type,
                 is_stream: valid && stream_response,
                 wire_api,
+                upstream_reasoning_included,
                 compaction: false,
                 native_compaction_passthrough: valid && success,
                 buffered_body: Some(body),
@@ -4644,6 +4669,7 @@ async fn open_vendor_responses_request(
                     wire_api,
                     compaction: false,
                     native_compaction_passthrough: stream_response,
+                    upstream_reasoning_included,
                     buffered_body: Some(probed),
                     stream_prefix: Vec::new(),
                     request_trace: None,
@@ -4674,6 +4700,7 @@ async fn open_vendor_responses_request(
                             wire_api,
                             compaction: false,
                             native_compaction_passthrough: true,
+                            upstream_reasoning_included,
                             buffered_body: Some(probed),
                             stream_prefix: Vec::new(),
                             request_trace: None,
@@ -4699,6 +4726,7 @@ async fn open_vendor_responses_request(
                             wire_api,
                             compaction: false,
                             native_compaction_passthrough: true,
+                            upstream_reasoning_included,
                             buffered_body: Some(incomplete_compaction_stream(&probed)),
                             stream_prefix: Vec::new(),
                             request_trace: None,
@@ -4730,6 +4758,7 @@ async fn open_vendor_responses_request(
                         wire_api,
                         compaction: false,
                         native_compaction_passthrough: true,
+                        upstream_reasoning_included,
                         buffered_body: Some(probed),
                         stream_prefix: Vec::new(),
                         request_trace: None,
@@ -4752,6 +4781,7 @@ async fn open_vendor_responses_request(
                         wire_api,
                         compaction: false,
                         native_compaction_passthrough: true,
+                        upstream_reasoning_included,
                         buffered_body: Some(sse),
                         stream_prefix: Vec::new(),
                         request_trace: None,
@@ -4781,6 +4811,7 @@ async fn open_vendor_responses_request(
                     wire_api,
                     compaction: false,
                     native_compaction_passthrough: false,
+                    upstream_reasoning_included,
                     buffered_body: Some(probed),
                     stream_prefix: Vec::new(),
                     request_trace: None,
@@ -4875,6 +4906,8 @@ async fn open_vendor_responses_request(
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("")
                 .to_string();
+            upstream_reasoning_included = wire_api == UpstreamWireApi::Responses
+                && response_includes_upstream_reasoning(&upstream);
         }
 
         // 内置兼容回退也可能重建请求体；最终返回的 trace 绑定最后一次发送。
@@ -5107,6 +5140,7 @@ async fn open_vendor_responses_request(
                         wire_api,
                         compaction: false,
                         native_compaction_passthrough: false,
+                        upstream_reasoning_included,
                         buffered_body: Some(body),
                         stream_prefix: Vec::new(),
                         request_trace: Some(request_trace),
@@ -5295,6 +5329,7 @@ async fn open_vendor_responses_request(
             content_type,
             wire_api,
             compaction: is_compaction_request,
+            upstream_reasoning_included,
             native_compaction_passthrough: false,
             buffered_body: None,
             stream_prefix,
@@ -5456,6 +5491,38 @@ fn upstream_rejects_custom_tools(relay: &crate::settings::RelayProfile) -> bool 
                 .iter()
                 .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
         })
+}
+
+/// Kimi 官方 Responses 的 `include` 只认 `reasoning.encrypted_content`（#3026）：
+/// 去掉 Codex 私有的 `output.encrypted_content`，其余项保留；过滤后为空就整个去掉。
+/// 请求的模型名带 `kimi`（如 `kimi-k3.1-pro`、`moonshot/kimi-k2`）：中转站转发的也是 Kimi 的接口（#3068）。
+fn request_model_is_kimi(body: &Value) -> bool {
+    body.get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| model.to_ascii_lowercase().contains("kimi"))
+}
+
+fn tidy_kimi_include(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let kept = object
+        .get("include")
+        .and_then(Value::as_array)
+        .map(|include| {
+            include
+                .iter()
+                .filter(|entry| entry.as_str() != Some("output.encrypted_content"))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    if let Some(kept) = kept {
+        if kept.is_empty() {
+            object.remove("include");
+        } else {
+            object.insert("include".to_string(), Value::Array(kept));
+        }
+    }
 }
 
 /// 只处理 Responses `input[].content[]` 与 `function_call_output.output[]`
@@ -5677,6 +5744,7 @@ pub async fn open_models_proxy_request(
         is_stream: false,
         content_type,
         wire_api: UpstreamWireApi::Responses,
+        upstream_reasoning_included: false,
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: None,
@@ -5753,6 +5821,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         is_stream: false,
         content_type,
         wire_api: UpstreamWireApi::AudioTranscriptions,
+        upstream_reasoning_included: false,
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: None,
@@ -5969,6 +6038,7 @@ async fn open_image_request_with_relay(
         is_stream: false,
         content_type,
         wire_api,
+        upstream_reasoning_included: false,
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: None,
@@ -6058,6 +6128,7 @@ async fn open_official_image_proxy_request(
         is_stream: false,
         content_type,
         wire_api,
+        upstream_reasoning_included: false,
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: None,
@@ -6161,6 +6232,7 @@ pub async fn open_chat_completions_proxy_request(
         is_stream: is_stream || content_type.contains("text/event-stream"),
         content_type,
         wire_api: UpstreamWireApi::ChatCompletions,
+        upstream_reasoning_included: false,
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: None,
@@ -6495,13 +6567,18 @@ async fn upstream_request_parts(
         // `web_search_call` 历史时必须声明 web_search 工具，否则流式返回
         // `response protection is unavailable`。Codex 对自定义 provider 走本地压缩
         // （`tools` 为空），所以官方成员的每个压缩请求都会被拒。
-        // 这里只对「完全没有声明工具」的官方登录请求自动补齐：补完 tool_choice 会被
-        // 置为 none（模型不能真正调用搜索），带工具的普通轮次保持原样。
+        // 没有声明工具或前一跳已恢复缓存工具的本地摘要都需补齐声明。
+        // 后者必须已有 none 和明确摘要身份，带工具的普通轮次保持原样。
         // 拓展用 gateway.replaces 关掉 builtin:official-shaping 时不自动补，由拓展在 upstream 段整理。
         let official_auto_repair = official_base.is_some()
             && !legacy_compact_path
             && !crate::extension_gateway::builtin_replaced("builtin:official-shaping")
-            && request_declares_no_tools(&body);
+            && (request_declares_no_tools(&body)
+                || (body.get("tool_choice").and_then(Value::as_str) == Some("none")
+                    && local_compaction::is_summary_request(
+                        &body,
+                        COMPACTION_SUMMARY_INSTRUCTION,
+                    )));
         let opt_in_repair = relay.web_search_history_compat_enabled() && !legacy_compact_path;
         if (opt_in_repair || official_auto_repair) && ensure_web_search_tool_for_history(&mut body)
         {
@@ -6511,6 +6588,18 @@ async fn upstream_request_parts(
                     "action": "declare_web_search",
                     "source": if official_auto_repair { "official_login" } else { "provider_opt_in" },
                     "inputContainsWebSearchCall": true
+                }),
+            );
+        }
+        let callless_outputs = downgrade_callless_function_outputs(&mut body);
+        if !callless_outputs.is_empty() {
+            // 只记录条数与工具名，不记录 output 内容。
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.callless_function_output_downgraded",
+                json!({
+                    "relayId": relay.id,
+                    "count": callless_outputs.len(),
+                    "names": callless_outputs,
                 }),
             );
         }
@@ -8269,6 +8358,52 @@ fn normalize_responses_item_ids(body: &mut Value) {
     }
 }
 
+/// Codex Desktop 在跨任务委派（`create_thread` / `send_message_to_thread`）和定时任务
+/// （`automation_update`）时，会在 input 里注入一条**没有 `call_id`** 的
+/// `function_call_output` 作为 bootstrap。HTTP 的 Responses 上游一律拒绝缺 call_id 的
+/// function_call_output（「continuation via previous_response_id is only supported on
+/// Responses WebSocket v2」，#2997 / #3000，参考 openai/codex#42014、#42088）。
+/// 把这类条目原位降级成普通 user 消息——只命中上游必然拒绝的形态，不加开关。
+/// 返回每条降级条目的原 `name`（缺失记 `""`），`.len()` 即降级条数。
+fn downgrade_callless_function_outputs(body: &mut Value) -> Vec<String> {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for item in items.iter_mut() {
+        if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+            continue;
+        }
+        let has_call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty());
+        if has_call_id {
+            continue;
+        }
+        names.push(
+            item.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
+        // 不保留原 id / name / namespace 等字段，避免 fco_ 前缀与 message 类型冲突。
+        let output = item.get("output").cloned().unwrap_or(Value::Null);
+        let content = match output {
+            Value::String(text) => vec![json!({"type": "input_text", "text": text})],
+            Value::Array(parts) if !parts.is_empty() => parts,
+            Value::Null => vec![json!({"type": "input_text", "text": ""})],
+            Value::Array(_) => vec![json!({"type": "input_text", "text": ""})],
+            other => vec![json!({
+                "type": "input_text",
+                "text": serde_json::to_string(&other).unwrap_or_default()
+            })],
+        };
+        *item = json!({"type": "message", "role": "user", "content": content});
+    }
+    names
+}
+
 /// Responses 上游要求同一请求里的 namespace 名称唯一。
 /// Codex 客户端在多轮 tool_search 后可能把多个历史 `tool_search_output` 都回放到
 /// 下一请求（#2156 / #2166）。同名工具/namespace 只在**第一次声明它的 output** 里
@@ -9251,7 +9386,7 @@ fn image_part_to_chat(part: &Value) -> Option<Value> {
 /// 已确认的 multi_agent v2 agent_message 明文形态：
 /// content[] 同时包含以 `Payload:` 结尾的 input_text 头部和 encrypted_content 载荷片段。
 /// 只有这一种结构允许把 encrypted_content 片段按明文文本透传；其余一律 fail closed。
-fn agent_message_has_confirmed_plaintext_shape(content: &Value) -> bool {
+pub(crate) fn agent_message_has_confirmed_plaintext_shape(content: &Value) -> bool {
     let Some(parts) = content.as_array() else {
         return false;
     };
@@ -9364,7 +9499,7 @@ fn responses_content_to_chat_content(
 ///    ASCII 文本，可打印占比高，不命中后半段。
 ///
 /// 两个条件都不满足即按明文透传。
-fn encrypted_content_value_is_opaque(value: &str) -> bool {
+pub(crate) fn encrypted_content_value_is_opaque(value: &str) -> bool {
     if value
         .chars()
         .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
@@ -11306,9 +11441,11 @@ const IMAGE_DATA_URL_PREFIX: &str = "data:image/";
 /// 这些上游只接受**纯 base64**，不认 `data:image/png;base64,` 前缀，收到就 400
 /// （issue #2031：GLM-5.3-Flash 的本地图片被拒）。只对这类供应商剥离前缀，
 /// 标准 data URL 上游（OpenAI 等）保持原样，免得把能用的改坏。
+/// 带命名空间的模型名（如 NVIDIA 的 `z-ai/glm-5.3-flash`、OpenRouter 的 `*/glm-*`）
+/// 是聚合平台的标准 OpenAI 兼容接口，`image_url.url` 必须保留 data URL（#2991）。
 fn upstream_needs_bare_base64(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    model.starts_with("glm-") || model.starts_with("zhipu") || model.contains("/glm-")
+    model.starts_with("glm-") || model.starts_with("zhipu")
 }
 
 /// 就地改写 messages 里 `image_url` 的 url：对需要纯 base64 的模型剥掉 data URL 前缀。
@@ -12442,6 +12579,131 @@ mod relay_custom_header_tests {
         assert_eq!(
             request.headers().get("authorization").unwrap(),
             "Bearer explicit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod kimi_include_tests {
+    use super::*;
+
+    fn kimi_relay(base_url: &str) -> crate::settings::RelayProfile {
+        crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            base_url: base_url.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn kimi_official_responses_upstreams_are_recognized() {
+        for base_url in [
+            "https://api.moonshot.ai/v1",
+            "https://api.moonshot.cn/v1",
+            "https://api.kimi.com/coding/v1",
+        ] {
+            assert!(
+                crate::relay_config::upstream_is_kimi_official_responses(&kimi_relay(base_url)),
+                "{base_url}"
+            );
+        }
+        for base_url in [
+            "https://api.openai.com/v1",
+            "https://api.x.ai/v1",
+            "https://moonshot.ai.example.com/v1",
+            "",
+        ] {
+            assert!(
+                !crate::relay_config::upstream_is_kimi_official_responses(&kimi_relay(base_url)),
+                "{base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_responses_protocol_is_not_kimi_official() {
+        let relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::ChatCompletions,
+            base_url: "https://api.moonshot.ai/v1".to_string(),
+            ..Default::default()
+        };
+        assert!(!crate::relay_config::upstream_is_kimi_official_responses(
+            &relay
+        ));
+    }
+
+    #[test]
+    fn kimi_models_behind_third_party_relays_are_recognized_by_name() {
+        for model in ["kimi-k3.1-pro", "Kimi-K2", "moonshot/kimi-k2-thinking"] {
+            assert!(request_model_is_kimi(&json!({ "model": model })), "{model}");
+        }
+        for body in [
+            json!({ "model": "gpt-6.1-sol" }),
+            json!({ "model": "deepseek-v4-pro" }),
+            json!({}),
+        ] {
+            assert!(!request_model_is_kimi(&body), "{body}");
+        }
+    }
+
+    #[test]
+    fn include_drops_only_output_encrypted_content() {
+        let mut body = json!({
+            "model": "k3.1-pro",
+            "include": [
+                "reasoning.encrypted_content",
+                "output.encrypted_content",
+                "message.output_text.logprobs"
+            ]
+        });
+        tidy_kimi_include(&mut body);
+        assert_eq!(
+            body["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "message.output_text.logprobs"
+            ])
+        );
+    }
+
+    #[test]
+    fn include_removed_entirely_when_only_private_entries_left() {
+        let mut body = json!({
+            "include": ["output.encrypted_content"],
+            "input": []
+        });
+        tidy_kimi_include(&mut body);
+        assert!(body.get("include").is_none());
+        // 其他字段不受影响。
+        assert_eq!(body["input"], json!([]));
+    }
+
+    #[test]
+    fn include_without_private_entries_is_untouched() {
+        let mut body = json!({"include": ["reasoning.encrypted_content"]});
+        tidy_kimi_include(&mut body);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn official_chatgpt_include_is_never_rewritten() {
+        // 官方 ChatGPT 上游不命中 Kimi 判定，include 原样转发。
+        let relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            ..Default::default()
+        };
+        assert!(!crate::relay_config::upstream_is_kimi_official_responses(
+            &relay
+        ));
+        let mut body =
+            json!({"include": ["reasoning.encrypted_content", "output.encrypted_content"]});
+        if crate::relay_config::upstream_is_kimi_official_responses(&relay) {
+            tidy_kimi_include(&mut body);
+        }
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content", "output.encrypted_content"])
         );
     }
 }
@@ -14845,6 +15107,8 @@ fn adapt_local_response(local: protected_local::UpstreamProxyResponse) -> Upstre
         protected_local::UpstreamWireApi::ImageGenerations => UpstreamWireApi::ImageGenerations,
         protected_local::UpstreamWireApi::ImageEdits => UpstreamWireApi::ImageEdits,
     };
+    let upstream_reasoning_included =
+        wire_api == UpstreamWireApi::Responses && response_includes_upstream_reasoning(&response);
     UpstreamProxyResponse {
         status_code: local.status_code,
         content_type: local.content_type,
@@ -14852,6 +15116,7 @@ fn adapt_local_response(local: protected_local::UpstreamProxyResponse) -> Upstre
         wire_api,
         compaction: local.compaction,
         native_compaction_passthrough: local.native_compaction_passthrough,
+        upstream_reasoning_included,
         buffered_body: None,
         stream_prefix: local.prefetched_chunk,
         request_trace: local.request_trace,
@@ -15124,6 +15389,49 @@ mod local_upstream_transport_contract {
             Some(r#"{"model":"gpt-6.1-sol"}"#)
         ));
     }
+    #[test]
+    fn local_adapter_preserves_upstream_reasoning_usage_contract() {
+        for (included, reported, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let mut builder = http::Response::builder().status(200);
+            if included {
+                builder = builder.header("x-reasoning-included", "true");
+            }
+            if reported {
+                builder = builder.header("x-codexplus-compaction-usage", "reported");
+            }
+            let response = builder.body(reqwest::Body::from("{}")).unwrap().into();
+            let local = protected_local::UpstreamProxyResponse {
+                status_code: 200,
+                content_type: "application/json".into(),
+                is_stream: false,
+                wire_api: protected_local::UpstreamWireApi::Responses,
+                capacity_retryable: false,
+                capacity_retry_enabled: false,
+                capacity_retry_key: None,
+                capacity_retry_max_attempts: 0,
+                prefetched_chunk: Vec::new(),
+                compaction: false,
+                native_compaction_passthrough: false,
+                request_trace: None,
+                exec_adapted: false,
+                exec_outcome: None,
+                response,
+                scheduled_account_id: Some("retained-account".into()),
+                _channel_permit: None,
+            };
+            let adapted = adapt_local_response(local);
+            assert_eq!(adapted.upstream_reasoning_included, expected);
+            assert_eq!(
+                adapted.scheduled_account_id.as_deref(),
+                Some("retained-account")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn response_body_holds_channel_queue_after_outer_state_is_dropped() {
         let profile = RelayProfile {
@@ -15153,5 +15461,151 @@ mod local_upstream_transport_contract {
         .await
         .expect("body completion releases queue");
         drop(next);
+    }
+}
+
+#[cfg(test)]
+mod callless_function_output_tests {
+    use super::*;
+
+    /// #2997 / #3000：Codex Desktop 的委派 / 定时任务 bootstrap 注入没有 call_id 的
+    /// function_call_output，HTTP Responses 上游必然拒绝，原位降级成 user 消息。
+    #[test]
+    fn delegation_bootstrap_output_becomes_a_user_message() {
+        let mut body = json!({"input": [
+            {"type":"function_call_output","id":"fco_x","name":"create_thread","namespace":"codex_app",
+             "output":"<codex_delegation>\n  <source_thread_id>t</source_thread_id>\n  <input>只回复 TEST_OK</input>\n</codex_delegation>"}
+        ]});
+        assert_eq!(
+            downgrade_callless_function_outputs(&mut body),
+            ["create_thread"]
+        );
+        let item = &body["input"][0];
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "user");
+        assert_eq!(item["content"][0]["type"], "input_text");
+        assert_eq!(
+            item["content"][0]["text"],
+            "<codex_delegation>\n  <source_thread_id>t</source_thread_id>\n  <input>只回复 TEST_OK</input>\n</codex_delegation>"
+        );
+        for key in ["id", "name", "namespace", "call_id", "output"] {
+            assert!(item.get(key).is_none(), "降级后不保留 {key}");
+        }
+    }
+
+    /// 空串与纯空白 call_id 同样会被上游拒绝，一并降级。
+    #[test]
+    fn blank_call_id_outputs_are_downgraded() {
+        for call_id in ["", "  "] {
+            let mut body = json!({"input": [
+                {"type":"function_call_output","call_id":call_id,"output":"x"}
+            ]});
+            assert_eq!(downgrade_callless_function_outputs(&mut body).len(), 1);
+            assert_eq!(body["input"][0]["type"], "message");
+        }
+    }
+
+    /// 带 call_id 的工具调用链原样保留。
+    #[test]
+    fn paired_function_call_output_is_untouched() {
+        let mut body = json!({"input": [
+            {"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":"ok"}
+        ]});
+        let before = body.clone();
+        assert!(downgrade_callless_function_outputs(&mut body).is_empty());
+        assert_eq!(body, before);
+    }
+
+    /// output 为部件数组时原样作为 message content（本来就是合法 content 类型）。
+    #[test]
+    fn array_output_is_reused_as_message_content() {
+        let mut body = json!({"input": [
+            {"type":"function_call_output","output":[
+                {"type":"input_text","text":"a"},
+                {"type":"input_image","image_url":"data:image/png;base64,AA"}
+            ]}
+        ]});
+        assert_eq!(downgrade_callless_function_outputs(&mut body).len(), 1);
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([
+                {"type":"input_text","text":"a"},
+                {"type":"input_image","image_url":"data:image/png;base64,AA"}
+            ])
+        );
+    }
+
+    /// 混合顺序里只动缺 call_id 的那一条，长度与顺序不变。
+    #[test]
+    fn mixed_input_only_rewrites_callless_entries() {
+        let mut body = json!({"input": [
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+            {"type":"function_call_output","name":"automation_update","output":"schedule"},
+            {"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":"ok"}
+        ]});
+        assert_eq!(
+            downgrade_callless_function_outputs(&mut body),
+            ["automation_update"]
+        );
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], "schedule");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+    }
+
+    /// input 不是数组时不改任何东西。
+    #[test]
+    fn non_array_input_is_ignored() {
+        let mut body = json!({"input": "text"});
+        let before = body.clone();
+        assert!(downgrade_callless_function_outputs(&mut body).is_empty());
+        assert_eq!(body, before);
+    }
+
+    /// 端到端：经 Responses 供应商转发后，上游收到的 input 里不再有缺 call_id 的输出。
+    #[tokio::test]
+    async fn responses_upstream_never_sees_a_callless_function_output() {
+        let relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            base_url: "https://relay.example.test/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        };
+        let body = json!({"model": "gpt-5.6-sol", "input": [
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+            {"type":"function_call_output","id":"fco_x","name":"create_thread","namespace":"codex_app","output":"delegate"},
+            {"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":"ok"}
+        ]});
+        let (_, out, _, _) = upstream_request_parts(
+            &relay,
+            body,
+            "/v1/responses",
+            None,
+            false,
+            None,
+            ProxySessionHeaders::default(),
+        )
+        .await
+        .unwrap();
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != "function_call_output"
+                    || item["call_id"]
+                        .as_str()
+                        .is_some_and(|id| !id.trim().is_empty())),
+            "上游收到的 input 里不应再有缺 call_id 的 function_call_output：{out}"
+        );
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["content"][0]["text"], "delegate");
     }
 }

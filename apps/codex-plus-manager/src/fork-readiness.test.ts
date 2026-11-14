@@ -6,6 +6,8 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../../../assets/inject/renderer-inject/32-fork-readiness-fallback.js", import.meta.url), "utf8");
 // 真实注入时整份脚本包在一个 IIFE 里，重新注入会得到新的作用域。
 const inject = `(() => {\n${source}\nreturn installCodexForkReadinessFallback();\n})()`;
+const discovery = readFileSync(new URL("../../../assets/inject/renderer-inject/20-menu.js", import.meta.url), "utf8");
+const collectRspack = new Function(`${discovery.slice(discovery.indexOf("  function codexRspackRequestModules("), discovery.indexOf("  async function loadAppServerRequestModules("))}\nreturn codexRspackRequestModules;`)();
 
 // 仿照 Codex 26.1027 的原生实现：getForkCapabilities 把 this.settings.read 绑定后交给 readPlacement。
 function nativeModule() {
@@ -44,14 +46,15 @@ class Settings {
   read(key: string) { return this.#gates[key]; }
 }
 
-async function install(enhancementsEnabled = true) {
+async function install(enhancementsEnabled = true, numericEntry = false) {
   const module = nativeModule();
   const diagnostics: unknown[][] = [];
   const window: any = { setTimeout: () => 0 };
   const context = vm.createContext({
     window,
     codexPlusBackendSettings: { enhancementsEnabled },
-    loadOptionalCodexAppModule: async (name: string) => (name === "app-initial-" ? module : null),
+    loadOptionalCodexAppModule: async (name: string) => (!numericEntry && name === "app-initial-" ? module : null),
+    loadAppServerRequestModules: async () => ({ modules: collectRspack({ c: { manager: { exports: module } } }) }),
     sendCodexPlusDiagnostic: (...args: unknown[]) => diagnostics.push(args),
   });
   const patched = await vm.runInContext(inject, context);
@@ -98,6 +101,14 @@ test("重复注入不会叠加包装", async () => {
   assert.equal(Manager.prototype.getForkCapabilities, first);
   assert.equal(typeof first.__codexPlusOriginal, "function");
   assert.equal(first.__codexPlusOriginal.__codexPlusForkReadiness, undefined);
+});
+
+test("数字 Rspack 入口没有 app-initial 模块时，仍修补原生分支放置且保留登录行为", async () => {
+  const { Manager, patched } = await install(true, true);
+  assert.equal(patched, true);
+  const settings = new Settings({ sidebarCustomSectionsEnabled: false, useAppServerCustomSections: undefined });
+  assert.equal(new Manager({ accountId: () => null }, settings).getForkCapabilities().readPlacement().status, "ready");
+  assert.equal(new Manager({ accountId: () => "account-1" }, settings).getForkCapabilities().readPlacement().status, "not-ready");
 });
 
 // #2898：启动时没联网，Statsig 是 Ready 但没有任何数据（NoValues），原生不发布执行配置，

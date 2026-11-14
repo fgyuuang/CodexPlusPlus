@@ -3,6 +3,14 @@
 本文件记录本 fork 相对于上游 BigPizzaV3/CodexPlusPlus origin/main 的核心差异功能。
 每次上游合并后必须逐条确认回归。以下清单记录需要保留的用户能力及历史实现，不要求永久保留全部本地代码；上游完整覆盖并验证兼容后优先采用上游实现。
 
+## 2026-11-12：v2.6.6 与独立服务拓展
+
+- 正式升级目标为 `v2.6.6`（`949d46b4`），整合源码位于 `D:/pro/codexpp-v266-integration-20261112`、分支 `codex/v266-extension-migration`；原工作区的待提交合并保持原位。构建与交付证据见[本轮报告](reports/2026-11-12-v2.6.6-extension-migration.md)。
+- 用户包 `local-services-independent` 通过上游拓展工具安装，名称「本地服务中心（独立）」。后台、页面和测试源码位于仓库外 `D:/pro/codexpp-local-services-extension-20261112`，仅使用通用 Node 后台与页面 API，不调用 fork 的 `/local-integrations/*` 路由。
+- 已迁出的边界是现有 CLIProxyAPI 的状态/显式启停、现有 NewAPI Compose 服务的状态/显式启停。只停止拓展自己启动且进程身份仍一致的 CLI；不自动接管旧入口启动的进程，不自动运行服务。NewAPI 不下载镜像、不删卷、不执行 down。CLI 原管理密码只在后台内存按既有 DPAPI 格式解密，不迁移账号目录。
+- 供应商创建、模型目录、API Key 管理、自启动及已有 Rust 服务入口尚未全部迁出。官方账号库、历史 provider 恢复和显式官方图片隔离继续保留；不能把此阶段称为已能直接换用纯上游程序。旧服务入口保留至用户实际验收，停用新拓展即可回退，外部数据保持原位。
+- 本轮安装时两个旧脚本阻止安全页内热重载，工具未刷新用户聊天；应在新版交付后重启或用户手动热重载，确认拓展状态 loaded，再验收真实启停。mock 测试和只读健康检查不替代真实服务操作验收。
+
 ## 2026-11-11：网关采用上游选路
 
 - 按用户明确要求，网关聊天及 compact 改用正式 v2.4.0 的子代理模型继承、`route::resolve_plan` 和候选切换，不再使用本地 `codex_routing` 的会话谱系推断与根账号亲和表。thread/session/root-turn 不同不再被该本地逻辑拒绝。

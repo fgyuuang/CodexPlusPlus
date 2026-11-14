@@ -350,6 +350,9 @@ fn default_weight() -> u32 {
 pub struct GatewayGroup {
     pub id: String,
     pub name: String,
+    /// 停用后保留配置，但不再出现在模型列表或参与路由。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
     #[serde(default, deserialize_with = "lenient")]
     pub mode: GroupMode,
     #[serde(default, deserialize_with = "lenient")]
@@ -444,6 +447,28 @@ pub struct GatewayRestoreState {
     pub extra: Map<String, Value>,
 }
 
+/// 用户在供应商名下选中的默认模型。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultModelSelection {
+    pub provider_id: String,
+    pub upstream_model: String,
+    #[serde(default)]
+    pub provider_source: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub provider_removed: bool,
+}
+
+impl DefaultModelSelection {
+    pub fn upstream_model_name(&self) -> String {
+        crate::model_suffix::parse_model_suffix(self.upstream_model.trim()).0
+    }
+
+    pub fn model_name(&self) -> String {
+        format!("{}/{}", self.provider_id, self.upstream_model_name())
+    }
+}
+
 /// 一个 Agent 的网关绑定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -454,6 +479,12 @@ pub struct AgentBinding {
     /// 为空时用池里第一个供应商的默认模型。
     #[serde(default)]
     pub model: String,
+    /// 用户明确从供应商下选择的默认模型；旧绑定没有该记录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model_selection: Option<DefaultModelSelection>,
+    /// 已写给这个 Agent 的明确选择；更换默认模型后旧会话仍可能使用。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_selections: Vec<DefaultModelSelection>,
     /// 额外暴露给 Agent 的模型（每行一个，可带 `[1M]` 窗口后缀）。
     #[serde(default)]
     pub extra_models: Vec<String>,
@@ -499,6 +530,8 @@ impl Default for AgentBinding {
         Self {
             enabled: false,
             model: String::new(),
+            default_model_selection: None,
+            model_selections: Vec::new(),
             extra_models: Vec::new(),
             claude_roles: ClaudeRoleModels::default(),
             unknown_model: UnknownModelPolicy::default(),
@@ -516,6 +549,19 @@ impl Default for AgentBinding {
 }
 
 impl AgentBinding {
+    pub fn selection_for(&self, model: &str) -> Option<&DefaultModelSelection> {
+        self.model_selections
+            .iter()
+            .find(|selection| selection.model_name().eq_ignore_ascii_case(model))
+            .or_else(|| {
+                self.default_model_selection.as_ref().filter(|selection| {
+                    let (current, _) = crate::model_suffix::parse_model_suffix(self.model.trim());
+                    selection.model_name().eq_ignore_ascii_case(model)
+                        && current.eq_ignore_ascii_case(model)
+                })
+            })
+    }
+
     /// 绑定里声明过的模型名（主模型、分档模型、额外模型），去掉窗口后缀、去重保序。
     pub fn declared_models(&self) -> Vec<String> {
         let mut models = Vec::new();
@@ -622,6 +668,11 @@ pub struct GatewaySettings {
     /// 模型下拉里不列自带模型（直连，不经 Codex++）的 Agent（默认都列，见 [`Self::shows_own_models_for`]）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hide_own_models: Vec<String>,
+    /// 子智能体按 Codex 实际请求的模型发送（#2987）。默认关：没有显式供应商身份的
+    /// 子智能体请求继承父回合的完整模型身份（改写 `request.model`，并在 spawn 工具
+    /// 描述里加继承指引）；打开后按请求里的模型发送，不改写也不注入指引。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub subagent_model_follow_request: bool,
     /// 旧版的全局生图模型，读的时候迁移给 Codex（见 [`read_store`]），之后不再写。
     #[serde(default, skip_serializing)]
     pub image_model: String,
@@ -657,6 +708,7 @@ impl Default for GatewaySettings {
             image_models: BTreeMap::new(),
             image_keep_urls: Vec::new(),
             hide_own_models: Vec::new(),
+            subagent_model_follow_request: false,
             image_model: String::new(),
             app_version: String::new(),
             extra: Map::new(),
@@ -1424,6 +1476,22 @@ mod tests {
         // 再读一遍还是同样的内容。
         let again = store.load().unwrap();
         assert_eq!(again.groups[0].extra["futureGroup"], 3);
+    }
+
+    /// #2987：默认关（子智能体继承父回合身份），序列化默认值时不落键，旧文件缺键也读成关。
+    #[test]
+    fn subagent_model_follow_request_defaults_off_and_round_trips() {
+        assert!(!GatewaySettings::default().subagent_model_follow_request);
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        store.save(&GatewaySettings::default()).unwrap();
+        let text = fs::read_to_string(&store.path).unwrap();
+        assert!(
+            !text.contains("subagentModelFollowRequest"),
+            "默认值不落键：{text}"
+        );
+        std::fs::write(&store.path, r#"{"subagentModelFollowRequest":true}"#).unwrap();
+        assert!(store.load().unwrap().subagent_model_follow_request);
     }
 
     #[test]

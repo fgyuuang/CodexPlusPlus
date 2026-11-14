@@ -43,6 +43,7 @@ function fixture() {
   const create = new Function("window", "client", "codexModelCatalog", "metadata", `
     const codexPlusModelCollectionSnapshots = new WeakMap(), codexPlusModelDefaultSnapshots = new WeakMap();
     const codexPlusBackendSettingsLoaded = true;
+    const codexPlusBackendSettings = {};
     const codexPlusModelUnlockEnabled = () => true;
     const codexPlusModelNames = () => codexModelCatalog.models;
     const codexPlusModelMetadata = (name) => metadata[name];

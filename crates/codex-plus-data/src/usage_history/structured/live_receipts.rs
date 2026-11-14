@@ -76,13 +76,29 @@ impl Receipt {
     }
 }
 
-fn receipt_model_matches(model: &str, actual: &str, provider: &str) -> bool {
-    let model = request_base_model(model);
+fn receipt_model_matches(receipt: &Receipt, actual: &str, record: &RequestEvidence) -> bool {
+    let model = receipt.model.as_str();
+    if (codex_plus_core::aggregate_catalog::is_aggregate_model(&record.model)
+        || codex_plus_core::aggregate_catalog::is_aggregate_model(model))
+        && model != record.model
+        && !(receipt.request_ids.contains(&record.id)
+            && receipt.request_signatures.get(&record.id) == Some(&request_signature(record)))
+    {
+        return false;
+    }
     model == actual
-        || model
-            .strip_prefix(provider)
-            .and_then(|suffix| suffix.strip_prefix('/'))
-            == Some(actual)
+        || (model == record.model
+            && (codex_plus_core::aggregate_catalog::is_aggregate_model(model)
+                || model.split_once('/').map(|(_, suffix)| suffix) == Some(actual)))
+        || (!codex_plus_core::aggregate_catalog::is_aggregate_model(model)
+            && model
+                .strip_prefix(&record.relay_id)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                == Some(actual))
+        || (codex_plus_core::aggregate_catalog::is_aggregate_model(actual)
+            && model == request_base_model(actual)
+            && receipt.request_ids.contains(&record.id)
+            && receipt.request_signatures.get(&record.id) == Some(&request_signature(record)))
 }
 
 pub(super) fn match_captured_receipts(
@@ -312,9 +328,9 @@ pub(super) fn match_receipts(
                     || record.keys().is_empty()
                     || !final_response_eligible(record)
                     || aliases.resolve(&record.thread_id).as_deref() != Some(session.as_str())
-                    || record.actual_model().is_none_or(|model| {
-                        !receipt_model_matches(&receipt.model, model, &record.relay_id)
-                    })
+                    || record
+                        .actual_model()
+                        .is_none_or(|model| !receipt_model_matches(receipt, model, record))
                     || (!receipt.provider.is_empty() && receipt.provider != record.relay_id)
                     || !within_receipt_window(
                         record,
@@ -393,6 +409,7 @@ pub(super) fn match_receipts(
             };
             let mut model: Option<&str> = None;
             let mut provider: Option<&str> = None;
+            let mut matching_model = true;
             let mut request_ids = Vec::new();
             for start in (end.saturating_sub(MAX_MERGED - 1)..=end).rev() {
                 let record = records[start];
@@ -416,6 +433,7 @@ pub(super) fn match_receipts(
                 }
                 model = Some(normalized);
                 provider = Some(&record.relay_id);
+                matching_model &= receipt_model_matches(receipt, normalized, record);
                 let usage = record.usage.unwrap();
                 let Some(input) = sum.input.checked_add(usage.input_tokens.unwrap()) else {
                     break;
@@ -449,9 +467,7 @@ pub(super) fn match_receipts(
                         continue;
                     }
                     // 已知模型与请求不一致也保留占用，不能把证据转给另一个回执。
-                    if (unknown_model(&receipt.model)
-                        || codex_plus_core::aggregate_catalog::is_aggregate_model(&receipt.model)
-                        || receipt_model_matches(&receipt.model, normalized, &record.relay_id))
+                    if (unknown_model(&receipt.model) || matching_model)
                         && (unknown_provider(&receipt.provider)
                             || receipt.provider == record.relay_id)
                     {
@@ -501,10 +517,22 @@ pub(super) fn match_receipts(
                 "cached":delta.cached,"rejected":true}));
         } else if count == 1 {
             let record = ids[candidate_ids[0].as_str()];
+            let actual_model = record.actual_model().unwrap();
+            let model = if codex_plus_core::aggregate_catalog::is_aggregate_model(actual_model)
+                && receipt.model == request_base_model(actual_model)
+                && candidate_ids.iter().all(|id| {
+                    receipt.request_ids.contains(id)
+                        && receipt.request_signatures.get(id)
+                            == Some(&request_signature(ids[id.as_str()]))
+                }) {
+                receipt.model.as_str()
+            } else {
+                actual_model
+            };
             result.push(json!({
                 "id":receipt.id,"sessionId":receipt.session_id,"timestamp":receipt.timestamp,
                 "input":delta.input,"output":delta.output,"cached":delta.cached,
-                "model":record.actual_model().unwrap(),
+                "model":model,
                 "provider":record.relay_id,"providerName":record.relay_name,
                 "requestIds":candidate_ids,
                 "requestSignatures":candidate_ids.iter().map(|id|

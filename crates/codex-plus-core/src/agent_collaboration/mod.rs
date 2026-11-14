@@ -1,5 +1,7 @@
 //! 本机 CLI 协作记录。每次状态转换均在 SQLite 写事务中完成；读取不会启动 agent。
 
+#[cfg(windows)]
+mod antigravity_windows;
 mod dsh;
 pub mod executor;
 pub mod integration;
@@ -144,6 +146,7 @@ impl Default for CollaborationConfig {
                 ("deepseek", "DeepSeek Harness"),
                 ("claude", "Claude Code"),
                 ("workbuddy", "WorkBuddy"),
+                ("antigravity", "Google Antigravity"),
             ]
             .into_iter()
             .map(|(id, name)| AgentConfig {
@@ -480,9 +483,9 @@ impl Store {
         }
         if !matches!(
             request.agent_id.as_str(),
-            "codex" | "deepseek" | "claude" | "workbuddy"
+            "codex" | "deepseek" | "claude" | "workbuddy" | "antigravity"
         ) {
-            bail!("不支持的 agent；仅支持 codex、deepseek、claude、workbuddy");
+            bail!("不支持的 agent；仅支持 codex、deepseek、claude、workbuddy、antigravity");
         }
         let path = Path::new(&request.cwd);
         if !path.is_absolute() || !path.is_dir() {
@@ -887,10 +890,17 @@ fn queue_wait_is_current(task: &TaskRecord, ahead: usize, timestamp: u64) -> boo
 }
 
 fn parse_state(payload: Option<&str>) -> anyhow::Result<State> {
-    match payload {
-        Some(payload) => serde_json::from_str(payload).context("协作记录损坏，未覆盖现有数据"),
-        None => Ok(State::default()),
+    let mut state: State = match payload {
+        Some(payload) => serde_json::from_str(payload).context("协作记录损坏，未覆盖现有数据")?,
+        None => State::default(),
+    };
+    // 旧记录没有新适配器：补入默认关闭项，保留原有目标、模型和任务。
+    for agent in CollaborationConfig::default().agents {
+        if !state.config.agents.iter().any(|saved| saved.id == agent.id) {
+            state.config.agents.push(agent);
+        }
     }
+    Ok(state)
 }
 
 fn queue_progress(ahead: usize) -> String {
@@ -915,9 +925,11 @@ fn normalize_config(config: CollaborationConfig) -> anyhow::Result<Collaboration
     normalized.default_agent_id = config.default_agent_id.trim().to_string();
     if !matches!(
         normalized.default_agent_id.as_str(),
-        "codex" | "deepseek" | "claude" | "workbuddy"
+        "codex" | "deepseek" | "claude" | "workbuddy" | "antigravity"
     ) {
-        bail!("默认子 Agent 必须是 Codex、DeepSeek Harness、Claude Code 或 WorkBuddy");
+        bail!(
+            "默认子 Agent 必须是 Codex、DeepSeek Harness、Claude Code 、WorkBuddy 或 Google Antigravity"
+        );
     }
     if !(1..=MAX_RUNTIME_MINUTES_LIMIT).contains(&config.max_runtime_minutes) {
         bail!("子 Agent 运行上限必须在 1 到 {MAX_RUNTIME_MINUTES_LIMIT} 分钟之间");

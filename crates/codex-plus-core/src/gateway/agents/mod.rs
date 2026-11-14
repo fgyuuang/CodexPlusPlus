@@ -52,6 +52,8 @@ pub enum AgentWire {
 pub struct ModelEntry {
     /// 网关里的模型名：`<供应商 id>/<模型>`、裸模型名或 `group/<组 id>`。
     pub id: String,
+    /// 当前显示名，模型组改名不改变请求 ID。
+    pub display_name: String,
     /// 上下文窗口（供应商池里写了的才有）。
     pub context_window: Option<u64>,
     /// 思考档位（由低到高，模型组取成员的并集）；没有资料时为空。
@@ -132,6 +134,9 @@ pub fn all() -> &'static [&'static AgentSpec] {
 }
 
 pub fn spec(id: &str) -> Option<&'static AgentSpec> {
+    if id == catalog_apps::CLAUDE_DESKTOP_LOCAL.id {
+        return Some(&catalog_apps::CLAUDE_DESKTOP_LOCAL);
+    }
     all().iter().copied().find(|spec| spec.id == id)
 }
 
@@ -207,5 +212,15 @@ mod tests {
                 spec.id
             );
         }
+    }
+
+    #[test]
+    fn claude_local_gateway_route_is_not_a_config_managed_agent() {
+        let route = spec(catalog_apps::CLAUDE_DESKTOP_LOCAL.id).unwrap();
+        assert!(std::ptr::eq(route, &catalog_apps::CLAUDE_DESKTOP_LOCAL));
+        assert!(!all().iter().any(|entry| entry.id == route.id));
+        assert!(is_generic(&crate::tools::ToolId::Unknown(
+            route.id.to_string()
+        )));
     }
 }

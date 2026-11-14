@@ -60,10 +60,14 @@
     if (codexForkReadinessState.patched || codexForkReadinessState.installing) return codexForkReadinessState.installing;
     codexForkReadinessState.installing = (async () => {
       const module = await loadOptionalCodexAppModule("app-initial-");
+      // 新版数字 Rspack 入口不再导出 app-initial，复用只读模块缓存发现。
+      const modules = module ? [module] : (await loadAppServerRequestModules()).modules;
       let patched = false;
-      for (const value of Object.values(module || {})) {
-        if (typeof value !== "function" || typeof value.prototype?.getForkCapabilities !== "function") continue;
-        patched = patchCodexForkCapabilities(value.prototype) || patched;
+      for (const candidate of modules) {
+        for (const value of Object.values(candidate || {})) {
+          if (typeof value !== "function" || typeof value.prototype?.getForkCapabilities !== "function") continue;
+          patched = patchCodexForkCapabilities(value.prototype) || patched;
+        }
       }
       return patched;
     })().catch(() => false).then((patched) => {

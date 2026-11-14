@@ -49,7 +49,7 @@ function Get-Snapshot([switch]$Dist) {
         if ($Dist) {
             $paths = @(Get-ChildItem -LiteralPath 'apps/codex-plus-manager/dist' -Recurse -File | ForEach-Object FullName)
         } else {
-            $roots = @('crates', 'apps', 'assets', 'scripts', 'docs/images', '.cargo') | Where-Object { Test-Path -LiteralPath $_ }
+            $roots = @('crates', 'apps', 'assets', 'scripts', 'tools/rice-maid-pet', 'local-plugins', 'docs/images', '.cargo') | Where-Object { Test-Path -LiteralPath $_ }
             $paths = @(& $script:rgPath --files --hidden --no-ignore @roots -g '!**/node_modules/**' -g '!**/target/**' -g '!**/dist/**' -g '!**/gen/**' -g '!**/.git/**' -g '!**/.env')
             if ($LASTEXITCODE -gt 1) { throw 'Unable to enumerate build inputs.' }
             $paths += @('Cargo.toml', 'Cargo.lock', 'rust-toolchain', 'rust-toolchain.toml', 'rustfmt.toml', '.rustfmt.toml') | Where-Object { Test-Path -LiteralPath $_ }

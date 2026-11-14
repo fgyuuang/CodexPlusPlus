@@ -39,8 +39,10 @@ describe("session more menu lifecycle", () => {
         matches: () => false, remove: () => { group.isConnected = false; },
       };
       const row = {
-        isConnected: true, dataset: {}, querySelectorAll: () => [group],
+        isConnected: true, dataset: {}, querySelectorAll: (selector?: string) => selector === "button" ? [] : [group],
         contains: (node: unknown) => node === group, classList: { remove: (name: string) => classes.delete(name) },
+        addEventListener: () => {}, appendChild: (node: unknown) => { row.rebuilt = node; },
+        rebuilt: null as unknown,
       };
       const menu = {
         ...events(), hidden: false, removed: false, isConnected: true, classes, row, group, button,
@@ -56,11 +58,19 @@ describe("session more menu lifecycle", () => {
     const api = new Function("document", "window", "codexPlusSettings", "codexPlusBackendSettings",
       "moreMenuClass", "moreButtonClass", "buttonClass", "actionGroupClass", "exportButtonClass",
       "codexDeleteVersion", "codexActionGroupVersion", "actionGroupFromRow", "sessionRefFromRow",
-      "codexPlusRegistry", "codexPlusExtensionItems",
+      "codexPlusRegistry", "codexPlusExtensionItems", "HTMLElement", "actionButtonClass",
+      "appendCodexPlusExtensionRowActions", "syncActionGroupLayout", "setTimeout",
       `${source.split("  function tryAttachButton(row)")[0]}
        return { pruneSessionMoreMenus, pruneRemovedSessionActions, attachButton, closeSessionMoreMenus, installSessionMoreMenuAutoClose };`,
     )(
-      { querySelectorAll: () => { menuQueries++; return menus.filter((menu) => !menu.removed); }, activeElement: null },
+      {
+        querySelectorAll: () => { menuQueries++; return menus.filter((menu) => !menu.removed); },
+        activeElement: null, body: { appendChild: () => {} },
+        createElement: () => ({
+          dataset: {}, setAttribute: () => {}, removeAttribute: () => {}, appendChild: () => {},
+          addEventListener: () => {}, removeEventListener: () => {},
+        }),
+      },
       {
         setTimeout: (callback: () => void) => {
           const id = ++timerId;
@@ -71,10 +81,11 @@ describe("session more menu lifecycle", () => {
       },
       () => ({ sessionDelete: true, markdownExport: true }), { enhancementsEnabled: true },
       "more-menu", "more-button", "delete-button", "actions", "export-button", "7", "7",
-      (row: { querySelectorAll: () => unknown[] }) => row.querySelectorAll()[0], () => ({}),
+      (row: { querySelectorAll: () => unknown[] }) => row.querySelectorAll()[0], () => ({ session_id: "thread-1" }),
       // 内置的删除（行内按钮）与导出（菜单项）都是注册进来的会话行操作。
       { rowActions: new Map([["export", { id: "export", label: "导出" }], ["delete", { id: "delete", label: "删除", placement: "inline" }]]) },
-      (registry: Map<string, unknown>) => [...registry.values()],
+      (registry: Map<string, unknown>) => [...registry.values()], class {}, "action-button",
+      () => {}, () => {}, () => 0,
     );
     return {
       ...api, timers, menuQueries: () => menuQueries,
@@ -130,6 +141,7 @@ describe("session more menu lifecycle", () => {
       else menu.__codexSessionMoreGroup = live.group;
       api.attachButton(menu.row);
       assert.equal(menu.group.isConnected, false, `${damage} must rebuild the retained group`);
+      assert.ok(menu.row.rebuilt, `${damage} must create a replacement group`);
     }
   });
 
@@ -628,7 +640,8 @@ it("groups aggregate models by exact member identity instead of bare model name"
   // 或完整展示名精确匹配目录，不能只按裸模型名命中目录里第一个同名成员。
   assert.match(picker, /function codexPlusModelPickerCatalogExactMap\(\)/);
   assert.match(picker, /codexPlusModelPickerNormalizeLoose\(split\.name\)/);
-  assert.match(picker, /provider:\$\{split\.provider\}/);
+  assert.match(picker, /providerIds\.get\(split\.provider\)/);
+  assert.doesNotMatch(picker, /provider:\$\{split\.provider\}/);
   assert.doesNotMatch(
     picker,
     /const known = providers\.get\(codexPlusModelPickerNormalizeStrict\(split\.name\)\)/,
@@ -1018,47 +1031,54 @@ describe("renderer injection header compatibility", () => {
     assert.match(html, /data-codex-plus-setting="pluginMarketplaceUnlock"/);
   });
 
-  it("patches current model/list MCP responses without a writable Electron bridge", async () => {
+  it("patches only tracked local first-page MCP model responses without a writable Electron bridge", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
     const start = renderer.indexOf("  function patchMcpModelResponseData(data) {");
     const end = renderer.indexOf("\n  function appServerModelRequestMethod", start);
-    assert.ok(start >= 0 && end > start);
     const patch = new Function(
-      "codexPlusModelUnlockEnabled", "codexPlusModelListRequestIds", "patchModelArray",
+      "codexPlusModelUnlockEnabled", "codexPlusModelListRequests", "patchModelArray",
+      "modelResponseIsComplete", "modelResponseHostId",
       `${renderer.slice(start, end)}\nreturn patchMcpModelResponseData;`,
-    ) as (enabled: () => boolean, ids: Set<string>, patchArray: (models: unknown[], allowEmpty: boolean) => boolean) => (data: unknown) => boolean;
-    const ids = new Set<string>();
-    const patchArray = (models: unknown[] | undefined, allowEmpty: boolean) => {
+    );
+    const requests = new Map([["17", { hostId: "local", cursor: null, cursorKnown: true, ambiguous: false }]]);
+    const patchArray = (models: unknown[] | undefined, allowEmpty: boolean, hostId: string) => {
       assert.equal(allowEmpty, true);
+      assert.equal(hostId, "local");
       if (!Array.isArray(models)) return false;
       models.push({ model: "CLIProxyAPI:deepseek-chat" });
       return true;
     };
-    const handle = patch(() => true, ids, patchArray);
+    const handle = patch(() => true, requests, patchArray,
+      (_result: unknown, params: { cursor: unknown }) => params?.cursor === null,
+      (...values: unknown[]) => values.find(value => value === "local"));
     const response = { type: "mcp-response", requestMethod: "model/list", message: { id: 17, result: { data: [{ model: "gpt-5.4" }] } } };
     assert.equal(handle(response), true);
     assert.equal(response.message.result.data.length, 2);
-    assert.equal(handle({ type: "mcp-response", requestMethod: "thread/list", message: { id: 18, result: { data: [] } } }), false);
+    assert.equal(handle(response), false, "one response consumes the tracked request only once");
+    assert.equal(handle({ type: "mcp-response", requestMethod: "model/list", message: { id: 18, result: { data: [] } } }), false);
   });
 
-  it("patches message data before an already registered Codex listener reads it", async () => {
+  it("installed message listeners follow the current catalog runtime after reinjection", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
     const start = renderer.indexOf("  function patchAppServerModelMessages() {");
-    const end = renderer.indexOf("\n  function patchMcpModelResponseData", start);
+    const end = renderer.indexOf("\n  function modelResponseHasPagination", start);
     assert.ok(start >= 0 && end > start);
-    class FakeMessageEvent {
-      private readonly payload: { patched?: boolean };
-      constructor(payload: { patched?: boolean }) { this.payload = payload; }
-      get data() { return this.payload; }
-    }
-    const fakeWindow = { addEventListener() {}, __codexPlusModelMessagePatchInstalled: false };
-    const install = new Function(
-      "window", "MessageEvent", "patchMcpModelResponseData",
-      `${renderer.slice(start, end)}\nreturn patchAppServerModelMessages;`,
-    ) as (windowValue: typeof fakeWindow, eventType: typeof FakeMessageEvent, patch: (data: { patched?: boolean }) => void) => () => void;
-    install(fakeWindow, FakeMessageEvent, (data) => { data.patched = true; })();
-    const event = new FakeMessageEvent({});
-    assert.equal(event.data.patched, true);
+    const listeners = new Map<string, (event: { data: unknown }) => void>();
+    let first = 0, second = 0;
+    const runtime = { patchMcp: () => { first += 1; } };
+    const fakeWindow = { addEventListener: (type: string, listener: (event: { data: unknown }) => void) => listeners.set(type, listener),
+      __codexPlusModelCatalogRuntime: runtime, __codexPlusModelMessagePatchInstalled: "" };
+    const install = new Function("window", "codexModelCatalogRuntime",
+      `${renderer.slice(start, end)}\nreturn patchAppServerModelMessages;`);
+    install(fakeWindow, runtime)();
+    listeners.get("message")!({ data: {} });
+    fakeWindow.__codexPlusModelCatalogRuntime = { patchMcp: () => { second += 1; } };
+    install(fakeWindow, fakeWindow.__codexPlusModelCatalogRuntime)();
+    listeners.get("message")!({ data: {} });
+    assert.equal(first, 1);
+    assert.equal(second, 1);
+    assert.equal(listeners.size, 2, "reinjection must reuse the installed listeners");
+    assert.doesNotMatch(renderer.slice(start, end), /Object\.defineProperty\(MessageEvent\.prototype/);
   });
 
   it("uses shared settings metadata for native next-step suggestions", async () => {
@@ -1800,14 +1820,17 @@ return {
   it("hot-reloads user scripts after toggling or uninstalling so the page actually drops them", async () => {
     const renderer = await readFile(rendererPath, "utf8");
     const harness = new Function("bridge", `
-const calls = [], toasts = [];
+const calls = [], toasts = [], toastOptions = [];
 let codexPlusExtensionsSelected = { kind: "installed", key: "user:pomodoro" };
+let codexPlusUserScripts = { scripts: [] }, codexPlusUserScriptsLoaded = false;
+const window = { __codexPlusUserScripts: { scripts: {} } };
 const postJson = async (path, payload) => { calls.push(path); return bridge(path, payload); };
-const loadUserScripts = async (path = "/user-scripts/list", payload = {}) => { await postJson(path, payload); };
-const showToast = (message) => toasts.push(message);
+const showToast = (message, options) => { toasts.push(message); toastOptions.push(options); };
 const refreshCodexPlusExtensionsView = () => calls.push("refresh");
+const renderUserScripts = () => {}, syncCodexPlusBuiltinExtensionToggles = () => {}, codexPlusActiveEntry = () => null;
 ${segment(renderer, "  async function uninstallUserScript(", "  /** 左面板的导航项。")}
-return { calls, toasts, setUserScriptEnabled, uninstallUserScript, selected: () => codexPlusExtensionsSelected };`);
+${segment(renderer, "  async function loadUserScripts(", "  /**\n   * 拉市场清单。")}
+return { calls, toasts, toastOptions, setUserScriptEnabled, uninstallUserScript, selected: () => codexPlusExtensionsSelected, scripts: () => codexPlusUserScripts.scripts };`);
     const ok = harness(async (path: string) => (path === "/user-scripts/delete" ? {} : { scripts: [] }));
     await ok.setUserScriptEnabled("user:pomodoro", false);
     assert.deepEqual(ok.calls, ["/user-scripts/set-script-enabled", "/user-scripts/reload", "/user-scripts/list"]);
@@ -1824,6 +1847,15 @@ return { calls, toasts, setUserScriptEnabled, uninstallUserScript, selected: () 
     assert.deepEqual(failed.calls, ["/user-scripts/set-script-enabled", "/user-scripts/reload", "/user-scripts/list"]);
     assert.equal(failed.toasts.length, 1);
     assert.match(failed.toasts[0], /Codex 页面尚未连接/);
+
+    const unknown = harness(async (path: string) => (path === "/user-scripts/reload"
+      ? { status: "unknown", message: "热重载超时，执行结果尚未确认" }
+      : { scripts: [{ enabled: false, status: "disabled" }, { enabled: true, status: "loaded" }] }));
+    await unknown.setUserScriptEnabled("user:pomodoro", false);
+    assert.deepEqual(unknown.calls, ["/user-scripts/set-script-enabled", "/user-scripts/reload", "/user-scripts/list"]);
+    assert.deepEqual(unknown.toasts, ["热重载超时，执行结果尚未确认"]);
+    assert.equal(unknown.toastOptions[0].type, "warn");
+    assert.deepEqual(unknown.scripts().map((script: { status: string }) => script.status), ["unknown", "unknown"]);
   });
 
   it("keeps the 拓展 page nav when extension hosts refresh it without a tab", async () => {
@@ -4342,7 +4374,7 @@ it("groups aggregate models by exact member identity instead of bare model name"
   // 或完整展示名精确匹配目录，不能只按裸模型名命中目录里第一个同名成员。
   assert.match(picker, /function codexPlusModelPickerCatalogExactMap\(\)/);
   assert.match(picker, /codexPlusModelPickerNormalizeLoose\(split\.name\)/);
-  assert.match(picker, /provider:\$\{split\.provider\}/);
+  assert.match(picker, /providerIds\.get\(split\.provider\)/);
   assert.doesNotMatch(
     picker,
     /const known = providers\.get\(codexPlusModelPickerNormalizeStrict\(split\.name\)\)/,
@@ -5892,7 +5924,7 @@ describe("功能页与原生弹出层的层级", () => {
   it("页面打开时连同弹出层的直接父容器一起提升，原生 tooltip 不被页面盖住", async () => {
     const style = await readFile(new URL("../../../assets/inject/renderer-inject/10-style.js", import.meta.url), "utf8");
     // 新版 Codex 把 tooltip 挂在 z-60 的固定视口容器里，只提升子节点逃不出该堆叠上下文（实测复现过）。
-    assert.match(style, /html\[data-codex-plus-page-open\] div:has\(> \[data-radix-popper-content-wrapper\], > \[role="tooltip"\], > \[role="menu"\]\):not\(\.\$\{codexPlusPageClass\} \*\),/);
+    assert.match(style, /html\[data-codex-plus-page-open\] div:has\(> \[data-radix-popper-content-wrapper\], > \[role="tooltip"\], > \[role="menu"\]\):not\(\.\$\{codexPlusPageClass\} \*\) \{/);
     const page = Number(/z-index: (\d+);\s*display: block;\s*background: var\(--codex-plus-bg-primary/.exec(style)?.[1]);
     const lifted = Number(/\.app-header-tint \{\s*z-index: (\d+) !important;/.exec(style)?.[1]);
     assert.ok(page > 0 && lifted > page, "提升后的弹出层必须高于功能页");
@@ -5962,9 +5994,13 @@ describe("extension rpc frame interception", () => {
     const sent: Frame[] = [];
     const toasts: string[] = [];
     const failures: string[] = [];
-    class MessagePort {}
-    (MessagePort.prototype as any).postMessage = function (message: Frame) { sent.push(message); };
-    const window: Record<string, unknown> = { MessagePort };
+    class PortMessageEvent extends MessageEvent<any> {
+      get data() { return super.data; }
+    }
+    class MessagePort extends EventTarget {
+      postMessage(message: Frame) { sent.push(message); }
+    }
+    const window: Record<string, unknown> = { MessagePort, MessageEvent: PortMessageEvent };
     const listeners = new Map<string, Set<{ handler: Handler; scriptKey: string }>>();
     const interceptors = new Map<string, Array<{ handler: Handler; scriptKey: string; order: number; seq: number }>>();
     const api = new Function("window", "codexPlusExtensionListeners", "codexPlusExtensionInterceptors",
@@ -5991,7 +6027,7 @@ describe("extension rpc frame interception", () => {
     const intercept = (name: string, handler: Handler) => {
       interceptors.set(name, [...(interceptors.get(name) || []), { handler, scriptKey: "probe", order: 0, seq: ++seq }]);
     };
-    const port = new MessagePort() as { postMessage: (frame: Frame) => void };
+    const port = new MessagePort();
     const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
     return { api, window, sent, toasts, failures, on, intercept, port, settle };
   }
@@ -6143,7 +6179,36 @@ describe("extension rpc frame interception", () => {
     env.on("agent/pre-step", async () => ({ kind: "reject" }));
     env.port.postMessage(["push", ["pipeline", -188, ["startConversation"], [{ input: [[{ ...userText }]] }, {}]]]);
     await env.settle();
-    assert.deepEqual(env.sent[0], ["push", ["pipeline", -188, ["__codexPlusRejectedByExtension"], []]]);
+    assert.deepEqual(env.sent, [
+      ["push", ["pipeline", -188, ["startConversation"], [{ input: [[{ ...userText }]] }, {}, ["promise", -0.5]]]],
+      ["reject", -0.5, ["error", "Error", "已被拓展拦截"]],
+    ]);
+  });
+
+  it("rejects native creation inputs at data consumption while leaving the host callback arguments intact", async () => {
+    const env = await runtime();
+    const received: Frame[] = [];
+    env.port.addEventListener("message", (event) => received.push((event as MessageEvent).data));
+    env.on("agent/pre-step", () => ({ kind: "reject", reason: "blocked by policy" }));
+    const callbacks = { readThreadCreationInputs: ["export", -688], onSettled: ["export", -689] };
+    const frame: Frame = ["push", ["pipeline", -188, ["startConversation"], [{
+      input: [[{ ...userText }]], clientUserMessageId: "blocked",
+    }, callbacks]]];
+    env.port.postMessage(frame);
+    await env.settle();
+    assert.deepEqual(env.sent, [frame]);
+    const EventClass = env.window.MessageEvent as typeof MessageEvent;
+    env.port.dispatchEvent(new EventClass("message", {
+      data: ["push", ["pipeline", -688, [], [{ clientUserMessageId: "blocked" }, "full"]]],
+    }));
+    await env.settle();
+    assert.deepEqual(received, [
+      ["push", ["pipeline", -688, [], [{ clientUserMessageId: "blocked" }, "full", ["promise", -0.5]]]],
+      ["reject", -0.5, ["error", "Error", "blocked by policy"]],
+    ]);
+    const rpc = await readFile(new URL("../../../assets/inject/renderer-inject/91-extension-rpc.js", import.meta.url), "utf8");
+    assert.match(rpc, /codexPlusRpcInterceptorVersion = 7;/);
+    assert.doesNotMatch(rpc, /codexPlusRpcPlanResume|prepareCodexThreadProviderResume|codexPlusRpcResumeGates/);
   });
 
   it("routes manager sendRequest calls through codex/request", async () => {

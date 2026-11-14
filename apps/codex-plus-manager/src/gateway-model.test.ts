@@ -7,6 +7,7 @@ import {
   defaultProviderAgents,
   glanceAgents,
   skippedAgents,
+  poolExcludeToggle,
   isDirectProxy,
   proxyAddressError,
   agentModels,
@@ -20,10 +21,12 @@ import {
   activeSponsorIds,
   gatewayPresets,
   groupModelId,
+  groupDisplayName,
   memberLabel,
   memberStatus,
   modelDispatch,
   modelDisplay,
+  qualifiedProvider,
   prettyModelName,
   modelRoutable,
   parseContextWindow,
@@ -41,8 +44,11 @@ import {
   routeNarrative,
   slugify,
   splitModels,
+  unlistedModels,
+  disabledGroup,
   validateDraft,
   validateProviderDraft,
+  imageModelLabel,
   type GatewayAgentView,
   type GatewayPayload,
 } from "./gateway-model.ts";
@@ -117,11 +123,37 @@ test("校验：池里要有能用的供应商，模型要能路由，窗口格�
   assert.equal(validateDraft({ ...base, contextWindow: "12" }, data), "上下文窗口格式不对，例如 200000、200k 或 1M");
 });
 
+test("保留已停用的绑定组时，让后端按新的供应商池验证回退模型", () => {
+  const data = payload();
+  data.groups[0].disabled = true;
+  const draft = { ...draftFromBinding(undefined), model: "group/daily", poolExclude: ["deepseek"] };
+  assert.equal(modelRoutable(data, "deepseek-v4-pro", draft.poolExclude), false, "旧回退模型不在新池里");
+  assert.equal(modelRoutable(data, "glm-5.3", draft.poolExclude), true, "新池仍有可用模型");
+  assert.equal(validateDraft(draft, data, "group/daily"), null);
+  assert.equal(validateDraft(draft, data), "供应商池里没有这个模型", "新绑定不能选择停用组");
+  assert.equal(validateDraft(draft, data, "group/other"), "供应商池里没有这个模型", "更换成停用组不能绕过校验");
+  assert.equal(validateDraft({ ...draft, poolExclude: ["deepseek", "glm", "bare"] }, data, "group/daily"), "供应商池是空的，先到「供应商」里添加");
+  assert.equal(validateDraft({ ...draft, contextWindow: "12" }, data, "group/daily"), "上下文窗口格式不对，例如 200000、200k 或 1M");
+});
+
+test("保留不可用的默认供应商时允许修改详情，新选择仍需验证", () => {
+  const data = payload();
+  const selection = { providerId: "deepseek", upstreamModel: "deepseek-v4-pro", providerSource: "" };
+  const draft = { ...draftFromBinding(undefined), model: "deepseek/deepseek-v4-pro" };
+  data.pool[0].enabled = false;
+  assert.equal(validateDraft(draft, data, draft.model, selection), null);
+  assert.equal(validateDraft(draft, data), "供应商池里没有这个模型");
+  assert.equal(validateDraft({ ...draft, model: "missing/model" }, data, draft.model, selection), "供应商池里没有这个模型");
+  assert.equal(validateDraft({ ...draft, poolExclude: ["glm", "bare"] }, data, draft.model, selection), "供应商池是空的，先到「供应商」里添加");
+  data.pool[0].enabled = true;
+  assert.equal(validateDraft({ ...draft, poolExclude: ["deepseek"] }, data, draft.model, selection), null);
+});
+
 test("模型选择器：每个供应商一组，路由组作为 group/ 模型在后；未知输入给出 <供应商>/<模型>", () => {
   const all = pickerSections(payload(), "", initials);
   assert.deepEqual(all.map((section) => section.key), ["provider:deepseek", "provider:glm", "group"]);
   assert.deepEqual(all[0].items.map((item) => item.model), ["deepseek-v4-pro", "deepseek-v4-flash"]);
-  assert.deepEqual(all[2].items[0], { model: "group/daily", label: "Daily", sub: "group/daily", avatar: "DA" });
+  assert.deepEqual(all[2].items[0], { model: "group/daily", label: "Daily", sub: "group/Daily", avatar: "DA" });
   assert.deepEqual(pickerSections(payload(), "flash", initials)[0].items.map((item) => item.model), ["deepseek-v4-flash"]);
   const custom = pickerSections(payload(), "kimi-k3", initials).at(-1);
   assert.equal(custom?.key, "custom");
@@ -132,15 +164,188 @@ test("模型选择器：每个供应商一组，路由组作为 group/ 模型在
   assert.deepEqual(pickerSections(payload(), "", initials, ["deepseek"]).map((section) => section.key), ["provider:glm", "group"]);
 });
 
+test("默认模型选择保留供应商身份，旧裸名与共享选择器保留原样", () => {
+  const data = payload();
+  const item = pickerSections(data, "", initials)[0].items[0];
+  assert.equal(item.model, "deepseek-v4-pro");
+  assert.equal(item.providerModel, "deepseek/deepseek-v4-pro");
+  const saved = bindingFromDraft({ ...draftFromBinding(undefined), model: item.providerModel! }, undefined);
+  data.pool[1].models.push("deepseek-v4-pro");
+  assert.equal(saved.model, "deepseek/deepseek-v4-pro");
+  assert.deepEqual(modelDisplay(data, saved.model), { title: "DeepSeek-V4-Pro", sub: "DeepSeek", group: false });
+  assert.equal(modelDisplay(data, "deepseek-v4-pro").auto, true);
+  assert.equal(draftFromBinding({ ...blankBinding(), model: "deepseek-v4-pro" }).model, "deepseek-v4-pro");
+});
+
+test("明确选择的供应商模型保存来源，冲突时不显示成其他供应商", () => {
+  const data = payload();
+  data.pool[0].source = "preset:deepseek";
+  const item = pickerSections(data, "", initials)[0].items[0];
+  assert.deepEqual(item.defaultModelSelection, {
+    providerId: "deepseek",
+    upstreamModel: "deepseek-v4-pro",
+    providerSource: "preset:deepseek",
+  });
+  const draft = { ...draftFromBinding(undefined), model: item.providerModel! };
+  const saved = bindingFromDraft(draft, undefined, item);
+  assert.deepEqual(saved.defaultModelSelection, item.defaultModelSelection);
+  data.pool[1].models.push(saved.model);
+  const view = modelDisplay(data, saved.model, [], saved.defaultModelSelection);
+  assert.equal(view.title, "DeepSeek-V4-Pro");
+  assert.equal(view.sub, "DeepSeek");
+  assert.equal(view.issue, "conflict");
+  assert.equal(modelDisplay(data, saved.model).sub, "GLM", "旧绑定继续按完整原生名称显示");
+  assert.equal(bindingFromDraft({ ...draftFromBinding(saved), model: "group/daily" }, saved).defaultModelSelection, null);
+  const removed = { ...saved.defaultModelSelection!, providerRemoved: true };
+  assert.equal(modelDisplay(data, saved.model, [], removed).issue, "unavailable", "同 ID 供应商重建后仍需重新选择");
+  assert.deepEqual(bindingFromDraft(draft, saved, item).defaultModelSelection, item.defaultModelSelection, "重新选择后恢复有效状态");
+});
+
+test("完整含斜杠的模型名优先于供应商前缀", () => {
+  const data = payload();
+  data.pool[1].models.push("deepseek/deepseek-v4-pro");
+  assert.equal(qualifiedProvider(data, "deepseek/deepseek-v4-pro"), null);
+  assert.equal(modelDisplay(data, "deepseek/deepseek-v4-pro").sub, "GLM");
+  assert.equal(qualifiedProvider(data, "DEEPSEEK/DEEPSEEK-V4-PRO"), null);
+  assert.equal(qualifiedProvider(data, "deepseek/deepseek-v4-pro", ["glm"])?.entry.id, "deepseek");
+  data.pool[1].enabled = false;
+  assert.equal(qualifiedProvider(data, "DEEPSEEK/deepseek-v4-pro")?.entry.id, "deepseek");
+  assert.equal(qualifiedProvider(data, "group/daily"), null);
+});
+
+test("自定义限定模型保留供应商和原始上游模型", () => {
+  const data = payload();
+  data.pool[1].source = "preset:glm";
+  const qualified = pickerSections(data, "glm/vendor/new", initials).find((section) => section.key === "custom")!.items;
+  assert.equal(qualified.length, 1);
+  assert.equal(qualified[0].model, "glm/vendor/new");
+  assert.deepEqual(qualified[0].defaultModelSelection, {
+    providerId: "glm", upstreamModel: "vendor/new", providerSource: "preset:glm",
+  });
+  const unqualified = pickerSections(data, "vendor/new", initials).find((section) => section.key === "custom")!.items[1];
+  assert.equal(unqualified.model, "glm/vendor/new");
+  assert.deepEqual(unqualified.defaultModelSelection, qualified[0].defaultModelSelection);
+  assert.deepEqual(bindingFromDraft({ ...draftFromBinding(undefined), model: qualified[0].model }, undefined, qualified[0]).defaultModelSelection, qualified[0].defaultModelSelection);
+});
+
+test("自定义模型的窗口后缀不属于上游模型身份", () => {
+  const data = payload();
+  data.pool[1].source = "preset:glm";
+  const item = pickerSections(data, "glm/vendor/new[1M]", initials)
+    .find((section) => section.key === "custom")!.items[0];
+  assert.equal(item.model, "glm/vendor/new[1M]");
+  assert.equal(item.defaultModelSelection?.upstreamModel, "vendor/new");
+  data.pool[1].enabled = false;
+  assert.equal(modelDisplay(data, item.model, [], {
+    ...item.defaultModelSelection!, upstreamModel: "vendor/new[1M]",
+  }).issue, "unavailable");
+});
+
+test("供应商 ID 与模型组前缀同名时显示冲突，不把供应商选择当停用组", () => {
+  const data = payload();
+  data.groups[0].disabled = true;
+  data.pool.push({ ...data.pool[0], id: "GROUP", name: "Group provider", source: "extension:group" });
+  const selection = { providerId: "GROUP", upstreamModel: "daily", providerSource: "extension:group" };
+  assert.equal(disabledGroup(data, "GROUP/daily", selection), undefined);
+  assert.equal(disabledGroup(data, "GROUP/daily[1M]", selection), undefined);
+  assert.equal(disabledGroup(data, "GROUP/daily")?.id, "daily");
+  assert.equal(disabledGroup(data, "GROUP/daily", { ...selection, upstreamModel: "other" })?.id, "daily");
+  assert.equal(modelDisplay(data, "GROUP/daily", [], selection).issue, "conflict");
+  assert.equal(modelDisplay(data, "GROUP/daily[1M]", [], selection).issue, "conflict");
+});
+
+test("停用组退出选择器、释放隐藏成员，重新启用后恢复；同名上游仍可按供应商选择", () => {
+  const data = payload();
+  data.groups[0].hideMembers = true;
+  assert.ok(unlistedModels(data).has("glm-5.3"));
+  data.groups[0].disabled = true;
+  assert.equal(disabledGroup(data, " GROUP/DAILY[ 1M ] ")?.id, "daily");
+  assert.equal(modelRoutable(data, "GROUP/DAILY[ 1M ]"), false);
+  assert.ok(!agentModels(data).includes("group/daily"));
+  assert.ok(!unlistedModels(data).has("glm-5.3"));
+  assert.ok(!pickerSections(data, "", initials).some((section) => section.key === "group"));
+  assert.ok(!pickerSections(data, "group/daily", initials).some((section) => section.key === "custom"));
+
+  data.pool[0].models.push("group/daily");
+  assert.ok(agentModels(data).includes("deepseek/group/daily"));
+  assert.ok(pickerSections(data, "", initials).flatMap((section) => section.items)
+    .some((item) => item.model === "deepseek/group/daily"));
+  data.groups[0].disabled = false;
+  assert.ok(agentModels(data).includes("group/daily"));
+  assert.ok(unlistedModels(data).has("glm-5.3"));
+  assert.ok(pickerSections(data, "", initials).some((section) => section.key === "group"));
+});
+
+test("关闭自动组后不再列出自动组入口，同名供应商模型仍可选择", () => {
+  const data = payload();
+  data.pool[1].models.push("deepseek-v4-pro");
+  data.autoGroups = [{
+    id: "auto:deepseek-v4-pro", name: "deepseek-v4-pro", mode: "inOrder",
+    members: [{ model: "deepseek/deepseek-v4-pro", weight: 1 }, { model: "glm/deepseek-v4-pro", weight: 1 }],
+    hidden: false, customized: false,
+  }];
+  assert.ok(pickerSections(data, "", initials).some((section) => section.key === "auto"));
+  data.autoGroups[0].hidden = true;
+  assert.ok(!pickerSections(data, "", initials).some((section) => section.key === "auto"));
+  assert.ok(agentModels(data).includes("deepseek-v4-pro"));
+  assert.ok(pickerSections(data, "", initials).flatMap((section) => section.items)
+    .some((item) => item.model === "deepseek/deepseek-v4-pro"));
+  data.autoGroups[0].hidden = false;
+  assert.ok(pickerSections(data, "", initials).some((section) => section.key === "auto"));
+});
+
 test("模型显示：模型名 + 提供它的供应商；<供应商>/<模型> 拆开；路由组显示组名", () => {
   assert.deepEqual(modelDisplay(payload(), ""), { title: "DeepSeek-V4-Pro", sub: "DeepSeek", group: false });
   assert.deepEqual(modelDisplay(payload(), "glm-5.3"), { title: "GLM-5.3", sub: "GLM", group: false });
   assert.deepEqual(modelDisplay(payload(), "deepseek/deepseek-v4-flash"), { title: "DeepSeek-V4-Flash", sub: "DeepSeek", group: false });
-  assert.deepEqual(modelDisplay(payload(), "group/daily"), { title: "Daily", sub: "group/daily", group: true });
+  assert.deepEqual(modelDisplay(payload(), "group/daily"), { title: "Daily", sub: "group/Daily", group: true });
   assert.equal(memberLabel(payload(), "deepseek/deepseek-v4-flash"), "DeepSeek · DeepSeek-V4-Flash");
   assert.equal(memberLabel(payload(), "group/daily"), "Daily");
   assert.equal(groupModelId("daily"), "group/daily");
   assert.equal(slugify(" 系统 默认 "), "系统-默认");
+});
+
+test("模型组改名：显示与选择器副标签跟随当前名称，路由 ID 保持不变", () => {
+  const data = payload();
+  data.groups[0].id = "聚合供应商-1";
+  data.groups[0].name = "6.1 Sol";
+  const model = "group/聚合供应商-1";
+  assert.deepEqual(modelDisplay(data, model), { title: "6.1 Sol", sub: "group/6.1 Sol", group: true });
+  const item = pickerSections(data, "6.1 Sol", initials).find((section) => section.key === "group")?.items[0];
+  assert.deepEqual(item, { model, label: "6.1 Sol", sub: "group/6.1 Sol", avatar: "6." });
+  assert.ok(agentModels(data).includes(model));
+  assert.equal(memberLabel(data, model), "6.1 Sol");
+  data.groups[0].name = "工作模型";
+  assert.deepEqual(modelDisplay(data, model), { title: "工作模型", sub: "group/工作模型", group: true });
+  assert.equal(pickerSections(data, "工作模型", initials).find((section) => section.key === "group")?.items[0].model, model);
+});
+
+test("多个组连续改名及复用旧名：显示按稳定 ID 解析，历史记录不被改写", () => {
+  const data = withActivity();
+  data.groups.push({ ...data.groups[0], id: "second", name: "Second" });
+  const record = data.activity!.agents[0].last!;
+  record.requestedModel = "group/daily";
+  const before = JSON.stringify(record);
+  for (const names of [["First renamed", "Second renamed"], ["Second", "First renamed"], ["相同名称", "相同名称"]]) {
+    data.groups.forEach((group, index) => { group.name = names[index]; });
+    data.groups.forEach((group, index) => {
+      const id = groupModelId(group.id);
+      assert.equal(groupDisplayName(data, id), names[index]);
+      assert.equal(groupDisplayName(data, id.toUpperCase()), names[index]);
+      assert.equal(modelDisplay(data, id).title, names[index]);
+      assert.equal(memberLabel(data, id), names[index]);
+      const item = pickerSections(data, "", initials).find((section) => section.key === "group")!.items.find((item) => item.model === id)!;
+      assert.equal(item.label, names[index]);
+      assert.equal(item.sub, `group/${names[index]}`);
+    });
+    const narrative = routeNarrative("claude", record, data);
+    assert.equal(narrative[0].args[1], names[0]);
+    assert.equal(narrative[0].args[2], names[0]);
+    assert.equal(JSON.stringify(record), before);
+  }
+  assert.equal(groupDisplayName(data, "deepseek-v4-pro"), undefined);
+  assert.equal(groupDisplayName(data, "group/deleted"), undefined);
+  assert.equal(groupDisplayName(null, "group/daily"), undefined);
 });
 
 test("模型名显示成正式写法，只影响显示", () => {
@@ -326,6 +531,8 @@ test("网关页接入导航，命令已注册", () => {
     "reorder_gateway_providers",
     "import_gateway_providers",
     "save_gateway_group",
+    "set_gateway_group_enabled",
+    "set_gateway_auto_group_enabled",
     "delete_gateway_group",
     "reveal_gateway_agent_config",
   ]) {
@@ -361,6 +568,10 @@ test("会话：合并排序、按 Agent 与关键词过滤；路径与相对时�
   assert.deepEqual(filterSessions(sessions, "all", "app").map((session) => session.id), ["g1", "c1"]);
   assert.equal(shortPath("/Users/me/code/app"), "~/code/app");
   assert.equal(shortPath("/Users/me/a/b/c/d/e"), "…/d/e");
+  // #3030：Windows 的 `\\?\` 长路径前缀不显示，反斜杠路径也能缩短。
+  assert.equal(shortPath("\\\\?\\D:\\work\\app"), "D:\\work\\app");
+  assert.equal(shortPath("\\\\?\\C:\\Users\\me\\a\\b\\c\\d"), "…\\c\\d");
+  assert.equal(shortPath("\\\\?\\UNC\\server\\share\\app"), "\\\\server\\share\\app");
   const now = 1_000_000_000;
   assert.deepEqual(relativeTime(now - 5_000, now), { text: "刚刚", args: [] });
   assert.deepEqual(relativeTime(now - 5 * 60_000, now), { text: "{0} 分钟前", args: [5] });
@@ -405,13 +616,15 @@ test("普通供应商的价格与代理在详情里编辑，官方账号可在�
 test("赞助商单独一组放在「添加供应商」最前面，不再混在中转里", () => {
   const presets = gatewayPresets(new Date(2026, 9, 26));
   const sponsors = presets.filter((preset) => preset.section === "sponsor").map((preset) => preset.key);
-  assert.deepEqual(sponsors, ["jojocode-max", "runapi", "apikeyfun", "cccccc-api"]);
+  assert.deepEqual(sponsors, ["jojocode-max", "runapi", "apikeyfun", "cccccc-api", "tokenmy"]);
   // 到期日当天仍显示，第二天起从目录里去掉。
   const keys = (date: Date) => gatewayPresets(date).map((preset) => preset.key);
-  assert.ok(keys(new Date(2026, 10, 7)).includes("runapi"));
-  assert.ok(!keys(new Date(2026, 10, 8)).includes("runapi"));
-  assert.deepEqual(activeSponsorIds(new Date(2026, 10, 23)), ["jojocode-max", "cccccc-api"]);
-  assert.deepEqual(activeSponsorIds(new Date(2026, 11, 2)), ["jojocode-max"]);
+  assert.ok(keys(new Date(2026, 11, 7)).includes("runapi"));
+  assert.ok(!keys(new Date(2026, 11, 8)).includes("runapi"));
+  assert.ok(keys(new Date(2026, 10, 20)).includes("tokenmy"));
+  assert.ok(!keys(new Date(2026, 10, 21)).includes("tokenmy"));
+  assert.deepEqual(activeSponsorIds(new Date(2026, 10, 23)), ["jojocode-max", "runapi", "cccccc-api"]);
+  assert.deepEqual(activeSponsorIds(new Date(2026, 11, 2)), ["jojocode-max", "runapi"]);
   for (const gone of ["pateway", "therouter", "shengsuanyun", "ccsub"]) assert.ok(!keys(new Date(2026, 9, 26)).includes(gone), gone);
   assert.equal(presets[0].section, "sponsor");
   const relays = presets.filter((preset) => preset.section === "relay").map((preset) => preset.key);
@@ -512,6 +725,15 @@ test("添加供应商：只给内置和已接入的 Agent 勾选，装了没接�
   assert.deepEqual(skippedAgents(payload, ["codex"]), ["claude", "grok", "opencode"]);
 });
 
+test("编辑供应商：poolExcludeToggle 改某个 Agent 是否用它（#3030）", () => {
+  const binding = { poolExclude: ["p1", "p2"] };
+  assert.deepEqual(poolExcludeToggle(binding.poolExclude, "p1", false), ["p1", "p2"], "已排除的再关一次不变");
+  assert.deepEqual(poolExcludeToggle(binding.poolExclude, "p1", true), ["p2"], "重新用它就从排除列表去掉");
+  assert.deepEqual(poolExcludeToggle(binding.poolExclude, "p3", false), ["p1", "p2", "p3"], "没用就加进排除列表");
+  assert.deepEqual(poolExcludeToggle(undefined, "p1", false), ["p1"], "没有排除列表时按空处理");
+  assert.deepEqual(poolExcludeToggle(undefined, "p1", true), [], "没有排除列表时重新用它不新增");
+});
+
 test("Agent 自带的模型：单独一组、标出直连对象，按名字或厂商筛", () => {
   const own = { vendor: "OpenAI", current: "gpt-6-sol", models: [{ id: "gpt-6-sol", label: "GPT-6-Sol" }, { id: "gpt-6-luna", label: "gpt-6-luna" }] };
   const section = ownPickerSection(own, "", (name) => name);
@@ -550,4 +772,11 @@ test("自带模型开关：关掉后只留 Agent 现在用着的那一个，没�
   const onLuna = { ...agent, ownModels: { ...own, current: "GPT-6-LUNA" } };
   assert.deepEqual(visibleOwnModels(onLuna, payload(["codex"]))?.models.map((model) => model.id), ["gpt-6-luna"]);
   assert.equal(visibleOwnModels({ ...agent, ownModels: null }, payload([])), null);
+});
+
+test("ChatGPT 账号的生图模型显示成不带版本号的 GPT Image，其余照原名", () => {
+  // 后端自己选模型，gpt-image-2 只是占位，显示版本号会被当成只能用旧版
+  assert.equal(imageModelLabel("gpt-image-2", true), "GPT Image");
+  assert.equal(imageModelLabel("gpt-image-2", false), "gpt-image-2");
+  assert.equal(imageModelLabel("flux-kontext-pro", false), "flux-kontext-pro");
 });

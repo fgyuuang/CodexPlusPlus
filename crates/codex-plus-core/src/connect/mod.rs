@@ -358,40 +358,15 @@ pub async fn run_weixin_connect_with_outbound(
             let job_key = key.clone();
             let job_peer = peer.clone();
             let job = jobs.spawn(async move {
-                let result = if existing_outbox.is_some() {
-                    deliver_weixin_reply(&client, &task_store, &key, &peer, &app_config.work_dir)
-                        .await
-                } else {
-                    let server = server_pool.lock().await.pop();
-                    let mut server = Some(match server {
-                        Some(server) => server,
-                        None => match CodexAppServer::start(app_config.clone()).await {
-                            Ok(server) => server,
-                            Err(error) => return (key, peer, Err(error)),
-                        },
-                    });
-                    let result = async {
-                        let mut state = task_store.load()?;
-                        let Some(outbox) = prepare_weixin_reply(
-                            &client,
-                            &app_config,
-                            &mut server,
-                            &mut state,
-                            &message,
-                            &message.text().unwrap_or_default(),
-                            &task_stop,
-                            &task_outbound,
-                            &task_config.account_id,
-                            &task_config.project_id,
-                            !task_config.work_dir.is_empty(),
-                        )
-                        .await?
-                        else {
-                            return Ok(state.thread_ids.get(&peer).cloned().unwrap_or_default());
-                        };
-                        let saved =
-                            task_store.update(|state| state.save_reply_outbox(&key, outbox))?;
-                        anyhow::ensure!(saved, "无法保存微信回复队列；消息未发送");
+                let typing_ticket = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.start_typing(&message.from_user_id, &message.context_token),
+                )
+                .await
+                .ok()
+                .and_then(|result| result.ok());
+                let result = async {
+                    if existing_outbox.is_some() {
                         deliver_weixin_reply(
                             &client,
                             &task_store,
@@ -400,26 +375,70 @@ pub async fn run_weixin_connect_with_outbound(
                             &app_config.work_dir,
                         )
                         .await
-                    }
-                    .await;
-                    if let Some(mut server) = server {
-                        if result.is_ok()
-                            && server.is_running()
-                            && !task_stop.load(Ordering::SeqCst)
-                            && task_codex_path.matches(&app_config.executable)
-                        {
-                            server_pool.lock().await.push(server);
-                        } else {
-                            server.close().await;
+                    } else {
+                        let server = server_pool.lock().await.pop();
+                        let mut server = Some(match server {
+                            Some(server) => server,
+                            None => CodexAppServer::start(app_config.clone()).await?,
+                        });
+                        let result = async {
+                            let mut state = task_store.load()?;
+                            let Some(outbox) = prepare_weixin_reply(
+                                &client,
+                                &app_config,
+                                &mut server,
+                                &mut state,
+                                &message,
+                                &message.text().unwrap_or_default(),
+                                &task_stop,
+                                &task_outbound,
+                                &task_config.account_id,
+                                &task_config.project_id,
+                                !task_config.work_dir.is_empty(),
+                            )
+                            .await?
+                            else {
+                                return Ok(state
+                                    .thread_ids
+                                    .get(&peer)
+                                    .cloned()
+                                    .unwrap_or_default());
+                            };
+                            let saved =
+                                task_store.update(|state| state.save_reply_outbox(&key, outbox))?;
+                            anyhow::ensure!(saved, "无法保存微信回复队列；消息未发送");
+                            deliver_weixin_reply(
+                                &client,
+                                &task_store,
+                                &key,
+                                &peer,
+                                &app_config.work_dir,
+                            )
+                            .await
                         }
+                        .await;
+                        if let Some(mut server) = server {
+                            if result.is_ok()
+                                && server.is_running()
+                                && !task_stop.load(Ordering::SeqCst)
+                                && task_codex_path.matches(&app_config.executable)
+                            {
+                                server_pool.lock().await.push(server);
+                            } else {
+                                server.close().await;
+                            }
+                        }
+                        result
                     }
-                    result
-                };
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    client.send_typing(&message.from_user_id, &message.context_token, false),
-                )
+                }
                 .await;
+                if let Some(typing_ticket) = typing_ticket {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        client.stop_typing(&message.from_user_id, &typing_ticket),
+                    )
+                    .await;
+                }
                 (key, peer, result)
             });
             active_jobs.insert(job.id(), (job_key, job_peer));

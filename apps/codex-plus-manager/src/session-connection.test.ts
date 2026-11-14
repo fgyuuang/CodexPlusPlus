@@ -271,29 +271,28 @@ describe("managed aggregate session connection", () => {
     }, { model: "chosen" });
     assert.equal(calls, 2);
   });
-  it("upgrades installed version 16 wrappers and sends fresh threads without a resume", async () => {
+  it("upgrades previous wrappers and switches equal-context account aliases without a resume", async () => {
     const prelude = readFileSync(new URL("../../../assets/inject/renderer-inject/00-prelude.js", import.meta.url), "utf8");
     const version = prelude.match(/const codexAppServerModelRequestPatchVersion = "([^"]+)"/)?.[1];
     assert.notEqual(version, "16", "the previous mandatory-preflight closure must be replaced");
+    assert.notEqual(version, "37", "the previous model-alias context closure must be replaced");
     const catalog = readFileSync(new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
     const instancePatch = catalog.slice(catalog.indexOf("  function patchAppServerModelRequestClient("),
       catalog.indexOf("  // issue #2177"));
     const prototypePatch = catalog.slice(catalog.indexOf("  function installCodexAppServerClientPrototypePatch()"),
       catalog.indexOf("  const appServerModelRequestPatchMaxMisses"));
-    for (const mode of ["instance", "prototype", "envelope"]) {
+    for (const [mode, previousVersion] of ["16", "37"].flatMap(version =>
+      ["instance", "prototype", "envelope"].map(mode => [mode, version]))) {
       const calls: string[] = [];
-      let allowContextResume = false;
-      let rejectContextResume = false;
+      let nativeParams: any;
+      let runtimeContext: any = null;
       const nativeSend = async function(this: any, method: string, params: any): Promise<any> {
         assert.equal(this.hostId, "local", "preserve the native method receiver during upgrade");
         if (method === "send-cli-request-for-host") return nativeSend.call(this, params.method, params.params);
         calls.push(method);
-        if (method === "thread/resume") {
-          if (!allowContextResume) throw new Error("no rollout found for thread id fresh");
-          assert.equal(params.model, "new");
-          assert.equal(params.modelProvider, "codex_plus_managed");
-          if (rejectContextResume) throw new Error("context refresh failed");
-        }
+        nativeParams = params;
+        if (method === "thread/read") return { thread: { status: { type: "active" } } };
+        if (method === "thread/resume") throw new Error("no rollout found for thread id fresh");
         return method === "thread/start" ? { thread: { id: "fresh" } } : { turn: { id: "first" } };
       };
       class Client {
@@ -306,7 +305,7 @@ describe("managed aggregate session connection", () => {
       Object.assign(Client.prototype, {
         sendRequest: oldWrapper,
         __codexPlusModelOriginalSendRequest: nativeSend,
-        __codexPlusModelRequestPatch: "16",
+        __codexPlusModelRequestPatch: previousVersion,
         __codexPlusServiceTierOriginalPrewarmThreadStart: nativePrewarm,
         prewarmThreadStart: oldWrapper,
       });
@@ -315,12 +314,12 @@ describe("managed aggregate session connection", () => {
       else Object.assign(client, {
         sendRequest: oldWrapper,
         __codexPlusModelOriginalSendRequest: nativeSend,
-        __codexPlusModelRequestPatch: "16",
+        __codexPlusModelRequestPatch: previousVersion,
       });
       const profile: any = { id: "aggregate", relayMode: "aggregate" };
       const context = vm.createContext({
         window: { __codexPlusAppServerClientClass: Client,
-          __codexPlusAppServerClientPrototypePatchInstalled: "16", __codexSessionDeleteBridge: {} },
+          __codexPlusAppServerClientPrototypePatchInstalled: previousVersion, __codexSessionDeleteBridge: {} },
         client, codexAppServerModelRequestPatchVersion: version,
         codexPlusBackendSettings: { managedSessionConnection: {
           profileId: "aggregate", provider: "codex_plus_managed", baseUrl: "http://127.0.0.1:62021/v1",
@@ -342,6 +341,9 @@ describe("managed aggregate session connection", () => {
         verifyCodexPureApiResumeResult() {},
         applyCodexServiceTierRequestOnly: (_method: string, params: any) => params,
         loadBackendSettingsState: async () => { calls.push("settings/get"); return true; },
+        loadCodexModelCatalog: async () => ({ runtimeContext }),
+        codexModelCatalog: { get runtimeContext() { return runtimeContext; } },
+        modelResponseHostId: (params: any, hostId: string) => params?.hostId || hostId,
         codexAppServerPreparationTimeoutMs: 1500,
         sendCodexPlusDiagnostic() {}, codexPlusModelUnlockEnabled: () => false,
         codexPluginMarketplacePatchEnabled: () => false, codexPlusSettings: () => ({}),
@@ -362,36 +364,31 @@ describe("managed aggregate session connection", () => {
       await send("turn/start", { threadId: "fresh", model: "selected" });
       assert.deepEqual(calls, ["turn/start"], mode);
       assert.equal((client as any).__codexPlusModelRequestPatch, version);
-      allowContextResume = true;
-      // 使用真实刷新函数，分别覆盖窗口、压缩和 metadata 配置。
+      // 外部或尚未迁移的目录不因模型名变化触发无效的 warm resume。
       for (const key of ["modelWindows", "modelAutoCompact", "modelMetadata"]) {
         profile[key] = '{"old":200000,"new":1000000}';
         await send("thread/start", { model: "old" });
         calls.length = 0;
         await send("turn/start", { threadId: "fresh", model: "new" });
-        assert.deepEqual(calls, ["thread/resume", "turn/start"], `${mode}:${key}`);
+        assert.deepEqual(calls, ["turn/start"], `${mode}:${key}`);
         calls.length = 0;
         await send("turn/start", { threadId: "fresh", model: "new" });
         assert.deepEqual(calls, ["turn/start"], `${mode}:unchanged`);
-        // 同线程正在恢复时不得抢先刷新上下文或发送消息。
-        await send("thread/start", { model: "old" });
-        (context.window as any).__codexPlusConnectionRecoveryPending = new Set(["fresh"]);
-        calls.length = 0;
-        await assert.rejects(send("turn/start", { threadId: "fresh", model: "new" }), /正在检查连接/);
-        assert.deepEqual(calls, []);
-        (context.window as any).__codexPlusConnectionRecoveryPending.clear();
-        // 刷新失败不能由受管发送覆盖缓存，下一条消息仍应重试刷新。
-        await send("thread/start", { model: "old" });
-        rejectContextResume = true;
-        calls.length = 0;
-        await send("turn/start", { threadId: "fresh", model: "new" });
-        assert.deepEqual(calls, ["thread/resume", "turn/start"]);
-        rejectContextResume = false;
-        calls.length = 0;
-        await send("turn/start", { threadId: "fresh", model: "new" });
-        assert.deepEqual(calls, ["thread/resume", "turn/start"], `${mode}:retry`);
         delete profile[key];
       }
+      runtimeContext = { status: "ok", models: {
+        "account-a": { model_auto_compact_token_limit: 117964, model_context_window: 131072 },
+        "account-b": { model_context_window: 131072, model_auto_compact_token_limit: 117964 },
+      } };
+      await send("thread/start", { model: "account-a" });
+      calls.length = 0;
+      const selected = {
+        threadId: "fresh", model: "account-b", serviceTier: "fast",
+        collaborationMode: { settings: { model: "account-b", reasoning_effort: "max" } },
+      };
+      await send("turn/start", selected);
+      assert.deepEqual(calls, ["turn/start"], `${mode}:${previousVersion}:equal-context`);
+      assert.equal(nativeParams, selected, "keep the explicit account, reasoning and service tier");
     }
   });
 

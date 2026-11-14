@@ -38,6 +38,16 @@ test("incomplete lazy exports cannot hide another already initialized transport"
   assert.deepEqual(Object.keys(modules[0]), ["Broker"]);
 });
 
+test("Rspack discovery includes fork capabilities without requiring a transport singleton", () => {
+  class Manager {
+    constructor() { throw new Error("discovery must not instantiate a manager"); }
+    getForkCapabilities() {}
+  }
+  const modules = collect({ c: { manager: { exports: { Manager } } } });
+  assert.equal(modules.length, 1);
+  assert.equal(modules[0].Manager, Manager);
+});
+
 test("numeric entry discovery restores both provider transports and only imports this document's own scripts", async () => {
   const imported: string[] = [];
   const scripts = ["app://-/assets/348410.hash.js", "https://foreign.test/assets/123.hash.js"];

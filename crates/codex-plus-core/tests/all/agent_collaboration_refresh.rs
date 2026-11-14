@@ -9,7 +9,7 @@ const vm = require('node:vm');
 const source = process.argv[1];
 const mode = process.argv[2];
 const uuid = '01a14973-0aa5-72a1-850f-79e8462acfc1';
-const names = ['list_agents','delegate_task','delegate_to_deepseek','delegate_to_claude_code','delegate_to_codex','delegate_to_workbuddy','send_task','get_task','wait_task','list_tasks','cancel_task'];
+const names = ['list_agents','delegate_task','delegate_to_deepseek','delegate_to_claude_code','delegate_to_codex','delegate_to_workbuddy','delegate_to_antigravity','send_task','get_task','wait_task','list_tasks','cancel_task'];
 const tools = Object.fromEntries(names.filter(name => mode!=='legacy-worker' || name!=='delegate_to_workbuddy').map(name => [name,{name,inputSchema:{type:'object'}}]));
 const item = runtimeStatus => ({name:'codex_plus_collaboration',runtimeStatus,tools,toolsError:null});
 const key = ['mcp','servers','status','local','full'];
@@ -92,7 +92,7 @@ const context = {window,document,Map,Set,Promise,JSON,Object,Array,Error,setTime
    assert.deepEqual(calls.map(call=>call[0]),['mcpServerStatus/list','config/mcpServer/reload','mcpServerStatus/list']);
    assert.equal(calls[0][1].threadId,undefined);
    assert.equal(calls[2][1].threadId,['no-thread','temporary-thread'].includes(mode)?undefined:uuid);
-   assert.equal(report.toolCount,mode==='legacy-worker'?10:11);
+   assert.equal(report.toolCount,mode==='legacy-worker'?11:12);
    if (mode==='legacy-worker') {
      assert.equal(report.status,'partial'); assert.equal(report.toolsReady,false); assert.equal(report.cacheRefreshed,false);
    } else if (mode==='missing-query-client') {

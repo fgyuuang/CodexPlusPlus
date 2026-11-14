@@ -287,6 +287,7 @@ mod tests {
             small_model: "api/model".into(),
             models: vec![ModelEntry {
                 id: "api/model".into(),
+                display_name: "API model".into(),
                 context_window: Some(200_000),
                 reasoning_levels: vec!["high".into()],
             }],

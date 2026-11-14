@@ -4,7 +4,7 @@
 //! 直连模式的 Codex / Claude / Grok 供应商只在「导入」时被读取并复制一份。
 
 use anyhow::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -99,6 +99,10 @@ pub struct GatewayAgentView {
     pub requires_disconnect_preview: bool,
     pub base_url: String,
     pub default_model: String,
+    /// 当前默认选择在实际路由快照中的状态。
+    pub default_selection_status: Option<&'static str>,
+    /// 网关默认模型的成员与可编辑供应商池不一致时，界面只显示模型 ID。
+    pub default_model_differs: bool,
     pub models: Vec<String>,
     /// 开着网关、但配置已被别的工具改掉（请求不再经过 Codex++）。
     pub drift: Option<codex_plus_core::gateway::drift::Drift>,
@@ -280,8 +284,49 @@ fn account_kind(relay: &RelayProfile) -> String {
         .unwrap_or_default()
 }
 
+fn default_model_view(
+    gateway: &GatewaySettings,
+    runtime: &GatewaySettings,
+    binding: &AgentBinding,
+) -> (String, Option<&'static str>, bool) {
+    use codex_plus_core::gateway::route::model_entry_members;
+
+    let model = apply::resolved_default_model(runtime, binding);
+    let (selected, _) = codex_plus_core::model_suffix::parse_model_suffix(binding.model.trim());
+    let status = binding.selection_for(&selected).map(|_| {
+        if !model.eq_ignore_ascii_case(&selected) {
+            "fallback"
+        } else if model_entry_members(runtime, binding, &selected).is_empty() {
+            "invalid"
+        } else {
+            "available"
+        }
+    });
+    let differs = if !model.is_empty() {
+        let actual = model_entry_members(runtime, binding, &model);
+        let local = model_entry_members(gateway, binding, &model);
+        actual.len() != local.len()
+            || actual
+                .iter()
+                .zip(&local)
+                .any(|((actual, actual_model), (local, local_model))| {
+                    actual.id != local.id
+                        || actual.name != local.name
+                        || actual_model != local_model
+                        || runtime
+                            .provider(&actual.id)
+                            .map(|provider| &provider.source)
+                            != gateway.provider(&local.id).map(|provider| &provider.source)
+                })
+    } else {
+        false
+    };
+    (model, status, differs)
+}
+
 fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> GatewayPayload {
     let port = port();
+    let runtime_gateway = gateway.clone().with_extension_providers();
     let pool = gateway
         .providers
         .iter()
@@ -353,6 +398,9 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         .map(|agent| {
             let binding = gateway.binding(agent);
             let enabled = binding.is_some_and(|binding| binding.enabled);
+            let (default_model, default_selection_status, default_model_differs) = binding
+                .map(|binding| default_model_view(&gateway, &runtime_gateway, binding))
+                .unwrap_or_default();
             GatewayAgentView {
                 agent: agent.as_str().to_string(),
                 name: codex_plus_core::tools::tool_display_name(agent).to_string(),
@@ -370,9 +418,9 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                         _ => false,
                     },
                 base_url: apply::gateway_base_url(port, agent),
-                default_model: binding
-                    .map(|binding| apply::resolved_default_model(&gateway, binding))
-                    .unwrap_or_default(),
+                default_model,
+                default_selection_status,
+                default_model_differs,
                 models: codex_plus_core::gateway::server::exposed_models(&gateway, agent),
                 drift: binding
                     .filter(|binding| binding.enabled)
@@ -642,6 +690,12 @@ fn refresh_agents<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
         );
     }
     result
+}
+
+fn refresh_group_agents<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    let saved = result?;
+    apply::refresh_enabled(&context()).context("模型组设置已保存，但 Agent 配置刷新失败")?;
+    Ok(saved)
 }
 
 /// 界面每隔几秒轮询一次：读设置、gateway.json、检查各 Agent 配置漂移都是文件 IO，
@@ -914,21 +968,20 @@ pub fn use_gateway_own_model(
 pub fn rotate_gateway_token(agent: String) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
         let agent = parse_agent(&agent)?;
-        let store = GatewayStore::default();
-        // 带锁读改写：只换这个 Agent 的 token，不拿旧状态覆盖同时刷新写回的登录 token。
-        let (gateway, binding) = store.update(|gateway| {
-            let Some(binding) = gateway.bindings.get_mut(agent.as_str()) else {
-                anyhow::bail!("还没有配置网关绑定");
-            };
-            binding.token = new_client_token(&agent);
-            Ok(binding.clone())
-        })?;
-        if binding.enabled {
-            return apply::enable_binding(&context(), &agent, binding);
-        }
-        Ok(gateway)
+        apply::rotate_binding_token(&context(), &agent)
     })();
     respond("已更换网关 token。", "更换网关 token 失败", result)
+}
+
+#[tauri::command]
+pub fn reset_gateway_model_selections(agent: String) -> CommandResult<Option<GatewayPayload>> {
+    let result = parse_agent(&agent)
+        .and_then(|agent| apply::reset_model_selections(&GatewayStore::default(), &agent));
+    respond(
+        "已清除历史模型选择。",
+        "清除历史模型选择失败",
+        refresh_agents(result),
+    )
 }
 
 /// 网关全局选项：Key 轮换方式、退出时恢复直连。
@@ -949,6 +1002,23 @@ pub fn save_gateway_options(
         Ok(gateway)
     })();
     respond("网关选项已保存。", "保存网关选项失败", result)
+}
+
+/// 「子智能体使用自己请求的模型」开关：开着时子智能体请求按 Codex 实际请求的模型发送，
+/// 不继承父回合的模型身份（#2987）。只影响之后的请求，不需要重写 Agent 配置。
+#[tauri::command]
+pub fn save_gateway_subagent_model_policy(
+    follow_request: bool,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = GatewayStore::default().update(|gateway| {
+        gateway.subagent_model_follow_request = follow_request;
+        Ok(())
+    });
+    respond(
+        "子智能体模型策略已保存。",
+        "保存子智能体模型策略失败",
+        result,
+    )
 }
 
 /// 「多家自动切换」开关：多家都有的模型额外列一份按顺序自动切换的入口。改完重写开着的 Agent 配置。
@@ -1043,7 +1113,11 @@ pub fn save_gateway_image_model(
                     .insert(agent.as_str().to_string(), model.to_string());
             }
             Ok(())
-        })
+        })?;
+        if agent == ToolId::Codex {
+            apply::refresh_enabled(&context()).context("生图模型已保存，但应用 Codex 配置失败")?;
+        }
+        Ok(())
     });
     respond("生图模型已保存。", "保存生图模型失败", result)
 }
@@ -1121,18 +1195,43 @@ pub fn save_gateway_provider_metadata(
 }
 
 /// 自动组卡片上的设置（模式、会话固定、隐藏成员、手动选中的成员、隐藏整个自动组）。和默认一样时记录会被删掉。
+#[derive(Deserialize)]
+pub struct AutoGroupInput {
+    #[serde(flatten)]
+    settings: codex_plus_core::gateway::store::AutoGroupSettings,
+    #[serde(default)]
+    hidden: Option<bool>,
+}
+
 #[tauri::command]
 pub fn save_gateway_auto_group(
     model: String,
-    settings: codex_plus_core::gateway::store::AutoGroupSettings,
+    settings: AutoGroupInput,
 ) -> CommandResult<Option<GatewayPayload>> {
     respond(
         "自动组已保存。",
-        "保存自动组失败",
-        refresh_agents(apply::save_auto_group(
+        "自动组更新未完全完成",
+        refresh_group_agents(apply::save_auto_group_with_hidden(
             &GatewayStore::default(),
             &model,
-            settings,
+            settings.settings,
+            settings.hidden,
+        )),
+    )
+}
+
+#[tauri::command]
+pub fn set_gateway_auto_group_enabled(
+    model: String,
+    enabled: bool,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "自动组已保存。",
+        "自动组更新未完全完成",
+        refresh_group_agents(apply::set_auto_group_enabled(
+            &GatewayStore::default(),
+            &model,
+            enabled,
         )),
     )
 }
@@ -1385,16 +1484,12 @@ pub fn save_gateway_provider_windows(
     windows: std::collections::BTreeMap<String, u64>,
     fallback: Option<u64>,
 ) -> CommandResult<Option<GatewayPayload>> {
-    respond(
-        "上下文窗口已保存。",
-        "保存上下文窗口失败",
-        refresh_agents(apply::set_provider_windows(
-            &GatewayStore::default(),
-            &id,
-            windows,
-            fallback,
-        )),
-    )
+    let result = apply::set_provider_windows(&GatewayStore::default(), &id, windows, fallback)
+        .and_then(|saved| {
+            apply::refresh_enabled(&context()).context("窗口已保存，但刷新 Agent 配置失败")?;
+            Ok(saved)
+        });
+    respond("上下文窗口已保存。", "更新上下文窗口失败", result)
 }
 
 /// 用存下的凭据重新拉一个供应商的模型，和现有列表比较（不改列表，只记下差异供界面提示）。
@@ -1484,11 +1579,11 @@ pub fn apply_gateway_provider_windows_sync(
     id: String,
     picks: Vec<meta_sync::WindowPick>,
 ) -> CommandResult<Option<GatewayPayload>> {
-    let result = refresh_agents(meta_sync::apply_window_sync(
-        &GatewayStore::default(),
-        &id,
-        &picks,
-    ));
+    let result =
+        meta_sync::apply_window_sync(&GatewayStore::default(), &id, &picks).and_then(|saved| {
+            apply::refresh_enabled(&context()).context("窗口已同步，但刷新 Agent 配置失败")?;
+            Ok(saved)
+        });
     let message = match &result {
         Ok((_, written)) => format!("已从上游同步 {written} 个模型的上下文窗口。"),
         Err(_) => String::new(),
@@ -1908,8 +2003,24 @@ fn import_from_direct(source: &str, id: &str, skip: Option<&[String]>) -> anyhow
 pub fn save_gateway_group(group: GroupInput) -> CommandResult<Option<GatewayPayload>> {
     respond(
         "模型组已保存。",
-        "保存模型组失败",
-        refresh_agents(apply::save_group(&GatewayStore::default(), &group)),
+        "模型组更新未完全完成",
+        refresh_group_agents(apply::save_group(&GatewayStore::default(), &group)),
+    )
+}
+
+#[tauri::command]
+pub fn set_gateway_group_enabled(
+    id: String,
+    enabled: bool,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "模型组已保存。",
+        "模型组更新未完全完成",
+        refresh_group_agents(apply::set_group_enabled(
+            &GatewayStore::default(),
+            &id,
+            enabled,
+        )),
     )
 }
 
@@ -1941,9 +2052,11 @@ pub fn reveal_gateway_agent_config(agent: String) -> CommandResult<Option<Gatewa
             .arg("-R")
             .arg(&path)
             .status()?;
+        // 展开的路径可能含正斜杠，资源管理器需要 Windows 分隔符。
         #[cfg(target_os = "windows")]
         let status = std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
+            .arg("/select,")
+            .arg(path.components().collect::<std::path::PathBuf>())
             .status()?;
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let status = std::process::Command::new("xdg-open")
@@ -1960,8 +2073,10 @@ fn agent_config_path(agent: &ToolId) -> String {
         // Codex 的配置目录跟着 CODEX_HOME 走；以前漏了它，详情里「改动了」后面是空的，「查看」也打不开。
         ToolId::Codex => codex_plus_core::gateway::agents::AgentEnv::current()
             .display(&codex_plus_core::relay_config::default_codex_home_dir().join("config.toml")),
-        ToolId::Claude => "~/.claude/settings.json".to_string(),
-        ToolId::Grok => "~/.grok/config.toml".to_string(),
+        ToolId::Claude => codex_plus_core::gateway::agents::AgentEnv::current()
+            .display(&codex_plus_core::tools::default_claude_home_dir().join("settings.json")),
+        ToolId::Grok => codex_plus_core::gateway::agents::AgentEnv::current()
+            .display(&codex_plus_core::grok_config::default_grok_home_dir().join("config.toml")),
         other => match codex_plus_core::gateway::agents::spec(other.as_str()) {
             Some(spec) => {
                 let env = codex_plus_core::gateway::agents::AgentEnv::current();
@@ -2080,6 +2195,199 @@ fn parse_version(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_version;
+
+    #[test]
+    fn default_model_view_uses_the_extension_routing_snapshot() {
+        use codex_plus_core::gateway::store::{AgentBinding, GatewaySettings};
+        use codex_plus_core::user_scripts::UserScriptManager;
+        use serde_json::json;
+
+        let gateway: GatewaySettings = serde_json::from_value(json!({
+            "providers": [{
+                "source": "preset:a",
+                "relay": { "id": "a", "name": "A", "model": "m", "modelList": "m" }
+            }]
+        }))
+        .unwrap();
+        let binding: AgentBinding = serde_json::from_value(json!({
+            "model": "a/m[1M]",
+            "defaultModelSelection": { "providerId": "a", "upstreamModel": "m", "providerSource": "preset:a" }
+        })).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("user/swap");
+        std::fs::create_dir_all(&package).unwrap();
+        let manifest = package.join("codexpp.json");
+        let manager = UserScriptManager::new(
+            temp.path().join("builtin"),
+            temp.path().join("user"),
+            temp.path().join("user_scripts.json"),
+        );
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "a", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["m"], "override": false }]
+        }).to_string()).unwrap();
+        let unchanged = gateway.clone().with_extension_providers_from(&manager);
+        assert_eq!(
+            super::default_model_view(&gateway, &unchanged, &binding),
+            ("a/m".into(), Some("available"), false)
+        );
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "a", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["m"], "override": true }]
+        }).to_string()).unwrap();
+        let mut disabled = gateway.clone();
+        disabled.providers[0].enabled = false;
+        assert_eq!(
+            super::default_model_view(&disabled, &disabled, &binding),
+            ("".into(), Some("fallback"), false)
+        );
+        let overridden = disabled.clone().with_extension_providers_from(&manager);
+        assert_eq!(overridden.provider("a").unwrap().source, "extension:swap");
+        assert_eq!(
+            super::default_model_view(&disabled, &overridden, &binding),
+            ("m".into(), Some("fallback"), true)
+        );
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "b", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["a/m"] }]
+        }).to_string()).unwrap();
+        let collision = gateway.clone().with_extension_providers_from(&manager);
+        assert_eq!(
+            super::default_model_view(&gateway, &collision, &binding),
+            ("m".into(), Some("fallback"), false)
+        );
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "b", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["fallback"] }]
+        }).to_string()).unwrap();
+        let added = disabled.clone().with_extension_providers_from(&manager);
+        assert_eq!(
+            super::default_model_view(&disabled, &added, &binding),
+            ("fallback".into(), Some("fallback"), true)
+        );
+
+        let empty: AgentBinding = serde_json::from_value(json!({ "model": "" })).unwrap();
+        assert_eq!(
+            super::default_model_view(&disabled, &added, &empty),
+            ("fallback".into(), None, true)
+        );
+        assert_eq!(
+            super::default_model_view(&disabled, &disabled, &empty),
+            ("".into(), None, false)
+        );
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "a", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["m2"], "override": true }]
+        }).to_string()).unwrap();
+        let different_model = gateway.clone().with_extension_providers_from(&manager);
+        assert_eq!(
+            super::default_model_view(&gateway, &different_model, &empty),
+            ("m2".into(), None, true)
+        );
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "a", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["m"], "override": true }]
+        }).to_string()).unwrap();
+        let mut with_group = gateway.clone();
+        with_group.groups = serde_json::from_value(json!([{
+            "id": "disabled", "name": "Disabled", "disabled": true, "members": []
+        }]))
+        .unwrap();
+        let inactive: AgentBinding =
+            serde_json::from_value(json!({ "model": "group/disabled" })).unwrap();
+        let overridden = with_group.clone().with_extension_providers_from(&manager);
+        assert_eq!(
+            super::default_model_view(&with_group, &overridden, &inactive),
+            ("m".into(), None, true)
+        );
+        assert_eq!(
+            super::default_model_view(&with_group, &with_group, &inactive),
+            ("m".into(), None, false)
+        );
+    }
+
+    #[test]
+    fn agent_config_paths_follow_the_write_directories() {
+        use codex_plus_core::gateway::agents::AgentEnv;
+        use codex_plus_core::tools::ToolId;
+
+        const CHILD: &str = "CODEX_PLUS_TEST_AGENT_CONFIG_PATHS";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let env = AgentEnv::current();
+            let claude = env.expand(&super::agent_config_path(&ToolId::Claude));
+            let grok = env.expand(&super::agent_config_path(&ToolId::Grok));
+            assert!(
+                claude == codex_plus_core::tools::default_claude_home_dir().join("settings.json")
+            );
+            assert!(
+                grok == codex_plus_core::grok_config::default_grok_home_dir().join("config.toml")
+            );
+            if mode == "custom" {
+                assert!(
+                    claude
+                        == std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap())
+                            .join("settings.json")
+                );
+                assert!(
+                    grok == std::path::PathBuf::from(std::env::var_os("GROK_HOME").unwrap())
+                        .join("config.toml")
+                );
+            }
+            println!("agent config paths checked");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        for mode in ["default", "custom"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "gateway_commands::tests::agent_config_paths_follow_the_write_directories",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("GROK_HOME");
+            if mode == "custom" {
+                child
+                    .env("CLAUDE_CONFIG_DIR", temp.path().join("claude config"))
+                    .env("GROK_HOME", temp.path().join("grok config"));
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains("agent config paths checked"));
+        }
+    }
+
+    #[test]
+    fn auto_group_input_separates_optional_hidden_from_other_settings() {
+        use codex_plus_core::gateway::store::GroupMode;
+        use serde_json::json;
+
+        let input: super::AutoGroupInput = serde_json::from_value(json!({
+            "mode": "manual",
+            "hidden": true,
+            "hideMembers": true,
+            "pick": "provider/model",
+            "futureField": 3
+        }))
+        .unwrap();
+        assert_eq!(input.hidden, Some(true));
+        assert_eq!(input.settings.mode, GroupMode::Manual);
+        assert!(input.settings.hide_members);
+        assert_eq!(input.settings.pick, "provider/model");
+        assert_eq!(input.settings.extra["futureField"], 3);
+        assert!(!input.settings.extra.contains_key("hidden"));
+
+        let input: super::AutoGroupInput = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(input.hidden, None);
+    }
 
     #[test]
     fn cli_version_is_the_first_dotted_number() {
@@ -2339,6 +2647,14 @@ pub fn resume_agent_session(
 /// 最近一次打开的登录页地址：登录提示条上「复制登录链接」读它，方便用无痕窗口或别的浏览器打开（#2823）。
 static LAST_LOGIN_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// 清掉记住的登录地址：每次开始新登录时调用，避免提示条复制到上一次登录的旧链接。
+/// finish 阶段不能清——订阅 / Copilot 的登录网址是 start 阶段打开的，等待期间还要能复制。
+fn clear_login_url() {
+    if let Ok(mut slot) = LAST_LOGIN_URL.lock() {
+        *slot = None;
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginUrlPayload {
@@ -2481,7 +2797,10 @@ pub fn cancel_gateway_login() -> CommandResult<()> {
 
 #[cfg(test)]
 mod login_tests {
-    use super::{LoginOutcome, cancel_gateway_login, cancellable_login, login_slot};
+    use super::{
+        LAST_LOGIN_URL, LoginOutcome, cancel_gateway_login, cancellable_login, clear_login_url,
+        login_slot,
+    };
 
     /// 等后台登录任务登记好中止函数。
     fn wait_registered() {
@@ -2517,6 +2836,15 @@ mod login_tests {
             assert!(login_slot().is_none());
         });
     }
+
+    #[test]
+    fn clear_login_url_drops_the_remembered_address() {
+        if let Ok(mut slot) = LAST_LOGIN_URL.lock() {
+            *slot = Some("https://example.test/login".to_string());
+        }
+        clear_login_url();
+        assert!(LAST_LOGIN_URL.lock().unwrap().is_none());
+    }
 }
 
 /// 在网关里登录 ChatGPT 订阅：浏览器登录后加进网关的供应商池。同一个账号再登录只更新 token。
@@ -2527,6 +2855,7 @@ pub async fn login_gateway_chatgpt(
 ) -> CommandResult<Option<GatewayPayload>> {
     let before = GatewayStore::default().load().unwrap_or_default();
     use codex_plus_core::gateway::accounts;
+    clear_login_url();
     let outcome = cancellable_login(async move {
         let account = accounts::chatgpt_login(open_in_browser).await?;
         let store = GatewayStore::default();
@@ -2628,6 +2957,7 @@ fn add_account_provider(
 #[tauri::command]
 pub async fn start_gateway_copilot_login()
 -> CommandResult<Option<codex_plus_core::gateway::accounts::DeviceCode>> {
+    clear_login_url();
     match codex_plus_core::gateway::accounts::copilot_device_code().await {
         Ok(code) => {
             open_in_browser(&code.verification_uri);
@@ -2659,6 +2989,7 @@ pub async fn login_gateway_grok(
 ) -> CommandResult<Option<GatewayPayload>> {
     let before = GatewayStore::default().load().unwrap_or_default();
     use codex_plus_core::gateway::accounts;
+    clear_login_url();
     let outcome = cancellable_login(async move {
         let tokens = accounts::grok_login(open_in_browser).await?;
         // 登录时还没有供应商（也就没有它的代理设置），走系统代理。
@@ -2682,6 +3013,7 @@ pub async fn login_gateway_chatgpt_api(
 ) -> CommandResult<Option<GatewayPayload>> {
     let before = GatewayStore::default().load().unwrap_or_default();
     use codex_plus_core::gateway::accounts;
+    clear_login_url();
     let outcome = cancellable_login(async move {
         let state_dir = codex_plus_core::paths::default_app_state_dir();
         let account = accounts::chatgpt_api_login(&state_dir, open_in_browser).await?;
@@ -2722,6 +3054,9 @@ pub async fn start_gateway_subscription_login(
             SubscriptionLoginStartPayload { start: None },
         );
     };
+    // 导入本地凭据 / 粘贴凭据这类方式没有要打开的网址：先清掉上一次登录记住的地址，
+    // 否则等待条上的「复制登录链接」会拿到旧链接。
+    clear_login_url();
     let result = async {
         let http = codex_plus_core::http_client::proxied_client("")?;
         item.begin_login(&http, method, input.as_deref().unwrap_or_default())

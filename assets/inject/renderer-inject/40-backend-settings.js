@@ -106,7 +106,7 @@
   }
 
   async function syncBackendSettingsFromHeartbeat() {
-    if (syncBackendSettingsInFlight) return;
+    if (syncBackendSettingsInFlight) return false;
     syncBackendSettingsInFlight = true;
     try {
       // 记下读之前的设置：loadBackendSettingsState 换成新对象，旧引用里还是上一次的值。
@@ -116,6 +116,10 @@
       if (loaded) {
         syncOfficialUsagePolicy();
         const next = previous ? codexPlusBackendSettingsSnapshot() : null;
+        if (previous?.modelCatalogFingerprint && next?.modelCatalogFingerprint
+            && previous.modelCatalogFingerprint !== next.modelCatalogFingerprint) {
+          await loadCodexModelCatalog(typeof refreshCodexModelCatalogForSettings !== "function");
+        }
         // 启动期读取全部失败时，心跳是之后唯一的设置来源；跟着设置走的功能（含梦皮 #2680、对话宽度）由内置拓展订阅。
         emitCodexPlusSettingsLoaded("heartbeat", previous && next && typeof codexPlusChangedBackendSettingKeys === "function"
           ? codexPlusChangedBackendSettingKeys(previous, next)
@@ -125,6 +129,7 @@
         syncCodexPlusBackendToggleButtons();
         renderCodexPlusMenu();
       }
+      return loaded;
     } finally {
       syncBackendSettingsInFlight = false;
     }
@@ -203,7 +208,7 @@
   let codexPlusBackendCheckSeq = 0;
   let codexPlusBackendCheckInFlight = false;
   let codexPlusBackendFailureCount = 0;
-  /** 上次心跳看到的设置版本；只有它变了才值得再拉一份完整的 /settings/get。 */
+  /** 上次心跳成功读取的设置版本。 */
   let codexPlusBackendSettingsRevision = "";
   const CODEX_PLUS_BACKEND_FAILURE_THRESHOLD = 3;
   // 桥接通道（binding）与后端可用性分开统计：HTTP 回落成功会让后端状态保持绿色，
@@ -299,8 +304,11 @@
           || !codexPlusBackendSettingsLoaded
           || revision !== codexPlusBackendSettingsRevision;
         if (settingsStale) {
-          codexPlusBackendSettingsRevision = revision;
-          void syncBackendSettingsFromHeartbeat();
+          void syncBackendSettingsFromHeartbeat().then((loaded) => {
+            if (loaded && codexPlusBackendGeneration === window.__codexPlusBackendGeneration) {
+              codexPlusBackendSettingsRevision = revision;
+            }
+          }).catch(() => {});
         }
       } else {
         codexPlusBackendFailureCount += 1;
@@ -340,7 +348,7 @@
   }
 
   function userScriptStatusLabel(status) {
-    return { loaded: "已加载", failed: "失败", disabled: "已禁用", not_loaded: "未加载", loading: "加载中" }[status] || status || "未知";
+    return { loaded: "已加载", failed: "失败", disabled: "已禁用", not_loaded: "未加载", loading: "加载中", unknown: "状态待确认" }[status] || status || "未知";
   }
 
   // 使用已安装 Lucide Search / RotateCw / Plus / ArrowLeft / Settings 的 ISC 图标路径。
@@ -657,8 +665,9 @@
    */
   async function reloadUserScriptsAfterChange() {
     const result = await postJson("/user-scripts/reload", {});
-    if (!result?.scripts) showToast(`拓展重载失败：${result?.message || "未知错误"}，重启 Codex 后生效`, { type: "error" });
-    await loadUserScripts();
+    if (result?.status === "unknown") showToast(result.message, { type: "warn" });
+    else if (!result?.scripts) showToast(`拓展重载失败：${result?.message || "未知错误"}，重启 Codex 后生效`, { type: "error" });
+    await loadUserScripts("/user-scripts/list", {}, result?.status === "unknown");
   }
 
   /** 左面板的导航项。Codex++ 页面切分组，「拓展」页面列脚本。 */
@@ -739,12 +748,13 @@
     if (codexPlusActiveEntry() === "extensions") refreshCodexPlusPageNav(codexPlusExtensionsTab);
   }
 
-  async function loadUserScripts(path = "/user-scripts/list", payload = {}) {
+  async function loadUserScripts(path = "/user-scripts/list", payload = {}, runtimeUnknown = false) {
     const requestPayload = path === "/user-scripts/list"
       ? { ...payload, runtime_status: window.__codexPlusUserScripts?.scripts || {} }
       : payload;
     const result = await postJson(path, requestPayload);
     if (result?.scripts) {
+      if (runtimeUnknown) result.scripts.forEach((script) => { script.status = "unknown"; });
       codexPlusUserScripts = result;
       codexPlusUserScriptsLoaded = true;
       renderUserScripts();
@@ -1244,7 +1254,9 @@
   function syncCodexPlusRailNativeSelection() {
     const root = document.documentElement;
     if (!root) return;
-    if (!document.querySelector(`.${codexPlusPageClass}`)) {
+    const open = Boolean(document.querySelector(`.${codexPlusPageClass}`));
+    syncCodexPlusPagePopupStyle(open);
+    if (!open) {
       root.removeAttribute("data-codex-plus-page-open");
       root.style.removeProperty("--codex-plus-rail-dim");
       return;

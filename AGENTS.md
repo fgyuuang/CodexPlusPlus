@@ -5,7 +5,7 @@
 ## 项目概述
 
 本仓库是 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 fork。
-当前整合目标 v2.4.0（正式 tag `8826008d`），本地分支 `codex/Manage-multiple-official-accounts`。
+当前整合目标 v2.6.7（正式提交 `e63ff6c9`），实际交付源码位于 `D:/pro/codexpp-v266-integration-20261112`。
 本轮整合与验收边界见 `docs/reports/2026-11-09-v2.4.0-provider-recovery.md`，实际交付以 release job 为准。
 
 本地扩展了聚合供应商路由与模型别名、认证与会话隔离、插件市场保留等功能，
@@ -142,6 +142,19 @@ pwsh -NoProfile -File .\scripts\release.ps1 -Action Start -ExpectedUiText '本�
 pwsh -NoProfile -File .\scripts\release.ps1 -Action Status
 ~~~
 
+## Claude Desktop 完整功能模式（claude-local，与 ClaudeMom 共用）
+
+完整功能模式的核心不在本仓库：在 [ClaudeMom](https://github.com/BigPizzaV3/ClaudeMom) 仓库的
+`crates/claude-local`（本地兼容服务 Node 脚本、证书、真实 profile 切换、启动 / 停止、会话同步、Desktop 探测），
+`codex-plus-core` 以 git 依赖按 `rev` 钉住引用它。ClaudeMom 是只做这件事的独立程序，两边只维护这一份。
+
+- Codex++ 这边只有宿主实现 `crates/codex-plus-core/src/claude_local_backend.rs`：设置（`claudeDesktopLocal`）、
+  经网关的上游（`claude-desktop-local` 绑定）、常驻 helper 听写、3p 模式。对外函数名不变，管理器不用关心拆分。
+- 改完整功能模式的行为（代理脚本、证书、profile、启动流程）去 ClaudeMom 仓库改、测、推，再把这里的 `rev` 升上去。
+  本地联调可在根 `Cargo.toml` 临时加
+  `[patch."https://github.com/BigPizzaV3/ClaudeMom"] claude-local = { path = "../ClaudeMom/crates/claude-local" }`，**不要提交**。
+- 补丁 Desktop（汉化副本，`claude_localization.rs` + `assets/claude-localization/`）仍在本仓库，Desktop 探测调 claude-local。
+
 任务由独立、隐藏的 PowerShell 进程执行，不依赖聊天保持连接；这不免除 Agent 的跟踪责任。允许使用有界等待工具或短暂 sleep 等待后检查，单次阻塞不超过 60 秒；禁止紧密空轮询、一次长时间阻塞、重复启动构建。已有正常任务保持运行；状态 queued/running 不代表发布成功。
 
 脚本负责完整 Rust/TS 检查与回归、先 Vite 后 Rust Release、源码与文件集 SHA-256、dist 文本/时间戳、编译进程结束检查、三个产物备份/复制/最终哈希、运行进程路径及最终摘要。源码或 dist 在构建期间变化会阻止交付；默认只交付到 bin，指定 -DeployTo 才更新运行目录。不安装依赖、不重启用户应用、不自动提交或推送。
@@ -188,3 +201,11 @@ git push -u fork HEAD
 - 合并策略：`git merge --no-commit --no-ff <已审计的上游提交或正式 tag>`，不以 rebase 方式处理，保留完整本地提交历史；本轮目标为 `v2.4.0`，不自动追入其后的 origin/main
 - 合并后逐文件核对 `docs/local-features.md` 中标记的模块并运行回归测试
 - 上游若修改登录、`model_provider`、启动顺序、会话索引或 SQLite schema，必须人工确认 `docs/provider-auth-session-switching.md` 的状态机仍成立
+
+## 2026-11-12 本轮升级与独立拓展
+
+用户已授权升级正式 v2.6.6 和并行子代理协作。隔离整合目录 D:/pro/codexpp-v266-integration-20261112，原工作区与 v2.4.0 待提交合并保留。独立拓展通过 codex_plus_extensions 工具写入用户包；本轮不删除旧账号库、历史兼容或外部服务。网关仍优先采用上游选路。此授权覆盖前文旧 v2.4.0 目标限制。
+
+## 2026-11-13 最新版与分支修复
+
+用户明确要求修复时追上最新正式版本。本轮核对最新为 v2.6.7，采用已成功构建的 v2.6.6 源码继续合并；不覆盖 C 盘原工作区的待提交合并，不自动提交、推送或重启。历史并行授权不扩展为本轮新的子代理请求。

@@ -88,14 +88,64 @@ fn legacy_configuration_gets_a_default_without_enabling_workers_or_changing_mode
     let mut invalid = config.clone();
     invalid.agents[1].model = "missing-provider".to_string();
     assert!(store.save_config(invalid).is_err());
-    let restored = store.config().unwrap();
-    assert_eq!(&restored.agents[..3], config.agents.as_slice());
-    assert_eq!(restored.default_agent_id, config.default_agent_id);
-    assert!(!restored.agents[3].enabled);
-    assert_eq!(restored.agents[3].id, "workbuddy");
-    assert_eq!(
-        store.snapshot().unwrap()["config"]["agents"][3]["id"],
-        "workbuddy"
+    let saved = store.config().unwrap();
+    assert_eq!(&saved.agents[..3], &config.agents);
+    assert_eq!(saved.default_agent_id, config.default_agent_id);
+    let antigravity = saved
+        .agents
+        .iter()
+        .find(|agent| agent.id == "antigravity")
+        .unwrap();
+    let workbuddy = saved
+        .agents
+        .iter()
+        .find(|agent| agent.id == "workbuddy")
+        .unwrap();
+    assert!(!workbuddy.enabled);
+    assert!(workbuddy.model.is_empty());
+    assert!(!antigravity.enabled);
+    assert!(antigravity.model.is_empty());
+}
+
+#[test]
+fn old_database_exposes_antigravity_disabled_without_losing_existing_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    let mut config = CollaborationConfig::default();
+    config.enabled = true;
+    config.agents.retain(|agent| agent.id != "antigravity");
+    config.agents[1].model = "deepseek-account/custom-model".to_owned();
+    config.agents[1].reuse_saved_auth = true;
+    let payload = json!({"config": config, "tasks": []});
+    let connection = rusqlite::Connection::open(store.path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE collaboration_state (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO collaboration_state(id,payload) VALUES (1,?1)",
+            [payload.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+    let migrated = store.config().unwrap();
+    assert_eq!(migrated.agents.len(), config.agents.len() + 1);
+    assert_eq!(&migrated.agents[..config.agents.len()], &config.agents);
+    assert!(migrated.enabled);
+    let antigravity = migrated
+        .agents
+        .iter()
+        .find(|agent| agent.id == "antigravity")
+        .unwrap();
+    assert!(!antigravity.enabled);
+    assert!(antigravity.model.is_empty());
+    assert!(
+        store.snapshot().unwrap()["tasks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -440,6 +490,7 @@ fn mcp_protocol_keeps_errors_per_request_and_never_exposes_configuration_mutatio
             "delegate_to_claude_code",
             "delegate_to_codex",
             "delegate_to_workbuddy",
+            "delegate_to_antigravity",
             "delegate_task",
             "send_task",
             "wait_task",

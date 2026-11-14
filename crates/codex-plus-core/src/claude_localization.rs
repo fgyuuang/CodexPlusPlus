@@ -24,6 +24,7 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(40);
 #[derive(Debug)]
 struct ProbeOutput {
     status: ExitStatus,
+    #[cfg_attr(not(windows), allow(dead_code))]
     stdout: Vec<u8>,
 }
 
@@ -253,122 +254,12 @@ fn runtime_dir() -> PathBuf {
     crate::paths::default_app_state_dir().join("claude-localization")
 }
 
-#[cfg(target_os = "macos")]
-fn source_app(_deadline: Instant) -> Result<PathBuf> {
-    let system = PathBuf::from("/Applications/Claude.app");
-    if system.is_dir() {
-        return Ok(system);
-    }
-    Ok(home_dir().join("Applications/Claude.app"))
-}
-
-#[cfg(target_os = "windows")]
-fn source_app(deadline: Instant) -> Result<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(home_dir);
-    let program = std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-    let query = probe_output(Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop'; @(Get-AppxPackage -Name Claude; Get-AppxPackage -Name AnthropicPBC.Claude) | Select-Object Name,InstallLocation | ConvertTo-Json -Compress"]), deadline);
-    if let Ok(output) = &query {
-        if output.status.success() {
-            for install in claude_package_locations(&output.stdout)? {
-                let packaged = PathBuf::from(install).join(r"app\Claude.exe");
-                if packaged.is_file() {
-                    return Ok(packaged);
-                }
-            }
-        }
-    }
-    let candidates = [
-        local.join(r"Microsoft\WindowsApps\claude-desktop.exe"),
-        local.join(r"Microsoft\WindowsApps\Claude_pzs8sxrjxfjjc\claude-desktop.exe"),
-        local.join(r"Programs\Claude\Claude.exe"),
-        local.join(r"Programs\claude-desktop\Claude.exe"),
-        local.join(r"Claude\Claude.exe"),
-        program.join(r"Claude\Claude.exe"),
-    ];
-    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
-        return Ok(path);
-    }
-    // 查询失败不是「未安装」，明确返回错误，避免把超时误报成未安装。
-    let output = query?;
-    ensure!(
-        output.status.success(),
-        "无法检测 Claude 安装位置，请检查 Windows 应用包服务后重试"
-    );
-    Ok(local.join(r"Programs\Claude\Claude.exe"))
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn claude_package_locations(bytes: &[u8]) -> Result<Vec<String>> {
-    // PowerShell 对零、一、多条记录分别输出空白、对象、数组。
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Vec::new());
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).context("Claude 应用包查询返回了无效 JSON")?;
-    let records = match &value {
-        serde_json::Value::Array(records) => records.as_slice(),
-        serde_json::Value::Null => &[],
-        _ => std::slice::from_ref(&value),
-    };
-    Ok(records
-        .iter()
-        .filter_map(|record| {
-            let name = record.get("Name")?.as_str()?;
-            if !["Claude", "AnthropicPBC.Claude"]
-                .iter()
-                .any(|known| name.eq_ignore_ascii_case(known))
-            {
-                return None;
-            }
-            let path = record.get("InstallLocation")?.as_str()?.trim();
-            (!path.is_empty()).then(|| path.to_string())
-        })
-        .collect())
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn is_claude_msix_path(path: &Path) -> bool {
-    let text = path.to_string_lossy().replace('/', "\\");
-    let parts = text
-        .split('\\')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    let Some(index) = parts
-        .iter()
-        .position(|part| part.eq_ignore_ascii_case("WindowsApps"))
-    else {
-        return false;
-    };
-    let tail = &parts[index + 1..];
-    if tail.len() == 1 && tail[0].eq_ignore_ascii_case("claude-desktop.exe") {
-        return true; // 已注册的 App Execution Alias。
-    }
-    let Some(package) = tail.first() else {
-        return false;
-    };
-    let known = ["Claude_", "AnthropicPBC.Claude_"].iter().any(|prefix| {
-        package
-            .get(..prefix.len())
-            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
-    });
-    known
-        && ((tail.len() == 3
-            && tail[1].eq_ignore_ascii_case("app")
-            && tail[2].eq_ignore_ascii_case("Claude.exe"))
-            || (tail.len() == 2 && tail[1].eq_ignore_ascii_case("claude-desktop.exe")))
-}
-
 /// MSIX 入口是否只是 App Execution Alias（`claude-desktop.exe`）。
 ///
 /// 别名是重解析点，所在目录是放满各应用别名的 `Microsoft\WindowsApps`，
 /// 不能当成 Claude 应用目录整个复制；只有包内真实的 `app\Claude.exe` 才能复制成副本。
 #[cfg(any(target_os = "windows", test))]
-fn is_claude_msix_alias(path: &Path) -> bool {
+pub(crate) fn is_claude_msix_alias(path: &Path) -> bool {
     let text = path.to_string_lossy().replace('/', "\\");
     let name = text.rsplit('\\').next().unwrap_or_default();
     is_claude_msix_path(path) && name.eq_ignore_ascii_case("claude-desktop.exe")
@@ -393,9 +284,9 @@ const INSPECT_FUSE_INDEX: usize = 3;
 
 /// 关闭 inspect fuse 的 Claude 没法通过调试端口注入（#2818）：说清原因和用户能做什么。
 #[cfg(any(target_os = "windows", test))]
-const INSPECT_FUSE_DISABLED_MESSAGE: &str = "增强版副本的 Electron 调试开关（EnableNodeCliInspectArguments fuse）处于关闭状态，\
-Claude 会忽略 --inspect 参数，汉化与 Bash 时限增强都无法注入。请完全退出 Claude 后，\
-在 Codex++「Claude 增强」里点「制作增强版 / 更新副本」重新制作副本再启动；\
+const INSPECT_FUSE_DISABLED_MESSAGE: &str = "补丁版副本的 Electron 调试开关（EnableNodeCliInspectArguments fuse）处于关闭状态，\
+Claude 会忽略 --inspect 参数，汉化与 Bash 时限补丁都无法注入。请完全退出 Claude 后，\
+在 Codex++「补丁 Desktop」里点「制作补丁版 / 更新副本」重新制作副本再启动；\
 若重新制作后仍提示此错误，请在 issue 中附上 Codex++ 状态目录下 claude-localization\\operation.log。";
 
 #[cfg(any(target_os = "windows", test))]
@@ -604,7 +495,7 @@ fn verify_packed_ion_copy(copy_exe: &Path) -> Result<()> {
     crate::claude_ion_asar::verify_ion_asar(&asar)?;
     ensure!(
         asar_integrity_fuse_disabled(&fs::read(copy_exe)?),
-        "增强版副本改写了 ion-dist.asar，但 asar 完整性校验 fuse 仍是打开的，Claude 会拒绝加载。请在 Codex++「Claude 增强」里点「制作增强版 / 更新副本」重新制作副本。"
+        "补丁版副本改写了 ion-dist.asar，但 asar 完整性校验 fuse 仍是打开的，Claude 会拒绝加载。请在 Codex++「补丁 Desktop」里点「制作补丁版 / 更新副本」重新制作副本。"
     );
     Ok(())
 }
@@ -618,15 +509,15 @@ fn source_read_error_message(path: &Path, error: &std::io::Error, copy_root: &Pa
         std::io::ErrorKind::PermissionDenied => format!(
             "无法读取 Claude 安装文件 {path}：当前账户没有读取权限（{error}）。\
 Windows 商店版（MSIX）Claude 的官方程序关闭了 Electron 调试开关，Codex++ 需要先把它复制到 {copy_root} \
-并在副本里打开调试开关，才能注入汉化与 Bash 时限增强。请用安装 Claude 的同一个 Windows 账户运行 Codex++，\
-不要以管理员或其他用户身份运行；若仍被拒绝，可改装 Claude 官网安装包后重新「制作增强版」。"
+并在副本里打开调试开关，才能注入汉化与 Bash 时限补丁。请用安装 Claude 的同一个 Windows 账户运行 Codex++，\
+不要以管理员或其他用户身份运行；若仍被拒绝，可改装 Claude 官网安装包后重新「制作补丁版」。"
         ),
         std::io::ErrorKind::NotFound => format!(
             "找不到 Claude 安装文件 {path}：Claude 可能正在更新或已被卸载。请打开一次官方 Claude 确认能正常启动，\
-再回到 Codex++ 重新「制作增强版」。"
+再回到 Codex++ 重新「制作补丁版」。"
         ),
         _ => format!(
-            "读取 Claude 安装文件 {path} 失败：{error}。请确认 Claude 已安装完整后重新「制作增强版」。"
+            "读取 Claude 安装文件 {path} 失败：{error}。请确认 Claude 已安装完整后重新「制作补丁版」。"
         ),
     }
 }
@@ -693,9 +584,18 @@ fn windows_packed_ion(_copy: &Path, _patch: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn source_app(_deadline: Instant) -> Result<PathBuf> {
-    Ok(PathBuf::from("Claude.exe"))
+/// 本机安装的原版 Claude Desktop（与 claude-local / ClaudeMom 同一份探测逻辑）。
+pub(crate) fn source_app(deadline: Instant) -> Result<PathBuf> {
+    claude_local::desktop::source_app(deadline)
+}
+
+pub(crate) fn app_version(app: &Path, key: &str, deadline: Instant) -> Result<String> {
+    claude_local::desktop::app_version(app, key, deadline)
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn is_claude_msix_path(path: &Path) -> bool {
+    claude_local::desktop::is_claude_msix_path(path)
 }
 
 fn home_dir() -> PathBuf {
@@ -944,51 +844,6 @@ fn find_runtime(name: &str, deadline: Instant) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
-}
-
-#[cfg(target_os = "macos")]
-fn app_version(app: &Path, key: &str, deadline: Instant) -> Result<String> {
-    if !app.is_dir() {
-        return Ok(String::new());
-    }
-    let output = probe_output(
-        Command::new("/usr/bin/defaults")
-            .args(["read"])
-            .arg(app.join("Contents/Info"))
-            .arg(key),
-        deadline,
-    )?;
-    Ok(if output.status.success() {
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    } else {
-        String::new()
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn app_version(app: &Path, _key: &str, deadline: Instant) -> Result<String> {
-    if !app.is_file() {
-        return Ok(String::new());
-    }
-    let escaped = app.to_string_lossy().replace('\'', "''");
-    let output = probe_output(
-        Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command"])
-            .arg(format!(
-                "(Get-Item -LiteralPath '{escaped}').VersionInfo.ProductVersion"
-            )),
-        deadline,
-    )?;
-    Ok(if output.status.success() {
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    } else {
-        String::new()
-    })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn app_version(_app: &Path, _key: &str, _deadline: Instant) -> Result<String> {
-    Ok(String::new())
 }
 
 #[cfg(target_os = "macos")]
@@ -1260,7 +1115,7 @@ pub fn set_bash_timeout(
     status()
 }
 
-const BASH_PENDING_MESSAGE: &str = "已准备，暂未确认。将在增强版启动后自动确认。";
+const BASH_PENDING_MESSAGE: &str = "已准备，暂未确认。将在补丁版启动后自动确认。";
 
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1588,7 +1443,7 @@ pub fn perform_with_progress(
 ) -> Result<ClaudeLocalizationResult> {
     ensure!(
         cfg!(any(target_os = "macos", target_os = "windows")),
-        "Claude 增强目前支持 macOS 和 Windows"
+        "补丁 Desktop 目前支持 macOS 和 Windows"
     );
     ensure!(
         ["prepare", "check", "launch", "restore"].contains(&action),
@@ -1596,7 +1451,7 @@ pub fn perform_with_progress(
     );
     let _guard = OPERATION
         .try_lock()
-        .map_err(|_| anyhow::anyhow!("另一项 Claude 增强操作正在进行"))?;
+        .map_err(|_| anyhow::anyhow!("另一项补丁 Desktop 操作正在进行"))?;
     let deadline = Instant::now() + STATUS_TIMEOUT;
     let source = source_app(deadline)?;
     ensure!(
@@ -1632,13 +1487,13 @@ pub fn perform_with_progress(
             } else {
                 "build-copy.py"
             };
-            progress(2, "准备增强版目录");
+            progress(2, "准备补丁版目录");
             run_script(&script_runtime, script, &source, &staged, &[], progress)?;
             // Windows 的 fuse 由这里改写（PowerShell 逐字节扫描 exe 太慢），改完立即复核。
             windows_copy_inspect_fuse(&staged, true)?;
             // 新版 Claude 的本地界面打包成 ion-dist.asar：Windows 由这里改写（#2884）。
             windows_packed_ion(&staged, true)?;
-            progress(92, "校验增强版");
+            progress(92, "校验补丁版");
             run_script(
                 &script_runtime,
                 script,
@@ -1661,9 +1516,9 @@ pub fn perform_with_progress(
             }
             fs::write(root.join("prepared.json"), serde_json::to_vec(&receipt)?)?;
             if msix {
-                "已从 Windows 商店版 Claude 复制出增强版并打开调试开关，官方包未修改。".to_string()
+                "已从 Windows 商店版 Claude 复制出补丁版并打开调试开关，官方包未修改。".to_string()
             } else {
-                "增强版已制作，签名与 app.asar 校验通过。".to_string()
+                "补丁版已制作，签名与 app.asar 校验通过。".to_string()
             }
         }
         "check" => {
@@ -1769,7 +1624,7 @@ pub fn perform_with_progress(
             if action == "restore" {
                 "已还原保存的语言并启动副本。".to_string()
             } else if !localization {
-                "已按原语言启动副本，其他增强照常注入。".to_string()
+                "已按原语言启动副本，其他补丁照常注入。".to_string()
             } else {
                 "中文启动注入完成，主界面将在加载后应用中文。".to_string()
             }
@@ -1924,24 +1779,6 @@ mod tests {
         let failed = bash_timeout_status_at(&report, &settings);
         assert!(!failed.pending);
         assert_eq!(failed.warning.as_deref(), Some("unsupported workspace"));
-    }
-
-    #[test]
-    fn claude_msix_namespace_discovery_and_classification_agree() {
-        let packages = br#"[{"Name":"AnthropicPBC.Claude","InstallLocation":"C:\\Program Files\\WindowsApps\\AnthropicPBC.Claude_2.42304.0.0_x64__fnn82j28hfe8t"},{"Name":"ClaudeFork","InstallLocation":"C:\\Other"}]"#;
-        let locations = claude_package_locations(packages).unwrap();
-        assert_eq!(locations.len(), 1);
-        assert!(is_claude_msix_path(Path::new(&format!(
-            "{}\\app\\Claude.exe",
-            locations[0]
-        ))));
-        assert_eq!(
-            claude_package_locations(br#"{"Name":"Claude","InstallLocation":"C:\\legacy"}"#)
-                .unwrap(),
-            vec![r"C:\legacy"]
-        );
-        assert!(claude_package_locations(b"").unwrap().is_empty());
-        assert!(claude_package_locations(b"not JSON").is_err());
     }
 
     #[test]
@@ -2175,7 +2012,7 @@ print(found.name if found else "dir")
             &std::io::Error::from(std::io::ErrorKind::NotFound),
             copy_root,
         );
-        assert!(missing.contains("找不到") && missing.contains("重新「制作增强版」"));
+        assert!(missing.contains("找不到") && missing.contains("重新「制作补丁版」"));
         let dir = tempfile::tempdir().unwrap();
         let error = ensure_source_readable(&dir.path().join("Claude.exe"), copy_root)
             .unwrap_err()

@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::{Value, json};
@@ -38,9 +38,12 @@ fn is_local_sensevoice(settings: &DictationSettings) -> bool {
 }
 
 pub const MAX_AUDIO_BODY_BYTES: usize = 25 * 1024 * 1024;
+const PCM_WAV_HEADER_BYTES: usize = 44;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const TOKEN_HEADER: &str = "X-Codex-Plus-Dictation-Token";
 static HELPER_TOKEN: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+static LOCAL_RECOGNIZER_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(1)));
 static LOCAL_DOWNLOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static LOCAL_DOWNLOAD_STATE: LazyLock<Mutex<Value>> =
     LazyLock::new(|| Mutex::new(json!({ "phase": "idle" })));
@@ -66,6 +69,21 @@ fn local_model_ready() -> bool {
         std::fs::metadata(root.join(asset.name))
             .is_ok_and(|meta| meta.is_file() && meta.len() == asset.bytes)
     })
+}
+
+pub(crate) fn ensure_local_sensevoice_available(
+    settings: &DictationSettings,
+) -> Result<(), DictationError> {
+    if !settings.enabled {
+        return Err(DictationError::new(403, "语音输入未启用"));
+    }
+    if !is_local_sensevoice(settings) {
+        return Err(DictationError::new(403, "此语音连接仅支持本地 SenseVoice"));
+    }
+    if !local_model_ready() {
+        return Err(DictationError::new(503, "本地 SenseVoice 模型未就绪"));
+    }
+    Ok(())
 }
 
 /// 只通过特权 bridge 发给当前应用；公开 HTTP 状态接口不能返回这个 capability。
@@ -646,6 +664,17 @@ fn local_wav_samples(audio: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn spawn_local_recognizer_waiter<T: Send + 'static>(
+    answer: std::sync::mpsc::Receiver<T>,
+    guards: Vec<Arc<OwnedSemaphorePermit>>,
+) -> tokio::task::JoinHandle<Result<T, std::sync::mpsc::RecvError>> {
+    tokio::task::spawn_blocking(move || {
+        let result = answer.recv();
+        drop(guards);
+        result
+    })
+}
+
 /// 在识别线程里跑一次本地识别；模型没变时复用缓存，既不重新加载也不重算 SHA256。
 fn recognize_local(
     cached: &mut Option<CachedLocalRecognizer>,
@@ -706,6 +735,14 @@ async fn transcribe_local_recording(
     settings: &DictationSettings,
     recording: Recording<'_>,
 ) -> Result<Value, DictationError> {
+    transcribe_local_recording_with_guard(settings, recording, None).await
+}
+
+async fn transcribe_local_recording_with_guard(
+    settings: &DictationSettings,
+    recording: Recording<'_>,
+    stream_guard: Option<Arc<OwnedSemaphorePermit>>,
+) -> Result<Value, DictationError> {
     validate_local_wav(recording.audio)?;
     let language = match settings.language.trim() {
         "" => "auto",
@@ -713,6 +750,10 @@ async fn transcribe_local_recording(
         _ => return Err(DictationError::new(400, "SenseVoice 不支持该语音语言")),
     }
     .to_string();
+    let recognizer_guard = LOCAL_RECOGNIZER_SLOTS
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| DictationError::new(429, "本地语音识别正在处理中，请稍后重试"))?;
     let sender = LOCAL_RECOGNIZER_TX
         .as_ref()
         .ok_or_else(|| DictationError::new(500, "本地语音推理线程不可用"))?;
@@ -724,12 +765,85 @@ async fn transcribe_local_recording(
             reply,
         })
         .map_err(|_| DictationError::new(500, "本地语音推理线程已停止"))?;
-    // 推理线程一次只做一件事，这里等它把结果交回来。
-    let text = tokio::task::spawn_blocking(move || answer.recv())
+    // 分段解码共享会话许可；断开 socket 也必须等不可取消的推理真正完成才释放容量。
+    let mut guards = vec![Arc::new(recognizer_guard)];
+    if let Some(stream_guard) = stream_guard {
+        guards.push(stream_guard);
+    }
+    let text = spawn_local_recognizer_waiter(answer, guards)
         .await
         .map_err(|_| DictationError::new(500, "本地 SenseVoice 推理失败"))?
         .map_err(|_| DictationError::new(500, "本地语音推理线程已停止"))??;
     Ok(json!({ "text": text }))
+}
+
+fn pcm16_mono_16khz_wav(pcm: &[u8]) -> Vec<u8> {
+    let mut wav = Vec::with_capacity(PCM_WAV_HEADER_BYTES + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36u32 + pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&16_000u32.to_le_bytes());
+    wav.extend_from_slice(&32_000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
+}
+
+fn validate_local_pcm16(pcm: &[u8]) -> Result<(), DictationError> {
+    if pcm.is_empty() || pcm.len() % 2 != 0 {
+        return Err(DictationError::new(400, "PCM 音频为空或长度无效"));
+    }
+    if pcm.len() > MAX_AUDIO_BODY_BYTES - PCM_WAV_HEADER_BYTES {
+        return Err(DictationError::new(413, "PCM 音频超过 25 MiB 限制"));
+    }
+    Ok(())
+}
+
+/// 专供本地语音 WebSocket 使用；非 SenseVoice 配置会在进入转写器前被拒绝，
+/// 不会沿用通用 `transcribe` 的 API provider 路径。
+pub(crate) async fn transcribe_local_pcm16(
+    settings: &DictationSettings,
+    pcm: &[u8],
+    language: Option<&str>,
+) -> Result<String, DictationError> {
+    transcribe_local_pcm16_with_guard(settings, pcm, language, None).await
+}
+
+pub(crate) async fn transcribe_local_pcm16_with_guard(
+    settings: &DictationSettings,
+    pcm: &[u8],
+    language: Option<&str>,
+    stream_guard: Option<Arc<OwnedSemaphorePermit>>,
+) -> Result<String, DictationError> {
+    ensure_local_sensevoice_available(settings)?;
+    validate_local_pcm16(pcm)?;
+
+    let mut local_settings = settings.clone();
+    if let Some(language) = language {
+        if !matches!(language, "auto" | "zh" | "en" | "yue" | "ja" | "ko") {
+            return Err(DictationError::new(400, "SenseVoice 不支持该语音语言"));
+        }
+        local_settings.language = language.to_string();
+    }
+    let wav = pcm16_mono_16khz_wav(pcm);
+    let result = transcribe_local_recording_with_guard(
+        &local_settings,
+        Recording {
+            audio: &wav,
+            filename: "dictation.wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            language: String::new(),
+        },
+        stream_guard,
+    )
+    .await?;
+    Ok(result["text"].as_str().unwrap_or_default().to_string())
 }
 
 pub async fn transcribe(
@@ -1146,6 +1260,86 @@ mod tests {
         assert!((samples[1] - 0.5).abs() < 1e-6);
         assert_eq!(samples[2], -1.0);
         assert!(samples[3] > 0.999 && samples[3] <= 1.0);
+    }
+
+    #[test]
+    fn local_stream_pcm_is_wrapped_as_sensevoice_wav() {
+        let pcm = [0, 0, 0, 64];
+        assert!(validate_local_pcm16(&pcm).is_ok());
+        let wav = pcm16_mono_16khz_wav(&pcm);
+        assert_eq!(wav.len(), PCM_WAV_HEADER_BYTES + pcm.len());
+        assert_eq!(&wav[24..28], &16_000u32.to_le_bytes());
+        assert!(validate_local_wav(&wav).is_ok());
+        assert_eq!(local_wav_samples(&wav), vec![0.0, 0.5]);
+    }
+
+    #[tokio::test]
+    async fn aborted_local_waiter_keeps_stream_and_recognizer_slots_until_decode_finishes() {
+        let stream_slots = Arc::new(Semaphore::new(1));
+        let recognizer_slots = Arc::new(Semaphore::new(1));
+        let stream_guard = Arc::new(stream_slots.clone().try_acquire_owned().unwrap());
+        let recognizer_guard = Arc::new(recognizer_slots.clone().try_acquire_owned().unwrap());
+        let (reply, answer) = std::sync::mpsc::channel::<()>();
+        let waiter =
+            spawn_local_recognizer_waiter(answer, vec![stream_guard.clone(), recognizer_guard]);
+        drop(waiter);
+        drop(stream_guard);
+
+        assert!(stream_slots.clone().try_acquire_owned().is_err());
+        assert!(recognizer_slots.clone().try_acquire_owned().is_err());
+        reply.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let (Ok(stream), Ok(recognizer)) = (
+                    stream_slots.clone().try_acquire_owned(),
+                    recognizer_slots.clone().try_acquire_owned(),
+                ) {
+                    drop((stream, recognizer));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn segmented_local_waiters_keep_the_session_slot_between_decodes() {
+        let slots = Arc::new(Semaphore::new(1));
+        let session = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        for _ in 0..2 {
+            let (reply, answer) = std::sync::mpsc::channel();
+            let waiter = spawn_local_recognizer_waiter(answer, vec![session.clone()]);
+            reply.send(()).unwrap();
+            waiter.await.unwrap().unwrap();
+            assert!(slots.clone().try_acquire_owned().is_err());
+        }
+        drop(session);
+        assert!(slots.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_stream_never_falls_back_to_api_provider() {
+        let settings = DictationSettings {
+            enabled: true,
+            base_url: "https://example.invalid/v1".to_string(),
+            api_key: "not-a-real-key".to_string(),
+            ..Default::default()
+        };
+        let error = transcribe_local_pcm16(&settings, &[0, 0], None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 403);
+        assert!(error.message.contains("本地 SenseVoice"));
+    }
+
+    #[tokio::test]
+    async fn local_stream_rejects_misaligned_pcm_before_recognition() {
+        assert_eq!(validate_local_pcm16(&[]).unwrap_err().status, 400);
+        assert_eq!(validate_local_pcm16(&[0]).unwrap_err().status, 400);
+        let oversized = vec![0; MAX_AUDIO_BODY_BYTES - PCM_WAV_HEADER_BYTES + 2];
+        assert_eq!(validate_local_pcm16(&oversized).unwrap_err().status, 413);
     }
 
     #[test]

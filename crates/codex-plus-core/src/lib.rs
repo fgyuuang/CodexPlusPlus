@@ -21,6 +21,7 @@ pub mod channel_protection;
 pub mod claude_hooks;
 #[cfg(any(target_os = "windows", test))]
 mod claude_ion_asar;
+pub mod claude_local_backend;
 pub mod claude_localization;
 pub mod codex_app_state;
 pub mod codex_app_tools_compat;
@@ -32,6 +33,7 @@ pub mod computer_use_approval;
 pub mod computer_use_js;
 pub mod computer_use_proxy;
 pub mod computer_use_tools;
+pub mod config_doctor;
 pub mod connect;
 pub(crate) mod context_usage;
 pub mod cu_activity;

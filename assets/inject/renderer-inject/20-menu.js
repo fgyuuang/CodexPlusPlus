@@ -345,11 +345,13 @@
       for (const key of Object.keys(exports)) {
         let value;
         try { value = exports[key]; } catch { continue; }
-        if (typeof value !== "function" || typeof value.getInstance !== "function") continue;
+        if (typeof value !== "function") continue;
         const proto = value.prototype;
-        if (typeof proto?.dispatchMessage === "function" && typeof proto?.subscribe === "function"
+        if (typeof proto?.getForkCapabilities === "function"
+            || typeof value.getInstance === "function" && (
+              typeof proto?.dispatchMessage === "function" && typeof proto?.subscribe === "function"
             || typeof proto?.sendRequest === "function"
-              && Function.prototype.toString.call(proto.sendRequest).includes("vscode://codex/")) {
+              && Function.prototype.toString.call(proto.sendRequest).includes("vscode://codex/"))) {
           requestTransport = true;
           break;
         }
