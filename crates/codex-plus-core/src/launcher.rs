@@ -3394,7 +3394,12 @@ async fn handle_protocol_proxy_connection_inner(
     let (mut upstream, _key_slot) = match opened {
         Ok(upstream) => upstream,
         Err(error) => {
-            if request_is_stream {
+            // 未知/退役模型是发请求前就能判定的拒绝：走 400 JSON（上游 2.6.10 契约），
+            // 不占用流式失败的 200 + response.failed 通道，否则客户端拿不到 model_not_found。
+            let retired_before_stream = error
+                .downcast_ref::<crate::gateway::server::RetiredCodexModel>()
+                .is_some();
+            if request_is_stream && !retired_before_stream {
                 let error_chain = crate::protocol_proxy::error_chain(&error);
                 let body = crate::protocol_proxy::responses_stream_failure_events(
                     request_json.as_ref(),
