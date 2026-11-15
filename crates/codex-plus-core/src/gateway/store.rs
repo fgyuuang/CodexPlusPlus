@@ -664,7 +664,11 @@ pub struct GatewaySettings {
     pub favorite_models: Vec<String>,
     /// 各 Agent 的生图模型（键是 Agent id）：没有或空串是自动（见 [`crate::gateway::images`]），
     /// `off` 是关闭，其余是 `<供应商 id>/<模型>`。不放在 [`AgentBinding`] 里：界面保存绑定时整份替换。
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub image_models: BTreeMap<String, String>,
     /// 生图结果只给链接时原样转发、不下载成图片数据的 Agent（默认都转，见 [`Self::inline_image_urls_for`]）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

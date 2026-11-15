@@ -1,0 +1,28 @@
+{
+  "error": "Step 'rust-fmt' failed with exit code 1. See D:\\pro\\codexpp-v269-review-20261114\\output\\release-jobs\\20261115-155147-46587a21\\rust-fmt.log",
+  "steps": [
+    {
+      "exitCode": 0,
+      "startedAt": "2026-11-15T07:51:54.6616090Z",
+      "endedAt": "2026-11-15T07:51:54.9726048Z",
+      "name": "renderer-check",
+      "log": "D:\\pro\\codexpp-v269-review-20261114\\output\\release-jobs\\20261115-155147-46587a21\\renderer-check.log"
+    },
+    {
+      "exitCode": 1,
+      "startedAt": "2026-11-15T07:51:54.9882795Z",
+      "endedAt": "2026-11-15T07:52:06.7030779Z",
+      "name": "rust-fmt",
+      "log": "D:\\pro\\codexpp-v269-review-20261114\\output\\release-jobs\\20261115-155147-46587a21\\rust-fmt.log"
+    }
+  ],
+  "delivery": [],
+  "updatedAt": "2026-11-15T07:52:06.7342019Z",
+  "restartPerformed": false,
+  "state": "failed",
+  "createdAt": "2026-11-15T07:51:50.6461769Z",
+  "artifacts": [],
+  "stage": "rust-fmt",
+  "id": "20261115-155147-46587a21",
+  "currentLog": "D:\\pro\\codexpp-v269-review-20261114\\output\\release-jobs\\20261115-155147-46587a21\\rust-fmt.log"
+}
