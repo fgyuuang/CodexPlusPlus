@@ -3480,7 +3480,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"38\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"48\""));
     assert!(script.contains("patchCodexVscodeRequestTransport"));
 
     assert!(script.contains("list-models-for-host"));
@@ -3680,12 +3680,11 @@ fn injection_script_exposes_local_controls_through_shared_settings_catalog() {
 fn injection_script_keeps_remote_provider_patch_installed_for_openai_identity() {
     let script = assets::injection_script(57321);
 
-    assert!(
-        script
-            .contains("codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled()")
-    );
     assert!(script.contains(
-        "if (!codexRemoteSessionProviderPatchEnabled() && !codexPlusSettings().quotaResume && !codexPlusSettings().serviceTierControls) return;"
+        "codexRemoteSessionProviderPatchEnabled() || codexPlusBackendSettings.providerSyncEnabled"
+    ));
+    assert!(script.contains(
+        "&& !codexPlusSettings().quotaResume && !codexPlusSettings().serviceTierControls) return;"
     ));
 }
 

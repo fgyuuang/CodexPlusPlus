@@ -23,7 +23,7 @@ pub use provider_sync::{
     SessionIndexCleanupCandidate, SessionIndexCleanupPreview, SessionIndexCleanupResult,
     ThreadSidebarCleanupResult, apply_session_index_cleanup, inspect_provider_sync_lock,
     is_provider_sync_internal_alias, load_provider_sync_targets,
-    normalize_all_session_providers_to_custom, pending_recovery_journal,
+    normalize_all_session_providers_to_custom, pending_recovery_journal, prepare_thread_provider,
     preview_session_index_cleanup, provider_sync_target_for_settings,
     recover_provider_sync_from_backup, remote_control_session_recovery_candidate_exists,
     remove_thread_sidebar_references, run_provider_sync, run_provider_sync_with_target,
