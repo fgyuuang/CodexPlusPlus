@@ -2327,6 +2327,26 @@ pub fn codex_switch_blocked_by_gateway(settings: &SettingsStore, target_id: &str
 
 /// Codex 开着网关时，同步托管供应商的会话身份和原生生图注册条件。
 /// 不一致（登录 / 退出，或旧版配置缺少生图标记）就重写一次，端口没变也要检查。
+pub fn sync_codex_identity_after_selection(ctx: &ApplyContext) -> anyhow::Result<()> {
+    let changed = sync_codex_identity(ctx)?;
+    // A/B 同为官方身份时配置不变，但已有线程仍需读到新的凭据代际。
+    // 连接代际仅供重连，不代表运行中的原生 OAuth 已重载。
+    if !changed {
+        let settings = ctx.settings.load()?;
+        let gateway = ctx.gateway.load()?;
+        if settings.active_relay_id == CODEX_GATEWAY_RELAY_ID
+            && gateway
+                .binding(&ToolId::Codex)
+                .is_some_and(|binding| binding.enabled)
+            && !crate::wsl_network::codex_runs_in_wsl(&ctx.codex_home)
+            && taken_over(ctx, &ToolId::Codex).is_none()
+        {
+            crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
     let _guard = AGENT_CONFIG_LOCK
         .lock()
@@ -2338,7 +2358,7 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
     else {
         return Ok(false);
     };
-    let settings = ctx.settings.load()?;
+    let mut settings = ctx.settings.load()?;
     if settings.active_relay_id != CODEX_GATEWAY_RELAY_ID {
         return Ok(false);
     }
@@ -2376,6 +2396,7 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
         registered == crate::gateway::images::targets(&gateway, &ToolId::Codex, None).is_ok()
     };
     if keeps_login == can_sign_in && image_config_matches {
+        // 本地：请求目标切换不授权恢复登录（不借池中账号），见 AGENTS.md 认证源/请求目标分离。
         return Ok(false);
     }
     if write_codex(ctx, &gateway, &binding.clone(), false)? {
