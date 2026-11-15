@@ -745,10 +745,12 @@ describe("native default model fallback in pure API filtering", () => {
 
   it("redirects in-set native defaults to the effective configured default (issue #3122)", () => {
     const snapshots = new WeakMap();
+    // 本地版 descriptor 会调用 codexPlusModelDisplayName 取显示名，这里要一并注入；
+    // 上游版没有这一步，合并后两者共用同一段切片，作用域必须对齐。
     const patch = new Function("codexModelCatalog", "codexPlusModelDefaultSnapshots", "modelFilterPolicy",
-      "codexPlusModelMetadata", "modelReasoningEfforts", `${descriptor}\n${defaults}\nreturn patchModelDefaults;`)(
+      "codexPlusModelMetadata", "modelReasoningEfforts", "codexPlusModelDisplayName", `${descriptor}\n${defaults}\nreturn patchModelDefaults;`)(
       { model: "my-gateway-model", default_model: "my-gateway-model" }, snapshots, () => "pureApi:local",
-      () => null, () => []);
+      () => null, () => [], (_metadata: unknown, name: string) => name);
     const allowed = new Set(["gpt-6.1-codex", "my-gateway-model"]);
     const host: any = {
       defaultModel: "gpt-6.1-codex",
