@@ -783,6 +783,18 @@ async fn agent_pet_image_returns_cached_data_uri_without_network() {
         png,
     )
     .unwrap();
+    // 兜底图也要预先缓存：并行跑测试时这里若去联网，回落的 id 会变成错误响应，
+    // 而本用例要断言的只是「未知 id 回落到默认图」。
+    let fallback =
+        agent_pet::builtin_image_url(agent_pet::DEFAULT_IMAGE_ID, agent_pet::CDN_HOSTS[0]).unwrap();
+    std::fs::write(
+        cache_dir.join(agent_pet::cache_file_name(
+            &fallback,
+            agent_pet::ImageKind::Png,
+        )),
+        png,
+    )
+    .unwrap();
     // 图片按拓展配置（请求参数）选择。
     let result =
         handle_bridge_request(ctx.clone(), "/agent-pet/image", json!({"image": "fox"})).await;
