@@ -1663,6 +1663,21 @@ mod tests {
             app_data: normalized_path(&app_data).unwrap(),
             owned_debug_port: None,
         };
+        // lib 测试是并行跑的，子进程刚起来时偶发读不到命令行（PEB 还没就绪）；
+        // 先做一次「只读」预检，确认两个子进程的参数都能读，再做真正会停进程的那一步。
+        for _ in 0..40 {
+            let readable = [main.0.id(), isolated.0.id()].iter().all(|id| {
+                VerifiedStopProcess::capture(*id, false)
+                    .ok()
+                    .flatten()
+                    .and_then(|process| process.arguments().ok())
+                    .is_some()
+            });
+            if readable {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let count = capture_and_stop(
             [main.0.id(), isolated.0.id()],
             VerifiedStopProcess::capture,
