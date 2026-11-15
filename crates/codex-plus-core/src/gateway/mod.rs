@@ -57,6 +57,7 @@ pub mod store;
 mod subagent_models;
 pub mod subscriptions;
 pub mod usage;
+pub mod reset_credits;
 
 /// helper 收到的路径是否归网关处理。
 pub fn is_gateway_path(path: &str) -> bool {

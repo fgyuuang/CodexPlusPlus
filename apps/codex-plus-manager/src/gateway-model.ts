@@ -115,6 +115,8 @@ export type GatewayPoolEntry = {
   lentToCodex?: boolean;
   /** 订阅账号的剩余额度；查不到或普通供应商为空。 */
   quota?: ProviderQuota | null;
+  /** ChatGPT 账号手上的额度重置卡；只有订阅账号有，没查过时为空。 */
+  resetCredits?: ResetCredits | null;
   /** 已保存的 Key（打码，#2782）：订阅账号等不用 Key 的为空。旧版后端没有。 */
   keys?: ProviderKeyView[];
   /** 有余额接口的厂商（DeepSeek、Kimi 等，#2793）：卡片用「用量」页同一份余额。旧版后端没有。 */
@@ -165,6 +167,43 @@ export type ProviderQuota = {
   officialLimitReached?: boolean | null;
   creditsAvailable?: boolean | null;
 };
+/** 一张额度重置卡。 */
+export type ResetCredit = {
+  id: string;
+  /** available / redeemed / expired / redeeming / pending / unknown */
+  status: string;
+  grantedAtMs?: number | null;
+  expiresAtMs?: number | null;
+  /** 后端算好的「现在就能用」：状态是 available 且没过期。 */
+  usable: boolean;
+};
+
+/** 一个账号手上的重置卡与汇总数（汇总数为空表示上游没给，不是 0）。 */
+export type ResetCredits = {
+  availableCount?: number | null;
+  applicableAvailableCount?: number | null;
+  totalEarnedCount?: number | null;
+  credits: ResetCredit[];
+  observedAtMs: number;
+};
+
+/** 能用的重置卡张数；没有读数时返回 null（界面显示「尚未查询」，不要当成 0）。 */
+export function usableResetCardCount(entry?: GatewayPoolEntry | null): number | null {
+  const cards = entry?.resetCredits;
+  if (!cards) return null;
+  if (!cards.credits?.length) return cards.applicableAvailableCount ?? cards.availableCount ?? null;
+  return cards.credits.filter((card) => card.usable).length;
+}
+
+/** 能用的卡里最近的一张到期时间；没有到期时间的卡不算（null 表示不会因到期丢失）。 */
+export function soonestResetCardExpiry(entry?: GatewayPoolEntry | null): number | null {
+  const cards = entry?.resetCredits?.credits?.filter((card) => card.usable) ?? [];
+  const expiries = cards
+    .map((card) => card.expiresAtMs)
+    .filter((at): at is number => typeof at === "number" && at > 0);
+  return expiries.length ? Math.min(...expiries) : null;
+}
+
 export type SpeedView = { relayId: string; model: string; ms: number; samples: number };
 
 /** 私有接口订阅的登录方式。 */

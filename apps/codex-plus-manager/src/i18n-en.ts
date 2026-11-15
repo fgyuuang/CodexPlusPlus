@@ -3983,10 +3983,33 @@ export const EN_PLAIN: Record<string, string> = {
   "缺少 Node.js，无法启动本地服务": "Node.js is missing, so the local service cannot start",
   "Claude 本地模式": "Claude local mode",
   "操作失败": "The action failed",
+  // 供应商池：额度重置卡。
+  "重置券": "Reset vouchers",
+  "尚未查询": "Not checked yet",
+  "不过期": "No expiry",
+  "刷新重置卡": "Refresh vouchers",
+  "已用或已失效": "Used or expired",
+  "这个账号没有可用的重置卡": "This account has no usable reset vouchers",
+  "上次结果未确认：再点一次会用同一请求标识重试": "The last attempt was not confirmed. Click again to retry with the same request id",
+  "使用一张": "Use one",
+  "没有可用的重置卡": "No usable reset vouchers",
+  "没有重置卡": "No reset vouchers",
+  "使用重置卡": "Use reset voucher",
+  "重置 Codex 配额": "Reset Codex quota",
+  "确认重置": "Confirm reset",
+  "将消耗 1 张重置卡，把 5 小时与每周额度一起重置。是否继续？": "This uses one reset voucher and resets both the 5-hour and weekly allowance. Continue?",
+  "消耗一张重置卡，重置 5 小时与每周额度": "Use one reset voucher to reset the 5-hour and weekly allowance",
+
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "重置券 {0}": "{0} reset vouchers",
+  "{0} 张可用": "{0} usable",
+  "最近到期 {0}": "Earliest expiry {0}",
+  "最近一张 {0} 到期": "Next expires {0}",
+  "获得 {0}": "Granted {0}",
+  "到期 {0}": "Expires {0}",
   "客户端能力与始终允许的应用 · {0} 个": "Client capabilities and always-allowed apps · {0}",
   "已设 {0} 个": "{0} set",
   "查看全部 {0} 条": "Show all {0}",

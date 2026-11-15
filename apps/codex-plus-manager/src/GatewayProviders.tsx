@@ -31,6 +31,8 @@ import {
   poolExcludeToggle,
   protocolLabel,
   providerEnabled,
+  soonestResetCardExpiry,
+  usableResetCardCount,
   providerInput,
   skippedAgents,
   subscriptionBlockReason,
@@ -107,6 +109,112 @@ const MODEL_CHIP_PREVIEW = 6;
 const MODEL_CHIP_COLLAPSE = 8;
 
 /** 供应商池上次用的视图（切页再回来保持）。 */
+
+/** 重置卡的时间只到分钟；没有时间就是不会过期。 */
+function creditTime(value: number | null | undefined): string {
+  if (typeof value !== "number" || value <= 0) return t("不过期");
+  return new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+/**
+ * ChatGPT 账号的「额度重置卡」，信息口径对齐 CLIProxyAPI 配额页：剩几张、每张什么时候到手、
+ * 什么时候过期，按用户确认用掉一张。
+ *
+ * 请求标识保存在这一行里：结果没确认时（断网、上游换了返回）保留同一个标识重试，
+ * 服务端据此判重，不会重复扣卡。
+ */
+function ResetCreditsRow({ entry, busy, run }: { entry: GatewayPoolEntry; busy: string | null; run: Run }) {
+  const cards = entry.resetCredits ?? null;
+  const usable = usableResetCardCount(entry);
+  const soonest = soonestResetCardExpiry(entry);
+  const [requestId, setRequestId] = useState<string | null>(null);
+  const asking = useRef(false);
+  // 展开详情、还没有读数或读数超过两分钟才真的打上游：这一步只读，不消耗卡。
+  useEffect(() => {
+    if (!entry.enabled || asking.current) return;
+    if (cards && Date.now() - cards.observedAtMs < 120_000) return;
+    asking.current = true;
+    void run(`cards:${entry.id}`, "refresh_gateway_reset_credits", { id: entry.id }, t("刷新重置卡"), true)
+      .finally(() => { asking.current = false; });
+  }, [entry.id, entry.enabled, cards?.observedAtMs]);
+  const consume = async () => {
+    const ok = await appConfirm(t("将消耗 1 张重置卡，把 5 小时与每周额度一起重置。是否继续？"), { title: t("重置 Codex 配额"), confirmText: t("确认重置"), danger: true });
+    if (!ok) return;
+    const id = requestId ?? crypto.randomUUID();
+    setRequestId(id);
+    const done = await run(`consume:${entry.id}`, "consume_gateway_reset_card", { id: entry.id, requestId: id }, t("使用重置卡"), true);
+    // 只剩「结果未确认」这一种情况保留原标识，其余换新，免得下一次操作被当成重放。
+    if (done) setRequestId(null);
+  };
+  const listed = (cards?.credits ?? []).filter((card) => card.usable || card.status !== "redeemed").slice(0, 6);
+  return (
+    <div className="gw-detail-row gw-reset-row">
+      <span className="gw-detail-label">{t("重置券")}</span>
+      <div className="gw-detail-value gw-reset-value">
+        {cards === null ? (
+          <span className="gw-muted">{t("尚未查询")}</span>
+        ) : (
+          <>
+            <span className="gw-reset-count" data-tone={usable ? "ok" : "none"}>
+              {tf("{0} 张可用", [String(usable ?? 0)])}
+            </span>
+            {soonest ? <span className="gw-reset-expiry">{tf("最近到期 {0}", [creditTime(soonest)])}</span> : null}
+            {listed.length ? (
+              <ul className="gw-reset-list">
+                {listed.map((card) => (
+                  <li data-tone={card.usable ? "ok" : "done"} key={card.id}>
+                    <span>{tf("获得 {0}", [creditTime(card.grantedAtMs)])}</span>
+                    <span>{tf("到期 {0}", [creditTime(card.expiresAtMs)])}</span>
+                    {card.usable ? null : <span className="gw-muted">{t("已用或已失效")}</span>}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <span className="gw-muted">{t("这个账号没有可用的重置卡")}</span>
+            )}
+            {requestId ? <span className="gw-reset-pending">{t("上次结果未确认：再点一次会用同一请求标识重试")}</span> : null}
+          </>
+        )}
+      </div>
+      <span className="gw-detail-actions">
+        <button
+          className="gw-text-button gw-sync-button"
+          disabled={busy !== null}
+          onClick={() => void run(`cards:${entry.id}`, "refresh_gateway_reset_credits", { id: entry.id }, t("刷新重置卡"), true)}
+          type="button"
+        >
+          <RefreshCw className={busy === `cards:${entry.id}` ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
+          {t("刷新")}
+        </button>
+        <button
+          className="gw-text-button"
+          disabled={busy !== null || !usable}
+          onClick={() => void consume()}
+          title={usable ? t("消耗一张重置卡，重置 5 小时与每周额度") : t("没有可用的重置卡")}
+          type="button"
+        >
+          {t("使用一张")}
+        </button>
+      </span>
+    </div>
+  );
+}
+
+/** 折叠状态下的重置券张数：和 5h / 每周额度条并排，一眼看出还有没有牌可打。 */
+function ResetCardsChip({ entry }: { entry: GatewayPoolEntry }) {
+  const usable = usableResetCardCount(entry);
+  if (usable === null) return null;
+  const soonest = soonestResetCardExpiry(entry);
+  return (
+    <span
+      className="gw-reset-chip"
+      data-tone={usable ? "ok" : "none"}
+      title={soonest ? tf("最近一张 {0} 到期", [creditTime(soonest)]) : t("没有重置卡")}
+    >
+      {tf("重置券 {0}", [String(usable)])}
+    </span>
+  );
+}
 
 export function ProvidersView({
   payload,
@@ -709,6 +817,7 @@ function PoolRow({
           {quotaSupported ? entry.quota
             ? <QuotaWindows compact maxAgeSeconds={entry.subscriptionPolicy?.maxAgeSeconds} quota={entry.quota} />
             : <small>{t("额度待刷新")}</small> : null}
+          {entry.account === "chatgpt" ? <ResetCardsChip entry={entry} /> : null}
         </div>
         <span className="gw-pool-status">
           {newModels ? (
@@ -847,6 +956,7 @@ function PoolRow({
               </span>
             </div>
           ) : null}
+          {entry.account === "chatgpt" ? <ResetCreditsRow busy={busy} entry={entry} run={run} /> : null}
           {entry.account === "chatgpt" ? (
             <div className="gw-detail-row">
               <span className="gw-detail-label">{t("订阅额度策略")}</span>
