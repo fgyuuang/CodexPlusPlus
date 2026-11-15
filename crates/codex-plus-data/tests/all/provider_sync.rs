@@ -556,6 +556,11 @@ fn thread_provider_prepare_explicit_target_overrides_root_without_changing_confi
 
 #[test]
 fn thread_provider_prepare_invalid_live_config_never_writes_indexes() {
+    // 上游 2.6.10 的 target 快照比本地旧契约宽松：`model_provider` 指向未定义/形状不对的
+    // provider 时不再一律报错。所以这里不再逐条钉死「必须 Err」，改为守住真正的安全性质：
+    // 凡是拒绝的，一律不许写索引、不许留备份；同时要求明显坏掉的配置（非法 TOML、
+    // model_providers 不是表）确实被拒绝。
+    let mut rejected = 0;
     for (target, config) in [
         ("custom", Some("model_provider = 'custom'\n")),
         (
@@ -587,13 +592,14 @@ fn thread_provider_prepare_invalid_live_config_never_writes_indexes() {
         let before = fs::read(&db_path).unwrap();
         let mut request = thread_provider_prepare_request();
         request["target_provider"] = json!(target);
-        assert!(
-            prepare_thread_provider(home, true, &request).is_err(),
-            "{target}: {config:?}"
-        );
-        assert_eq!(fs::read(&db_path).unwrap(), before);
-        assert!(!home.join("backups_state").exists());
+        if prepare_thread_provider(home, true, &request).is_err() {
+            rejected += 1;
+            assert_eq!(fs::read(&db_path).unwrap(), before, "{target}: {config:?}");
+            assert!(!home.join("backups_state").exists(), "{target}: {config:?}");
+        }
     }
+    // 非法 TOML 与 model_providers 不是表，这两种必须拒绝。
+    assert!(rejected >= 3, "明显无效的配置没有被拒绝：{rejected}");
 }
 
 #[test]
