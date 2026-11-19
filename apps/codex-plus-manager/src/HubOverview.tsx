@@ -89,13 +89,13 @@ export function HubOverview({
   // 没勾选的 Agent 不在总览里出现；单 Agent 模式下网关就是这一个 Agent 专用的供应商池。
   const focus = useAgentFocus();
   const solo = singleAgent(focus);
-  const agents = hubAgents(payload, codex).filter((agent) => agentVisible(focus, agent.id));
+  const requestFlow = useRequestFlow(FLOW_REFRESH_MS);
+  const flowEntries = requestFlow.entries.filter((entry) => agentVisible(focus, flowAgent(entry)));
+  const agents = hubAgents(payload, codex, flowEntries).filter((agent) => agentVisible(focus, agent.id));
   const providers = hubProviders(payload, callsByProvider);
   // 连线的「活跃」改由真实请求决定：有请求在进行的连线流动，每条请求一颗来回的光点。
   const links = hubLinks(agents, providers).map((link) => (link.tone === "live" ? { ...link, tone: "idle" as const } : link));
   const totals = hubTotals(payload);
-  const requestFlow = useRequestFlow(FLOW_REFRESH_MS);
-  const flowEntries = requestFlow.entries.filter((entry) => agentVisible(focus, flowAgent(entry)));
   const flow = useMemo(
     () => ({ busy: busyLinks(flowEntries), routes: liveFlowRoutes(flowEntries) }),
     // 连线随进行中的请求、路由和响应阶段变化。
@@ -241,9 +241,10 @@ export function HubOverview({
 
 /** 左列一个 Agent：名字和当前模型同排，一行一个，省出纵向空间多放几个。 */
 function AgentNode({ agent, onOpen }: { agent: ReturnType<typeof hubAgents>[number]; onOpen: () => void }) {
+  const model = agent.recentModel && agent.detail ? tf("最近使用：{0}", [agent.detail]) : agent.detail;
   const detail = agent.direct
     ? (agent.detail ? tf("直连 · {0}", [agent.detail]) : t("直连模式"))
-    : agent.enabled ? agent.detail || t("已接入") : t("未接入网关");
+    : agent.enabled ? model || t("已接入") : t("未接入网关");
   return (
     <button className="hub-node" data-node={`agent:${agent.id}`} data-off={!agent.enabled && !agent.direct} onClick={onOpen} title={`${agent.name} · ${detail}`} type="button">
       <span className="hub-node-icon"><AgentGlyph agent={agent.id} /></span>

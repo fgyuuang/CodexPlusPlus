@@ -222,6 +222,31 @@ pub fn mentions_unverifiable_encrypted_content(text: &str) -> bool {
         || phrase_followed_by(&text, &["could not decrypt", "could not verify"], SUBJECT)
 }
 
+/// 目标明确表示它读不了别家签发的压缩检查点。
+///
+/// WorkBuddy 在收到 OpenAI/Codex 原生 `compaction.encrypted_content` 时会返回
+/// `foreign_compaction_checkpoint`，错误正文还包含稳定的英文说明。这里只认这个
+/// 明确契约，避免把普通请求错误误判成可转换为文字交接的压缩状态。
+pub fn mentions_foreign_compaction_checkpoint(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("foreign_compaction_checkpoint")
+        || text.contains("opaque compaction checkpoint")
+            && text.contains("cannot read")
+            && text.contains("earlier context has not been discarded")
+}
+
+pub fn is_foreign_compaction_rejection(status: u16, body: &[u8]) -> bool {
+    (400..500).contains(&status)
+        && mentions_foreign_compaction_checkpoint(&String::from_utf8_lossy(body))
+}
+
+pub fn is_foreign_compaction_stream_failure(code: Option<&str>, message: Option<&str>) -> bool {
+    [code, message]
+        .into_iter()
+        .flatten()
+        .any(mentions_foreign_compaction_checkpoint)
+}
+
 /// 上游的 4xx 错误体是不是「加密内容校验不过」。各家拒收用的状态码不一（400、422 …），
 /// 这里只看是不是客户端错误，具体以错误体措辞为准；5xx 一律不算。
 pub fn is_unverifiable_reasoning_rejection(status: u16, body: &[u8]) -> bool {
@@ -503,6 +528,25 @@ mod tests {
         assert!(!is_unverifiable_reasoning_rejection(
             400,
             br#"{"error":{"message":"Unsupported parameter: reasoning.effort"}}"#
+        ));
+    }
+
+    #[test]
+    fn recognizes_foreign_compaction_checkpoint_contract() {
+        let workbuddy = br#"{"error":{"code":"foreign_compaction_checkpoint","message":"This conversation contains an opaque compaction checkpoint that WorkBuddy cannot read. Return to the provider that created it and export a text handoff, or start a new conversation with that handoff. The earlier context has not been discarded."}}"#;
+        assert!(is_foreign_compaction_rejection(400, workbuddy));
+        assert!(is_foreign_compaction_stream_failure(
+            Some("foreign_compaction_checkpoint"),
+            None
+        ));
+        assert!(!is_foreign_compaction_rejection(500, workbuddy));
+        assert!(!is_foreign_compaction_rejection(
+            400,
+            br#"{"error":{"message":"ordinary invalid request"}}"#
+        ));
+        assert!(!is_foreign_compaction_stream_failure(
+            Some("invalid_request_error"),
+            Some("ordinary invalid request")
         ));
     }
 

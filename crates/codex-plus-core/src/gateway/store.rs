@@ -122,6 +122,10 @@ pub struct GatewayProvider {
     /// 没单独写窗口的模型用的窗口；都不填就交给模型自带的资料。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// 自动压缩阈值（#3100）：窗口的百分比，与窗口并列按模型填。都不填时不写压缩上限，
+    /// Codex 按自己的默认压缩，行为与没有这项设置时完全一样；旧文件读进来是空的。
+    #[serde(default, skip_serializing_if = "ProviderAutoCompact::is_empty")]
+    pub auto_compact: ProviderAutoCompact,
     /// 这个供应商单独走的 HTTP 代理；空串表示不单独走代理（沿用系统代理）。
     /// 与直连模式的「供应商独立代理」互不相干。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -161,6 +165,30 @@ pub struct GatewayProvider {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// 供应商的自动压缩阈值（#3100），单位是窗口的百分比（如 `85.0` 表示窗口的 85%）。
+/// 写进 Codex 模型目录时换算成 `auto_compact_token_limit = 窗口 × 百分比`。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAutoCompact {
+    /// 按模型的阈值：键是上游模型名（不带供应商前缀）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, f64>,
+    /// 没单独写阈值的模型用的阈值；不填就交给 Codex 默认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<f64>,
+}
+
+impl ProviderAutoCompact {
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty() && self.fallback.is_none()
+    }
+
+    /// 合法的百分比：大于等于 1、不超过 100 的有限数。
+    pub fn valid_percent(value: f64) -> bool {
+        value.is_finite() && (1.0..=100.0).contains(&value)
+    }
 }
 
 /// 从上游同步写入的模型资料记录（#2807），键是小写、去掉 `[1M]` 后缀的模型名。
@@ -237,6 +265,25 @@ impl GatewayProvider {
             .map(|(_, window)| *window)
             .or(self.context_window)
             .filter(|window| *window > 0)
+    }
+
+    /// 某个上游模型的自动压缩百分比：单独写的优先（忽略大小写和 `[1M]` 后缀），其次是这家的默认值；
+    /// 都没有（或值不合法）返回 None，交给 Codex 默认。
+    pub fn auto_compact_for(&self, model: &str) -> Option<f64> {
+        let (slug, _) = crate::model_suffix::parse_model_suffix(model.trim());
+        let slug = slug.trim();
+        self.auto_compact
+            .models
+            .iter()
+            .find(|(name, _)| {
+                crate::model_suffix::parse_model_suffix(name.trim())
+                    .0
+                    .trim()
+                    .eq_ignore_ascii_case(slug)
+            })
+            .map(|(_, percent)| *percent)
+            .or(self.auto_compact.fallback)
+            .filter(|percent| ProviderAutoCompact::valid_percent(*percent))
     }
 
     /// 上游配置里带的窗口（从直连模式导入的、或模型列表里写了 `[1M]` 后缀的）收进网关自己的
@@ -473,6 +520,9 @@ impl DefaultModelSelection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentBinding {
+    /// 只读运行时投影：当前登录账号的可信原生目录，不写入 gateway.json。
+    #[serde(skip)]
+    pub native_official: Option<RelayProfile>,
     #[serde(default)]
     pub enabled: bool,
     /// 主模型：写进 Agent 配置的默认模型，也是未知模型的改写目标。
@@ -531,6 +581,7 @@ pub struct AgentBinding {
 impl Default for AgentBinding {
     fn default() -> Self {
         Self {
+            native_official: None,
             enabled: false,
             model: String::new(),
             default_model_selection: None,
@@ -851,6 +902,45 @@ impl GatewaySettings {
         self.merge_extension_providers(providers)
     }
 
+    /// 原生登录与供应商池独立；只使用账号目录中的精确模型 ID。
+    pub fn with_native_codex_account(
+        mut self,
+        settings: &crate::settings::BackendSettings,
+    ) -> Self {
+        if let Some(binding) = self.bindings.get_mut(crate::tools::ToolId::Codex.as_str()) {
+            binding.native_official = None;
+        }
+        let account = settings.active_official_account_id.trim();
+        if account.is_empty() || !settings.official_experience.enabled {
+            return self;
+        }
+        let models =
+            crate::official_model_catalog::visible_official_model_slugs_for_settings(settings);
+        if models.is_empty() {
+            return self;
+        }
+        // 不借用供应商凭据；每次请求仍由账号库检查状态并刷新认证。
+        let id = self
+            .providers
+            .iter()
+            .find(|provider| {
+                super::official_accounts::account_ref(&provider.relay).as_deref() == Some(account)
+            })
+            .map(|provider| provider.relay.id.clone())
+            .unwrap_or_else(|| format!("local-official-{account}"));
+        self.bindings.entry(crate::tools::ToolId::Codex.as_str().to_string()).or_default().native_official = Some(RelayProfile {
+            id,
+            name: "当前登录账号".into(),
+            relay_mode: crate::settings::RelayMode::Official,
+            protocol: crate::settings::RelayProtocol::Responses,
+            model: models[0].clone(),
+            model_list: models.join("\n"),
+            auth_contents: serde_json::json!({super::official_accounts::ACCOUNT_REF: account, "codex_plus_gateway": true}).to_string(),
+            ..RelayProfile::default()
+        });
+        self
+    }
+
     pub fn with_extension_providers_from(
         self,
         manager: &crate::user_scripts::UserScriptManager,
@@ -909,6 +999,7 @@ impl GatewaySettings {
                 newapi_access: None,
                 subscription_policy: None,
                 upstream_meta: Default::default(),
+                auto_compact: Default::default(),
                 relay,
                 extra: Map::new(),
             };
@@ -1435,6 +1526,7 @@ mod tests {
             newapi_access: None,
             subscription_policy: None,
             upstream_meta: Default::default(),
+            auto_compact: Default::default(),
             relay: RelayProfile {
                 id: "deepseek".to_string(),
                 ..RelayProfile::default()

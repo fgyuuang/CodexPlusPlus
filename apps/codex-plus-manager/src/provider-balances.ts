@@ -41,22 +41,22 @@ export function subscribeProviderBalances(listener: (balances: ProviderBalance[]
 }
 
 /**
- * 取余额。`maxAge` 为 null 时只要查过就用缓存（「用量」页的老行为：进页面查一次，点刷新才重查）；
- * 给了毫秒数就超时重查；`force` 一定重查。进行中的请求会被复用，不会重复发。
+ * 在缓存过期或手动刷新时查询余额。进行中的请求会被复用；失败时保留原值和时间。
  */
-export function loadProviderBalances(loader: Loader, options: { force?: boolean; maxAge?: number | null } = {}): Promise<ProviderBalance[]> {
-  const { force = false, maxAge = PROVIDER_BALANCE_TTL_MS } = options;
+export function loadProviderBalances(loader: Loader, { force = false }: { force?: boolean } = {}): Promise<ProviderBalance[]> {
   if (inflight) return inflight;
-  if (!force && cache.balances !== null && (maxAge === null || providerBalancesFresh(cache, Date.now(), maxAge))) {
+  if (!force && cache.balances !== null && providerBalancesFresh(cache, Date.now())) {
     return Promise.resolve(cache.balances);
   }
   inflight = loader()
-    .then((result) => result.balances ?? [])
-    // 查不到时保留上次的结果，不清空已显示的余额。
-    .catch(() => cache.balances ?? [])
-    .then((balances) => {
-      cache.balances = balances;
-      cache.at = Date.now();
+    .then((result) => {
+      if (result.balances) {
+        cache.balances = result.balances;
+        cache.at = Date.now();
+      }
+    }, () => {})
+    .then(() => {
+      const balances = cache.balances ?? [];
       for (const listener of listeners) listener(balances);
       return balances;
     })

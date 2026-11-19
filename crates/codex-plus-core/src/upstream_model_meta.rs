@@ -391,3 +391,28 @@ fn read_default_level(object: &Map<String, Value>, meta: &mut UpstreamModelMeta)
         return;
     }
 }
+
+#[cfg(test)]
+mod workbuddy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn workbuddy_models_keep_supported_levels_and_report_unknowns() {
+        let models = parse_upstream_model_metas(&json!({"data":[{
+            "id":"cn:test-model", "context_length":128000,
+            "supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"off"}],
+            "reasoning_default_effort":"high"
+        }]}));
+        let model = &models[0];
+        assert_eq!(model.context_window, Some(128000));
+        assert_eq!(model.reasoning_levels, vec!["low", "high"]);
+        assert_eq!(model.default_reasoning_level.as_deref(), Some("high"));
+        assert!(
+            model
+                .ignored
+                .iter()
+                .any(|item| item.reason == IgnoredReason::UnknownLevel)
+        );
+    }
+}

@@ -697,7 +697,9 @@
   }
 
   async function codexGatewayConnectionGeneration() {
-    const connection = await readCodexAppServerPreparation("/gateway/connection-generation", {});
+    // 读不到连接代数就无法开始聊天（#3137），按放宽的截止等迟到的回包。
+    const connection = await readCodexAppServerPreparation("/gateway/connection-generation", {},
+      codexBridgePreparationReadTimeoutMs);
     if (connection?.status !== "ok" || typeof connection.active !== "boolean"
         || typeof connection.generation !== "string") {
       throw new Error(connection?.message || "读取网关连接状态失败，请稍后重试");
@@ -1705,6 +1707,10 @@
   }
 
   const codexAppServerPreparationTimeoutMs = 2000;
+  // 「读不到就开不了聊天」的准备读取的截止（#3137）：新建聊天读运行时上下文所需的模型目录、网关连接代数。
+  // 桥接偶发 2–3 秒才回包，2 秒截止会把迟到的成功当失败，这两处显式放宽到有界的 8 秒。
+  // 其余读取（模型列表、白名单、会话元数据、设置）读不到也能降级，仍按默认 2 秒，桥接卡住时不拖住原生请求。
+  const codexBridgePreparationReadTimeoutMs = 8000;
 
   // 发送前只读取辅助配置；桥接无回包时及时降级，迟到的结果也不再应用。
   // 写 RPC（尤其 thread/resume）不能这样竞速，否则会在 turn/start 后迟到修改会话。

@@ -676,6 +676,7 @@ impl ResponsesSseToAnthropicSse {
             output_tokens: usage.output_tokens,
             cached_tokens: usage.cache_read_input_tokens,
             reasoning_tokens: usage.reasoning_tokens,
+            workbuddy_credits: usage.workbuddy_credits,
         });
         let stop_reason = stop_reason(response, self.emitted_tool_use);
         push_event(
@@ -717,6 +718,7 @@ struct AnthropicUsage {
     cache_read_input_tokens: u64,
     output_tokens: u64,
     reasoning_tokens: u64,
+    workbuddy_credits: Option<f64>,
 }
 
 /// Responses usage → Anthropic usage：Anthropic 的 `input_tokens` 不含缓存命中部分。
@@ -734,6 +736,7 @@ fn anthropic_usage(usage: Option<&Value>) -> AnthropicUsage {
         cache_read_input_tokens: cached,
         output_tokens: number("/output_tokens"),
         reasoning_tokens: number("/output_tokens_details/reasoning_tokens"),
+        workbuddy_credits: usage.and_then(crate::request_log::workbuddy_credits),
     }
 }
 

@@ -106,7 +106,7 @@ fn failed_restore_preserves_the_original_backup() {
     );
     assert!(!source.join("alpha").exists());
     assert!(!home.join("skills/alpha").exists());
-    assert_eq!(manager.list_backups().len(), 1);
+    assert_eq!(manager.list_backups().unwrap().len(), 1);
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn disabling_does_not_stage_inside_the_original_skill() {
         std::fs::read_to_string(local.join("SKILL.md")).unwrap(),
         "original"
     );
-    assert!(manager.list_backups().is_empty());
+    assert!(manager.list_backups().unwrap().is_empty());
     assert!(!source.exists());
     assert!(
         !manager
@@ -163,7 +163,7 @@ fn disabling_a_copied_installation_must_preserve_user_edits() {
         std::fs::read_to_string(source.join("alpha/SKILL.md")).unwrap(),
         "original source"
     );
-    assert!(manager.list_backups().is_empty());
+    assert!(manager.list_backups().unwrap().is_empty());
     assert!(
         !manager
             .local_inventory()
@@ -223,7 +223,7 @@ fn failed_uninstall_must_not_leave_stale_installed_state() {
         std::fs::read_to_string(local.join("SKILL.md")).unwrap(),
         "user original"
     );
-    assert!(manager.list_backups().is_empty());
+    assert!(manager.list_backups().unwrap().is_empty());
 }
 
 #[test]
@@ -271,7 +271,7 @@ fn failed_local_disable_must_not_hide_the_skill() {
         "user original"
     );
     assert!(!source.join("alpha").exists());
-    assert!(manager.list_backups().is_empty());
+    assert!(manager.list_backups().unwrap().is_empty());
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn failed_copy_disable_restores_both_directories_and_metadata() {
         std::fs::read_to_string(source.join("alpha/SKILL.md")).unwrap(),
         "old source"
     );
-    assert!(manager.list_backups().is_empty());
+    assert!(manager.list_backups().unwrap().is_empty());
 }
 
 #[test]
@@ -356,5 +356,5 @@ fn failed_second_backup_restores_the_first_uninstall_move() {
         std::fs::read_to_string(source.join("alpha/SKILL.md")).unwrap(),
         "source content"
     );
-    assert!(manager.list_backups().is_empty());
+    assert!(manager.list_backups().unwrap().is_empty());
 }

@@ -21,6 +21,8 @@ export type HubAgentNode = {
   direct: boolean;
   /** 副标题：网关模型，或直连的供应商名。 */
   detail: string;
+  /** detail 来自最近的真实请求，而非绑定里的默认模型。 */
+  recentModel?: boolean;
   requests: number;
   live: boolean;
 };
@@ -49,7 +51,7 @@ export type HubFeedItem = {
 
 export type CodexSummary = { running: boolean; providerName: string | null };
 
-export function hubAgents(payload: GatewayPayload | null, codex: CodexSummary): HubAgentNode[] {
+export function hubAgents(payload: GatewayPayload | null, codex: CodexSummary, recentRequests: FlowEntry[] = []): HubAgentNode[] {
   const activity = payload?.activity?.agents ?? [];
   // Codex 只出现一次：接入了网关就按网关节点画，否则排第一个、画成直连。
   const codexViaGateway = (payload?.agents ?? []).some((agent) => agent.agent === "codex" && agent.enabled);
@@ -60,13 +62,26 @@ export function hubAgents(payload: GatewayPayload | null, codex: CodexSummary): 
     if (agent.agent === "codex" && !codexViaGateway) continue;
     const binding = payload?.gateway.bindings[agent.agent];
     const stats = activity.find((item) => item.agent === agent.agent);
-    const model = binding?.enabled ? modelDisplay(payload, binding.model, binding.poolExclude ?? []).title : "";
+    const latestRequest = recentRequests
+      .filter((entry) => flowAgent(entry) === agent.agent)
+      .sort((left, right) => right.startedAtMs - left.startedAtMs)
+      .find((entry) => Boolean(entry.upstreamModel?.trim() || entry.model.trim()));
+    const requestModel = latestRequest?.upstreamModel?.trim() || latestRequest?.model.trim();
+    const lastSteps = stats?.last?.steps ?? [];
+    const lastActivityModel = [...lastSteps].reverse().find((step) => step.outcome === "answered")?.model
+      || lastSteps[lastSteps.length - 1]?.model
+      || stats?.last?.model;
+    const lastUsedModel = requestModel || lastActivityModel;
+    const model = binding?.enabled
+      ? modelDisplay(payload, lastUsedModel || binding.model, binding.poolExclude ?? []).title
+      : "";
     nodes.push({
       id: agent.agent,
       name: agent.name,
       enabled: agent.enabled,
       direct: false,
       detail: model,
+      recentModel: Boolean(binding?.enabled && (requestModel || lastActivityModel)),
       requests: stats?.requests ?? 0,
       live: agent.enabled && Boolean(stats && (stats.inFlight.length > 0 || stats.requests > 0)),
     });

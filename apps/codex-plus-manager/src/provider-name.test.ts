@@ -8,7 +8,7 @@ import { providerAvatarText, resolveProviderName, tomlSectionStringValue } from 
 
 // 执行实际编辑器 helper，避免只测名称解析器而遗漏写回时的覆盖。
 function editorRuntime() {
-  const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const source = readFileSync(new URL("./relay-profile-editing.ts", import.meta.url), "utf8");
   const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const names = new Set([
     "tomlStructureMask", "tomlQuotedValue", "tomlDottedKeyPath", "tomlKeyPathName", "codexProviderSectionName", "tomlKeyAssignment", "tomlInlineComment",
@@ -18,8 +18,8 @@ function editorRuntime() {
     "setRootTomlStringKey", "setRootTomlLine", "removeRootTomlKey", "splitTomlRootAndTables",
   ]);
   const functions = ast.statements.filter((node) => ts.isFunctionDeclaration(node) && names.has(node.name?.text || ""));
-  const code = functions.map((node) => node.getText(ast)).join("\n");
-  const context = vm.createContext({ resolveProviderName });
+  const code = functions.map((node) => node.getText(ast).replace(/^export /, "")).join("\n");
+  const context = vm.createContext({ exports: {}, resolveProviderName });
   vm.runInContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
   return context;
 }

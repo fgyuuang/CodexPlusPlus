@@ -341,15 +341,32 @@ export function ProviderBalancePoolBadge({
   onRefresh: () => void;
 }) {
   const amount = typeof balance.amount === "number" && Number.isFinite(balance.amount) ? balance.amount : null;
+  const registered = balance.poolRegisteredAt ? new Date(balance.poolRegisteredAt * 1000).toLocaleString() : null;
   return (
     <span className="gw-billing-status">
-      {amount !== null ? (
-        <span className="gw-quota-badge" data-tone={amount <= 0 ? "low" : "ok"} title={t("余额接口查询，和「用量」页、托盘面板同一来源")}>
-          {tf("余额 {0}", [formatRelayAmount(amount, balance.currency)])}
+      {typeof balance.poolAmount === "number" && Number.isFinite(balance.poolAmount) ? (
+        <span className="gw-quota-badge" data-tone={balance.poolAmount <= 0 ? "low" : "ok"} title={registered
+          ? tf("账号池已知余额，覆盖 {0} 个账号；最早登记于 {1}", [balance.poolCoverage || "", registered])
+          : tf("账号池上游状态快照，已获取 {0} 个账号", [balance.poolCoverage || ""])}>
+          {tf("账号池 {0}", [formatRelayAmount(balance.poolAmount, balance.currency)])}{balance.poolCoverage ? ` (${balance.poolCoverage})` : ""}
         </span>
+      ) : balance.scope === "key" ? (
+        <span className="gw-billing-stale" title={t(balance.poolNote || "请检查管理登录、服务地址和分组绑定，或更新 WorkBuddy Manager")}>
+          {t(balance.poolNote === "请登录 WorkBuddy Manager" ? balance.poolNote : "账号池未知")}
+        </span>
+      ) : null}
+      {amount !== null ? (
+          <span className="gw-quota-badge" data-tone={amount <= 0 ? "low" : "ok"} title={t(balance.note || "余额接口查询，和「用量」页、托盘面板同一来源")}>
+            {tf(balance.scope === "key" ? "Key 额度 {0}" : "余额 {0}", [formatRelayAmount(amount, balance.currency)])}
+        </span>
+        ) : balance.scope === "key" && balance.note ? (
+          <span className="gw-quota-badge" title={t(balance.note)}>{t("Key 不限额")}</span>
       ) : (
         <em className="gw-billing-stale" title={t(balance.error || "查不到")}>{t("暂时获取失败")}</em>
       )}
+      {balance.scope === "key" && typeof balance.keyUsed === "number" && Number.isFinite(balance.keyUsed) ? (
+        <span className="gw-quota-badge" title={t("此 Key 自创建以来记录的积分消耗，并非所选时间段或账号池的消耗")}>{tf("Key 累计消耗 {0}", [formatRelayAmount(balance.keyUsed, balance.currency)])}</span>
+      ) : null}
       <RelayBillingRefreshButton loading={loading} onRefresh={onRefresh} title={t("刷新余额")} />
     </span>
   );

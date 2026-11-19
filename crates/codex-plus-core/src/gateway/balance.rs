@@ -2,10 +2,12 @@
 //! 用该供应商的第一个 Key 查；识别为中转站（sub2api / new-api）的，和供应商池卡片走同一条识别链路。
 //! 其它供应商不列出。
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::Serialize;
 use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 use crate::gateway::store::GatewaySettings;
 use crate::settings::RelayProfile;
@@ -22,6 +24,31 @@ pub struct ProviderBalance {
     /// 没有金额时的说明（如 new-api 的 Key 不限额度、没配访问令牌），界面放在悬停提示里。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_amount: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_coverage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_registered_at: Option<u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub workbuddy_model_rates: BTreeMap<String, f64>,
+    /// 当前调用 Key 自创建以来已记录的积分消耗，不是所选时间段或账号池消耗。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_used: Option<f64>,
+}
+
+pub fn has_workbuddy_usage(source: &str) -> bool {
+    matches!(source, "workbuddy" | "codex:managed-workbuddy") || workbuddy_realm(source).is_some()
+}
+
+pub fn workbuddy_realm(source: &str) -> Option<&str> {
+    source
+        .strip_prefix("workbuddy:")
+        .filter(|realm| matches!(*realm, "cn" | "global"))
 }
 
 /// 余额接口：地址和解析方式。
@@ -124,7 +151,11 @@ pub async fn fetch_balances(gateway: &GatewaySettings) -> Vec<ProviderBalance> {
         .map(|provider| {
             let relay = provider.relay.clone();
             let access = provider.newapi_access.clone();
+            let source = provider.source.clone();
             tokio::spawn(async move {
+                if has_workbuddy_usage(&source) {
+                    return Some(workbuddy_balance(&relay, workbuddy_realm(&source)).await);
+                }
                 match balance_api(&relay) {
                     Some(api) => Some(vendor_balance(&relay, api).await),
                     None => {
@@ -161,6 +192,13 @@ async fn vendor_balance(relay: &RelayProfile, api: BalanceApi) -> ProviderBalanc
             .unwrap_or_default(),
         error: result.err(),
         note: None,
+        scope: None,
+        pool_amount: None,
+        pool_coverage: None,
+        pool_note: None,
+        pool_registered_at: None,
+        workbuddy_model_rates: BTreeMap::new(),
+        key_used: None,
     }
 }
 
@@ -192,7 +230,181 @@ fn relay_balance(
         currency: usage.unit.clone(),
         error,
         note,
+        scope: None,
+        pool_amount: None,
+        pool_coverage: None,
+        pool_note: None,
+        pool_registered_at: None,
+        workbuddy_model_rates: BTreeMap::new(),
+        key_used: None,
     })
+}
+
+fn workbuddy_usage(value: &Value) -> Result<Option<f64>, String> {
+    if value.get("object").and_then(Value::as_str) != Some("key.usage") {
+        return Err("额度响应格式不正确".into());
+    }
+    let credits = value
+        .get("credits")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "额度响应缺少积分字段".to_string())?;
+    match (credits.get("limit"), credits.get("remaining")) {
+        (Some(Value::Null), Some(Value::Null)) => Ok(None),
+        (Some(limit), Some(remaining)) => {
+            let limit = number(limit).filter(|n| n.is_finite() && *n >= 0.0);
+            let remaining = number(remaining).filter(|n| n.is_finite() && *n >= 0.0);
+            match (limit, remaining) {
+                (Some(_), Some(n)) => Ok(Some(n)),
+                _ => Err("额度响应中的积分数值无效".into()),
+            }
+        }
+        _ => Err("额度响应缺少限额信息".into()),
+    }
+}
+
+async fn workbuddy_balance(relay: &RelayProfile, realm: Option<&str>) -> ProviderBalance {
+    let result = async {
+        let base = if relay.upstream_base_url.trim().is_empty() {
+            relay.base_url.trim()
+        } else {
+            relay.upstream_base_url.trim()
+        };
+        let mut url = reqwest::Url::parse(base).map_err(|_| "服务地址无效".to_string())?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !matches!(url.path().trim_end_matches('/'), "" | "/v1")
+        {
+            return Err("服务地址不是受支持的本机地址".to_string());
+        }
+        url.set_path("/v1/usage");
+        url.set_query(Some("codexpp=1"));
+        let key = relay
+            .selected_api_key()
+            .map(|item| item.api_key.as_str())
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or(&relay.api_key)
+            .trim();
+        if key.is_empty() {
+            return Err("没有 Key".to_string());
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| "无法创建额度查询".to_string())?;
+        let mut response = client
+            .get(url.clone())
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|_| "查询额度失败：连不上".to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("查询额度失败：HTTP {}", response.status().as_u16()));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| "读取额度响应失败".to_string())?
+        {
+            if body.len() + chunk.len() > 1024 * 1024 {
+                return Err("额度响应过大".to_string());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let value: Value =
+            serde_json::from_slice(&body).map_err(|_| "额度响应不是 JSON".to_string())?;
+        if let Some(realm) = realm
+            && value.pointer("/key/realm").and_then(Value::as_str) != Some(realm)
+        {
+            return Err("调用 Key 的版本与此 WorkBuddy 供应商不匹配".into());
+        }
+        let amount = workbuddy_usage(&value)?;
+        let used = value
+            .pointer("/credits/used")
+            .and_then(number)
+            .filter(|n| n.is_finite() && *n >= 0.0);
+        let pool_id = match value.pointer("/key/upstream_id") {
+            Some(Value::Null) => Some(0),
+            Some(value) => value.as_u64(),
+            None => None,
+        };
+        let pool = pool_id.and_then(|id| account_pool_summary(&value, id));
+        let rates: BTreeMap<String, f64> = value
+            .get("model_credit_rates")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(id, value)| {
+                let (realm, name) = id.split_once(':')?;
+                if !matches!(realm, "cn" | "global") || name.is_empty() || name.len() > 200 {
+                    return None;
+                }
+                let rate = value
+                    .as_f64()
+                    .filter(|rate| rate.is_finite() && *rate >= 0.0)?;
+                Some((id.clone(), rate))
+            })
+            .collect();
+        Ok::<_, String>((amount, pool, used, rates))
+    }
+    .await;
+    let snapshot = result
+        .as_ref()
+        .ok()
+        .and_then(|(_, pool, _, _)| pool.as_ref());
+    ProviderBalance {
+        provider_id: relay.id.clone(),
+        provider: relay.name.clone(),
+        base_url: relay.base_url.clone(),
+        amount: result.as_ref().ok().and_then(|(amount, _, _, _)| *amount),
+        currency: "积分".into(),
+        note: result.as_ref().ok().map(|(amount, _, _, _)| {
+            if amount.is_none() {
+                "当前调用 Key 不限额度，不代表账号池余额".into()
+            } else {
+                "当前选中 Key 的限额，不代表账号池余额".into()
+            }
+        }),
+        key_used: result.as_ref().ok().and_then(|(_, _, used, _)| *used),
+        scope: Some("key".into()),
+        pool_amount: snapshot.map(|(amount, _, _)| *amount),
+        pool_coverage: snapshot.map(|(_, coverage, _)| coverage.clone()),
+        pool_note: snapshot
+            .is_none()
+            .then(|| "WorkBuddy Manager 未返回此 Key 所属分组的余额".into()),
+        pool_registered_at: snapshot.and_then(|(_, _, time)| *time),
+        workbuddy_model_rates: result
+            .as_ref()
+            .ok()
+            .map(|(_, _, _, rates)| rates.clone())
+            .unwrap_or_default(),
+        error: result.err(),
+    }
+}
+
+fn account_pool_summary(value: &Value, expected_id: u64) -> Option<(f64, String, Option<u64>)> {
+    let pool = value.get("account_pool")?;
+    let id = pool.get("upstream_id")?;
+    if !(expected_id == 0 && id.is_null()) && id.as_u64() != Some(expected_id) {
+        return None;
+    }
+    let amount = pool
+        .get("remaining")?
+        .as_f64()
+        .filter(|n| n.is_finite() && *n >= 0.0)?;
+    let observed = pool.get("observed")?.as_u64()?;
+    let total = pool.get("total")?.as_u64()?;
+    if observed == 0 || observed > total {
+        return None;
+    }
+    let time = pool.get("oldest_registered_at").and_then(Value::as_u64);
+    Some((amount, format!("{observed}/{total}"), time))
 }
 
 async fn fetch_one(relay: &RelayProfile, api: BalanceApi) -> Result<(f64, String), String> {
@@ -235,6 +447,92 @@ async fn fetch_one_at(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn workbuddy_usage_preserves_key_quota_semantics() {
+        assert_eq!(
+            workbuddy_usage(&json!({"object":"key.usage","credits":{"limit":100,"remaining":27}})),
+            Ok(Some(27.0))
+        );
+        assert_eq!(
+            workbuddy_usage(
+                &json!({"object":"key.usage","credits":{"limit":null,"remaining":null}})
+            ),
+            Ok(None)
+        );
+        assert!(
+            workbuddy_usage(&json!({"object":"key.usage","credits":{"limit":null,"remaining":0}}))
+                .is_err()
+        );
+        assert!(workbuddy_usage(&json!({"credits":{"limit":100,"remaining":0}})).is_err());
+    }
+
+    #[test]
+    fn account_pool_summary_requires_matching_group_and_reports_coverage() {
+        let snapshot = json!({"account_pool":{"upstream_id":7,"remaining":10,"observed":2,"total":3,"oldest_registered_at":99}});
+        assert_eq!(
+            account_pool_summary(&snapshot, 7),
+            Some((10.0, "2/3".into(), Some(99)))
+        );
+        assert_eq!(account_pool_summary(&snapshot, 8), None);
+        assert_eq!(
+            account_pool_summary(
+                &json!({"account_pool":{"upstream_id":7,"remaining":null,"observed":0,"total":2}}),
+                7
+            ),
+            None
+        );
+        assert_eq!(
+            account_pool_summary(
+                &json!({"account_pool":{"upstream_id":null,"remaining":0,"observed":1,"total":1}}),
+                0
+            ),
+            Some((0.0, "1/1".into(), None))
+        );
+    }
+
+    #[tokio::test]
+    async fn workbuddy_usage_queries_selected_key_on_loopback_only() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/usage"))
+            .and(query_param("codexpp", "1"))
+            .and(header("authorization", "Bearer selected-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object":"key.usage", "credits":{"limit":100,"remaining":42,"used":58},
+                "key":{"upstream_id":1},
+                "account_pool":{"upstream_id":1,"remaining":3060.5,"observed":2,"total":2,"oldest_registered_at":99},
+                "model_credit_rates":{"cn:free":0,"global:paid":1.33,"cn:invalid":-1,"bare":1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut relay = relay(&server.uri());
+        relay.api_key = "old-key".into();
+        relay.api_keys = vec![crate::settings::RelayApiKey {
+            id: "selected".into(),
+            name: "Selected".into(),
+            api_key: "selected-test-key".into(),
+        }];
+        relay.active_api_key_id = "selected".into();
+        let balance = workbuddy_balance(&relay, None).await;
+        assert_eq!(balance.amount, Some(42.0));
+        assert_eq!(balance.key_used, Some(58.0));
+        assert_eq!(balance.scope.as_deref(), Some("key"));
+        assert_eq!(balance.pool_amount, Some(3060.5));
+        assert_eq!(balance.pool_registered_at, Some(99));
+        assert_eq!(balance.workbuddy_model_rates.get("cn:free"), Some(&0.0));
+        assert_eq!(
+            balance.workbuddy_model_rates.get("global:paid"),
+            Some(&1.33)
+        );
+        assert_eq!(balance.workbuddy_model_rates.len(), 2);
+        relay.base_url = "https://example.com/v1".into();
+        assert!(workbuddy_balance(&relay, None).await.error.is_some());
+    }
 
     fn relay(base_url: &str) -> RelayProfile {
         RelayProfile {
@@ -384,6 +682,7 @@ mod tests {
             newapi_access: None,
             subscription_policy: None,
             upstream_meta: Default::default(),
+            auto_compact: Default::default(),
             relay: RelayProfile {
                 id: "relay-a".to_string(),
                 name: "中转 A".to_string(),

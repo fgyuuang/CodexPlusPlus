@@ -15,6 +15,35 @@ fn manager(root: &std::path::Path) -> UserScriptManager {
     .with_bundled_dir(root.join("bundled"))
 }
 
+#[test]
+fn local_service_replacement_keeps_permission_and_restores_bundled_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    materialize(&temp.path().join("bundled")).unwrap();
+    let user = temp.path().join("user/services");
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(user.join("manager.html"), "<p>services</p>").unwrap();
+    std::fs::write(user.join("codexpp.json"), r#"{"id":"services","manager":{"page":"manager.html"},"replaces":["local-cliproxy","local-newapi"],"permissions":{"routes":["/local-integrations/cliproxy","/local-integrations/newapi","/local-integrations/workbuddy"]}}"#).unwrap();
+    let manager = manager(temp.path());
+    assert_eq!(script(&manager, "bundled:local-cliproxy")["enabled"], false);
+    for service in ["cliproxy", "newapi", "workbuddy"] {
+        assert!(
+            manager
+                .authorize_local_integration(
+                    "user:services",
+                    &format!("/local-integrations/{service}")
+                )
+                .is_ok()
+        );
+    }
+    manager.set_script_enabled("user:services", false).unwrap();
+    assert_eq!(script(&manager, "bundled:local-cliproxy")["enabled"], true);
+    assert!(
+        manager
+            .authorize_local_integration("user:services", "/local-integrations/workbuddy")
+            .is_err()
+    );
+}
+
 fn script(manager: &UserScriptManager, key: &str) -> Value {
     manager.inventory().unwrap()["scripts"]
         .as_array()

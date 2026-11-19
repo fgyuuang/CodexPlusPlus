@@ -10,7 +10,7 @@ import { ArrowUpRight, CheckCircle2, Loader2, Play, XCircle } from "lucide-react
 import { t, tf } from "./i18n";
 import { agentAccessState, agentUsageStats, recentAgentRequests, type DashboardRequest } from "./agent-dashboard-model";
 import { AgentGlyph, useGatewayPayload } from "./HubOverview";
-import { formatElapsed, formatTokens, groupDisplayName, modelDisplay, relativeTime, shortPath, type AgentSessionView, type UsageSummary } from "./gateway-model";
+import { formatElapsed, formatTokens, modelDisplay, relativeTime, shortPath, type AgentSessionView, type UsageSummary } from "./gateway-model";
 import { providersHidden } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
 import { CxBadge, CxCard, CxEmpty, CxRow, CxSection, CxStats, CxStatusIcon } from "./cx-layout";
@@ -99,7 +99,7 @@ export function AgentDashboard({
   const view = payload?.agents.find((item) => item.agent === agent);
   const access = agentAccessState(view);
   const binding = payload?.gateway.bindings[agent];
-  const model = view?.enabled && binding ? modelDisplay(payload, binding.model, binding.poolExclude ?? []).title : "";
+  const model = view?.enabled && binding ? modelDisplay(payload, requests?.[0]?.model || binding.model, binding.poolExclude ?? []).title : "";
   const usageStats = agentUsageStats(usage, agent);
 
   const launch = async () => {
@@ -200,7 +200,7 @@ export function AgentDashboard({
                   title={agent === "codex" ? t("最近没有经过本地代理的请求") : t("还没有经过网关的请求")}
                 />
               ) : requests.map((request) => {
-                const name = groupDisplayName(payload, request.model) ?? request.model;
+                const name = request.model ? modelDisplay(payload, request.model).title || request.model : "";
                 return (
                   <CxRow detail={request.provider ? `→ ${request.provider}` : "—"} key={request.id} title={<span title={name}>{name}</span>}>
                     <time className="cx-dash-time">{request.running ? t("进行中") : formatElapsed(request.durationMs)}</time>

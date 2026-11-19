@@ -13,6 +13,34 @@ use codex_plus_core::settings::{
 };
 use serde_json::json;
 
+/// 手动读取当前机器目录，只输出耗时与数量，不输出模型、凭据或配置。
+#[tokio::test]
+#[ignore = "requires the user's local model catalog"]
+async fn local_model_catalog_read_timing() {
+    let _state = crate::common::global_state_lock();
+    for attempt in 1..=2 {
+        let started = std::time::Instant::now();
+        let (catalog, heartbeat) = tokio::join!(read_codex_model_catalog(), async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            started.elapsed()
+        });
+        eprintln!(
+            "catalog attempt={attempt} elapsed_ms={} status={} models={}",
+            started.elapsed().as_millis(),
+            catalog["status"],
+            catalog["models"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default()
+        );
+        assert_eq!(catalog["status"], "ok");
+        assert!(
+            heartbeat.as_millis() < 500,
+            "本地目录解析不能阻塞异步桥接：{heartbeat:?}"
+        );
+    }
+}
+
 #[test]
 fn catalog_entries_apply_manual_windows_case_insensitively() {
     // 上游 /models 返回的 id 与本地保存的 key 常只差大小写；精确查表会让用户

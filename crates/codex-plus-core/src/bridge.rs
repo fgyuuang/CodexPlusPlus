@@ -104,6 +104,10 @@ fn release_bridge_generation(generation: &BridgeGeneration) {
     {
         generations.remove(&generation.target);
     }
+    APP_SERVER_CAPTURE_GENERATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&generation.id);
 }
 
 pub fn build_bridge_script(binding_name: &str) -> String {
@@ -944,8 +948,9 @@ fn spawn_app_server_client_capture(websocket_url: &str, generation: BridgeGenera
     spawn_app_server_client_capture_with(websocket_url, generation, false);
 }
 
-/// 同一桥接代际里已按需开过捕获的代际号，避免拓展反复请求时叠出多个调试会话。
-static ON_DEMAND_CAPTURE_GENERATIONS: std::sync::LazyLock<
+/// 自动捕获与拓展按需捕获共用同一登记：Debugger.enable 会枚举大型 bundle，
+/// 重复启动既拖慢页面初始化，也会让两套会话争抢同一次暂停的恢复。
+static APP_SERVER_CAPTURE_GENERATIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
@@ -962,26 +967,43 @@ pub fn request_app_server_client_capture(websocket_url: &str) -> bool {
     else {
         return false;
     };
-    if !ON_DEMAND_CAPTURE_GENERATIONS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(id)
-    {
-        return false;
-    }
     let generation = BridgeGeneration {
         target: websocket_url.to_string(),
         id,
     };
-    spawn_app_server_client_capture_with(websocket_url, generation, true);
-    true
+    spawn_app_server_client_capture_with(websocket_url, generation, true)
+}
+
+fn claim_app_server_client_capture(generation: &BridgeGeneration) -> bool {
+    // 与 release_bridge_generation 保持相同锁顺序；检查与登记必须是同一事务，
+    // 防止已经释放的代际被迟到的按需请求重新登记。
+    let generations = CURRENT_BRIDGE_GENERATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if generations.get(&generation.target) != Some(&generation.id) {
+        return false;
+    }
+    APP_SERVER_CAPTURE_GENERATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(generation.id)
 }
 
 fn spawn_app_server_client_capture_with(
     websocket_url: &str,
     generation: BridgeGeneration,
     force: bool,
-) {
+) -> bool {
+    if !force {
+        let settings = crate::builtin_takeover::load_effective_settings().unwrap_or_default();
+        if !settings.codex_app_model_whitelist_unlock && !settings.codex_app_session_delete {
+            // 自动捕获未启用时不占用登记，拓展之后仍可按需捕获。
+            return false;
+        }
+    }
+    if !claim_app_server_client_capture(&generation) {
+        return false;
+    }
     let websocket_url = websocket_url.to_string();
     tokio::spawn(async move {
         if let Err(error) = run_app_server_client_capture(&websocket_url, generation, force).await {
@@ -991,6 +1013,7 @@ fn spawn_app_server_client_capture_with(
             );
         }
     });
+    true
 }
 
 async fn run_app_server_client_capture(
@@ -1495,7 +1518,8 @@ fn cdp_websocket_config() -> WebSocketConfig {
         .max_frame_size(Some(CDP_MAX_MESSAGE_BYTES))
 }
 
-async fn connect_cdp_websocket(
+/// 连 CDP WebSocket（校验地址是本机调试端口）。远程控制的桌面镜像也用它。
+pub(crate) async fn connect_cdp_websocket(
     websocket_url: &str,
 ) -> anyhow::Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -2263,6 +2287,65 @@ mod native_quota_lifecycle_tests {
 #[cfg(test)]
 mod app_server_capture_tests {
     use super::*;
+
+    #[test]
+    fn automatic_capture_blocks_duplicate_on_demand_capture() {
+        let generation = next_bridge_generation("capture-auto-and-on-demand");
+        assert!(publish_bridge_generation(&generation));
+        assert!(claim_app_server_client_capture(&generation));
+        // 没有 Tokio runtime：若按需路径错误地再 spawn，这里会直接失败。
+        assert!(!request_app_server_client_capture(&generation.target));
+        release_bridge_generation(&generation);
+        assert!(!claim_app_server_client_capture(&generation));
+        assert!(
+            !APP_SERVER_CAPTURE_GENERATIONS
+                .lock()
+                .unwrap()
+                .contains(&generation.id)
+        );
+    }
+
+    #[test]
+    fn concurrent_capture_requests_claim_only_one_debugger() {
+        let generation = next_bridge_generation("capture-concurrent-claims");
+        assert!(publish_bridge_generation(&generation));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let requests: Vec<_> = (0..8)
+            .map(|_| {
+                let generation = generation.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_app_server_client_capture(&generation)
+                })
+            })
+            .collect();
+        let claimed = requests
+            .into_iter()
+            .map(|request| usize::from(request.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(claimed, 1);
+        release_bridge_generation(&generation);
+    }
+
+    #[test]
+    fn replacement_capture_is_independent_and_rejects_stale_requests() {
+        let original = next_bridge_generation("capture-replacement-claims");
+        let replacement = next_bridge_generation(&original.target);
+        let other_page = next_bridge_generation("capture-other-page-claims");
+        assert!(publish_bridge_generation(&original));
+        assert!(claim_app_server_client_capture(&original));
+        assert!(publish_bridge_generation(&replacement));
+        assert!(publish_bridge_generation(&other_page));
+        assert!(!claim_app_server_client_capture(&original));
+        assert!(claim_app_server_client_capture(&replacement));
+        assert!(claim_app_server_client_capture(&other_page));
+        release_bridge_generation(&original);
+        assert!(bridge_generation_is_current(&replacement));
+        assert!(!claim_app_server_client_capture(&replacement));
+        release_bridge_generation(&replacement);
+        release_bridge_generation(&other_page);
+    }
 
     #[derive(Clone, Copy)]
     enum CaptureCase {

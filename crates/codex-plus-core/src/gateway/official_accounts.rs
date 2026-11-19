@@ -286,6 +286,7 @@ pub async fn credential(
     let parsed = crate::official_accounts::parse_official_auth(&auth)?;
     ensure!(parsed.id == id, "官方账号凭据身份不匹配");
     Ok(crate::official_login::OfficialCredential {
+        account_scope: crate::native_auth::account_scope(&auth.to_string()),
         access_token: crate::official_accounts::auth_token(&auth, "access_token")
             .context("所引用官方账号缺少访问令牌")?
             .to_string(),

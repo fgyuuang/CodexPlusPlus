@@ -10,13 +10,14 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::gateway::balance::has_workbuddy_usage;
 use crate::gateway::store::{GatewaySettings, ProviderPrice};
 use crate::request_log::RequestLogEntry;
 
 const USAGE_FILE: &str = "gateway-usage.json";
 
 /// 一组请求的累计数字。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageCounts {
     #[serde(default)]
@@ -41,6 +42,9 @@ pub struct UsageCounts {
     /// 其中成功的生图请求（生图一般不返回 token，只能按次数看）。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub images: u64,
+    /// 只加总 WorkBuddy 实际报告的积分；旧数据不填 0。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workbuddy_credits: Option<f64>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -58,11 +62,14 @@ impl UsageCounts {
         self.duration_ms += other.duration_ms;
         self.timed_calls += other.timed_calls;
         self.images += other.images;
+        if let Some(credits) = other.workbuddy_credits {
+            self.workbuddy_credits = Some(self.workbuddy_credits.unwrap_or(0.0) + credits);
+        }
     }
 }
 
 /// 某一天里某个 Agent 经某个供应商用某个模型的累计。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRow {
     pub agent: String,
@@ -76,7 +83,7 @@ pub struct UsageRow {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UsageFile {
     #[serde(default)]
@@ -183,6 +190,10 @@ impl UsageStore {
                 summary.totals.add(&row.counts);
                 let price = gateway
                     .provider(&row.provider_id)
+                    .filter(|provider| {
+                        row.counts.workbuddy_credits.is_none()
+                            && !has_workbuddy_usage(&provider.source)
+                    })
                     .and_then(|provider| provider.price_for(&row.model));
                 add_group(
                     &mut summary.by_agent,
@@ -261,15 +272,23 @@ fn add_group(
     }
 }
 
-/// 一条请求按供应商里填的价格估算的费用；没填价格或没有 token 时为空。
+/// 优先显示实际扣费；其余供应商按填入的价格估算。
 pub fn entry_cost(entry: &RequestLogEntry, gateway: &GatewaySettings) -> Option<UsageCost> {
     let usage = entry.usage.as_ref()?;
+    if let Some(amount) = usage.workbuddy_credits {
+        return Some(UsageCost {
+            currency: "积分".into(),
+            amount,
+        });
+    }
     if usage.input_tokens == 0 && usage.output_tokens == 0 {
         return None;
     }
-    let price = gateway
-        .provider(&entry.relay_id)?
-        .price_for(entry.usage_model())?;
+    let provider = gateway.provider(&entry.relay_id)?;
+    if has_workbuddy_usage(&provider.source) {
+        return None;
+    }
+    let price = provider.price_for(entry.usage_model())?;
     let counts = UsageCounts {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -397,6 +416,7 @@ pub fn record_entry_in(store: &UsageStore, entry: &RequestLogEntry) -> anyhow::R
             duration_ms: entry.duration_ms,
             timed_calls: u64::from(entry.duration_ms > 0),
             images: u64::from(entry.success && entry.is_image()),
+            workbuddy_credits: usage.workbuddy_credits,
         },
         extra: Default::default(),
     };
@@ -453,9 +473,11 @@ mod tests {
                 output_tokens: output,
                 cached_tokens: cached,
                 reasoning_tokens: 1,
+                workbuddy_credits: None,
             }),
             cache_hit_ratio: None,
             final_response_evidence: None,
+            final_response_id: None,
             agent: agent.map(str::to_string),
         }
     }
@@ -465,6 +487,58 @@ mod tests {
         assert_eq!(shift_day("2026-10-01", -1), "2026-09-30");
         assert_eq!(shift_day("2026-12-31", 1), "2027-01-01");
         assert_eq!(local_day(0).len(), 10);
+    }
+
+    #[test]
+    fn workbuddy_credits_follow_the_terminal_response_into_usage() {
+        let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::default();
+        transformer.push_bytes(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":0},\"workbuddy_credits\":0.375}}}\n\n");
+        let mut metered = entry(None, "wb", 12, 3, 0);
+        metered.usage = transformer.take_usage();
+        assert_eq!(
+            metered.usage.as_ref().unwrap().workbuddy_credits,
+            Some(0.375)
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::at(temp.path().join("usage.json"));
+        let day = local_day(metered.timestamp_ms);
+        let gateway = GatewaySettings::default();
+        let old = entry(None, "wb", 10, 2, 0);
+        record_entry_in(&store, &old).unwrap();
+        assert!(entry_cost(&old, &gateway).is_none());
+        assert_eq!(
+            store
+                .summary(&day, None, &gateway)
+                .unwrap()
+                .totals
+                .workbuddy_credits,
+            None
+        );
+
+        let mut free = metered.clone();
+        free.usage.as_mut().unwrap().workbuddy_credits = Some(0.0);
+        assert_eq!(entry_cost(&free, &gateway).unwrap().amount, 0.0);
+        record_entry_in(&store, &free).unwrap();
+        assert_eq!(
+            store
+                .summary(&day, None, &gateway)
+                .unwrap()
+                .totals
+                .workbuddy_credits,
+            Some(0.0)
+        );
+
+        record_entry_in(&store, &metered).unwrap();
+        let cost = entry_cost(&metered, &gateway).unwrap();
+        assert_eq!((cost.currency.as_str(), cost.amount), ("积分", 0.375));
+        let summary = store.summary(&day, None, &gateway).unwrap();
+        assert_eq!(summary.totals.workbuddy_credits, Some(0.375));
+        assert_eq!(summary.days[0].counts.workbuddy_credits, Some(0.375));
+        assert_eq!(summary.by_provider[0].counts.workbuddy_credits, Some(0.375));
+        assert_eq!(summary.by_model[0].counts.workbuddy_credits, Some(0.375));
+        assert_eq!(summary.by_agent[0].counts.workbuddy_credits, Some(0.375));
+        assert!(summary.costs.is_empty());
     }
 
     #[test]
@@ -510,6 +584,7 @@ mod tests {
             newapi_access: None,
             subscription_policy: None,
             upstream_meta: Default::default(),
+            auto_compact: Default::default(),
             relay: RelayProfile {
                 id: "ds".to_string(),
                 ..RelayProfile::default()

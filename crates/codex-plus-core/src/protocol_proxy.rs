@@ -198,6 +198,31 @@ pub(crate) fn managed_protocol_proxy_base_urls() -> Vec<String> {
         .collect()
 }
 
+/// 本地 WS 入口只能把 `response.create` 转给原生 Responses 上游；Chat Completions /
+/// Anthropic 兼容路由只能走 HTTP/SSE。混合协议池一律在握手阶段回 426，让客户端继续
+/// 用 HTTP，而不是升级成功后在路由阶段把整轮请求打成失败（#2963 的能力边界）。
+pub(crate) fn websocket_upgrade_serves_all_routes(
+    settings: &crate::settings::BackendSettings,
+) -> bool {
+    let native_responses = |relay: &crate::settings::RelayProfile| {
+        relay.protocol == crate::settings::RelayProtocol::Responses
+    };
+    if settings.relay_profiles_enabled && !settings.relay_profiles.iter().all(native_responses) {
+        return false;
+    }
+    // 网关成员各自有协议；池里只要有一位是 Chat / Anthropic，升级成功也可能在路由阶段失败。
+    let Ok(gateway) = crate::gateway::store::GatewayStore::default().load() else {
+        // 读不到网关配置时不能假定全部是原生 Responses，否则会把错误推迟到 101 之后。
+        return false;
+    };
+    gateway
+        .with_extension_providers()
+        .providers
+        .iter()
+        .filter(|provider| provider.enabled)
+        .all(|provider| native_responses(&provider.relay))
+}
+
 pub(crate) fn is_managed_protocol_proxy_base_url(value: &str) -> bool {
     let Ok(mut parsed) = reqwest::Url::parse(value.trim()) else {
         return false;
@@ -1348,9 +1373,12 @@ pub fn responses_to_chat_completions_with_options(
     remove_unsupported_native_search(&mut body)?;
     validate_chat_attachments(&body)?;
     expand_local_compaction_history(&mut body);
-    // #3106：剩下的是原生上游签发的加密压缩项，Chat 协议无法表达，换成占位说明，其余历史照常转换。
-    // 代理入口已按候选决定过是切换还是降级（见 open_responses_proxy_request_once），这里兜底。
-    degrade_native_compaction_history(&mut body);
+    // 能展开的只有 Codex++ 自己生成的明文摘要；剩下的是别家签发的加密检查点。
+    // 公共转换函数拿不到线程历史，不能在这里假装“前文已丢失”继续发送。
+    // 代理入口应先完成外来压缩的文字交接；没有交接时明确拒绝。
+    if input_has_native_compaction(&body) {
+        return Err(NativeCompactionUnsupported::history().into());
+    }
     // agent_message 的 encrypted_content 片段在 multi_agent v2 里实际承载明文任务；
     // 转换时按文本透传，opaque 内容则明确失败，避免静默发空任务。
     let mut result = json!({});
@@ -1914,6 +1942,8 @@ pub struct UpstreamProxyResponse {
     /// 上游请求是否使用了 Responses exec 兼容包装。
     pub exec_adapted: bool,
     pub(crate) exec_outcome: Option<crate::responses_exec_transport::ExecOutcome>,
+    /// 原生 WS 的准备结果；HTTP 调用始终为 None。
+    pub(crate) websocket: Option<Box<crate::responses_websocket::PreparedWebsocket>>,
     pub response: Option<reqwest::Response>,
     // 兼容本地容量重试状态；上游普通供应商路径不参与该计数。
     pub capacity_retryable: bool,
@@ -2033,7 +2063,7 @@ impl UpstreamProxyResponse {
     }
 
     pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status_code)
+        (200..300).contains(&self.status_code) || self.websocket.is_some()
     }
 
     pub async fn read_body(&mut self) -> anyhow::Result<Vec<u8>> {
@@ -2070,7 +2100,19 @@ pub fn upstream_header_timeout() -> Duration {
 }
 
 pub fn upstream_stream_header_timeout() -> Duration {
-    UPSTREAM_STREAM_HEADER_TIMEOUT
+    stream_header_timeout()
+}
+
+/// 流式请求等上游响应头的上限：默认 120s（[`UPSTREAM_STREAM_HEADER_TIMEOUT`]），
+/// 可在 settings.json 写 `upstreamStreamHeaderTimeoutSecs` 调大（#3130：长推理模型
+/// 首字超过 120s 会被判超时）。下限 120（兜底真正卡死的连接）、上限 3600。
+pub fn stream_header_timeout() -> Duration {
+    let configured = SettingsStore::default()
+        .load()
+        .ok()
+        .and_then(|settings| settings.upstream_stream_header_timeout_secs);
+    let secs = configured.unwrap_or(UPSTREAM_STREAM_HEADER_TIMEOUT.as_secs());
+    Duration::from_secs(secs.clamp(UPSTREAM_STREAM_HEADER_TIMEOUT.as_secs(), 3600))
 }
 
 pub fn upstream_http_client() -> anyhow::Result<reqwest::Client> {
@@ -2995,6 +3037,12 @@ fn compaction_input_rejected(status_code: u16, body: &[u8]) -> bool {
         Err(_) => String::from_utf8_lossy(body).into_owned(),
     }
     .to_ascii_lowercase();
+    // #3101：ChatGPT 订阅共享（「ChatGPT API」上游，api.openai.com + ChatGPT 登录）按白名单收输入项，
+    // compaction_trigger 不在其中；报错只列白名单、不点名被拒的项，只能按错误码认。
+    // 这里只用于带 trigger 的探测请求：若真正被拒的是历史里别的项，降级重发后上游会再报同样的错，原样交回。
+    if text.contains("subscription_sharing_unsupported_capability") {
+        return true;
+    }
     let unrecognized = text.contains("unknown")
         || text.contains("unrecognized")
         || text.contains("unsupported")
@@ -3182,6 +3230,7 @@ fn native_compaction_unsupported_result(
             request_trace: None,
             exec_adapted: false,
             exec_outcome: None,
+            websocket: None,
             response: None,
             capacity_retryable: false,
             capacity_retry_enabled: false,
@@ -3225,41 +3274,6 @@ fn expand_compaction_item(item: &Value) -> Option<Value> {
         "role": "user",
         "content": [{ "type": "input_text", "text": text }]
     }))
-}
-
-/// 原生压缩项（#3106）降级成的占位说明：写给模型看，措辞与 [`COMPACTION_REPLAY_PREFIX`] 一样用英文。
-const NATIVE_COMPACTION_PLACEHOLDER: &str = "[Context note] The earlier part of this conversation was compacted by a different provider. That compaction summary is stored in an encrypted format that cannot be read under the current protocol, so the earlier context has been omitted. Continue from the remaining conversation, and ask the user if essential earlier details are missing.";
-
-/// 把展开本地摘要后仍留在 input 里的原生 compaction 项（Responses 原生上游签发的 Fernet 密文，
-/// 网关无法解密）换成一条 user 占位说明，返回替换了几项。
-/// 位置不变：compaction 项本来就代替压缩前的整段历史，占位说明留在原处，前后顺序与配对不受影响。
-fn degrade_native_compaction_history(body: &mut Value) -> usize {
-    let placeholder = || {
-        json!({
-            "type": "message",
-            "role": "user",
-            "content": [{ "type": "input_text", "text": NATIVE_COMPACTION_PLACEHOLDER }]
-        })
-    };
-    let is_native =
-        |item: &Value| item.get("type").and_then(Value::as_str) == Some(COMPACTION_OUTPUT_TYPE);
-    let mut degraded = 0;
-    match body.get_mut("input") {
-        Some(Value::Array(items)) => {
-            for item in items.iter_mut() {
-                if is_native(item) {
-                    *item = placeholder();
-                    degraded += 1;
-                }
-            }
-        }
-        Some(input @ Value::Object(_)) if is_native(input) => {
-            *input = json!([placeholder()]);
-            degraded = 1;
-        }
-        _ => {}
-    }
-    degraded
 }
 
 fn expand_local_compaction_history(body: &mut Value) {
@@ -3783,6 +3797,7 @@ fn extension_rejected_response(reason: &str) -> anyhow::Result<UpstreamProxyResp
         request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
+        websocket: None,
         response: None,
         capacity_retryable: false,
         capacity_retry_enabled: false,
@@ -3858,6 +3873,7 @@ async fn open_vendor_responses_request(
                 request_trace: None,
                 exec_adapted: false,
                 exec_outcome: None,
+                websocket: None,
                 response: None,
                 capacity_retryable: false,
                 capacity_retry_enabled: false,
@@ -3905,6 +3921,16 @@ async fn open_vendor_responses_request(
         (binding.relay.clone(), vec![binding.relay.clone()])
     } else if let Some(route) = &model_route {
         (route.relay.clone(), vec![route.relay.clone()])
+    } else if let Some(id) = crate::responses_websocket::pinned_relay() {
+        let relay = settings
+            .relay_profiles
+            .iter()
+            .find(|relay| relay.id == id)
+            .cloned()
+            .ok_or(crate::responses_websocket::Unsupported(
+                "WS 续接的原供应商已移除，请使用完整上下文开始新响应",
+            ))?;
+        (relay.clone(), vec![relay])
     } else {
         let relay = crate::relay_rotation::select_relay_for_request(
             &settings,
@@ -3967,6 +3993,8 @@ async fn open_vendor_responses_request(
     let mut foreign_compaction_dropped = false;
     // 上游不收推理项的明文 content、已清空后重发过（#2917）：每个请求只重发这一次，不占上面两项的预算。
     let mut reasoning_content_retried = false;
+    // 外来压缩检查点已换成文字交接；同一请求不再重复生成摘要。
+    let mut foreign_compaction_handoff_retried = false;
     let mut request_trace = crate::request_log::RequestTrace {
         model: source_model.clone(),
         ..Default::default()
@@ -3993,6 +4021,14 @@ async fn open_vendor_responses_request(
         }
         let has_more_candidates = attempt + 1 < relay_count;
         validate_upstream(&relay)?;
+        if crate::responses_websocket::active()
+            && relay.protocol != crate::settings::RelayProtocol::Responses
+        {
+            return Err(crate::responses_websocket::RequiresHttp(
+                "此 WS 路径只支持原生 Responses 上游；HTTP/SSE 兼容路由请继续使用 HTTP",
+            )
+            .into());
+        }
         // 官方登录成员：用该账号 OAuth 凭据发往 chatgpt.com，而不是 API Key。
         let official_member = crate::official_login::member_uses_official_login_transport(&relay);
         let mut official_credential = if official_member {
@@ -4091,23 +4127,81 @@ async fn open_vendor_responses_request(
         if let Some(candidate) = local_candidate {
             logical_body = candidate.body;
         }
-        // #3106：Responses 原生上游签发的加密压缩项（Fernet 密文），Chat / Anthropic 桥接读不了。
-        // 还能切到下一个候选时保持原来的做法（交给后面也许能读它的 Responses 上游）；
-        // 已经没得切（最后一个候选、聚合 / 强制上游不切换）时换成占位说明继续发，
-        // 否则这段历史每轮都要重放，每条后续消息都 400，会话永久锁死。
-        let native_compaction_degraded = if relay.requires_protocol_proxy_conversion()
-            && !(has_more_candidates && !strict_aggregate_model)
+        // 拒收重试会从头重建请求；先复用已生成的文字交接，避免重发时又把
+        // 原密文送回同一个目标。后续新请求也走这里，不再重复调用摘要模型。
+        if let Some((thread_id, digest, summary)) =
+            cached_foreign_compaction_handoff(&logical_body, session_headers)
         {
-            degrade_native_compaction_history(&mut logical_body)
-        } else {
-            0
-        };
-        if native_compaction_degraded > 0 {
-            log_foreign_compaction_dropped(
-                &relay,
-                native_compaction_degraded,
-                "bridge_placeholder",
+            let replaced = crate::foreign_compaction_handoff::replace_foreign_compactions(
+                &mut logical_body,
+                &summary,
             );
+            if replaced > 0 {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.foreign_compaction_handoff",
+                    json!({
+                        "relayId": relay.id,
+                        "relayName": relay.name,
+                        "threadId": thread_id,
+                        "checkpointDigest": digest,
+                        "replaced": replaced,
+                        "cacheHit": true,
+                        "stage": "request_rebuild"
+                    }),
+                );
+            }
+        }
+        // 目标协议读不了原生压缩状态时，先用本机可见历史生成文字交接；成功就不需要
+        // 再降级成“上下文已丢失”的占位说明。摘要按线程 + 检查点缓存，后续轮次直接复用。
+        if relay.requires_protocol_proxy_conversion()
+            && crate::foreign_compaction_handoff::has_foreign_compaction(&logical_body)
+            && !foreign_compaction_handoff_retried
+        {
+            match prepare_foreign_compaction_handoff(
+                &relay,
+                &mut logical_body,
+                original_user_agent,
+                beta_features,
+                session_headers,
+                official_credential.as_ref(),
+                &mut foreign_compaction_handoff_retried,
+                &mut retry_reasons,
+                false,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    let error = anyhow::anyhow!("外来压缩检查点没有被替换");
+                    if has_more_candidates && !strict_aggregate_model {
+                        crate::relay_rotation::record_relay_request_failure(&settings);
+                        continue 'request_attempts;
+                    }
+                    return native_compaction_unsupported_result(
+                        anyhow::Error::new(NativeCompactionUnsupported::history())
+                            .context(error.to_string()),
+                    );
+                }
+                Err(error) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "protocol_proxy.foreign_compaction_handoff_failed",
+                        json!({
+                            "relayId": relay.id,
+                            "relayName": relay.name,
+                            "stage": "request_conversion",
+                            "error": error.to_string()
+                        }),
+                    );
+                    if has_more_candidates && !strict_aggregate_model {
+                        crate::relay_rotation::record_relay_request_failure(&settings);
+                        continue 'request_attempts;
+                    }
+                    return native_compaction_unsupported_result(
+                        anyhow::Error::new(NativeCompactionUnsupported::history())
+                            .context(error.to_string()),
+                    );
+                }
+            }
         }
         let (mut endpoint, mut upstream_body, mut wire_api, compaction) =
             match upstream_request_parts(
@@ -4182,7 +4276,7 @@ async fn open_vendor_responses_request(
         let foreign_scope = foreign_reasoning_scope(&relay, official_credential.as_ref());
         let mut compaction_dropped_now = false;
         if foreign_reasoning_handled {
-            // reasoning 与 compaction / compaction_summary 项一并按记忆提前去掉。
+            // 通用密文校验错误仍按上游规则重试；明确的压缩检查点拒收不写入这份记忆。
             let skipped =
                 crate::foreign_reasoning::strip_remembered(&foreign_scope, &mut upstream_body);
             if skipped.total() > 0 {
@@ -4203,8 +4297,7 @@ async fn open_vendor_responses_request(
             }
         }
         // 按这次实际发出的请求算：换到别的候选、压缩项没被去掉时不再标出。
-        // 桥接换成占位说明的原生压缩项（#3106）同样丢了压缩前的上下文，一并标出。
-        foreign_compaction_dropped = compaction_dropped_now || native_compaction_degraded > 0;
+        foreign_compaction_dropped = compaction_dropped_now;
         // #2917：这家（供应商 + Key / 账号）的这个模型拒收过推理项的明文 content，提前清空。
         // 拒收重发时请求从头重建，也是靠这里清空。
         if foreign_reasoning_handled {
@@ -4291,6 +4384,139 @@ async fn open_vendor_responses_request(
         request_trace.bind_upstream_model(&upstream_body);
         if let Some(id) = live_request_id {
             crate::request_log::update_running_route(id, &request_trace, is_stream);
+        }
+        if crate::responses_websocket::active() {
+            if compaction || experimental_local_compaction || forced_adapted || local_exec_adapted {
+                return Err(crate::responses_websocket::RequiresHttp(
+                    "此 WS 路径不执行 HTTP 压缩或 exec 协议转换，请继续使用 HTTP",
+                )
+                .into());
+            }
+            let builder = build_responses_upstream_request(
+                &relay,
+                &endpoint,
+                &upstream_body,
+                wire_api,
+                false,
+                original_user_agent,
+                beta_features,
+                session_headers,
+                official_credential.as_ref(),
+            )?;
+            let mut prepared = crate::responses_websocket::prepare(
+                &relay.id,
+                builder,
+                upstream_body.clone(),
+                header_timeout,
+                official_credential
+                    .as_ref()
+                    .and_then(|credential| credential.account_scope.as_deref()),
+            )
+            .await;
+            // 尚未提交 response.create，401 刷新与握手失败换候选仍是安全的。
+            if official_member
+                && matches!(&prepared, Ok(crate::responses_websocket::PreparedUpstream::Rejected(response)) if response.status() == reqwest::StatusCode::UNAUTHORIZED)
+            {
+                if let Ok(credential) =
+                    crate::official_login::resolve_official_credential(&relay, true).await
+                {
+                    official_credential = Some(credential);
+                    let builder = build_responses_upstream_request(
+                        &relay,
+                        &endpoint,
+                        &upstream_body,
+                        wire_api,
+                        false,
+                        original_user_agent,
+                        beta_features,
+                        session_headers,
+                        official_credential.as_ref(),
+                    )?;
+                    request_attempt += 1;
+                    prepared = crate::responses_websocket::prepare(
+                        &relay.id,
+                        builder,
+                        upstream_body,
+                        header_timeout,
+                        official_credential
+                            .as_ref()
+                            .and_then(|credential| credential.account_scope.as_deref()),
+                    )
+                    .await;
+                }
+            }
+            let (websocket, response, status_code) = match prepared {
+                Ok(crate::responses_websocket::PreparedUpstream::Websocket(mut ready)) => {
+                    if !strict_aggregate_model {
+                        ready.rotation = Some(settings.clone());
+                    }
+                    (Some(ready), None, 101)
+                }
+                Ok(crate::responses_websocket::PreparedUpstream::Rejected(response)) => {
+                    let status = response.status().as_u16();
+                    if !strict_aggregate_model {
+                        crate::relay_rotation::record_relay_request_failure(&settings);
+                    }
+                    if has_more_candidates && matches!(status, 401 | 403 | 429 | 500..=599) {
+                        retry_reasons.push(format!("WS handshake {status}"));
+                        continue;
+                    }
+                    // HTTP 200 不是升级成功，不能在网关中当成成功候选。
+                    (
+                        None,
+                        Some(response),
+                        if (200..300).contains(&status) {
+                            502
+                        } else {
+                            status
+                        },
+                    )
+                }
+                Err(error) if error.is::<crate::responses_websocket::Unsupported>() => {
+                    return Err(error);
+                }
+                Err(error) if error.is::<crate::responses_websocket::RequiresHttp>() => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    if !strict_aggregate_model {
+                        crate::relay_rotation::record_relay_request_failure(&settings);
+                    }
+                    if has_more_candidates {
+                        retry_reasons.push("WS handshake transport failure".into());
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            request_trace.attempts = request_attempt as u32;
+            fill_retry_trace(
+                &mut request_trace,
+                &retry_reasons,
+                foreign_compaction_dropped,
+            );
+            return Ok(UpstreamProxyResponse {
+                status_code,
+                content_type: "application/json".into(),
+                is_stream: true,
+                wire_api,
+                upstream_reasoning_included: false,
+                compaction: false,
+                native_compaction_passthrough: false,
+                buffered_body: None,
+                stream_prefix: Vec::new(),
+                request_trace: Some(request_trace),
+                exec_adapted: false,
+                exec_outcome: None,
+                websocket,
+                response,
+                capacity_retryable: false,
+                capacity_retry_enabled: false,
+                capacity_retry_key: None,
+                capacity_retry_max_attempts: 0,
+                scheduled_account_id: None,
+                _channel_permit: None,
+            });
         }
         let mut key = None;
         let mut exec_adapted = forced_adapted;
@@ -4478,24 +4704,33 @@ async fn open_vendor_responses_request(
         // #2917：上游说推理项的 content 必须为空（别家转换回来的明文思考），清空后对同一候选重发一次。
         let foreign_rejection_possible = foreign_retries < crate::foreign_reasoning::MAX_RETRIES
             && crate::foreign_reasoning::has_encrypted_items(&upstream_body);
+        let foreign_compaction_possible = !foreign_compaction_handoff_retried
+            && crate::foreign_compaction_handoff::has_foreign_compaction(&upstream_body);
         let content_rejection_possible = !reasoning_content_retried
             && crate::foreign_reasoning::has_reasoning_content(&upstream_body);
-        if foreign_reasoning_handled
-            && (400..500).contains(&status_code)
-            && (foreign_rejection_possible || content_rejection_possible)
+        let inspect_foreign_reasoning =
+            foreign_reasoning_handled && (foreign_rejection_possible || content_rejection_possible);
+        if (400..500).contains(&status_code)
+            && (foreign_compaction_possible || inspect_foreign_reasoning)
         {
             let mut error_text = String::new();
             let mut rejection = None;
             let sent_body = &upstream_body;
             let inspected =
                 crate::responses_exec_transport::inspect_error_body(upstream, |status, _, body| {
-                    if content_rejection_possible
+                    if foreign_reasoning_handled
+                        && content_rejection_possible
                         && crate::foreign_reasoning::is_reasoning_content_rejection(
                             status, body, sent_body,
                         )
                     {
                         rejection = Some(HistoryRejection::ReasoningContent);
-                    } else if foreign_rejection_possible
+                    } else if foreign_compaction_possible
+                        && crate::foreign_reasoning::is_foreign_compaction_rejection(status, body)
+                    {
+                        rejection = Some(HistoryRejection::ForeignCompaction);
+                    } else if foreign_reasoning_handled
+                        && foreign_rejection_possible
                         && crate::foreign_reasoning::is_unverifiable_reasoning_rejection(
                             status, body,
                         )
@@ -4509,8 +4744,8 @@ async fn open_vendor_responses_request(
                 })
                 .await;
             match inspected {
-                Ok((_, true))
-                    if match rejection {
+                Ok((response, true)) => {
+                    let retried = match rejection {
                         Some(HistoryRejection::ReasoningContent) => {
                             prepare_reasoning_content_retry(
                                 &relay,
@@ -4521,6 +4756,35 @@ async fn open_vendor_responses_request(
                                 &mut retry_reasons,
                                 &foreign_scope,
                             )
+                        }
+                        Some(HistoryRejection::ForeignCompaction) => {
+                            match prepare_foreign_compaction_handoff(
+                                &relay,
+                                &mut upstream_body,
+                                original_user_agent,
+                                beta_features,
+                                session_headers,
+                                official_credential.as_ref(),
+                                &mut foreign_compaction_handoff_retried,
+                                &mut retry_reasons,
+                                true,
+                            )
+                            .await
+                            {
+                                Ok(retried) => retried,
+                                Err(error) => {
+                                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                                        "protocol_proxy.foreign_compaction_handoff_failed",
+                                        json!({
+                                            "relayId": relay.id,
+                                            "relayName": relay.name,
+                                            "stage": "http_status",
+                                            "error": error.to_string()
+                                        }),
+                                    );
+                                    false
+                                }
+                            }
                         }
                         Some(HistoryRejection::EncryptedContent) => {
                             prepare_foreign_reasoning_retry(
@@ -4536,10 +4800,12 @@ async fn open_vendor_responses_request(
                             )
                         }
                         None => false,
-                    } =>
-                {
-                    candidate_index = attempt;
-                    continue 'request_attempts;
+                    };
+                    if retried {
+                        candidate_index = attempt;
+                        continue 'request_attempts;
+                    }
+                    upstream = response;
                 }
                 Ok((response, _)) => upstream = response,
                 Err(error) => {
@@ -4667,6 +4933,7 @@ async fn open_vendor_responses_request(
                 buffered_body: Some(body),
                 exec_adapted: false,
                 exec_outcome: None,
+                websocket: None,
                 response: None,
                 capacity_retryable: false,
                 capacity_retry_enabled: false,
@@ -4729,6 +4996,7 @@ async fn open_vendor_responses_request(
                     request_trace: None,
                     exec_adapted: false,
                     exec_outcome: None,
+                    websocket: None,
                     response: None,
                     capacity_retryable: false,
                     capacity_retry_enabled: false,
@@ -4760,6 +5028,7 @@ async fn open_vendor_responses_request(
                             request_trace: None,
                             exec_adapted: false,
                             exec_outcome: None,
+                            websocket: None,
                             response: None,
                             capacity_retryable: false,
                             capacity_retry_enabled: false,
@@ -4786,6 +5055,7 @@ async fn open_vendor_responses_request(
                             request_trace: None,
                             exec_adapted: false,
                             exec_outcome: None,
+                            websocket: None,
                             response: None,
                             capacity_retryable: false,
                             capacity_retry_enabled: false,
@@ -4818,6 +5088,7 @@ async fn open_vendor_responses_request(
                         request_trace: None,
                         exec_adapted: false,
                         exec_outcome: None,
+                        websocket: None,
                         response: None,
                         capacity_retryable: false,
                         capacity_retry_enabled: false,
@@ -4841,6 +5112,7 @@ async fn open_vendor_responses_request(
                         request_trace: None,
                         exec_adapted: false,
                         exec_outcome: None,
+                        websocket: None,
                         response: None,
                         capacity_retryable: false,
                         capacity_retry_enabled: false,
@@ -4871,6 +5143,7 @@ async fn open_vendor_responses_request(
                     request_trace: None,
                     exec_adapted: false,
                     exec_outcome: None,
+                    websocket: None,
                     response: None,
                     capacity_retryable: false,
                     capacity_retry_enabled: false,
@@ -5080,6 +5353,8 @@ async fn open_vendor_responses_request(
         let foreign_stream_watch = foreign_reasoning_handled
             && foreign_retries < crate::foreign_reasoning::MAX_RETRIES
             && crate::foreign_reasoning::has_encrypted_items(&upstream_body);
+        let foreign_compaction_watch = !foreign_compaction_handoff_retried
+            && crate::foreign_compaction_handoff::has_foreign_compaction(&upstream_body);
         let mut stream_prefix = Vec::new();
         if is_stream
             && (200..300).contains(&status_code)
@@ -5120,6 +5395,46 @@ async fn open_vendor_responses_request(
                     {
                         candidate_index = attempt;
                         continue 'request_attempts;
+                    }
+                    // 目标在流内明确拒绝外来压缩检查点时，先用本机可见历史生成文字
+                    // 交接并重发；成功后会移除该密文，不能退回“直接删掉”。
+                    if foreign_compaction_watch
+                        && let Some((code, message)) = terminal_failure.as_ref()
+                        && crate::foreign_reasoning::is_foreign_compaction_stream_failure(
+                            code.as_deref(),
+                            message.as_deref(),
+                        )
+                    {
+                        match prepare_foreign_compaction_handoff(
+                            &relay,
+                            &mut upstream_body,
+                            original_user_agent,
+                            beta_features,
+                            session_headers,
+                            official_credential.as_ref(),
+                            &mut foreign_compaction_handoff_retried,
+                            &mut retry_reasons,
+                            true,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                candidate_index = attempt;
+                                continue 'request_attempts;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                let _ = crate::diagnostic_log::append_diagnostic_log(
+                                    "protocol_proxy.foreign_compaction_handoff_failed",
+                                    json!({
+                                        "relayId": relay.id,
+                                        "relayName": relay.name,
+                                        "stage": "buffered_stream",
+                                        "error": error.to_string()
+                                    }),
+                                );
+                            }
+                        }
                     }
                     // 整段缓冲：还没向 Codex 写出任何字节，流内拒收加密内容可以重发。
                     if foreign_stream_watch
@@ -5200,6 +5515,7 @@ async fn open_vendor_responses_request(
                         request_trace: Some(request_trace),
                         exec_adapted: false,
                         exec_outcome: None,
+                        websocket: None,
                         response: None,
                         capacity_retryable: false,
                         capacity_retry_enabled: false,
@@ -5225,7 +5541,7 @@ async fn open_vendor_responses_request(
             && !is_compaction_request
             && !experimental_local_compaction
             && !exec_adapted
-            && (auto_retry.is_some() || foreign_stream_watch)
+            && (auto_retry.is_some() || foreign_stream_watch || foreign_compaction_watch)
         {
             // 重试预算已用尽时再缓冲没有收益，直接退回旧提交时机，
             // 避免为首字白等一个宽限窗口。没开「请求避震」、只为流内拒收加密内容预读时，
@@ -5273,6 +5589,43 @@ async fn open_vendor_responses_request(
                     {
                         candidate_index = attempt;
                         continue 'request_attempts;
+                    }
+                    if foreign_compaction_watch
+                        && crate::foreign_reasoning::is_foreign_compaction_stream_failure(
+                            code.as_deref(),
+                            message.as_deref(),
+                        )
+                    {
+                        match prepare_foreign_compaction_handoff(
+                            &relay,
+                            &mut upstream_body,
+                            original_user_agent,
+                            beta_features,
+                            session_headers,
+                            official_credential.as_ref(),
+                            &mut foreign_compaction_handoff_retried,
+                            &mut retry_reasons,
+                            true,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                candidate_index = attempt;
+                                continue 'request_attempts;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                let _ = crate::diagnostic_log::append_diagnostic_log(
+                                    "protocol_proxy.foreign_compaction_handoff_failed",
+                                    json!({
+                                        "relayId": relay.id,
+                                        "relayName": relay.name,
+                                        "stage": "stream",
+                                        "error": error.to_string()
+                                    }),
+                                );
+                            }
+                        }
                     }
                     // 预读还没提交给 Codex：流内拒收加密内容就去掉一批后对同一候选重发。
                     if foreign_stream_watch
@@ -5392,6 +5745,7 @@ async fn open_vendor_responses_request(
             exec_outcome: (exec_adapted && (200..300).contains(&status_code)).then(|| {
                 crate::responses_exec_transport::ExecOutcome::new(key, adapted_tools, &settings)
             }),
+            websocket: None,
             response: Some(upstream),
             capacity_retryable: false,
             capacity_retry_enabled: false,
@@ -5495,10 +5849,389 @@ fn prepare_foreign_reasoning_retry(
 /// 上游拒收历史里的推理内容属于哪一类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryRejection {
+    /// 目标明确拒绝别家供应商签发的压缩检查点。
+    ForeignCompaction,
     /// 别家签发的加密内容校验不过（#2777）。
     EncryptedContent,
     /// 推理项不许带明文 content（#2917）。
     ReasoningContent,
+}
+
+static FOREIGN_COMPACTION_HANDOFF_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn foreign_compaction_thread_ids(
+    body: &Value,
+    session_headers: ProxySessionHeaders<'_>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in [
+        session_headers.thread_id,
+        session_headers.session_id,
+        session_headers.opencode_session,
+        body.get("prompt_cache_key").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    {
+        if !ids.iter().any(|seen| seen == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+fn cached_foreign_compaction_handoff(
+    body: &Value,
+    session_headers: ProxySessionHeaders<'_>,
+) -> Option<(String, String, String)> {
+    let digest = crate::foreign_compaction_handoff::checkpoint_digest(body)?;
+    for thread_id in foreign_compaction_thread_ids(body, session_headers) {
+        if let Some(summary) = crate::foreign_compaction_handoff::load_cached(&thread_id, &digest) {
+            return Some((thread_id, digest, summary));
+        }
+    }
+    None
+}
+
+fn validate_handoff_completion(wire_api: UpstreamWireApi, body: &Value) -> anyhow::Result<String> {
+    let has_tool_output = |items: &[Value]| {
+        items.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some(
+                    "function_call"
+                        | "custom_tool_call"
+                        | "local_shell_call"
+                        | "web_search_call"
+                        | "tool_use"
+                )
+            )
+        })
+    };
+    let summary = match wire_api {
+        UpstreamWireApi::Responses => {
+            anyhow::ensure!(
+                body.get("status").and_then(Value::as_str) == Some("completed"),
+                "交接摘要上游没有返回 completed 状态"
+            );
+            let output = body
+                .get("output")
+                .and_then(Value::as_array)
+                .context("交接摘要响应缺少 output")?;
+            anyhow::ensure!(!has_tool_output(output), "交接摘要意外调用了工具");
+            extract_summary_text_from_responses(body)
+        }
+        UpstreamWireApi::ChatCompletions => {
+            let choice = body
+                .pointer("/choices/0")
+                .context("交接摘要响应缺少 choices[0]")?;
+            anyhow::ensure!(
+                choice.get("finish_reason").and_then(Value::as_str) == Some("stop"),
+                "交接摘要上游没有以 stop 完整结束"
+            );
+            let message = choice.get("message").context("交接摘要响应缺少 message")?;
+            anyhow::ensure!(
+                message.get("tool_calls").is_none()
+                    && message.get("function_call").is_none()
+                    && !has_tool_output(std::slice::from_ref(message)),
+                "交接摘要意外调用了工具"
+            );
+            extract_summary_text_from_chat(body)
+        }
+        UpstreamWireApi::AnthropicMessages => {
+            anyhow::ensure!(
+                matches!(
+                    body.get("stop_reason").and_then(Value::as_str),
+                    Some("end_turn" | "stop_sequence")
+                ),
+                "交接摘要 Anthropic 上游没有正常结束"
+            );
+            let content = body
+                .get("content")
+                .and_then(Value::as_array)
+                .context("交接摘要响应缺少 content")?;
+            anyhow::ensure!(!has_tool_output(content), "交接摘要意外调用了工具");
+            content
+                .iter()
+                .filter_map(|part| {
+                    (part.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| part.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => anyhow::bail!("当前协议不支持交接摘要"),
+    };
+    let summary = summary.trim();
+    anyhow::ensure!(!summary.is_empty(), "交接摘要为空");
+    anyhow::ensure!(summary.len() <= 1024 * 1024, "交接摘要超过 1 MiB 上限");
+    Ok(summary.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn generate_foreign_compaction_handoff(
+    relay: &crate::settings::RelayProfile,
+    source_body: &Value,
+    thread_id: &str,
+    transcript: &str,
+    original_user_agent: Option<&str>,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+    official_credential: Option<&crate::official_login::OfficialCredential>,
+) -> anyhow::Result<String> {
+    let model = source_body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .context("交接摘要缺少目标模型")?;
+    let prompt = format!(
+        "{}\n\n<visible_history>\n{transcript}\n</visible_history>",
+        crate::foreign_compaction_handoff::SUMMARY_INSTRUCTION
+    );
+    let summary_request = json!({
+        "model": model,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": prompt }]
+        }],
+        "tools": [],
+        "tool_choice": "none",
+        "parallel_tool_calls": false,
+        "stream": false,
+        "store": false,
+        "max_output_tokens": 8000
+    });
+    let official_base = official_credential.map(|_| crate::official_login::official_base_url());
+    let (endpoint, upstream_body, wire_api, _) = upstream_request_parts(
+        relay,
+        summary_request,
+        "/responses",
+        Some(model),
+        false,
+        official_base.as_deref(),
+        session_headers,
+    )
+    .await?;
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.foreign_compaction_summary_request",
+        json!({
+            "relayId": relay.id,
+            "relayName": relay.name,
+            "threadId": thread_id,
+            "model": model,
+            "wireApi": wire_api,
+            "transcriptBytes": transcript.len()
+        }),
+    );
+    let mut upstream = send_responses_upstream_request(
+        relay,
+        &endpoint,
+        &upstream_body,
+        wire_api,
+        false,
+        original_user_agent,
+        beta_features,
+        session_headers,
+        official_credential,
+        UPSTREAM_SLOW_HEADER_TIMEOUT,
+    )
+    .await?;
+    let status = upstream.status().as_u16();
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = read_limited_upstream_body(&mut upstream, 4 * 1024 * 1024).await?;
+    anyhow::ensure!(
+        !response_body_is_stream(&content_type, &body),
+        "交接摘要上游意外返回了流式响应"
+    );
+    if !(200..300).contains(&status) {
+        let (message, kind, code, _) = upstream_error_parts(status, &content_type, &body);
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.foreign_compaction_summary_failed",
+            json!({
+                "relayId": relay.id,
+                "threadId": thread_id,
+                "status": status,
+                "type": kind,
+                "code": code,
+                "message": truncate_error_preview(&message)
+            }),
+        );
+        anyhow::bail!("交接摘要上游返回 HTTP {status}");
+    }
+    let value: Value = serde_json::from_slice(&body).context("交接摘要响应不是 JSON")?;
+    validate_handoff_completion(wire_api, &value)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_foreign_compaction_handoff(
+    relay: &crate::settings::RelayProfile,
+    upstream_body: &mut Value,
+    original_user_agent: Option<&str>,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+    official_credential: Option<&crate::official_login::OfficialCredential>,
+    retried: &mut bool,
+    retry_reasons: &mut Vec<String>,
+    record_retry_reason: bool,
+) -> anyhow::Result<bool> {
+    let Some(digest) = crate::foreign_compaction_handoff::checkpoint_digest(upstream_body) else {
+        return Ok(false);
+    };
+    let thread_ids = foreign_compaction_thread_ids(upstream_body, session_headers);
+    anyhow::ensure!(
+        !thread_ids.is_empty(),
+        "请求没有可用于读取本机历史的线程 ID"
+    );
+    for thread_id in &thread_ids {
+        if let Some(summary) = crate::foreign_compaction_handoff::load_cached(thread_id, &digest) {
+            let replaced = crate::foreign_compaction_handoff::replace_foreign_compactions(
+                upstream_body,
+                &summary,
+            );
+            if replaced == 0 {
+                return Ok(false);
+            }
+            *retried = true;
+            if record_retry_reason {
+                retry_reasons.push(crate::foreign_compaction_handoff::RETRY_REASON.to_string());
+            }
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.foreign_compaction_handoff",
+                json!({
+                    "relayId": relay.id,
+                    "relayName": relay.name,
+                    "threadId": thread_id,
+                    "checkpointDigest": digest,
+                    "replaced": replaced,
+                    "cacheHit": true
+                }),
+            );
+            return Ok(true);
+        }
+    }
+
+    let _generation = FOREIGN_COMPACTION_HANDOFF_LOCK.lock().await;
+    for thread_id in &thread_ids {
+        if let Some(summary) = crate::foreign_compaction_handoff::load_cached(thread_id, &digest) {
+            let replaced = crate::foreign_compaction_handoff::replace_foreign_compactions(
+                upstream_body,
+                &summary,
+            );
+            if replaced == 0 {
+                return Ok(false);
+            }
+            *retried = true;
+            if record_retry_reason {
+                retry_reasons.push(crate::foreign_compaction_handoff::RETRY_REASON.to_string());
+            }
+            return Ok(true);
+        }
+    }
+
+    let home = crate::codex_sqlite::default_codex_home_dir();
+    let mut selected = None;
+    let mut errors = Vec::new();
+    for thread_id in &thread_ids {
+        match crate::foreign_compaction_handoff::visible_transcript(&home, thread_id) {
+            Ok(transcript) => {
+                selected = Some((thread_id.clone(), transcript));
+                break;
+            }
+            Err(error) => errors.push(format!("{thread_id}: {error}")),
+        }
+    }
+    let (thread_id, transcript) = selected.with_context(|| {
+        format!(
+            "无法读取本机会话历史，不能生成外来压缩交接摘要：{}",
+            errors.join("; ")
+        )
+    })?;
+    let generated = generate_foreign_compaction_handoff(
+        relay,
+        upstream_body,
+        &thread_id,
+        &transcript,
+        original_user_agent,
+        beta_features,
+        session_headers,
+        official_credential,
+    )
+    .await;
+    let (summary, handoff_source) = match generated {
+        Ok(summary) => {
+            if let Err(error) = crate::foreign_compaction_handoff::remember(
+                &thread_id,
+                &digest,
+                upstream_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                &summary,
+            ) {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.foreign_compaction_cache_failed",
+                    json!({ "threadId": thread_id, "error": error.to_string() }),
+                );
+            }
+            (summary, "model_summary")
+        }
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.foreign_compaction_summary_fallback",
+                json!({
+                    "relayId": relay.id,
+                    "relayName": relay.name,
+                    "threadId": thread_id,
+                    "error": error.to_string(),
+                    "transcriptBytes": transcript.len()
+                }),
+            );
+            // 可见历史已是完整交接；模型摘要只是压缩形式，不能因它失败而丢弃上下文。
+            if let Err(error) =
+                crate::foreign_compaction_handoff::remember_visible_transcript_fallback(
+                    &thread_id,
+                    &digest,
+                    &transcript,
+                )
+            {
+                return Err(error).context("无法缓存本机可见历史交接");
+            }
+            (transcript, "visible_transcript_fallback")
+        }
+    };
+    let replaced =
+        crate::foreign_compaction_handoff::replace_foreign_compactions(upstream_body, &summary);
+    if replaced == 0 {
+        return Ok(false);
+    }
+    *retried = true;
+    if record_retry_reason {
+        retry_reasons.push(crate::foreign_compaction_handoff::RETRY_REASON.to_string());
+    }
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.foreign_compaction_handoff",
+        json!({
+            "relayId": relay.id,
+            "relayName": relay.name,
+            "threadId": thread_id,
+            "checkpointDigest": digest,
+            "replaced": replaced,
+            "cacheHit": false,
+            "summaryBytes": summary.len(),
+            "source": handoff_source
+        }),
+    );
+    Ok(true)
 }
 
 /// 上游不收推理项的明文 `content`（#2917，DeepSeek / GLM 转换回来的思考过程）：清空所有推理项的
@@ -5806,6 +6539,7 @@ pub async fn open_models_proxy_request(
         request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
+        websocket: None,
         response: Some(upstream),
         capacity_retryable: false,
         capacity_retry_enabled: false,
@@ -5883,6 +6617,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
+        websocket: None,
         response: Some(upstream),
         capacity_retryable: false,
         capacity_retry_enabled: false,
@@ -6100,6 +6835,7 @@ async fn open_image_request_with_relay(
         request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
+        websocket: None,
         response: Some(upstream),
         capacity_retryable: false,
         capacity_retry_enabled: false,
@@ -6190,6 +6926,7 @@ async fn open_official_image_proxy_request(
         request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
+        websocket: None,
         response: Some(upstream),
         capacity_retryable: false,
         capacity_retry_enabled: false,
@@ -6202,7 +6939,7 @@ async fn open_official_image_proxy_request(
 
 fn response_header_timeout(is_stream: bool) -> Duration {
     if is_stream {
-        UPSTREAM_STREAM_HEADER_TIMEOUT
+        stream_header_timeout()
     } else {
         UPSTREAM_HEADER_TIMEOUT
     }
@@ -6294,6 +7031,7 @@ pub async fn open_chat_completions_proxy_request(
         request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
+        websocket: None,
         response: Some(upstream),
         capacity_retryable: false,
         capacity_retry_enabled: false,
@@ -6514,8 +7252,8 @@ async fn upstream_request_parts(
         || request_has_compaction_trigger(&request_json);
     let is_v2_compaction = compact && request_has_compaction_trigger(&request_json);
     // Chat 与 Anthropic 上游都没有原生压缩项，只能走合成摘要路径。
-    // 走到这里还带着原生压缩项，说明调用方还有别的候选可切（没得切时已换成占位说明，#3106），
-    // 交回这个错误让它换下一个候选。
+    // 走到这里还带着原生压缩项，说明调用方没有先完成文字交接；交回这个错误让它
+    // 切到兼容候选，或者给 Codex 返回明确的 compaction_incompatible 错误。
     if relay.requires_protocol_proxy_conversion() && input_has_native_compaction(&request_json) {
         return Err(NativeCompactionUnsupported::history().into());
     }
@@ -8426,6 +9164,10 @@ fn normalize_responses_item_ids(body: &mut Value) {
 /// 把这类条目原位降级成普通 user 消息——只命中上游必然拒绝的形态，不加开关。
 /// 返回每条降级条目的原 `name`（缺失记 `""`），`.len()` 即降级条数。
 fn downgrade_callless_function_outputs(body: &mut Value) -> Vec<String> {
+    // WS 原生续接支持这种委派 bootstrap，不能照搬 HTTP 的降级修复。
+    if crate::responses_websocket::active() {
+        return Vec::new();
+    }
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return Vec::new();
     };
@@ -11426,6 +12168,9 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
         "output_tokens": output_tokens,
         "total_tokens": total_tokens
     });
+    if let Some(credits) = crate::request_log::workbuddy_credits(usage) {
+        result["workbuddy_credits"] = json!(credits);
+    }
 
     if !has_claude_cache_fields && has_cache_details && cached_tokens > 0 {
         result["input_tokens_details"] = json!({ "cached_tokens": cached_tokens });
@@ -13437,7 +14182,7 @@ pub(crate) struct ResponsesSseTransformer {
     apply_patch_declared_as_function: bool,
     /// 从 `response.completed` 里抓到的 usage，供请求日志使用。
     usage: Option<crate::request_log::RequestUsage>,
-    final_response_usage: Option<crate::request_log::RequestUsage>,
+    final_response_usage: Option<crate::request_log::FinalResponseUsage>,
     final_response_invalid: bool,
     /// 终态失败事件里的 code/message 摘要。只进请求日志与诊断日志，
     /// 不拼进 failure 原因（原因会随 SSE 回给客户端，不能泄露上游 payload）。
@@ -13736,7 +14481,7 @@ impl ResponsesSseTransformer {
         self.usage.take()
     }
 
-    pub(crate) fn final_response_usage(&self) -> Option<crate::request_log::RequestUsage> {
+    pub(crate) fn final_response_usage(&self) -> Option<crate::request_log::FinalResponseUsage> {
         (self.completed
             && !self.failed
             && !self.final_response_invalid
@@ -14490,7 +15235,11 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
             final_stream.push_bytes(chunk);
         }
         assert_eq!(
-            final_stream.final_response_usage().unwrap().input_tokens,
+            final_stream
+                .final_response_usage()
+                .unwrap()
+                .usage
+                .input_tokens,
             12
         );
         assert!(final_stream.finish().is_none());
@@ -14512,7 +15261,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
         let mut done = ResponsesSseTransformer::default();
         done.push_bytes(completed);
         done.push_bytes(b"data: [DONE]\n\n");
-        assert_eq!(done.final_response_usage().unwrap().input_tokens, 12);
+        assert_eq!(done.final_response_usage().unwrap().usage.input_tokens, 12);
         for body in [
             &completed[..completed.len() - 2],
             &b"data: [DONE]\n\n"[..],
@@ -14539,6 +15288,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
             returned_attempt
                 .final_response_usage()
                 .unwrap()
+                .usage
                 .input_tokens,
             12
         );
@@ -15182,6 +15932,7 @@ fn adapt_local_response(local: protected_local::UpstreamProxyResponse) -> Upstre
         request_trace: local.request_trace,
         exec_adapted: local.exec_adapted,
         exec_outcome: local.exec_outcome,
+        websocket: None,
         response: Some(response),
         capacity_retryable: local.capacity_retryable,
         capacity_retry_enabled: local.capacity_retry_enabled,
@@ -15667,5 +16418,59 @@ mod callless_function_output_tests {
         );
         assert_eq!(input[1]["type"], "message");
         assert_eq!(input[1]["content"][0]["text"], "delegate");
+    }
+
+    #[test]
+    fn foreign_compaction_summary_requires_complete_text_without_tools() {
+        let responses = json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[
+                {"type":"output_text","text":"handoff"}
+            ]}]
+        });
+        assert_eq!(
+            validate_handoff_completion(UpstreamWireApi::Responses, &responses).unwrap(),
+            "handoff"
+        );
+        let mut incomplete = responses.clone();
+        incomplete["status"] = json!("incomplete");
+        assert!(validate_handoff_completion(UpstreamWireApi::Responses, &incomplete).is_err());
+        let tool = json!({
+            "status":"completed",
+            "output":[{"type":"function_call","name":"exec","arguments":"{}"}]
+        });
+        assert!(validate_handoff_completion(UpstreamWireApi::Responses, &tool).is_err());
+
+        let chat = json!({
+            "choices":[{"finish_reason":"stop","message":{"content":"chat handoff"}}]
+        });
+        assert_eq!(
+            validate_handoff_completion(UpstreamWireApi::ChatCompletions, &chat).unwrap(),
+            "chat handoff"
+        );
+        let anthropic = json!({
+            "stop_reason":"end_turn",
+            "content":[{"type":"text","text":"anthropic handoff"}]
+        });
+        assert_eq!(
+            validate_handoff_completion(UpstreamWireApi::AnthropicMessages, &anthropic).unwrap(),
+            "anthropic handoff"
+        );
+    }
+
+    #[test]
+    fn foreign_compaction_thread_ids_prefer_thread_and_deduplicate() {
+        let body = json!({"prompt_cache_key":"session"});
+        assert_eq!(
+            foreign_compaction_thread_ids(
+                &body,
+                ProxySessionHeaders {
+                    thread_id: Some("thread"),
+                    session_id: Some("session"),
+                    ..ProxySessionHeaders::default()
+                }
+            ),
+            vec!["thread".to_string(), "session".to_string()]
+        );
     }
 }

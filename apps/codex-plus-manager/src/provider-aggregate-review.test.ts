@@ -91,6 +91,7 @@ function runtime(mode: "aggregate" | "pureApi", source: string, status: "idle" |
     client, window: { __codexSessionDeleteBridge: () => {} },
     codexAppServerModelRequestPatchVersion: patchVersion,
     codexPlusBackendSettings: settings, codexModelCatalog: modelCatalog, codexAppServerPreparationTimeoutMs: 100,
+    codexBridgePreparationReadTimeoutMs: 100,
     registerNativeHostClient() {}, sendCodexPlusDiagnostic: (name: string) => diagnostics.push(name),
     registerCodexQuotaResumeClient() {}, codexQuotaResumeAppServerRequestTarget: () => null,
     applyCodexServiceTierRequestOnly: (_method: string, params: any) => params,

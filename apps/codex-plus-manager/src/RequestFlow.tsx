@@ -7,7 +7,7 @@ import "./flow-provider-colors.css";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { t, tf } from "./i18n";
-import { agentName, formatElapsed, formatTokens, groupDisplayName, maskAccountName, relativeTime, type GatewayPayload } from "./gateway-model";
+import { agentName, formatElapsed, formatTokens, modelDisplay, maskAccountName, relativeTime, type GatewayPayload } from "./gateway-model";
 import { AgentIcon } from "./gateway-ui";
 import { clockTime, flowAgent, flowElapsed, flowStatus, returningLinks, type FlowEntry } from "./request-flow-model";
 import "./RequestFlow.css";
@@ -56,10 +56,10 @@ export function FlowRequestRow({ entry, payload, now = Date.now() }: { entry: Fl
   const status = flowStatus(entry);
   const agent = flowAgent(entry);
   const relay = maskAccountName(entry.relayName || entry.relayId || "");
-  const requested = groupDisplayName(payload, entry.model) ?? entry.model;
-  const upstream = groupDisplayName(payload, entry.upstreamModel ?? "") ?? entry.upstreamModel;
+  const requested = entry.model ? modelDisplay(payload, entry.model).title || entry.model : "";
+  const upstream = entry.upstreamModel ? modelDisplay(payload, entry.upstreamModel).title || entry.upstreamModel : "";
   const model = upstream || requested || "—";
-  const remapped = Boolean(entry.upstreamModel && entry.model && entry.upstreamModel !== entry.model);
+  const remapped = Boolean(upstream && requested && upstream !== requested);
   const when = relativeTime(entry.startedAtMs || entry.timestampMs, now);
   const tokens = entry.usage
     ? `↑${formatTokens(entry.usage.inputTokens)} ↓${formatTokens(entry.usage.outputTokens)}`

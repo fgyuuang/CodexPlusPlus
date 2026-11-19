@@ -51,6 +51,8 @@ pub struct GatewayPoolEntry {
     pub model_windows: std::collections::BTreeMap<String, u64>,
     /// 没单独写窗口的模型用的窗口。
     pub context_window: Option<u64>,
+    /// 自动压缩阈值（窗口的百分比，按模型 + 默认值，#3100）；没设时为空。
+    pub auto_compact: codex_plus_core::gateway::store::ProviderAutoCompact,
     /// 登录得到的账号：`chatgpt` / `copilot` / `grok`；普通供应商为空。
     pub account: String,
     /// 订阅账号的套餐（如「ChatGPT Pro」「Copilot Pro+」）；普通供应商为空。
@@ -88,6 +90,7 @@ pub struct GatewayPoolEntry {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayAgentView {
+    pub native_models: Option<NativeCodexModels>,
     pub agent: String,
     pub name: String,
     /// 本机装的 CLI 版本（后台探测，探测完成前为空）。
@@ -112,6 +115,13 @@ pub struct GatewayAgentView {
     pub diagnostics: Option<codex_plus_core::gateway::diagnostics::AgentDiagnostics>,
     /// Agent 自带的模型（用它自己的登录或 Key 直连厂商，不经 Codex++）；没有时为 None。
     pub own_models: Option<codex_plus_core::gateway::own_models::OwnModels>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeCodexModels {
+    pub provider_id: String,
+    pub models: Vec<String>,
 }
 
 /// 界面上的自动组：组本身 + 是否隐藏 + 有没有改过设置。
@@ -252,6 +262,7 @@ fn pool_entry(
         model_prices,
         model_windows: Default::default(),
         context_window: None,
+        auto_compact: Default::default(),
         model_metadata: relay.model_metadata.clone(),
         image_models: codex_plus_core::gateway::images::provider_image_models(relay),
         account: account_kind(relay),
@@ -269,7 +280,8 @@ fn pool_entry(
         quota: codex_plus_core::gateway::quota::quota_for_relay(relay),
         subscription_policy: None,
         subscription_block_reason: None,
-        balance_api: codex_plus_core::gateway::balance::has_balance_api(relay),
+        balance_api: codex_plus_core::gateway::balance::has_balance_api(relay)
+            || codex_plus_core::gateway::balance::has_workbuddy_usage(source),
         newapi_access: None,
     }
 }
@@ -299,7 +311,15 @@ fn default_model_view(
     let model = apply::resolved_default_model(runtime, binding);
     let (selected, _) = codex_plus_core::model_suffix::parse_model_suffix(binding.model.trim());
     let status = binding.selection_for(&selected).map(|_| {
-        if !model.eq_ignore_ascii_case(&selected) {
+        let native_alias = binding.native_official.as_ref().is_some_and(|native| {
+            selected.eq_ignore_ascii_case(&format!("{}/{model}", native.id))
+                && codex_plus_core::gateway::route::relay_models(native)
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&model))
+        });
+        if native_alias {
+            "available"
+        } else if !model.eq_ignore_ascii_case(&selected) {
             "fallback"
         } else if model_entry_members(runtime, binding, &selected).is_empty() {
             "invalid"
@@ -331,7 +351,10 @@ fn default_model_view(
 
 fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> GatewayPayload {
     let port = port();
-    let runtime_gateway = gateway.clone().with_extension_providers();
+    let runtime_gateway = gateway
+        .clone()
+        .with_extension_providers()
+        .with_native_codex_account(settings);
     let pool = gateway
         .providers
         .iter()
@@ -347,6 +370,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
             .map(|blocked| blocked.message),
             model_windows: provider.model_windows.clone(),
             context_window: provider.context_window,
+            auto_compact: provider.auto_compact.clone(),
             key_rpm: provider.key_rpm,
             key_concurrency: provider.key_concurrency,
             ..pool_entry(
@@ -401,12 +425,18 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
     let agents = listed_agents(&gateway)
         .iter()
         .map(|agent| {
-            let binding = gateway.binding(agent);
+            let binding = runtime_gateway.binding(agent);
             let enabled = binding.is_some_and(|binding| binding.enabled);
             let (default_model, default_selection_status, default_model_differs) = binding
                 .map(|binding| default_model_view(&gateway, &runtime_gateway, binding))
                 .unwrap_or_default();
             GatewayAgentView {
+                native_models: binding
+                    .and_then(|binding| binding.native_official.as_ref())
+                    .map(|relay| NativeCodexModels {
+                        provider_id: relay.id.clone(),
+                        models: codex_plus_core::gateway::route::relay_models(relay),
+                    }),
                 agent: agent.as_str().to_string(),
                 name: codex_plus_core::tools::tool_display_name(agent).to_string(),
                 version: agent_version(agent),
@@ -426,7 +456,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                 default_model,
                 default_selection_status,
                 default_model_differs,
-                models: codex_plus_core::gateway::server::exposed_models(&gateway, agent),
+                models: codex_plus_core::gateway::server::exposed_models(&runtime_gateway, agent),
                 drift: binding
                     .filter(|binding| binding.enabled)
                     .and_then(|_| codex_plus_core::gateway::drift::check(&drift_ctx, agent))
@@ -790,6 +820,11 @@ fn refresh_agents<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
         );
     }
     result
+}
+
+pub(crate) fn refresh_local_integration() -> anyhow::Result<()> {
+    notify_settings_changed();
+    apply::refresh_enabled(&context()).map(|_| ())
 }
 
 fn refresh_group_agents<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
@@ -1393,17 +1428,59 @@ pub fn create_gateway_provider(
     )
 }
 
+/// 核实调用 Key 的版本，再添加独立的 WorkBuddy 供应商。
+#[tauri::command]
+pub async fn create_gateway_workbuddy_lane(
+    realm: String,
+    base_url: String,
+    api_key: String,
+    skip_agents: Option<Vec<String>>,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = crate::local_provider_gateway::create_workbuddy_lane(
+        &GatewayStore::default(),
+        &realm,
+        &base_url,
+        &api_key,
+        skip_agents.as_deref(),
+    )
+    .await;
+    respond(
+        "已接入独立的 WorkBuddy 供应商",
+        "接入 WorkBuddy 失败",
+        refresh_added(result),
+    )
+}
+
 /// 编辑网关供应商；Key 留空表示不改。
 #[tauri::command]
-pub fn update_gateway_provider(
+pub async fn update_gateway_provider(
     id: String,
-    input: ProviderInput,
+    mut input: ProviderInput,
 ) -> CommandResult<Option<GatewayPayload>> {
-    let result = refresh_agents(apply::update_provider(
-        &GatewayStore::default(),
-        &id,
-        &input,
-    ));
+    let store = GatewayStore::default();
+    let result = async {
+        let gateway = store.load()?;
+        if let Some(provider) = gateway.provider(&id)
+            && let Some(realm) =
+                codex_plus_core::gateway::balance::workbuddy_realm(&provider.source)
+        {
+            input.base_url = crate::local_provider_gateway::workbuddy_url(&input.base_url)?;
+            anyhow::ensure!(
+                input.protocol == RelayProtocol::Responses,
+                "WorkBuddy 独立线路使用 Responses 协议"
+            );
+            anyhow::ensure!(
+                input.base_url == provider.relay.base_url,
+                "请保留此线路的服务地址；更换地址需重新接入"
+            );
+            for key in input.keys.iter().filter(|value| !value.trim().is_empty()) {
+                crate::local_provider_gateway::validate_workbuddy_key(&input.base_url, key, realm)
+                    .await?;
+            }
+        }
+        refresh_agents(apply::update_provider(&store, &id, &input))
+    }
+    .await;
     // 表单里可能改了模型列表：新模型按公开价格表补价格。
     if result.is_ok() {
         autofill_prices(Some(id));
@@ -1413,32 +1490,45 @@ pub fn update_gateway_provider(
 }
 
 /// 给网关供应商再加一个 Key（#2782，在供应商池的详情里操作）。
+async fn validate_gateway_provider_key(
+    store: &GatewayStore,
+    id: &str,
+    key: &str,
+) -> anyhow::Result<()> {
+    let gateway = store.load()?;
+    if let Some(provider) = gateway.provider(id)
+        && let Some(realm) = codex_plus_core::gateway::balance::workbuddy_realm(&provider.source)
+    {
+        crate::local_provider_gateway::validate_workbuddy_key(&provider.relay.base_url, key, realm)
+            .await?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
-pub fn add_gateway_provider_key(id: String, key: String) -> CommandResult<Option<GatewayPayload>> {
-    respond(
-        "Key 已添加。",
-        "添加 Key 失败",
-        refresh_agents(apply::add_provider_key(&GatewayStore::default(), &id, &key)),
-    )
+pub async fn add_gateway_provider_key(
+    id: String,
+    key: String,
+) -> CommandResult<Option<GatewayPayload>> {
+    let store = GatewayStore::default();
+    let result = validate_gateway_provider_key(&store, &id, &key)
+        .await
+        .and_then(|_| refresh_agents(apply::add_provider_key(&store, &id, &key)));
+    respond("Key 已添加。", "添加 Key 失败", result)
 }
 
 /// 把供应商的某个 Key 换成新值（按 Key 的标识找，#2782）。
 #[tauri::command]
-pub fn replace_gateway_provider_key(
+pub async fn replace_gateway_provider_key(
     id: String,
     key_id: String,
     key: String,
 ) -> CommandResult<Option<GatewayPayload>> {
-    respond(
-        "Key 已替换。",
-        "替换 Key 失败",
-        refresh_agents(apply::replace_provider_key(
-            &GatewayStore::default(),
-            &id,
-            &key_id,
-            &key,
-        )),
-    )
+    let store = GatewayStore::default();
+    let result = validate_gateway_provider_key(&store, &id, &key)
+        .await
+        .and_then(|_| refresh_agents(apply::replace_provider_key(&store, &id, &key_id, &key)));
+    respond("Key 已替换。", "替换 Key 失败", result)
 }
 
 /// 删掉供应商的某个 Key（按 Key 的标识找，至少保留一个，#2782）。
@@ -1594,14 +1684,22 @@ pub fn save_gateway_provider_newapi_access(
     )
 }
 
-/// 改供应商的上下文窗口（按模型的和其余模型用的默认值）；窗口写在 Agent 的模型资料里，存完重写 Agent 配置。
+/// 改供应商的上下文窗口（按模型的和其余模型用的默认值）与自动压缩阈值（#3100，可不传）；
+/// 都写在 Agent 的模型资料里，存完重写 Agent 配置。
 #[tauri::command]
 pub fn save_gateway_provider_windows(
     id: String,
     windows: std::collections::BTreeMap<String, u64>,
     fallback: Option<u64>,
+    auto_compact: Option<codex_plus_core::gateway::store::ProviderAutoCompact>,
 ) -> CommandResult<Option<GatewayPayload>> {
-    let result = apply::set_provider_windows(&GatewayStore::default(), &id, windows, fallback)
+    let store = GatewayStore::default();
+    let result = apply::set_provider_windows(&store, &id, windows, fallback)
+        .and_then(|saved| match auto_compact {
+            // 旧界面不传压缩阈值：原样保留（#3100）。
+            Some(auto_compact) => apply::set_provider_auto_compact(&store, &id, auto_compact),
+            None => Ok(saved),
+        })
         .and_then(|saved| {
             apply::refresh_enabled(&context()).context("窗口已保存，但刷新 Agent 配置失败")?;
             Ok(saved)
@@ -1884,8 +1982,11 @@ pub async fn refresh_gateway_reset_credits(id: String) -> CommandResult<Option<G
     };
     match codex_plus_core::gateway::reset_credits::refresh_if_stale(&relay, 60_000).await {
         Ok(Some(view)) => {
-            let usable = view.usable_count().unwrap_or(0);
-            ok(&format!("重置卡已刷新：可用 {usable} 张。"), current_payload())
+            let message = match view.usable_count() {
+                Some(usable) => format!("重置卡已刷新：可用 {usable} 张。"),
+                None => "重置卡已刷新：可用张数未知。".to_string(),
+            };
+            ok(&message, current_payload())
         }
         Ok(None) => ok("重置卡已刷新。", current_payload()),
         Err(error) => failed(&format!("查询重置卡失败：{error:#}"), current_payload()),
@@ -1894,8 +1995,7 @@ pub async fn refresh_gateway_reset_credits(id: String) -> CommandResult<Option<G
 
 /// 用掉一张额度重置卡。
 ///
-/// `requestId` 由界面生成并保留：网络中断后用同一个标识重试，服务端只会处理一次。
-/// 换标识重试等于再扣一张，所以这里不替调用方生成，只在缺失时拒绝。
+/// `requestId` 由界面持久保存；核心另按官方账号保存未确认操作，跨窗口也复用同一标识。
 #[tauri::command]
 pub async fn consume_gateway_reset_card(
     id: String,
@@ -1905,16 +2005,28 @@ pub async fn consume_gateway_reset_card(
         return failed(&format!("供应商不存在：{id}"), current_payload());
     };
     match codex_plus_core::gateway::reset_credits::consume(&relay, &request_id).await {
-        Ok(codex_plus_core::gateway::reset_credits::ConsumeOutcome::Reset) => {
-            if let Some(relay) = pool_relay(&id) {
-                let _ = codex_plus_core::gateway::quota::refresh(&relay).await;
-            }
-            let _ = codex_plus_core::gateway::reset_credits::refresh_if_stale(&relay, 0).await;
-            ok("已使用一张重置卡，额度窗口随即更新。", current_payload())
-        }
-        Ok(codex_plus_core::gateway::reset_credits::ConsumeOutcome::AlreadyRedeemed) => {
-            let _ = codex_plus_core::gateway::reset_credits::refresh_if_stale(&relay, 0).await;
-            ok("这次重置此前已经生效，没有重复扣卡。", current_payload())
+        Ok(
+            outcome @ (codex_plus_core::gateway::reset_credits::ConsumeOutcome::Reset
+            | codex_plus_core::gateway::reset_credits::ConsumeOutcome::AlreadyRedeemed),
+        ) => {
+            let quota_fresh = codex_plus_core::gateway::quota::refresh(&relay)
+                .await
+                .is_ok();
+            let cards_fresh = codex_plus_core::gateway::reset_credits::refresh_if_stale(&relay, 0)
+                .await
+                .is_ok();
+            let message =
+                if outcome == codex_plus_core::gateway::reset_credits::ConsumeOutcome::Reset {
+                    "已使用一张重置卡。"
+                } else {
+                    "这次重置此前已经生效，没有重复扣卡。"
+                };
+            let refresh = if quota_fresh && cards_fresh {
+                "额度与卡片读数已刷新。"
+            } else {
+                "部分读数尚未刷新，请稍后手动刷新；无需再次消费。"
+            };
+            ok(&format!("{message}{refresh}"), current_payload())
         }
         Ok(codex_plus_core::gateway::reset_credits::ConsumeOutcome::Unknown) => failed(
             "重置结果未确认：请保留同一请求标识，先刷新额度再决定是否重试。",
@@ -3452,4 +3564,91 @@ mod disconnect_preview_tests {
         assert_eq!(value["preview"], serde_json::Value::Null);
         assert!(value.get("preview").is_some());
     }
+}
+
+/// Codex 页面「供应商」页的网关命令分发（core `provider_page::route_gateway` 已做白名单与脱敏）。
+///
+/// 参数名与前端 `invoke` 一致（camelCase）。直接调用上面的命令函数，所以生效（`refresh_agents`）、
+/// 价格填充、额度预取、断开预览 token、`notify_settings_changed` 都与管理器自己的界面完全相同。
+/// 调用方在阻塞线程里（bridge 路由用 `spawn_blocking`），异步命令用 `block_on` 等结果。
+pub fn provider_page_gateway_call(command: &str, args: serde_json::Value) -> serde_json::Value {
+    fn arg<T: serde::de::DeserializeOwned>(
+        args: &serde_json::Value,
+        key: &str,
+    ) -> Result<T, String> {
+        serde_json::from_value(args.get(key).cloned().unwrap_or(serde_json::Value::Null))
+            .map_err(|error| format!("参数 {key} 不正确：{error}"))
+    }
+    fn to_value<T: Serialize>(result: CommandResult<T>) -> serde_json::Value {
+        serde_json::to_value(result).unwrap_or_else(|error| {
+            serde_json::json!({ "status": "failed", "message": format!("返回结果无法序列化：{error}") })
+        })
+    }
+    let run = || -> Result<serde_json::Value, String> {
+        Ok(match command {
+            "load_gateway" => to_value(tauri::async_runtime::block_on(load_gateway())),
+            "create_gateway_provider" => to_value(create_gateway_provider(
+                arg(&args, "input")?,
+                arg::<Option<String>>(&args, "source")?.unwrap_or_else(|| "custom".to_string()),
+                arg(&args, "skipAgents")?,
+            )),
+            "update_gateway_provider" => to_value(tauri::async_runtime::block_on(
+                update_gateway_provider(arg(&args, "id")?, arg(&args, "input")?),
+            )),
+            "delete_gateway_provider" => to_value(delete_gateway_provider(arg(&args, "id")?)),
+            "set_gateway_provider_enabled" => to_value(set_gateway_provider_enabled(
+                arg(&args, "id")?,
+                arg(&args, "enabled")?,
+            )),
+            "reorder_gateway_providers" => to_value(reorder_gateway_providers(arg(&args, "ids")?)),
+            "add_gateway_provider_key" => to_value(tauri::async_runtime::block_on(
+                add_gateway_provider_key(arg(&args, "id")?, arg(&args, "key")?),
+            )),
+            "replace_gateway_provider_key" => to_value(tauri::async_runtime::block_on(
+                replace_gateway_provider_key(
+                    arg(&args, "id")?,
+                    arg(&args, "keyId")?,
+                    arg(&args, "key")?,
+                ),
+            )),
+            "delete_gateway_provider_key" => to_value(delete_gateway_provider_key(
+                arg(&args, "id")?,
+                arg(&args, "keyId")?,
+            )),
+            "test_gateway_provider" => {
+                to_value(tauri::async_runtime::block_on(test_gateway_provider(
+                    arg(&args, "id")?,
+                    arg(&args, "model")?,
+                    arg(&args, "keyId")?,
+                )))
+            }
+            "cancel_gateway_provider_test" => to_value(cancel_gateway_provider_test()),
+            "fetch_provider_models" => to_value(tauri::async_runtime::block_on(
+                crate::provider_lookup_commands::fetch_provider_models(
+                    arg(&args, "baseUrl")?,
+                    arg(&args, "protocol")?,
+                    arg::<Option<String>>(&args, "apiKey")?.unwrap_or_default(),
+                    arg(&args, "providerId")?,
+                ),
+            )),
+            "save_gateway_binding" => to_value(save_gateway_binding(
+                arg(&args, "agent")?,
+                arg(&args, "binding")?,
+                arg(&args, "reconnect")?,
+            )),
+            "preview_gateway_disconnect" => to_value(tauri::async_runtime::block_on(
+                preview_gateway_disconnect(arg(&args, "agent")?),
+            )),
+            "disable_gateway_binding" => to_value(disable_gateway_binding(
+                arg(&args, "agent")?,
+                arg(&args, "previewToken")?,
+            )),
+            "disable_gateway_binding_full_switch" => to_value(disable_gateway_binding_full_switch(
+                arg(&args, "agent")?,
+                arg(&args, "previewToken")?,
+            )),
+            other => return Err(format!("不支持的网关命令 {other}")),
+        })
+    };
+    run().unwrap_or_else(|message| serde_json::json!({ "status": "failed", "message": message }))
 }

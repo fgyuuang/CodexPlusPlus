@@ -18,6 +18,8 @@ import {
   prettyModelName,
   shortDate,
   usageDayStats,
+  isWorkBuddyProvider,
+  workbuddyCreditsText,
   type GatewayPayload,
   type ProviderBalance,
   type UsageGroup,
@@ -30,6 +32,7 @@ import { successRate } from "./hub-overview-model";
 import { openRequestLog } from "./UsageTabs";
 import { TopbarActions } from "./TopbarActions";
 import { cachedProviderBalances, loadProviderBalances, subscribeProviderBalances } from "./provider-balances";
+import { ProviderBalancePoolBadge } from "./RelayBillingLine";
 import { singleAgent } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
 import { CxCard, CxEmpty, CxRow, CxSection, CxStats } from "./cx-layout";
@@ -70,7 +73,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
     try {
       setBalances(await loadProviderBalances(
         () => invoke<{ status: string; balances?: ProviderBalance[] }>("load_gateway_balances"),
-        { force, maxAge: null },
+        { force },
       ));
     } finally {
       setLoadingBalances(false);
@@ -84,7 +87,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
 
   useEffect(() => {
     void load(range);
-    if (!cachedProviderBalances().balances) void loadBalances(false);
+    void loadBalances(false);
     // 进入时读一次；切换范围时由 setRange 读。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -102,9 +105,13 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
   const rate = totals ? successRate(totals) : null;
   const average = totals ? averageDuration(totals) : null;
   const cost = costText(summary?.costs);
+  const credits = workbuddyCreditsText(totals?.workbuddyCredits);
   const groups: UsageGroup[] = split === "provider" ? summary?.byProvider ?? [] : split === "model" ? summary?.byModel ?? [] : summary?.byAgent ?? [];
   const tokenTotal = Math.max(1, groups.reduce((sum, group) => sum + group.inputTokens + group.outputTokens, 0));
-  const anyCost = groups.some((group) => costText(group.costs));
+  const usageCost = (group: UsageGroup) => [costText(group.costs), workbuddyCreditsText(group.workbuddyCredits)].filter(Boolean).join(" · ");
+  const workbuddyRows = new Set(payload?.pool.filter(entry => isWorkBuddyProvider(entry.source)).map(entry => entry.id));
+  const workbuddyGroup = (group: UsageGroup) => split === "provider" && workbuddyRows.has(group.key);
+  const anyCost = groups.some((group) => usageCost(group) || workbuddyGroup(group));
 
   // 参照 Cursor 的设置页：时间段在标题行、数字一排、图表一张卡、明细一张表；余额放最后。
   return (
@@ -126,9 +133,9 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
       <CxStats
         items={[
           {
-            label: t("估算费用"),
-            value: cost ? `≈${cost}` : "—",
-            hint: <span title={cost ? t("按供应商里填写的价格") : undefined}>{cost ? t("按供应商价格估算") : t("在供应商里填上价格后估算")}</span>,
+            label: t(credits ? "费用与积分" : "估算费用"),
+            value: [cost ? `≈${cost}` : "", credits].filter(Boolean).join(" · ") || "—",
+            hint: credits ? t("积分仅汇总已回传的实际扣费") : <span title={cost ? t("按供应商里填写的价格") : undefined}>{cost ? t("按供应商价格估算") : t("在供应商里填上价格后估算")}</span>,
           },
           {
             label: t("Tokens"),
@@ -203,7 +210,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
               <span>{t("Tokens")}</span>
               <span>{t("缓存命中")}</span>
               <span>{t("出错")}</span>
-              <span>{t("费用")}</span>
+              <span>{t(workbuddyRows.size ? "费用与积分" : "费用")}</span>
             </div>
           ) : null}
           {groups.map((group) => {
@@ -243,7 +250,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
                 <span className="gw-usage-num" title={tf("{0} 输入 · {1} 输出", [formatTokens(group.inputTokens), formatTokens(group.outputTokens)])}>{formatTokens(total)}</span>
                 <span className="gw-usage-num">{groupHit === null ? "—" : `${Math.round(groupHit * 100)}%`}</span>
                 <span className="gw-usage-num" data-tone={group.errors ? "err" : undefined}>{group.errors || "—"}</span>
-                <span className="gw-usage-num">{costText(group.costs) || "—"}</span>
+                <span className="gw-usage-num">{usageCost(group) || (workbuddyGroup(group) ? t("积分未上报") : "—")}</span>
               </div>
             );
           })}
@@ -260,7 +267,9 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
                 key={balance.providerId}
                 title={maskAccountName(balance.provider)}
               >
-                {balance.amount !== null && balance.amount !== undefined
+                {balance.scope === "key" ? (
+                  <ProviderBalancePoolBadge balance={balance} loading={loadingBalances} onRefresh={() => void loadBalances(true)} />
+                ) : balance.amount !== null && balance.amount !== undefined
                   ? <strong className="gw-usage-balance">{formatMoney(balance.amount, balance.currency)}</strong>
                   : <small className="gw-usage-balance-missing" title={balance.error ?? (balance.note ? t(balance.note) : "")}>{balance.error ? t(balance.error) : balance.note ? "—" : t("查不到")}</small>}
               </CxRow>

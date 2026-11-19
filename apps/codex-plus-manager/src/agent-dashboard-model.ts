@@ -32,7 +32,7 @@ export function recentAgentRequests(entries: RequestLogLike[], agent: string, li
     .slice(0, limit)
     .map((entry) => ({
       id: entry.id,
-      model: entry.model || entry.upstreamModel,
+      model: entry.upstreamModel?.trim() || entry.model,
       provider: maskAccountName(entry.relayName),
       durationMs: entry.durationMs,
       success: entry.success,

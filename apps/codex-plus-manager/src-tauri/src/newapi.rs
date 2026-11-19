@@ -717,8 +717,21 @@ fn deduplicate(values: &mut Vec<String>) {
 
 async fn status_payload() -> anyhow::Result<NewApiStatusPayload> {
     let settings = load_integration_settings()?;
-    let docker = inspect_docker(&settings).await;
-    let public_status = fetch_public_status(&settings).await.ok();
+    // 远程 API 不依赖本机 Docker；健康检查与本机运维分别报告。
+    let local = reqwest::Url::parse(&settings.base_url)
+        .ok()
+        .is_some_and(|url| matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")));
+    let (docker, public_status) = tokio::join!(
+        async {
+            if local && validate_compose_layout(&settings).is_ok() {
+                inspect_docker(&settings).await
+            } else {
+                DockerStatus::default()
+            }
+        },
+        fetch_public_status(&settings)
+    );
+    let public_status = public_status.ok();
     let backend_settings = SettingsStore::default().load().unwrap_or_default();
     Ok(NewApiStatusPayload {
         configured: Path::new(&settings.project_root).is_dir()
@@ -924,6 +937,11 @@ fn apply_profile(request: NewApiApplyRequest) -> anyhow::Result<NewApiApplyPaylo
     let api_key = integration.api_key()?;
     let store = SettingsStore::default();
     apply_profile_with(request, &integration, &api_key, &store)
+}
+
+pub(crate) fn gateway_connection() -> anyhow::Result<(String, String)> {
+    let settings = load_integration_settings()?;
+    Ok((settings.api_base_url(), settings.api_key()?))
 }
 
 fn apply_profile_with(

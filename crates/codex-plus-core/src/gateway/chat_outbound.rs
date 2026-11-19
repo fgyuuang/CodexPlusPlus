@@ -859,6 +859,7 @@ pub(crate) struct ResponsesUsage {
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_tokens: u64,
     pub(crate) total_tokens: u64,
+    pub(crate) workbuddy_credits: Option<f64>,
 }
 
 pub(crate) fn responses_usage(usage: Option<&Value>) -> ResponsesUsage {
@@ -875,6 +876,7 @@ pub(crate) fn responses_usage(usage: Option<&Value>) -> ResponsesUsage {
         output_tokens,
         reasoning_tokens: number("/output_tokens_details/reasoning_tokens").unwrap_or(0),
         total_tokens: number("/total_tokens").unwrap_or(input_tokens + output_tokens),
+        workbuddy_credits: usage.and_then(crate::request_log::workbuddy_credits),
     }
 }
 
@@ -886,6 +888,7 @@ impl ResponsesUsage {
             output_tokens: self.output_tokens,
             cached_tokens: self.cached_tokens,
             reasoning_tokens: self.reasoning_tokens,
+            workbuddy_credits: self.workbuddy_credits,
         }
     }
 

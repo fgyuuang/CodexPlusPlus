@@ -9,6 +9,7 @@ import { CSS as DndCSS } from "@dnd-kit/utilities";
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
+import { beginResetCardOperation, finishResetCardOperation, pendingResetCardOperation } from "./reset-card-operation";
 import { Check, ChevronRight, Copy, GripVertical, Pencil, Plus, RefreshCw, Search, X, Zap } from "lucide-react";
 import { t, tf } from "./i18n";
 import { providerPoolSections, reorderProviderSlots } from "./provider-pool-layout";
@@ -31,8 +32,12 @@ import {
   poolExcludeToggle,
   protocolLabel,
   providerEnabled,
+  isWorkBuddyProvider,
+  workbuddyModelRate,
+  type WorkBuddyRealm,
   soonestResetCardExpiry,
   usableResetCardCount,
+  resetCardUsable,
   providerInput,
   skippedAgents,
   subscriptionBlockReason,
@@ -59,6 +64,7 @@ import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaWindows, Switch, t
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, ProviderLimitsDialog, ProviderNewApiAccessDialog, keyLimitSummary, priceSummary } from "./ProviderExtrasDialog";
 import { ProviderWindowsDialog, windowSummary, withUnlistedWindows } from "./ProviderWindowsDialog";
+import { withUnlistedAutoCompact } from "./gateway-auto-compact-model";
 import { ProviderReasoningDialog, reasoningSummary } from "./ProviderReasoningDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
 import { ProviderSyncDialog } from "./ProviderSyncDialog";
@@ -70,6 +76,7 @@ import { gatewayJump } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
 import { singleAgent, visibleAgents } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
+import { AccountQuotaDetails, ProviderQuotaTimeline } from "./ProviderQuotaPanel";
 
 /** 能在网关里直接登录的订阅。 */
 type AccountKind = "chatgpt" | "chatgpt-api" | "copilot" | "grok" | `sub:${string}`;
@@ -110,9 +117,9 @@ const MODEL_CHIP_COLLAPSE = 8;
 
 /** 供应商池上次用的视图（切页再回来保持）。 */
 
-/** 重置卡的时间只到分钟；没有时间就是不会过期。 */
-function creditTime(value: number | null | undefined): string {
-  if (typeof value !== "number" || value <= 0) return t("不过期");
+/** 重置卡的时间只到分钟；缺失时间由调用方分别标注。 */
+function creditTime(value: number | null | undefined, missing: string): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return missing;
   return new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
@@ -120,14 +127,22 @@ function creditTime(value: number | null | undefined): string {
  * ChatGPT 账号的「额度重置卡」，信息口径对齐 CLIProxyAPI 配额页：剩几张、每张什么时候到手、
  * 什么时候过期，按用户确认用掉一张。
  *
- * 请求标识保存在这一行里：结果没确认时（断网、上游换了返回）保留同一个标识重试，
- * 服务端据此判重，不会重复扣卡。
+ * 未确认的标识由页面存储及后端账号记录共同保留，切页或重启后仍复用同一次操作。
  */
 function ResetCreditsRow({ entry, busy, run }: { entry: GatewayPoolEntry; busy: string | null; run: Run }) {
   const cards = entry.resetCredits ?? null;
   const usable = usableResetCardCount(entry);
   const soonest = soonestResetCardExpiry(entry);
   const [requestId, setRequestId] = useState<string | null>(null);
+  const [operationError, setOperationError] = useState("");
+  const consuming = useRef(false);
+  const [, tick] = useState(0);
+  useEffect(() => {
+    try { setRequestId(pendingResetCardOperation(localStorage, entry.id)); setOperationError(""); }
+    catch { setOperationError(t("无法读取上次重置操作，请先核实结果")); }
+    const timer = setInterval(() => tick((value) => value + 1), 1000);
+    return () => clearInterval(timer);
+  }, [entry.id]);
   const asking = useRef(false);
   // 展开详情、还没有读数或读数超过两分钟才真的打上游：这一步只读，不消耗卡。
   useEffect(() => {
@@ -138,43 +153,48 @@ function ResetCreditsRow({ entry, busy, run }: { entry: GatewayPoolEntry; busy: 
       .finally(() => { asking.current = false; });
   }, [entry.id, entry.enabled, cards?.observedAtMs]);
   const consume = async () => {
-    const ok = await appConfirm(t("将消耗 1 张重置卡，把 5 小时与每周额度一起重置。是否继续？"), { title: t("重置 Codex 配额"), confirmText: t("确认重置"), danger: true });
-    if (!ok) return;
-    const id = requestId ?? crypto.randomUUID();
-    setRequestId(id);
-    const done = await run(`consume:${entry.id}`, "consume_gateway_reset_card", { id: entry.id, requestId: id }, t("使用重置卡"), true);
-    // 只剩「结果未确认」这一种情况保留原标识，其余换新，免得下一次操作被当成重放。
-    if (done) setRequestId(null);
+    if (consuming.current) return;
+    consuming.current = true;
+    try {
+      const ok = await appConfirm(t("将消耗 1 张重置卡，请确认后重置账号额度。未确认的上次操作会优先核实。"), { title: t("重置 Codex 配额"), confirmText: t("确认重置"), danger: true });
+      if (!ok) return;
+      const id = beginResetCardOperation(localStorage, entry.id, () => crypto.randomUUID());
+      setRequestId(id);
+      const done = await run(`consume:${entry.id}`, "consume_gateway_reset_card", { id: entry.id, requestId: id }, t("使用重置卡"), true);
+      if (done) { finishResetCardOperation(localStorage, entry.id, id); setRequestId(null); }
+      setOperationError("");
+    } catch { setOperationError(t("重置操作未确认，请保留原操作并稍后重试")); }
+    finally { consuming.current = false; }
   };
-  const listed = (cards?.credits ?? []).filter((card) => card.usable || card.status !== "redeemed").slice(0, 6);
+  const listed = (cards?.credits ?? []).filter((card) => resetCardUsable(card)).sort((a, b) => (a.expiresAtMs ?? Infinity) - (b.expiresAtMs ?? Infinity));
   return (
     <div className="gw-detail-row gw-reset-row">
-      <span className="gw-detail-label">{t("重置券")}</span>
+      <span className="gw-detail-label">{t("主动重置次数")}</span>
       <div className="gw-detail-value gw-reset-value">
         {cards === null ? (
           <span className="gw-muted">{t("尚未查询")}</span>
         ) : (
           <>
             <span className="gw-reset-count" data-tone={usable ? "ok" : "none"}>
-              {tf("{0} 张可用", [String(usable ?? 0)])}
+              {usable === null ? t("可用张数未知") : tf("{0} 张可用", [String(usable)])}
             </span>
-            {soonest ? <span className="gw-reset-expiry">{tf("最近到期 {0}", [creditTime(soonest)])}</span> : null}
+            {soonest ? <span className="gw-reset-expiry">{tf("最近到期 {0}", [creditTime(soonest, t("未知"))])}</span> : null}
             {listed.length ? (
               <ul className="gw-reset-list">
-                {listed.map((card) => (
-                  <li data-tone={card.usable ? "ok" : "done"} key={card.id}>
-                    <span>{tf("获得 {0}", [creditTime(card.grantedAtMs)])}</span>
-                    <span>{tf("到期 {0}", [creditTime(card.expiresAtMs)])}</span>
-                    {card.usable ? null : <span className="gw-muted">{t("已用或已失效")}</span>}
+                {listed.map((card, index) => (
+                  <li data-tone={resetCardUsable(card) ? "ok" : "done"} key={card.id} title={tf("获得 {0}", [creditTime(card.grantedAtMs, t("未知"))])}>
+                    <span>{tf("第 {0} 次", [index + 1])}</span>
+                    <span>{tf("到期 {0}", [creditTime(card.expiresAtMs, t("未提供到期时间"))])}</span>
                   </li>
                 ))}
               </ul>
             ) : (
-              <span className="gw-muted">{t("这个账号没有可用的重置卡")}</span>
+              <span className="gw-muted">{usable === null ? t("尚无卡片明细，可用张数未知") : usable > 0 ? t("接口只返回汇总数") : t("这个账号没有可用的重置卡")}</span>
             )}
-            {requestId ? <span className="gw-reset-pending">{t("上次结果未确认：再点一次会用同一请求标识重试")}</span> : null}
           </>
         )}
+        {requestId ? <span className="gw-reset-pending">{t("上次结果未确认：再点一次会用同一请求标识重试")}</span> : null}
+        {operationError ? <span role="alert" className="gw-reset-pending">{operationError}</span> : null}
       </div>
       <span className="gw-detail-actions">
         <button
@@ -188,12 +208,12 @@ function ResetCreditsRow({ entry, busy, run }: { entry: GatewayPoolEntry; busy: 
         </button>
         <button
           className="gw-text-button"
-          disabled={busy !== null || !usable}
+          disabled={busy !== null || (!usable && !requestId)}
           onClick={() => void consume()}
-          title={usable ? t("消耗一张重置卡，重置 5 小时与每周额度") : t("没有可用的重置卡")}
+          title={requestId ? t("核实上次重置操作") : usable ? t("消耗一张重置卡，重置账号额度") : t("没有可用的重置卡")}
           type="button"
         >
-          {t("使用一张")}
+          {requestId ? t("核实上次操作") : t("重置额度")}
         </button>
       </span>
     </div>
@@ -209,7 +229,7 @@ function ResetCardsChip({ entry }: { entry: GatewayPoolEntry }) {
     <span
       className="gw-reset-chip"
       data-tone={usable ? "ok" : "none"}
-      title={soonest ? tf("最近一张 {0} 到期", [creditTime(soonest)]) : t("没有重置卡")}
+      title={soonest ? tf("最近一张 {0} 到期", [creditTime(soonest, t("未知"))]) : usable ? t("未提供到期时间") : t("没有重置卡")}
     >
       {tf("重置券 {0}", [String(usable)])}
     </span>
@@ -328,10 +348,10 @@ export function ProvidersView({
     if (form?.mode !== "edit") return;
     if (await run(`edit:${form.entry.id}`, "update_gateway_provider", { id: form.entry.id, input: providerInput(draft) }, t("保存供应商"))) closeForm();
   };
-  const saveFormWindows = async (modelWindows: Record<string, number>, fallback: number | null) => {
+  const saveFormWindows = async (modelWindows: Record<string, number>, fallback: number | null, autoCompact: { models: Record<string, number>; fallback: number | null }) => {
     if (!editingEntry || !formWindows) return;
     const windows = withUnlistedWindows(editingEntry, formWindows, modelWindows);
-    if (await run(`windows:${editingEntry.id}`, "save_gateway_provider_windows", { id: editingEntry.id, windows, fallback }, t("保存上下文窗口"))) setFormWindows(null);
+    if (await run(`windows:${editingEntry.id}`, "save_gateway_provider_windows", { id: editingEntry.id, windows, fallback, autoCompact: withUnlistedAutoCompact(editingEntry, formWindows, autoCompact) }, t("保存上下文窗口"))) setFormWindows(null);
   };
 
   return (
@@ -365,6 +385,7 @@ export function ProvidersView({
           ) : null}
         </div>
       ) : null}
+      <ProviderQuotaTimeline entries={visible.filter(entry => entry.account === "chatgpt")} />
       {localLogins.length && localDismissed !== localKey ? (
         <LocalLoginsCard busy={busy !== null} found={localLogins} onDismiss={() => setLocalDismissed(localKey)} onImport={importLocal} pending={loginPending} />
       ) : null}
@@ -408,7 +429,7 @@ export function ProvidersView({
           busy={busy !== null}
           entry={{ ...editingEntry, models: formWindows }}
           onCancel={() => setFormWindows(null)}
-          onSave={(modelWindows, fallback) => void saveFormWindows(modelWindows, fallback)}
+          onSave={(modelWindows, fallback, autoCompact) => void saveFormWindows(modelWindows, fallback, autoCompact)}
         />
       ) : null}
     </>
@@ -640,6 +661,7 @@ export function ProviderAdder({
   const [importOnly, setImportOnly] = useState(startWith === "import");
   const [form, setForm] = useState<FormState | null>(null);
   const [loggingIn, setLoggingIn] = useState(false);
+  const [workbuddyRealm, setWorkbuddyRealm] = useState<WorkBuddyRealm | null>(null);
   const { login, dialog } = useAccountLogin(payload, run, notify);
   const agentPicks = <AgentPicks onChange={setPicked} payload={payload} picked={picked} />;
   const submit = async (draft: ProviderDraft) => {
@@ -656,6 +678,7 @@ export function ProviderAdder({
           notify={notify}
           onClose={onClose}
           onCustom={() => { setCatalogOpen(false); setForm({ mode: "custom" }); }}
+          onWorkBuddy={(realm) => { setCatalogOpen(false); setWorkbuddyRealm(realm); }}
           onLogin={(kind) => {
             setCatalogOpen(false);
             setLoggingIn(true);
@@ -683,8 +706,52 @@ export function ProviderAdder({
         />
       ) : null}
       {loggingIn ? dialog : null}
+      {workbuddyRealm ? <WorkBuddyConnectDialog realm={workbuddyRealm} busy={busy !== null} onClose={onClose}
+        onSave={async (baseUrl, apiKey) => {
+          if (await run("add:workbuddy", "create_gateway_workbuddy_lane", { realm: workbuddyRealm, baseUrl, apiKey, skipAgents }, t("接入 WorkBuddy"))) onClose();
+        }}
+      /> : null}
       {form ? <ProviderFormDialog agentPicks={agentPicks} busy={busy} form={form} onCancel={onClose} onSubmit={(draft) => void submit(draft)} /> : null}
     </>
+  );
+}
+
+function WorkBuddyConnectDialog({ realm, busy, onClose, onSave }: {
+  realm: WorkBuddyRealm;
+  busy: boolean;
+  onClose: () => void;
+  onSave: (baseUrl: string, apiKey: string) => Promise<void>;
+}) {
+  const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:7864");
+  const [apiKey, setApiKey] = useState("");
+  const title = t(realm === "cn" ? "WorkBuddy 国内版" : "WorkBuddy 国际版");
+  useEscapeLayer(true, () => { if (!busy) onClose(); });
+  return createPortal(
+    <div className="gw-modal-backdrop gw-portal">
+      <form className="gw-modal gw-device-modal" role="dialog" aria-modal="true" aria-label={title}
+        onSubmit={event => { event.preventDefault(); if (!busy) void onSave(baseUrl.trim(), apiKey.trim()); }}>
+        <header>
+          <strong>{title}</strong>
+          <button aria-label={t("关闭")} className="gw-icon-button" disabled={busy} onClick={onClose} type="button"><X className="h-4 w-4" /></button>
+        </header>
+        <div className="gw-modal-body">
+          <p className="gw-muted">{t("在 WorkBuddy Manager 建立这个版本专用的调用 Key。Codex++ 会验证 Key 的版本，并只导入对应模型。")}</p>
+          <label className="pf-field">
+            <span>{t("本地服务地址")}</span>
+            <input required type="url" value={baseUrl} onChange={event => setBaseUrl(event.target.value)} />
+          </label>
+          <label className="pf-field">
+            <span>{t("模型调用 Key")}</span>
+            <input required type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} />
+          </label>
+        </div>
+        <footer>
+          <button className="gw-soft-button" disabled={busy} onClick={onClose} type="button">{t("取消")}</button>
+          <button className="gw-primary-button" disabled={busy || !baseUrl.trim() || !apiKey.trim()} type="submit">{t("接入 WorkBuddy")}</button>
+        </footer>
+      </form>
+    </div>,
+    document.body,
   );
 }
 
@@ -713,6 +780,7 @@ function PoolRow({
   loggingIn: boolean;
 }) {
   const enabled = providerEnabled(entry);
+  const workbuddy = isWorkBuddyProvider(entry.source);
   // 拖动中跟手移动，松手时 200ms 滑到新位置；拖着的那一行本身不加过渡，免得跟不上指针。
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: entry.id });
   const status = memberStatus(payload, entry.id);
@@ -755,8 +823,8 @@ function PoolRow({
     if (await run(`reasoning:${entry.id}`, "save_gateway_provider_metadata", { id: entry.id, modelMetadata }, t("保存思考等级"))) setReasoningOpen(false);
   };
   const windows = windowSummary(entry);
-  const saveWindows = async (modelWindows: Record<string, number>, fallback: number | null) => {
-    if (await run(`windows:${entry.id}`, "save_gateway_provider_windows", { id: entry.id, windows: modelWindows, fallback }, t("保存上下文窗口"))) setWindowsOpen(false);
+  const saveWindows = async (modelWindows: Record<string, number>, fallback: number | null, autoCompact: { models: Record<string, number>; fallback: number | null }) => {
+    if (await run(`windows:${entry.id}`, "save_gateway_provider_windows", { id: entry.id, windows: modelWindows, fallback, autoCompact }, t("保存上下文窗口"))) setWindowsOpen(false);
   };
   // 从上游同步上下文窗口 / 思考等级（#2807）：先列差异，勾选后才写入。订阅账号的模型接口不带这些资料。
   const [metaSync, setMetaSync] = useState<MetaSyncKind | null>(null);
@@ -938,10 +1006,10 @@ function PoolRow({
             </div>
           ) : null}
           {quotaSupported ? (
-            <div className="gw-detail-row">
+            <div className="gw-detail-row gw-quota-detail-row">
               <span className="gw-detail-label">{t("额度")}</span>
               <div className="gw-detail-value gw-chip-row">
-                {entry.quota ? <QuotaWindows maxAgeSeconds={entry.subscriptionPolicy?.maxAgeSeconds} quota={entry.quota} /> : <span className="gw-muted">{t("尚未取得官方用量")}</span>}
+                {entry.account === "chatgpt" ? <AccountQuotaDetails entry={entry} /> : entry.quota ? <QuotaWindows maxAgeSeconds={entry.subscriptionPolicy?.maxAgeSeconds} quota={entry.quota} /> : <span className="gw-muted">{t("尚未取得官方用量")}</span>}
               </div>
               <span className="gw-detail-actions">
                 <button
@@ -973,7 +1041,19 @@ function PoolRow({
               {t("更多设置")}
               <span className="gw-pool-more-hint">{t("价格、上下文窗口、思考等级、代理、限速")}</span>
             </summary>
-          <div className="gw-detail-row">
+          {workbuddy ? (
+            <div className="gw-detail-row">
+              <span className="gw-detail-label">{t("积分倍率")}</span>
+              <div className="gw-detail-value gw-chip-row">
+                {vendorBalance.balance?.workbuddyModelRates ? entry.models.map(model => (
+                  <span className="gw-chip" key={model} title={t("当前目录倍率；实际扣分以请求日志为准")}>{model} {workbuddyModelRate(vendorBalance.balance?.workbuddyModelRates, model) || "—"}</span>
+                )) : <span className="gw-muted">{t("暂未取得 WorkBuddy 模型倍率")}</span>}
+              </div>
+              <span className="gw-detail-actions">
+                <button className="gw-text-button gw-sync-button" disabled={!enabled || vendorBalance.loading} onClick={vendorBalance.refresh} type="button">{t("刷新")}</button>
+              </span>
+            </div>
+          ) : <div className="gw-detail-row">
             <span className="gw-detail-label">{t("价格")}</span>
             <div className="gw-detail-value gw-chip-row">
               <span className={price ? undefined : "gw-muted"}>{price || t("未填写，不估算费用")}</span>
@@ -992,7 +1072,7 @@ function PoolRow({
                 {t("同步")}
               </button>
             </span>
-          </div>
+          </div>}
           <div className="gw-detail-row">
             <span className="gw-detail-label">{t("上下文窗口")}</span>
             <div className="gw-detail-value gw-chip-row">
@@ -1098,7 +1178,7 @@ function PoolRow({
         <ProviderReasoningDialog busy={busy !== null} entry={entry} onCancel={() => setReasoningOpen(false)} onSave={(modelMetadata) => void saveReasoning(modelMetadata)} />
       ) : null}
       {windowsOpen ? (
-        <ProviderWindowsDialog busy={busy !== null} entry={entry} onCancel={() => setWindowsOpen(false)} onSave={(modelWindows, fallback) => void saveWindows(modelWindows, fallback)} />
+        <ProviderWindowsDialog busy={busy !== null} entry={entry} onCancel={() => setWindowsOpen(false)} onSave={(modelWindows, fallback, autoCompact) => void saveWindows(modelWindows, fallback, autoCompact)} />
       ) : null}
       {accessOpen ? (
         <ProviderNewApiAccessDialog
@@ -1222,6 +1302,7 @@ function ProviderCatalog({
   onClose,
   onPreset,
   onCustom,
+  onWorkBuddy,
   onLogin,
   agentPicks,
   skipAgents,
@@ -1233,6 +1314,7 @@ function ProviderCatalog({
   onClose: () => void;
   onPreset: (preset: GatewayPreset) => void;
   onCustom: () => void;
+  onWorkBuddy: (realm: WorkBuddyRealm) => void;
   onLogin: (kind: AccountKind) => void;
   agentPicks: ReactNode;
   skipAgents: GatewayAgentId[];
@@ -1264,6 +1346,11 @@ function ProviderCatalog({
     }));
   const local: CatalogItem[] = [
     ...presetItems("local"),
+    ...(["cn", "global"] as const).map(realm => ({
+      key: `workbuddy:${realm}`, name: t(realm === "cn" ? "WorkBuddy 国内版" : "WorkBuddy 国际版"),
+      added: Boolean(payload?.pool.some(entry => entry.source === `workbuddy:${realm}`)),
+      onClick: () => onWorkBuddy(realm),
+    })).filter(item => hit(item.name)),
     ...(hit(t("自定义")) ? [{ key: "custom", name: t("自定义"), icon: <span className="gw-avatar gw-avatar-plus" data-size="sm"><Plus className="h-3.5 w-3.5" /></span>, onClick: onCustom }] : []),
   ];
   const sections: Array<{ key: string; title: string; hint: string; items: CatalogItem[] }> = [

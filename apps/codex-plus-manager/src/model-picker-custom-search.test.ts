@@ -5,13 +5,13 @@ import { isFavoriteModel, ownPickerSection, pickerSections, type GatewayPayload,
 
 const source = readFileSync(new URL("./GatewayAgents.tsx", import.meta.url), "utf8").replaceAll("\r\n", "\n");
 const start = "  const sections = useMemo(() => {\n";
-const end = "\n  }, [payload, query, exclude, favoritesOnly, sectionOnly, favorites, skipGroup, ownList]);";
+const end = "\n  }, [payload, query, exclude, favoritesOnly, sectionOnly, favorites, skipGroup, ownList, native]);";
 const begin = source.indexOf(start);
 const finish = source.indexOf(end, begin);
 assert.ok(begin >= 0 && finish > begin, "找不到选择器的分组筛选逻辑");
 const select = new Function(
   "payload", "query", "exclude", "skipGroup", "ownList", "sectionOnly", "favoritesOnly", "favorites",
-  "withOwnSection", "pickerSections", "ownPickerSection", "avatarOf", "isFavoriteModel",
+  "withOwnSection", "pickerSections", "ownPickerSection", "avatarOf", "isFavoriteModel", "native",
   source.slice(begin + start.length, finish),
 );
 const ownStart = source.indexOf("function withOwnSection(");

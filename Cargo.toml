@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.6.10"
+version = "2.7.2"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/BigPizzaV3/CodexPlusPlus"
@@ -54,6 +54,9 @@ debug = false
 
 [profile.release]
 strip = true
-lto = "fat"
-codegen-units = 1
+# lto/codegen-units 是编译时间与产物性能的主要取舍（2026-11-15 调整）：
+# fat + codegen-units=1 全量编译约 38 分钟；thin + codegen-units=16 约能压到 6-10 分钟，
+# 代价是 exe 大 10-20%、运行略慢。要发正式版可临时改回 fat/"1"。
+lto = "thin"
+codegen-units = 16
 panic = "abort"

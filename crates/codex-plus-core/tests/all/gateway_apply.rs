@@ -21,6 +21,81 @@ struct Fixture {
     ctx: ApplyContext,
 }
 
+#[test]
+fn codex_native_login_catalog_updates_identity_without_replacing_auth_or_history() {
+    let _guard = super::common::global_state_lock();
+    let Fixture { ctx, _temp } = fixture(29617);
+    let mut settings = BackendSettings::default();
+    settings.relay_profiles_enabled = true;
+    settings.official_experience.enabled = true;
+    settings.active_official_account_id = "native-catalog-account-a".into();
+    let model = codex_plus_core::official_model_catalog::visible_official_model_slugs_for_settings(
+        &settings,
+    )[0]
+    .clone();
+    ctx.settings.save(&settings).unwrap();
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"test-native-login","refresh_token":"test-refresh","account_id":"test-account"}}"#;
+    std::fs::write(ctx.codex_home.join("auth.json"), auth).unwrap();
+    enable_binding(
+        &ctx,
+        &ToolId::Codex,
+        AgentBinding {
+            model: model.clone(),
+            ..AgentBinding::default()
+        },
+    )
+    .unwrap();
+    let saved = ctx.settings.load().unwrap();
+    let profile = saved
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&profile.model_metadata).unwrap();
+    assert_eq!(metadata[&model]["codex_plus_group"], "当前登录账号");
+    assert_eq!(
+        metadata[&model]["codex_plus_group_id"],
+        "local-official-native-catalog-account-a"
+    );
+    let config: toml_edit::DocumentMut = codex_config(&ctx).parse().unwrap();
+    assert_eq!(config["model"].as_str(), Some(model.as_str()));
+    assert_eq!(config["model_provider"].as_str(), Some("openai"));
+    assert!(
+        !codex_plus_core::gateway::apply::sync_codex_identity(&ctx).unwrap(),
+        "目录与身份一致时不重复重写"
+    );
+    let mut settings = ctx.settings.load().unwrap();
+    settings.active_official_account_id = "native-catalog-account-b".into();
+    ctx.settings.save(&settings).unwrap();
+    assert!(codex_plus_core::gateway::apply::sync_codex_identity(&ctx).unwrap());
+    assert!(!codex_plus_core::gateway::apply::sync_codex_identity(&ctx).unwrap());
+    let saved = ctx.settings.load().unwrap();
+    let profile = saved
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&profile.model_metadata).unwrap();
+    assert_eq!(
+        metadata[&model]["codex_plus_group_id"],
+        "local-official-native-catalog-account-b"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ctx.codex_home.join("auth.json")).unwrap(),
+        auth
+    );
+    assert_eq!(
+        ctx.gateway
+            .load()
+            .unwrap()
+            .binding(&ToolId::Codex)
+            .unwrap()
+            .model,
+        model
+    );
+}
+
 fn fixture(port: u16) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
@@ -4034,6 +4109,127 @@ fn gateway_declared_fallback_keeps_model_capability_restrictions() {
     }
 }
 
+/// #3042：供应商池里声明的图片能力要一路带到 Codex 原生目录和注入层的 modelMetadata；
+/// 纯文本模型不能借通用模板宣称收图，多家共用的一项（自动组、模型组）取各家交集。
+#[test]
+fn gateway_catalog_forwards_declared_image_input_capability() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57404);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let deepseek = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    let (_, ark) = create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Ark".into(),
+            model: "ark-vision".into(),
+            model_list: "ark-vision\nark-text\ndeepseek-v4-pro".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    // DeepSeek 那家把内置标成纯文本的 deepseek-v4-flash 声明为收图；
+    // 方舟这家声明 ark-vision 收图、ark-text 纯文本，它的 deepseek-v4-pro 也收图。
+    set_provider_metadata(
+        &ctx.gateway,
+        &deepseek,
+        &json!({"deepseek-v4-flash": {"input_modalities": ["text", "image"]}}).to_string(),
+    )
+    .unwrap();
+    set_provider_metadata(
+        &ctx.gateway,
+        &ark,
+        &json!({
+            "ark-vision": {"input_modalities": ["text", "image"], "supports_image_detail_original": true},
+            "ark-text": {"input_modalities": ["text"], "supports_image_detail_original": false},
+            "deepseek-v4-pro": {"input_modalities": ["text", "image"]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (_, group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Mixed".into(),
+            members: vec![
+                GroupMember {
+                    model: format!("{ark}/ark-vision"),
+                    weight: 1,
+                },
+                GroupMember {
+                    model: format!("{ark}/ark-text"),
+                    weight: 1,
+                },
+            ],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+
+    let group_model = format!("group/{group}");
+    let ark_pro = format!("{ark}/deepseek-v4-pro");
+    let expected = [
+        ("ark-vision", json!(["text", "image"])),
+        ("ark-text", json!(["text"])),
+        ("deepseek-v4-flash", json!(["text", "image"])),
+        // 两家都有的裸名是自动切换入口：DeepSeek 内置纯文本，交集只剩 text。
+        ("deepseek-v4-pro", json!(["text"])),
+        (ark_pro.as_str(), json!(["text", "image"])),
+        (group_model.as_str(), json!(["text"])),
+    ];
+
+    let settings = ctx.settings.load().unwrap();
+    let profile = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&profile.model_metadata).unwrap();
+    for (slug, modalities) in &expected {
+        assert_eq!(
+            &metadata[*slug]["input_modalities"], modalities,
+            "{slug}: {metadata}"
+        );
+    }
+    assert_eq!(
+        metadata["ark-vision"]["supports_image_detail_original"],
+        true
+    );
+    assert_eq!(
+        metadata["ark-text"]["supports_image_detail_original"],
+        false
+    );
+    // 模型组有一家不支持原图细节，整组就不支持。
+    assert_eq!(
+        metadata[group_model.as_str()]["supports_image_detail_original"],
+        false
+    );
+
+    // 原生目录与注入层读的 modelMetadata（由目录条目经白名单生成）都要带上同一份声明。
+    let catalog = codex_catalog(ctx);
+    let models = catalog["models"].as_array().unwrap();
+    for (slug, modalities) in &expected {
+        let entry = models
+            .iter()
+            .find(|entry| entry["slug"] == *slug)
+            .unwrap_or_else(|| panic!("目录里缺少 {slug}"));
+        assert_eq!(&entry["input_modalities"], modalities, "{slug}: {entry}");
+        let ui = codex_plus_core::model_suffix::model_ui_metadata_with_override(slug, Some(entry))
+            .unwrap();
+        assert_eq!(&ui["inputModalities"], modalities, "{slug}: {ui}");
+        assert_eq!(&ui["input_modalities"], modalities, "{slug}: {ui}");
+    }
+}
+
 #[test]
 fn gateway_catalog_tracks_disabled_auto_groups_for_declared_and_default_models() {
     use codex_plus_core::gateway::apply::set_auto_group_enabled;
@@ -5263,4 +5459,69 @@ fn codex_disconnect_to_a_fallback_provider_only_fills_missing_user_root_settings
         "新供应商缺的键照样补回：{config}"
     );
     assert_eq!(config.matches("model_instructions_file =").count(), 1);
+}
+
+/// #3115：网关模式（activeRelayId = codex-plus-gateway）重写 Codex 配置时，用户直接在
+/// live config.toml 里给 MCP 加的 `tool_timeout_sec`、`env` 不能被顶掉。网关重写走
+/// `relay_switch`，读「切换时保留」开关；托管供应商的模板里没有 MCP，开关关着时也保留。
+#[test]
+fn gateway_rewrite_keeps_live_mcp_edits_with_or_without_preserve_setting() {
+    for (preserve, port) in [(true, 57411), (false, 57412)] {
+        let fixture = fixture(port);
+        let ctx = &fixture.ctx;
+        std::fs::create_dir_all(&ctx.codex_home).unwrap();
+        let mut direct = codex_plus_core::provider_import::pool_relay_profile(
+            "直连",
+            "https://api.direct.test/v1",
+            "sk-direct",
+            RelayProtocol::Responses,
+            "gpt-direct",
+            "gpt-direct",
+            &[],
+        )
+        .unwrap();
+        direct.id = "direct".into();
+        direct.relay_mode = RelayMode::PureApi;
+        codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut direct).unwrap();
+        let mut seeded = BackendSettings::default();
+        seeded.relay_profiles_enabled = true;
+        seeded.relay_profiles = vec![direct];
+        seeded.active_relay_id = "direct".into();
+        seeded.relay_preserve_nonprovider_settings = preserve;
+        seeded.relay_context_config_contents =
+            "[mcp_servers.my_tool]\ncommand = \"my-tool\"\n".into();
+        codex_plus_core::relay_switch::switch_relay_profile_in_home(
+            &ctx.settings,
+            &ctx.codex_home,
+            seeded,
+            "",
+        )
+        .unwrap();
+        enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+        assert_eq!(
+            ctx.settings.load().unwrap().active_relay_id,
+            "codex-plus-gateway"
+        );
+
+        // 用户在 live 里给这条 MCP 加超时和环境变量。
+        let config_path = ctx.codex_home.join("config.toml");
+        let mut doc = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc["mcp_servers"]["my_tool"]["tool_timeout_sec"] = toml_edit::value(120);
+        doc["mcp_servers"]["my_tool"]["env"] = toml_edit::table();
+        doc["mcp_servers"]["my_tool"]["env"]["MY_TOKEN"] = toml_edit::value("live-token");
+        std::fs::write(&config_path, doc.to_string()).unwrap();
+
+        // 网关重写 Codex 配置（池变化、身份同步、重启时都走这里）。
+        refresh_enabled(ctx).unwrap();
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(config.contains("/gw/codex/v1"), "{config}");
+        assert!(
+            config.contains("tool_timeout_sec = 120") && config.contains("live-token"),
+            "preserve={preserve}：{config}"
+        );
+        assert!(config.contains("command = \"my-tool\""), "{config}");
+    }
 }

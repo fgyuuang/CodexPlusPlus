@@ -2565,6 +2565,113 @@ fn apply_relay_files_preserves_live_windows_sandbox_across_profile_switches() {
     );
 }
 
+/// #3144 用：在 home 下写 config.toml 并返回 home 路径。
+fn home_with_config(root: &std::path::Path, name: &str, config: &str) -> std::path::PathBuf {
+    let home = root.join(name);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.toml"), config).unwrap();
+    home
+}
+
+fn windows_sandbox_of(home: &std::path::Path) -> Option<String> {
+    let parsed: toml::Value = std::fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    parsed
+        .get("windows")
+        .and_then(|windows| windows.get("sandbox"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+#[test]
+fn isolated_instance_windows_settings_follow_main_instance() {
+    // #3144：profile 快照带进来的 elevated 被主实例当前的 unelevated 整段替换。
+    let temp = tempfile::tempdir().unwrap();
+    let main_config = "[windows]\nsandbox = \"unelevated\"\nsandbox_private_desktop = false\n";
+    let main = home_with_config(temp.path(), "main", main_config);
+    let instance = home_with_config(
+        temp.path(),
+        "instance",
+        "model = \"m\"\n\n[windows]\nsandbox = \"elevated\"\nsandbox_private_desktop = true\n",
+    );
+
+    let changed = codex_plus_core::relay_config::align_isolated_instance_windows_settings(
+        &instance, &main, "",
+    )
+    .unwrap();
+
+    assert!(changed);
+    let parsed: toml::Value = std::fs::read_to_string(instance.join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(parsed["windows"]["sandbox"].as_str(), Some("unelevated"));
+    assert_eq!(
+        parsed["windows"]["sandbox_private_desktop"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(parsed["model"].as_str(), Some("m"));
+    // 主实例不动；再对齐一次不再改写。
+    assert_eq!(
+        std::fs::read_to_string(main.join("config.toml")).unwrap(),
+        main_config
+    );
+    assert!(
+        !codex_plus_core::relay_config::align_isolated_instance_windows_settings(
+            &instance, &main, "",
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn isolated_instance_windows_settings_keep_instance_choice_when_main_has_none() {
+    // 主实例没有 `[windows]`：实例写入前自己的设置保留，快照里的旧值不生效。
+    let temp = tempfile::tempdir().unwrap();
+    let main = home_with_config(temp.path(), "main", "model = \"m\"\n");
+    let instance = home_with_config(
+        temp.path(),
+        "instance",
+        "model = \"m\"\n\n[windows]\nsandbox = \"elevated\"\n",
+    );
+
+    codex_plus_core::relay_config::align_isolated_instance_windows_settings(
+        &instance,
+        &main,
+        "[windows]\nsandbox = \"unelevated\"\n",
+    )
+    .unwrap();
+
+    assert_eq!(windows_sandbox_of(&instance).as_deref(), Some("unelevated"));
+}
+
+#[test]
+fn isolated_instance_windows_settings_drop_snapshot_value_when_nobody_set_one() {
+    // 主实例和实例原先都没有：去掉 profile 快照带进来的 `[windows]`，交给 Codex 自己决定。
+    let temp = tempfile::tempdir().unwrap();
+    let main = home_with_config(temp.path(), "main", "");
+    let instance = home_with_config(
+        temp.path(),
+        "instance",
+        "model = \"m\"\n\n[windows]\nsandbox = \"elevated\"\n",
+    );
+
+    assert!(
+        codex_plus_core::relay_config::align_isolated_instance_windows_settings(
+            &instance,
+            &main,
+            "model = \"m\"\n",
+        )
+        .unwrap()
+    );
+
+    assert_eq!(windows_sandbox_of(&instance), None);
+    let config = std::fs::read_to_string(instance.join("config.toml")).unwrap();
+    assert!(config.contains("model = \"m\""), "{config}");
+}
+
 #[test]
 fn apply_relay_files_preserves_live_desktop_personalization_settings() {
     let temp = tempfile::tempdir().unwrap();
@@ -3406,7 +3513,13 @@ enabled = true
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains("[mcp_servers.enabled_one]"));
     assert!(config.contains("[plugins.enabled_two]"));
-    assert!(!config.contains("[plugins.disabled_one]"));
+    // 插件停用要写成 `enabled = false`：条目被删掉，Codex 就当它没装（#3115）。
+    let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        doc["plugins"]["disabled_one"]["enabled"].as_bool(),
+        Some(false),
+        "{config}"
+    );
     assert!(!config.contains("[skills.disabled_skill]"));
 }
 
@@ -5597,9 +5710,95 @@ enabled = true
         updated.contains(r#"[plugins."figma@openai-curated"]"#),
         "{updated}"
     );
-    assert!(
-        !updated.contains(r#"[plugins."notion@codex-plus-market"]"#),
+    // 停用的插件留在 live 里写成 `enabled = false`，不是整条删掉（#3115）。
+    let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        doc["plugins"]["notion@codex-plus-market"]["enabled"].as_bool(),
+        Some(false),
         "{updated}"
+    );
+}
+
+/// #3115：在「插件配置」里停用内置插件（列表行的 Codex 标签、或编辑成 `enabled = false`）。
+/// Codex 把 config.toml 里没有条目的插件当成「未安装」，内置插件随后会被当作启用装回，
+/// 所以停用必须在 live 里落成 `enabled = false`；再启用时改回 true。
+#[test]
+fn disabling_a_live_bundled_plugin_writes_enabled_false_instead_of_removing_it() {
+    let live = r#"model = "gpt-5"
+
+[plugins."chrome@openai-bundled"]
+enabled = true
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"#;
+    let disabled = r#"[plugins."chrome@openai-bundled"]
+enabled = false
+"#;
+
+    let updated = sync_live_config_context_entries(live, disabled).unwrap();
+    let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        doc["plugins"]["chrome@openai-bundled"]["enabled"].as_bool(),
+        Some(false),
+        "{updated}"
+    );
+    assert_eq!(
+        doc["plugins"]["browser@openai-bundled"]["enabled"].as_bool(),
+        Some(true),
+        "{updated}"
+    );
+    assert_eq!(
+        updated
+            .matches(r#"[plugins."chrome@openai-bundled"]"#)
+            .count(),
+        1,
+        "{updated}"
+    );
+
+    let enabled = r#"[plugins."chrome@openai-bundled"]
+enabled = true
+"#;
+    let updated = sync_live_config_context_entries(&updated, enabled).unwrap();
+    let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        doc["plugins"]["chrome@openai-bundled"]["enabled"].as_bool(),
+        Some(true),
+        "{updated}"
+    );
+}
+
+/// 切换供应商的 apply 流程同样要把停用的托管插件写成 `enabled = false`，
+/// 不能被 live 里旧的 `enabled = true` 补回，也不能整条删掉（#3115）。
+#[test]
+fn relay_apply_writes_disabled_managed_plugin_as_enabled_false() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "gpt-5"
+
+[plugins."chrome@openai-bundled"]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let mut profile = pure_api_profile_named("中转", r#"model = "qwen3-coder""#);
+    profile.use_common_config = true;
+
+    apply_relay_profile_with_preservation(
+        temp.path(),
+        &profile,
+        "[plugins.\"chrome@openai-bundled\"]\nenabled = false\n",
+        57321,
+        false,
+    )
+    .unwrap();
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        doc["plugins"]["chrome@openai-bundled"]["enabled"].as_bool(),
+        Some(false),
+        "{config}"
     );
 }
 

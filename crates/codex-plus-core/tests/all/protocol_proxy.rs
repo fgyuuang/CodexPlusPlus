@@ -694,10 +694,10 @@ fn assert_local_compaction_summary(item: &Value, summary: &str) {
     );
 }
 
-/// 读不懂的压缩项（原生密文、旧格式、损坏的本地摘要）原先整条拒绝，#3106 起改为占位说明：
-/// 不把原文当摘要发出去，也不再让重放这段历史的每轮请求都失败。
+/// 读不懂的压缩项（原生密文、旧格式、损坏的本地摘要）必须 fail closed。
+/// 公共转换函数拿不到线程历史，不能把它静默换成“前文已丢失”的占位文本。
 #[test]
-fn chat_conversion_degrades_unmarked_or_invalid_compaction_history() {
+fn chat_conversion_rejects_unmarked_or_invalid_compaction_history() {
     for content in [
         "OPAQUE_NATIVE",
         "unmarked legacy summary",
@@ -710,16 +710,17 @@ fn chat_conversion_degrades_unmarked_or_invalid_compaction_history() {
             json!({"type": "compaction", "encrypted_content": content}),
             json!([{"type": "compaction", "encrypted_content": content}]),
         ] {
-            let converted = responses_to_chat_completions(json!({"input": input})).unwrap();
-            let messages = converted["messages"].as_array().unwrap();
-            assert_eq!(messages.len(), 1, "{content}");
-            assert_eq!(messages[0]["role"], "user");
-            let text = messages[0]["content"].as_str().unwrap();
+            let error = responses_to_chat_completions(json!({"input": input}))
+                .expect_err("没有文字交接时必须拒绝原生压缩检查点");
+            let diagnostic = error.to_string();
             assert!(
-                text.contains("compacted by a different provider"),
-                "{content}"
+                diagnostic.contains("compaction checkpoint"),
+                "{content}: {diagnostic}"
             );
-            assert!(!text.contains(content), "原文不能当摘要发出: {content}");
+            assert!(
+                !diagnostic.contains(content),
+                "错误里不能回显密文: {content}"
+            );
         }
     }
 }
@@ -1206,6 +1207,62 @@ async fn write_remote_compaction_typed_response(
     stream.write_all(response.as_bytes()).await.unwrap();
 }
 
+fn write_visible_handoff_rollout(home: &Path, thread_id: &str) {
+    let day = home.join("sessions/2026/11/17");
+    std::fs::create_dir_all(&day).unwrap();
+    let path = day.join(format!("rollout-2026-11-17T16-44-00-{thread_id}.jsonl"));
+    let message = |id: &str, role: &str, text: &str| {
+        json!({
+            "type":"response_item",
+            "timestamp":"2026-11-17T08:44:00Z",
+            "payload":{
+                "type":"message",
+                "id":id,
+                "role":role,
+                "content":[{"type":if role == "assistant" { "output_text" } else { "input_text" }, "text":text}]
+            }
+        })
+        .to_string()
+    };
+    std::fs::write(
+        path,
+        [
+            message(
+                "msg_goal",
+                "user",
+                "把原任务完整交给 WorkBuddy，保留 D:/pro/codex-plus-plus。",
+            ),
+            message(
+                "msg_progress",
+                "assistant",
+                "已定位到 OpenAI 原生压缩检查点，下一步自动生成文字交接。",
+            ),
+            message(
+                "msg_constraint",
+                "user",
+                "不要逐会话手工修，也不能静默丢掉前文。",
+            ),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+}
+
+fn request_json_body(request: &str) -> Value {
+    let (_, body) = request
+        .split_once("\r\n\r\n")
+        .expect("captured HTTP request has no body");
+    serde_json::from_str(body).unwrap()
+}
+
+async fn write_test_sse_response(stream: &mut tokio::net::TcpStream, body: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/event-stream\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+}
+
 #[tokio::test]
 async fn responses_compaction_v2_falls_back_when_trigger_is_rejected() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1280,6 +1337,82 @@ async fn responses_compaction_v2_falls_back_when_trigger_is_rejected() {
         String::from_utf8(result.read_body().await.unwrap())
             .unwrap()
             .contains("COMPAT_SUMMARY")
+    );
+}
+
+/// #3101：「ChatGPT API」上游（ChatGPT 订阅共享）不收 compaction_trigger，报错只列白名单、
+/// 不点名 trigger。按错误码认出后要降级成摘要压缩，而不是把 400 交回 Codex。
+#[tokio::test]
+async fn responses_compaction_v2_falls_back_when_subscription_sharing_rejects_trigger() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..2 {
+            let (mut stream, _) = if index == 0 {
+                listener.accept().await.unwrap()
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("fallback request should arrive")
+                    .unwrap()
+            };
+            requests.push(
+                String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string(),
+            );
+            if index == 0 {
+                write_remote_compaction_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    r#"{"error":{"message":"User subscription sharing currently supports only text, image, and file messages, item references, additional tools, compaction summaries, reasoning items, Web Search call items, developer function and custom tool call items, and programmatic tool calling items. Remove unsupported input items or use an API key instead.","type":"invalid_request_error","param":"input","code":"subscription_sharing_unsupported_capability"}}"#,
+                )
+                .await;
+            } else {
+                write_remote_compaction_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"SHARING_SUMMARY"}]}]}"#,
+                )
+                .await;
+            }
+        }
+        requests
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "gpt-6.1-sol",
+            "stream": true,
+            "input": [
+                { "type": "message", "role": "user", "content": "history" },
+                { "type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "call_1", "output": "ok" },
+                { "type": "compaction_trigger" }
+            ]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(requests.len(), 2, "被订阅共享拒收后应降级重发一次");
+    assert!(requests[0].contains("compaction_trigger"));
+    assert!(
+        !requests[1].contains("compaction_trigger"),
+        "降级请求不再带 trigger"
+    );
+    assert!(requests[1].contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert!(requests[1].contains("call_1"), "历史里的工具调用原样保留");
+    assert_eq!(result.status_code, 200);
+    assert!(result.compaction);
+    assert!(
+        String::from_utf8(result.read_body().await.unwrap())
+            .unwrap()
+            .contains("SHARING_SUMMARY")
     );
 }
 
@@ -1688,30 +1821,15 @@ fn native_fernet_compaction() -> Value {
     })
 }
 
-/// #3106：Chat 桥接上游没有其他候选可切时，历史里的原生加密压缩项换成占位说明继续发送，
-/// 普通对话和压缩请求本身都不再 400。原先这里断言「必须拒绝」（native_compaction_unsupported），
-/// 那会让每轮重放这段历史的请求都失败、会话永久锁死。
+/// 没有线程 ID 就无法从本机 rollout 恢复可见历史。此时必须明确拒绝，不能把原生加密压缩项
+/// 静默换成“前文已丢失”的占位继续发送；正常 Codex 请求会带线程 ID，走自动文字交接路径。
 #[tokio::test]
-async fn native_compaction_history_on_chat_upstream_degrades_to_placeholder() {
+async fn native_compaction_history_without_thread_is_rejected_instead_of_dropped() {
     for trigger in [false, true] {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(capture_request_with_response(
-            listener,
-            "application/json",
-            json!({
-                "id": "chatcmpl_degraded",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": "CHAT_REPLY" },
-                    "finish_reason": "stop"
-                }]
-            })
-            .to_string(),
-        ));
         let mut input = vec![
             native_fernet_compaction(),
             json!({ "type": "message", "role": "user", "content": "继续" }),
@@ -1728,34 +1846,24 @@ async fn native_compaction_history_on_chat_upstream_degrades_to_placeholder() {
         )
         .await
         .unwrap();
-        let (headers, sent) = server.await.unwrap();
-
-        assert_eq!(result.status_code, 200, "trigger={trigger}");
-        assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
-        let sent_text = sent.to_string();
-        assert!(!sent_text.contains("OPAQUE_NATIVE"), "密文不能发给桥接上游");
-        assert!(!sent_text.contains("internal_chat_message_metadata_passthrough"));
-        let messages = sent["messages"].as_array().unwrap();
-        assert_eq!(messages[0]["role"], "user");
-        assert!(
-            messages[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("compacted by a different provider"),
-            "占位说明留在原压缩项的位置: {sent}"
-        );
-        assert!(sent_text.contains("继续"), "其余历史照常转换");
-        assert_eq!(result.compaction, trigger);
+        assert_eq!(result.status_code, 400, "trigger={trigger}");
         let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
-        assert!(body.contains("CHAT_REPLY"), "trigger={trigger}: {body}");
-        assert!(!body.contains("native_compaction_unsupported"));
+        assert!(body.contains("native_compaction_unsupported"), "{body}");
+        assert!(body.contains("compaction_incompatible"), "{body}");
+        assert!(!body.contains("OPAQUE_NATIVE"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "没有文字交接时不能把缺失上下文静默发给上游"
+        );
     }
 }
 
-/// #3106：转换函数本身（Chat 与 Anthropic 桥接共用的第一跳）遇到原生加密压缩项不再报错，
-/// 换成占位说明；本地摘要（codexplusplus:summary:v1:）仍展开成原文，工具调用配对不受影响。
+/// Chat 与 Anthropic 桥接共用的第一跳不能在缺少文字交接时继续发送。
+/// Codex++ 自己的本地摘要仍必须展开成原文；只有读不懂的原生检查点明确失败。
 #[test]
-fn responses_to_chat_replaces_native_compaction_with_placeholder() {
+fn responses_to_chat_rejects_native_compaction_without_text_handoff() {
     let body = json!({
         "model": "deepseek-v4-pro",
         "input": [
@@ -1769,44 +1877,388 @@ fn responses_to_chat_replaces_native_compaction_with_placeholder() {
             { "type": "function_call_output", "call_id": "call_1", "output": "a.txt" }
         ]
     });
-    let converted = responses_to_chat_completions(body.clone()).unwrap();
-    let messages = converted["messages"].as_array().unwrap();
-    let text = converted.to_string();
-    assert!(!text.contains("OPAQUE_NATIVE"));
+    let error = responses_to_chat_completions(body.clone())
+        .expect_err("原生压缩检查点没有文字交接时必须拒绝");
+    assert!(error.to_string().contains("compaction checkpoint"));
+    assert!(!error.to_string().contains("OPAQUE_NATIVE"));
+
+    // 单个 item 形式的 input 同样 fail closed。
+    let single_error = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-pro",
+        "input": native_fernet_compaction()
+    }))
+    .expect_err("单 item 也不能绕过交接");
+    assert!(!single_error.to_string().contains("OPAQUE_NATIVE"));
+
+    // Anthropic 桥接复用同一份第一跳转换，必须一起 fail closed。
+    let anthropic_error = codex_plus_core::anthropic_bridge::responses_to_anthropic_messages(
+        body,
+        &codex_plus_core::anthropic_bridge::AnthropicRequestOptions::default(),
+    )
+    .expect_err("Anthropic 桥接不能静默丢前文");
+    assert!(!anthropic_error.to_string().contains("OPAQUE_NATIVE"));
+
+    // 可读的本地摘要不受影响。
+    let local = responses_to_chat_completions(json!({
+        "model":"deepseek-v4-pro",
+        "input":[{
+            "type":"compaction",
+            "encrypted_content":"codexplusplus:summary:v1:\"LOCAL_SUMMARY\""
+        }]
+    }))
+    .unwrap();
     assert!(
-        messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("cannot be read under the current protocol")
-    );
-    assert!(
-        messages[1]["content"]
+        local["messages"][0]["content"]
             .as_str()
             .unwrap()
             .contains("LOCAL_SUMMARY")
     );
-    assert!(text.contains("看一下目录"));
-    assert_eq!(messages.last().unwrap()["role"], "tool");
-    assert_eq!(messages.last().unwrap()["tool_call_id"], "call_1");
+}
 
-    // 单个 item 形式的 input 同样降级。
-    let single = responses_to_chat_completions(json!({
-        "model": "deepseek-v4-pro",
-        "input": native_fernet_compaction()
-    }))
-    .unwrap();
-    assert_eq!(single["messages"].as_array().unwrap().len(), 1);
-    assert!(!single.to_string().contains("OPAQUE_NATIVE"));
+#[tokio::test]
+async fn foreign_compaction_http_rejection_retries_with_text_handoff_and_cache() {
+    let _state_lock = settings_path_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
+    let state = temp.path().join("codex-plus-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let _state = EnvVarGuard::set("CODEX_PLUS_STATE_DIR", state.to_str().unwrap());
+    let thread = "01a1e487-http-handoff-test";
+    write_visible_handoff_rollout(temp.path(), thread);
 
-    // Anthropic 桥接复用同一份第一跳转换，也不再整条拒绝。
-    let anthropic = codex_plus_core::anthropic_bridge::responses_to_anthropic_messages(
-        body,
-        &codex_plus_core::anthropic_bridge::AnthropicRequestOptions::default(),
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..4 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let body = request_json_body(&request);
+            match index {
+                0 => {
+                    assert!(request.contains("gAAAAA_OPAQUE_HANDOFF"));
+                    write_remote_compaction_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        r#"{"error":{"code":"foreign_compaction_checkpoint","message":"This conversation contains an opaque compaction checkpoint that WorkBuddy cannot read. The earlier context has not been discarded."}}"#,
+                    )
+                    .await;
+                }
+                1 => {
+                    assert_eq!(body["stream"], false);
+                    assert!(
+                        body.get("tools")
+                            .and_then(Value::as_array)
+                            .is_none_or(Vec::is_empty)
+                    );
+                    let prompt = body["input"][0]["content"][0]["text"].as_str().unwrap();
+                    assert!(prompt.contains("visible Codex conversation history"));
+                    assert!(prompt.contains("不要逐会话手工修"));
+                    write_remote_compaction_response(
+                        &mut stream,
+                        "200 OK",
+                        &json!({
+                            "id":"resp_handoff",
+                            "object":"response",
+                            "status":"completed",
+                            "output":[{
+                                "type":"message",
+                                "role":"assistant",
+                                "content":[{"type":"output_text","text":"HTTP_HANDOFF_SUMMARY"}]
+                            }]
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+                2 | 3 => {
+                    assert!(!request.contains("gAAAAA_OPAQUE_HANDOFF"));
+                    assert!(request.contains("HTTP_HANDOFF_SUMMARY"));
+                    write_remote_compaction_response(
+                        &mut stream,
+                        "200 OK",
+                        &json!({
+                            "id":"resp_ok",
+                            "object":"response",
+                            "status":"completed",
+                            "output":[{
+                                "type":"message",
+                                "role":"assistant",
+                                "content":[{"type":"output_text","text":"OK"}]
+                            }]
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+                _ => unreachable!(),
+            }
+            requests.push(request);
+        }
+        requests
+    });
+
+    let mut settings =
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses);
+    settings.relay_profiles[0].relay_mode = RelayMode::PureApi;
+    settings.relay_profiles[0].official_mix_api_key = false;
+    // 压缩检查点交接不能依赖“宽松推理历史”开关；严格模式也必须处理 WorkBuddy 的明确拒收。
+    settings.relay_profiles[0].strict_responses_reasoning = true;
+    let request = json!({
+        "model":"workbuddy-model",
+        "stream":false,
+        "input":[
+            {"type":"compaction","id":"cmp_foreign","encrypted_content":"gAAAAA_OPAQUE_HANDOFF"},
+            {"type":"message","role":"user","content":"继续完成"}
+        ]
+    });
+    let headers = ProxySessionHeaders {
+        thread_id: Some(thread),
+        ..ProxySessionHeaders::default()
+    };
+    let result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+        &request.to_string(),
+        settings.clone(),
+        "/v1/responses",
+        None,
+        headers,
     )
+    .await
     .unwrap();
-    let anthropic_text = anthropic.to_string();
-    assert!(!anthropic_text.contains("OPAQUE_NATIVE"));
-    assert!(anthropic_text.contains("compacted by a different provider"));
+    assert_eq!(result.status_code, 200);
+
+    let cached = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+        &request.to_string(),
+        settings,
+        "/v1/responses",
+        None,
+        headers,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cached.status_code, 200);
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 4);
+}
+
+#[tokio::test]
+async fn foreign_compaction_stream_failure_retries_with_text_handoff() {
+    let _state_lock = settings_path_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
+    let state = temp.path().join("codex-plus-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let _state = EnvVarGuard::set("CODEX_PLUS_STATE_DIR", state.to_str().unwrap());
+    let thread = "01a1e487-stream-handoff-test";
+    write_visible_handoff_rollout(temp.path(), thread);
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            match index {
+                0 => {
+                    assert!(request.contains("gAAAAA_STREAM_OPAQUE"));
+                    write_test_sse_response(
+                        &mut stream,
+                        concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+                            "event: response.failed\n",
+                            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_stream\",\"status\":\"failed\",\"error\":{\"code\":\"foreign_compaction_checkpoint\",\"message\":\"This conversation contains an opaque compaction checkpoint that WorkBuddy cannot read. The earlier context has not been discarded.\"}}}\n\n"
+                        ),
+                    )
+                    .await;
+                }
+                1 => {
+                    let body = request_json_body(&request);
+                    assert_eq!(body["stream"], false);
+                    write_remote_compaction_response(
+                        &mut stream,
+                        "200 OK",
+                        &json!({
+                            "id":"resp_handoff_stream",
+                            "object":"response",
+                            "status":"completed",
+                            "output":[{
+                                "type":"message",
+                                "role":"assistant",
+                                "content":[{"type":"output_text","text":"STREAM_HANDOFF_SUMMARY"}]
+                            }]
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+                2 => {
+                    assert!(!request.contains("gAAAAA_STREAM_OPAQUE"));
+                    assert!(request.contains("STREAM_HANDOFF_SUMMARY"));
+                    write_test_sse_response(
+                        &mut stream,
+                        concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok_stream\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok_stream\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                    )
+                    .await;
+                }
+                _ => unreachable!(),
+            }
+            requests.push(request);
+        }
+        requests
+    });
+
+    let mut settings =
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses);
+    settings.relay_profiles[0].relay_mode = RelayMode::PureApi;
+    settings.relay_profiles[0].official_mix_api_key = false;
+    let request = json!({
+        "model":"workbuddy-model",
+        "stream":true,
+        "input":[
+            {"type":"compaction","id":"cmp_stream","encrypted_content":"gAAAAA_STREAM_OPAQUE"},
+            {"type":"message","role":"user","content":"继续"}
+        ]
+    });
+    let result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+        &request.to_string(),
+        settings,
+        "/v1/responses",
+        None,
+        ProxySessionHeaders {
+            thread_id: Some(thread),
+            ..ProxySessionHeaders::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status_code, 200);
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 3);
+}
+
+#[tokio::test]
+async fn chat_conversion_uses_visible_transcript_when_summary_is_incomplete() {
+    let _state_lock = settings_path_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
+    let state = temp.path().join("codex-plus-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let _state = EnvVarGuard::set("CODEX_PLUS_STATE_DIR", state.to_str().unwrap());
+    let thread = "01a1e487-chat-handoff-test";
+    write_visible_handoff_rollout(temp.path(), thread);
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            match index {
+                0 => {
+                    assert!(!request.contains("gAAAAA_CHAT_OPAQUE"));
+                    write_remote_compaction_response(
+                        &mut stream,
+                        "200 OK",
+                        &json!({
+                            "id":"chatcmpl_incomplete",
+                            "object":"chat.completion",
+                            "choices":[{
+                                "index":0,
+                                "message":{"role":"assistant","content":"partial"},
+                                "finish_reason":"length"
+                            }]
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+                1 | 2 => {
+                    let body = request_json_body(&request);
+                    let sent_text = body.to_string();
+                    assert!(!request.contains("gAAAAA_CHAT_OPAQUE"));
+                    assert!(sent_text.contains("把原任务完整交给 WorkBuddy"));
+                    assert!(sent_text.contains("不能静默丢掉前文"));
+                    write_remote_compaction_response(
+                        &mut stream,
+                        "200 OK",
+                        &json!({
+                            "id":"chatcmpl_ok",
+                            "object":"chat.completion",
+                            "choices":[{
+                                "index":0,
+                                "message":{"role":"assistant","content":"OK"},
+                                "finish_reason":"stop"
+                            }]
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+                _ => unreachable!(),
+            }
+            requests.push(request);
+        }
+        requests
+    });
+
+    let mut settings = remote_compaction_settings(
+        &format!("http://{address}/v1"),
+        RelayProtocol::ChatCompletions,
+    );
+    settings.relay_profiles[0].relay_mode = RelayMode::PureApi;
+    settings.relay_profiles[0].official_mix_api_key = false;
+    let request = json!({
+        "model":"workbuddy-model",
+        "stream":false,
+        "tools":[],
+        "input":[
+            {"type":"compaction","id":"cmp_chat","encrypted_content":"gAAAAA_CHAT_OPAQUE"},
+            {"type":"message","role":"user","content":"继续完成"}
+        ]
+    });
+    let headers = ProxySessionHeaders {
+        thread_id: Some(thread),
+        ..ProxySessionHeaders::default()
+    };
+    let first = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+        &request.to_string(),
+        settings.clone(),
+        "/v1/responses",
+        None,
+        headers,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.status_code, 200);
+
+    let second = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+        &request.to_string(),
+        settings,
+        "/v1/responses",
+        None,
+        headers,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.status_code, 200);
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 3);
 }
 
 #[test]
@@ -4943,6 +5395,7 @@ fn upstream_header_timeout_is_bounded_for_hung_providers() {
     assert!(upstream_header_timeout() >= Duration::from_secs(30));
     assert!(upstream_header_timeout() <= Duration::from_secs(60));
     assert!(upstream_stream_header_timeout() >= Duration::from_secs(120));
+    assert!(upstream_stream_header_timeout() <= Duration::from_secs(3600));
     assert!(upstream_stream_idle_timeout() >= Duration::from_secs(60));
     assert!(upstream_stream_idle_timeout() <= Duration::from_secs(180));
 }
