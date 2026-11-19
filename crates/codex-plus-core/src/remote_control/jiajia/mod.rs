@@ -38,6 +38,10 @@ pub const MCP_FLAG: &str = "--codex-plus-jiajia-mcp";
 pub const ENV_URL: &str = "CODEX_PLUS_JIAJIA_URL";
 pub const ENV_TOKEN: &str = "CODEX_PLUS_JIAJIA_TOKEN";
 pub const MCP_SERVER_ID: &str = "jiajia";
+/// 微信里发给加加时记的发送方（网页上显示「微信」）：微信桥和 `focus_thread` 工具都靠它认出「本人在微信里说的话」。
+pub const WEIXIN_SENDER: &str = "微信";
+/// `focus_thread` 发出的请求过了这么久还没被微信桥取走就作废（微信连接没开着）。
+pub const FOCUS_REQUEST_TTL_MS: i64 = 2 * 60 * 1000;
 
 /// 后台循环的节拍；看会话的间隔。
 const TICK: Duration = Duration::from_secs(2);
@@ -51,10 +55,18 @@ const ROTATE_RATIO: f64 = 0.7;
 /// 推送给网页时带多少条最近的记录。
 const STATE_MESSAGES: usize = 80;
 
+/// 加加让微信进入专注的请求（`focus_thread` 工具发出，微信桥取走后切到这个会话）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusRequest {
+    pub thread_id: String,
+    pub title: String,
+    pub at: i64,
+}
+
 /// 交给加加的一条输入。
 #[derive(Debug, Clone)]
 enum Input {
-    User(String, Principal),
+    User(String, Principal, bool),
     Events(String),
     Later(String),
 }
@@ -62,15 +74,19 @@ enum Input {
 impl Input {
     fn text(&self) -> &str {
         match self {
-            Input::User(text, _) | Input::Events(text) | Input::Later(text) => text,
+            Input::User(text, _, _) | Input::Events(text) | Input::Later(text) => text,
         }
     }
 
     fn principal(&self) -> Option<&Principal> {
         match self {
-            Self::User(_, principal) => Some(principal),
+            Self::User(_, principal, _) => Some(principal),
             Self::Events(_) | Self::Later(_) => None,
         }
+    }
+
+    fn from_weixin(&self) -> bool {
+        matches!(self, Self::User(_, _, true))
     }
 }
 
@@ -78,13 +94,16 @@ impl Input {
 fn take_inputs(
     queue: &mut VecDeque<Input>,
     principal: Option<&Principal>,
+    from_weixin: bool,
     steering: bool,
 ) -> Vec<Input> {
+    let same_sender =
+        |input: &Input| input.principal() == principal && input.from_weixin() == from_weixin;
     let mut inputs = Vec::new();
     if steering {
         let mut rest = VecDeque::new();
         for input in queue.drain(..) {
-            if matches!(input, Input::User(_, _)) && input.principal() == principal {
+            if matches!(input, Input::User(..)) && same_sender(&input) {
                 inputs.push(input);
             } else {
                 rest.push_back(input);
@@ -92,10 +111,7 @@ fn take_inputs(
         }
         *queue = rest;
     } else {
-        while queue
-            .front()
-            .is_some_and(|input| input.principal() == principal)
-        {
+        while queue.front().is_some_and(same_sender) {
             inputs.push(queue.pop_front().unwrap());
         }
     }
@@ -149,6 +165,10 @@ pub struct Jiajia {
     sender: Mutex<Option<Principal>>,
     /// 加加用 read_thread 看过的每个会话的最后一轮：这一轮的跑完 / 出错不用再告诉它（它已经知道了）。
     seen_ends: Mutex<HashMap<String, String>>,
+    /// 最近一条用户消息是从哪儿来的（`by`）：`focus_thread` 只在用户是从微信说话时有效。
+    active_from_weixin: AtomicBool,
+    /// 等微信桥取走的「进入专注」请求。
+    focus_request: Mutex<Option<FocusRequest>>,
     changed: watch::Sender<u64>,
     tool_token: String,
     port: AtomicU16,
@@ -166,6 +186,8 @@ impl Jiajia {
             status: Mutex::new((false, None)),
             sender: Mutex::new(None),
             seen_ends: Mutex::new(HashMap::new()),
+            active_from_weixin: AtomicBool::new(false),
+            focus_request: Mutex::new(None),
             changed: watch::channel(0).0,
             tool_token: super::generate_token(),
             port: AtomicU16::new(0),
@@ -215,6 +237,31 @@ impl Jiajia {
             _ => None,
         };
         granted_role(sender.as_ref(), current)
+    }
+
+    /// 当前执行的回合是否来自已绑定的微信本人。
+    pub fn last_sender_is_weixin(&self) -> bool {
+        self.active_from_weixin
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 微信桥取走「进入专注」请求（取一次就没了；过期的丢掉）。
+    pub fn take_focus_request(&self) -> Option<FocusRequest> {
+        let request = self
+            .focus_request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        (now_ms() - request.at <= FOCUS_REQUEST_TTL_MS).then_some(request)
+    }
+
+    fn request_focus(&self, thread_id: &str, title: &str) {
+        *self.focus_request.lock().unwrap_or_else(|e| e.into_inner()) = Some(FocusRequest {
+            thread_id: thread_id.to_string(),
+            title: title.to_string(),
+            at: now_ms(),
+        });
+        self.touch();
     }
 
     /// 加加读过这个会话：记下它看到的最后一轮。
@@ -307,6 +354,28 @@ impl Jiajia {
 
     pub fn page_before(&self, before: Option<u64>, limit: usize) -> Vec<ChatMessage> {
         self.store().page_before(before, limit.clamp(1, 200))
+    }
+
+    /// 聊天记录当前的位置：(变更序号, 最后一条的 id)。微信转发从这里开始，不重放旧记录。
+    pub fn cursor(&self) -> (u64, u64) {
+        let store = self.store();
+        (
+            store.rev(),
+            store.messages.back().map(|message| message.id).unwrap_or(0),
+        )
+    }
+
+    /// 第一次选过模型（没选过时 `send` 会拒绝）。
+    pub fn is_configured(&self) -> bool {
+        self.store().settings.configured
+    }
+
+    /// 在别处（微信）处理了审批卡片：标成已处理，网页上跟着灰掉。
+    pub fn resolve_card(&self, id: u64) {
+        let changed = self.store().update(id, |message| message.resolved = true);
+        if changed {
+            self.touch();
+        }
     }
 
     pub fn mark_read(&self, upto: u64) {
@@ -500,6 +569,21 @@ impl Jiajia {
         by: Option<String>,
         principal: Principal,
     ) -> anyhow::Result<Value> {
+        self.enqueue_user(text, by, principal, false).await
+    }
+
+    pub(crate) async fn send_from_weixin(self: &Arc<Self>, text: &str) -> anyhow::Result<Value> {
+        self.enqueue_user(text, Some(WEIXIN_SENDER.into()), Principal::Master, true)
+            .await
+    }
+
+    async fn enqueue_user(
+        self: &Arc<Self>,
+        text: &str,
+        by: Option<String>,
+        principal: Principal,
+        from_weixin: bool,
+    ) -> anyhow::Result<Value> {
         let text = text.trim();
         if text.is_empty() {
             bail!("缺少 text");
@@ -522,7 +606,7 @@ impl Jiajia {
         self.queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push_back(Input::User(text.to_string(), principal));
+            .push_back(Input::User(text.to_string(), principal, from_weixin));
         self.touch();
         let jiajia = self.clone();
         tokio::spawn(async move { jiajia.pump().await });
@@ -582,7 +666,12 @@ impl Jiajia {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                take_inputs(&mut queue, sender.as_ref(), true)
+                take_inputs(
+                    &mut queue,
+                    sender.as_ref(),
+                    self.last_sender_is_weixin(),
+                    true,
+                )
             };
             if user.is_empty() {
                 return;
@@ -609,22 +698,29 @@ impl Jiajia {
             }
             return;
         }
-        let (inputs, sender) = {
+        let (inputs, sender, from_weixin) = {
             let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             let sender = queue.front().and_then(Input::principal).cloned();
-            (take_inputs(&mut queue, sender.as_ref(), false), sender)
+            let from_weixin = queue.front().is_some_and(Input::from_weixin);
+            (
+                take_inputs(&mut queue, sender.as_ref(), from_weixin, false),
+                sender,
+                from_weixin,
+            )
         };
         if inputs.is_empty() {
             return;
         }
         {
             let mut previous = self.sender.lock().unwrap_or_else(|e| e.into_inner());
-            if *previous != sender {
+            if *previous != sender || self.last_sender_is_weixin() != from_weixin {
                 if let Some(bot) = bot.as_mut() {
                     bot.rotate = true;
                 }
             }
             *previous = sender;
+            self.active_from_weixin
+                .store(from_weixin, std::sync::atomic::Ordering::SeqCst);
         }
         let result = async {
             self.ensure_thread(&mut bot).await?;
@@ -1200,7 +1296,7 @@ impl Jiajia {
     }
 
     /// 某个会话当前的状态（工具列会话时用；没看过的返回 None）。
-    async fn known_phase(&self, thread_id: &str) -> Option<(Phase, Option<String>)> {
+    pub(crate) async fn known_phase(&self, thread_id: &str) -> Option<(Phase, Option<String>)> {
         let watcher = self.watcher.lock().await;
         watcher.tracked.get(thread_id).map(|tracked| {
             (
@@ -1319,19 +1415,45 @@ mod authority_tests {
         let message = device("phone", Role::Message);
         let full = device("desktop", Role::Full);
         let mut queue = VecDeque::from([
-            Input::User("first".into(), message.clone()),
-            Input::User("admin".into(), full.clone()),
-            Input::User("later".into(), message.clone()),
+            Input::User("first".into(), message.clone(), false),
+            Input::User("admin".into(), full.clone(), false),
+            Input::User("later".into(), message.clone(), false),
         ]);
-        let first = take_inputs(&mut queue, Some(&message), false);
+        let first = take_inputs(&mut queue, Some(&message), false, false);
         assert_eq!(first.len(), 1);
-        let steering = take_inputs(&mut queue, Some(&message), true);
+        let steering = take_inputs(&mut queue, Some(&message), false, true);
         assert_eq!(steering.len(), 1);
         assert_eq!(queue.front().unwrap().principal(), Some(&full));
         assert_eq!(
             granted_role(Some(&message), Some(Role::Message)),
             Role::Message
         );
+    }
+
+    #[test]
+    fn weixin_input_cannot_steer_a_web_turn_from_the_same_owner() {
+        let master = Principal::Master;
+        let mut queue = VecDeque::from([
+            Input::User("wechat".into(), master.clone(), true),
+            Input::User("web".into(), master.clone(), false),
+        ]);
+        let web = take_inputs(&mut queue, Some(&master), false, true);
+        assert_eq!(web[0].text(), "web");
+        assert!(queue.front().unwrap().from_weixin());
+    }
+
+    #[tokio::test]
+    async fn weixin_origin_is_active_only_after_its_input_is_processed() {
+        let dir = tempfile::tempdir().unwrap();
+        let jiajia = Jiajia::new(dir.path().to_path_buf(), Weak::new());
+        jiajia
+            .update_settings(&json!({ "configured": true }))
+            .await
+            .unwrap();
+        jiajia.send_from_weixin("进入指定会话").await.unwrap();
+        assert!(!jiajia.last_sender_is_weixin());
+        jiajia.pump().await;
+        assert!(jiajia.last_sender_is_weixin());
     }
 
     #[test]

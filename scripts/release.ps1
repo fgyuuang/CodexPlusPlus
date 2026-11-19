@@ -109,6 +109,16 @@ function Assert-NoCompiler {
     $active = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('cargo.exe', 'rustc.exe', 'link.exe', 'tauri.exe') })
     if ($active.Count) { throw 'Another compiler is still active. Refusing a concurrent build/delivery; inspect processes first.' }
 }
+function Get-ReleaseDirectory {
+    $target = if ($env:CARGO_TARGET_DIR) {
+        if (-not [IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)) { throw 'CARGO_TARGET_DIR must be an absolute path.' }
+        [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+    } else {
+        Join-Path $repoRoot 'target'
+    }
+    Assert-PlainPath $target
+    Join-Path $target 'release'
+}
 function Get-RuntimeDependencySnapshot {
     $manifest = [IO.File]::ReadAllText((Join-Path $repoRoot 'Cargo.toml'), [Text.Encoding]::UTF8)
     # 只处理当前显式启用的共享语音库；绝不把 target/release 中任意 DLL 打包。
@@ -119,7 +129,7 @@ function Get-RuntimeDependencySnapshot {
     }
     $version = $Matches[1]
     if ($version -notmatch '^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$') { throw 'Invalid sherpa-onnx native-library version.' }
-    $releaseDirectory = Join-Path $repoRoot 'target/release'
+    $releaseDirectory = Get-ReleaseDirectory
     $cacheDirectory = Join-Path $repoRoot 'target/sherpa-onnx-prebuilt'
     $candidates = if ($env:SHERPA_ONNX_LIB_DIR) {
         @([IO.Path]::GetFullPath($env:SHERPA_ONNX_LIB_DIR))
@@ -415,14 +425,14 @@ try {
             $script:state['runtimeDependencies'] = @(Get-RuntimeDependencySnapshot)
             $artifactNames = @($names) + @($script:state.runtimeDependencies | ForEach-Object { $_.name })
             foreach ($name in $artifactNames) {
-                $artifact = Get-Item -LiteralPath (Join-Path $repoRoot "target/release/$name")
+                $artifact = Get-Item -LiteralPath (Join-Path (Get-ReleaseDirectory) $name)
                 if ($artifact.Length -eq 0) { throw "Empty release artifact: $name" }
                 if ($name -eq $names[0] -and $artifact.LastWriteTimeUtc -lt $index.LastWriteTimeUtc) { throw 'Manager predates generated frontend; refusing delivery.' }
                 $script:state.artifacts += @{ name=$name; sha256=(Get-FileHash -LiteralPath $artifact.FullName).Hash; lastWriteTime=$artifact.LastWriteTimeUtc.ToString('o'); length=$artifact.Length }
             }
             $script:state.stage = 'delivery'
             Save-State
-            Save-Artifacts (Join-Path $repoRoot 'target/release')
+            Save-Artifacts (Get-ReleaseDirectory)
             Publish-Artifacts
             $script:state['runningInstances'] = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in $names } | Select-Object ProcessId, Name, CreationDate, ExecutablePath)
             $script:state.state = 'succeeded'

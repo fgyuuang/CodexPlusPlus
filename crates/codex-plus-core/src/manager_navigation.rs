@@ -130,7 +130,8 @@ fn normalize_navigation(
     }
     match (navigation.page.as_str(), navigation.section.as_deref()) {
         ("relay", None | Some("official")) => Ok(navigation),
-        ("settings" | "pluginMarket", None)
+        // weixin：Codex 里「微信连接」页的「在 Codex++ 管理工具里打开更多设置」。
+        ("settings" | "pluginMarket" | "weixin", None)
         | ("enhance", None | Some("stepwise" | "dictation")) => Ok(navigation),
         _ => anyhow::bail!(
             "不支持的管理工具导航：{}/{}",
@@ -276,6 +277,11 @@ mod tests {
             },
             ManagerNavigationIntent {
                 page: "settings".to_string(),
+                section: None,
+            },
+            // Codex 里「微信连接」页跳到管理器的微信页。
+            ManagerNavigationIntent {
+                page: "weixin".to_string(),
                 section: None,
             },
         ] {

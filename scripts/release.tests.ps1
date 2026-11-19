@@ -63,7 +63,8 @@ if ($args -contains '--release') {
     [IO.File]::WriteAllText((Join-Path $root 'release-started.txt'), 'started')
     Start-Sleep -Seconds 3
     if ((Get-Content -LiteralPath (Join-Path $root 'mode.txt') -Raw) -eq 'cargo-failure') { 'simulated cargo failure'; exit 17 }
-    $release = Join-Path $root 'target/release'
+    $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
+    $release = Join-Path $target 'release'
     [IO.Directory]::CreateDirectory($release) | Out-Null
     foreach ($name in @('codex-plus-plus-manager.exe', 'codex-plus-plus.exe', 'codex-plus-mobile-relay.exe')) {
         [IO.File]::WriteAllText((Join-Path $release $name), "new $name")
@@ -130,6 +131,22 @@ $result = Read-StatusFile $task
 Assert ($result.state -eq 'succeeded' -and $result.delivery.Count -eq 3) 'Default delivery must only publish three bin artifacts.'
 foreach ($name in $names) { Assert ((Get-Content -LiteralPath (Join-Path $fixture.runtime $name) -Raw) -eq 'old artifact') 'Default must not change runtime files.' }
 Write-Output 'PASS default bin-only delivery preserves runtime'
+
+$fixture = New-Fixture 'shared-target'
+$priorTarget = $env:CARGO_TARGET_DIR
+try {
+    $env:CARGO_TARGET_DIR = Join-Path $fixture.root 'shared cache'
+    $task = Start-Fixture $fixture
+    Wait-Until { (Read-StatusFile $task).state -in @('succeeded', 'failed') } 'shared target delivery'
+    $status = Read-StatusFile $task
+    Assert ($status.state -eq 'succeeded') "Shared target delivery failed: $($status.error)"
+    foreach ($name in $names) {
+        Assert ((Get-Content -LiteralPath (Join-Path $fixture.runtime $name) -Raw) -eq "new $name") 'Shared target artifact not delivered.'
+    }
+} finally {
+    $env:CARGO_TARGET_DIR = $priorTarget
+}
+Write-Output 'PASS explicit shared target delivery and hashes'
 
 $fixture = New-Fixture 'sherpa-success'
 $task = Start-Fixture $fixture

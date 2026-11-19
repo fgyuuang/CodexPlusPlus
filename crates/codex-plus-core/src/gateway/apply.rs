@@ -614,6 +614,21 @@ fn codex_model_metadata(
             }
             // 组里轮到不收图的那家就会失败：图片能力取各成员的交集。
             narrow_image_capability(&mut fields, &member_fields);
+            // 设了图像输入模型（#3150）：带图片的请求只发给它，组就能收图，原图细节按图像输入模型的算。
+            if !group.image_input_model.trim().is_empty() {
+                let image_fields: Vec<Map<String, Value>> =
+                    route::group_image_input_members(gateway, binding, group)
+                        .iter()
+                        .filter_map(|(relay, upstream)| {
+                            let index = relays
+                                .iter()
+                                .position(|candidate| candidate.id == relay.id)?;
+                            member_catalog_entry(&mut member_catalogs, &relays, index, upstream)
+                        })
+                        .map(|entry| catalog_ui_fields(&entry))
+                        .collect();
+                open_image_capability(&mut fields, &image_fields);
+            }
             fields.insert("display_name".into(), json!(group.name));
             fields.insert(
                 "description".into(),
@@ -966,6 +981,36 @@ fn narrow_image_capability(fields: &mut Map<String, Value>, members: &[Map<Strin
         })
         .collect();
     if !originals.is_empty() {
+        fields.insert(
+            "supports_image_detail_original".into(),
+            json!(originals.iter().all(|original| *original)),
+        );
+    }
+}
+
+/// 模型组设了图像输入模型时（#3150）：`input_modalities` 补上 image——带图片的请求不会落到不收图的成员，
+/// Codex 不该再拦着贴图。用户明确指定了图像输入模型，就算它的目录条目没声明收图也照样打开：
+/// 图像输入模型真不可用时由网关路由给出明确错误，而不是让 Codex 笼统地报「不支持图像输入」。
+/// `supports_image_detail_original` 只看图像输入模型（它们都声明支持才是 true），都没声明就不写。
+fn open_image_capability(fields: &mut Map<String, Value>, image_members: &[Map<String, Value>]) {
+    if let Some(modalities) = fields
+        .get_mut("input_modalities")
+        .and_then(Value::as_array_mut)
+        && !modalities.iter().any(|modality| modality == "image")
+    {
+        modalities.push(json!("image"));
+    }
+    let originals: Vec<bool> = image_members
+        .iter()
+        .filter_map(|member| {
+            member
+                .get("supports_image_detail_original")
+                .and_then(Value::as_bool)
+        })
+        .collect();
+    if originals.is_empty() {
+        fields.remove("supports_image_detail_original");
+    } else {
         fields.insert(
             "supports_image_detail_original".into(),
             json!(originals.iter().all(|original| *original)),
@@ -2918,21 +2963,25 @@ pub fn copy_claude_provider(provider: &ClaudeProvider) -> anyhow::Result<RelayPr
             models.push(model);
         }
     }
-    let mut profile = build_relay(&ProviderInput {
-        name: provider.name.clone(),
-        base_url,
-        protocol: RelayProtocol::AnthropicMessages,
-        keys: vec![api_key],
-        model: models.first().cloned().unwrap_or_default(),
-        model_list: models.join("\n"),
-        price: None,
-        model_prices: None,
-        proxy: None,
-        strip_image_generation_tool: None,
-        subscription_policy: None,
-        strip_responses_image_detail: None,
-        disable_tool_search: None,
-    })?;
+    let mut profile = build_relay(
+        &ProviderInput {
+            name: provider.name.clone(),
+            base_url,
+            protocol: RelayProtocol::AnthropicMessages,
+            keys: vec![api_key],
+            model: models.first().cloned().unwrap_or_default(),
+            model_list: models.join("\n"),
+            price: None,
+            model_prices: None,
+            proxy: None,
+            strip_image_generation_tool: None,
+            subscription_policy: None,
+            strip_responses_image_detail: None,
+            disable_tool_search: None,
+            custom_headers: None,
+        },
+        Vec::new(),
+    )?;
     if bearer {
         profile.anthropic_auth_header =
             crate::anthropic_bridge::ANTHROPIC_AUTH_HEADER_BEARER.to_string();
@@ -2975,21 +3024,25 @@ pub fn copy_grok_profile(
         .into_iter()
         .filter_map(|(slug, window)| window.map(|window| (slug, window.to_string())))
         .collect();
-    let mut relay = build_relay(&ProviderInput {
-        name: source.name.clone(),
-        base_url,
-        protocol: source.protocol,
-        keys: vec![source.api_key.clone()],
-        model: models.first().cloned().unwrap_or_default(),
-        model_list: models.join("\n"),
-        price: None,
-        model_prices: None,
-        proxy: None,
-        strip_image_generation_tool: None,
-        subscription_policy: None,
-        strip_responses_image_detail: None,
-        disable_tool_search: None,
-    })?;
+    let mut relay = build_relay(
+        &ProviderInput {
+            name: source.name.clone(),
+            base_url,
+            protocol: source.protocol,
+            keys: vec![source.api_key.clone()],
+            model: models.first().cloned().unwrap_or_default(),
+            model_list: models.join("\n"),
+            price: None,
+            model_prices: None,
+            proxy: None,
+            strip_image_generation_tool: None,
+            subscription_policy: None,
+            strip_responses_image_detail: None,
+            disable_tool_search: None,
+            custom_headers: None,
+        },
+        Vec::new(),
+    )?;
     if !windows.is_empty() {
         relay.model_windows = serde_json::to_string(&windows)?;
     }
@@ -3320,6 +3373,9 @@ pub struct ProviderInput {
     /// 不向该上游发送 `tool_search` 托管工具（#2868）；不传表示不改。
     #[serde(default)]
     pub disable_tool_search: Option<bool>,
+    /// 自定义请求头（#3075）；不传表示不改（编辑时保留原来的）。敏感头没改时回传 `keep`。
+    #[serde(default)]
+    pub custom_headers: Option<Vec<crate::gateway::provider_headers::ProviderHeaderInput>>,
 }
 
 /// 代理地址只接受 http / https / socks5，空串表示不单独走代理。
@@ -3352,7 +3408,11 @@ fn clean_keys(keys: &[String]) -> Vec<String> {
 }
 
 /// 按输入组装上游配置：多个 Key 写成命名 Key，参与多 Key 轮换。
-fn build_relay(input: &ProviderInput) -> anyhow::Result<RelayProfile> {
+/// `custom_headers` 是已经按 [`crate::gateway::provider_headers::resolve`] 换好值的请求头。
+fn build_relay(
+    input: &ProviderInput,
+    custom_headers: Vec<crate::settings::RelayHeaderKeyValue>,
+) -> anyhow::Result<RelayProfile> {
     if input.base_url.contains("/gw/") {
         bail!("不能把网关自己加进供应商池");
     }
@@ -3373,6 +3433,8 @@ fn build_relay(input: &ProviderInput) -> anyhow::Result<RelayProfile> {
     relay.strip_image_generation_tool = input.strip_image_generation_tool.unwrap_or(false);
     relay.strip_responses_image_detail = input.strip_responses_image_detail.unwrap_or(false);
     relay.disable_tool_search = input.disable_tool_search.unwrap_or(false);
+    // 存盘前的规范化会再按 relay_headers 校验一次。
+    relay.custom_headers = custom_headers;
     if keys.len() > 1 {
         relay.api_keys = keys
             .iter()
@@ -3477,9 +3539,16 @@ pub fn create_provider(
     skip_agents: Option<&[String]>,
 ) -> anyhow::Result<(GatewaySettings, String)> {
     let proxy = clean_proxy(input.proxy.as_deref().unwrap_or_default())?;
+    // 新供应商没有已保存的头可沿用。
+    let headers = crate::gateway::provider_headers::resolve(
+        &[],
+        "",
+        &input.base_url,
+        input.custom_headers.as_deref().unwrap_or_default(),
+    )?;
     add_provider_with(
         store,
-        build_relay(input)?,
+        build_relay(input, headers)?,
         source,
         skip_agents,
         |provider| {
@@ -3580,7 +3649,19 @@ fn update_provider_in(
             vec![provider.relay.api_key.clone()]
         };
     }
-    let mut relay = build_relay(&input)?;
+    // 自定义请求头（#3075）：传了就按表单换值（敏感头没改时沿用，换站点不沿用），没传就保留原来的。
+    let headers = match &input.custom_headers {
+        Some(rows) if crate::gateway::provider_headers::editable(&provider.relay) => {
+            crate::gateway::provider_headers::resolve(
+                &provider.relay.custom_headers,
+                &provider.relay.base_url,
+                &input.base_url,
+                rows,
+            )?
+        }
+        _ => provider.relay.custom_headers.clone(),
+    };
+    let mut relay = build_relay(&input, headers)?;
     relay.id = id.to_string();
     // 沿用原来的 Key 时连标识一起沿用：Key 池按标识记的冷却、会话固定不会错位到别的 Key 上（#2782）。
     if keep_keys && !provider.relay.api_keys.is_empty() {
@@ -3588,8 +3669,7 @@ fn update_provider_in(
         relay.active_api_key_id = provider.relay.active_api_key_id.clone();
         relay.api_key = provider.relay.api_key.clone();
     }
-    // 原来的请求头、User-Agent、Anthropic 鉴权方式这些高级设置保留。
-    relay.custom_headers = provider.relay.custom_headers.clone();
+    // 原来的 User-Agent、Anthropic 鉴权方式这些高级设置保留（请求头见上面）。
     relay.user_agent = provider.relay.user_agent.clone();
     relay.anthropic_auth_header = provider.relay.anthropic_auth_header.clone();
     // 按模型的思考等级等模型资料也保留（在供应商池详情里单独编辑）。
@@ -4115,6 +4195,12 @@ pub fn delete_provider(store: &GatewayStore, id: &str) -> anyhow::Result<Gateway
             group
                 .members
                 .retain(|member| route::member_outlives_provider(remaining, id, &member.model));
+            // 图像输入模型指向它的也清掉，回到跟随默认（#3150）。
+            if !group.image_input_model.is_empty()
+                && !route::member_outlives_provider(remaining, id, &group.image_input_model)
+            {
+                group.image_input_model.clear();
+            }
         }
         // Agent 绑定里指向它的模型也清掉（#2897）：默认模型、附加模型、分档模型、审批 / 标题模型
         // 留着 `<id>/…` 会让请求带着这个前缀落到别家上游。清空的单值字段回落到池里的默认。
@@ -4152,6 +4238,7 @@ pub fn delete_provider(store: &GatewayStore, id: &str) -> anyhow::Result<Gateway
             for field in [
                 &mut binding.auto_review_model,
                 &mut binding.title_model,
+                &mut binding.compaction_model,
                 &mut roles.opus,
                 &mut roles.sonnet,
                 &mut roles.haiku,
@@ -4232,6 +4319,9 @@ pub struct GroupInput {
     /// 手动模式下选中的成员。
     #[serde(default)]
     pub pick: String,
+    /// 图像输入模型（#3150）：省略时保留已有组的设置（旧界面不认这个字段），空串表示跟随默认。
+    #[serde(default)]
+    pub image_input_model: Option<String>,
 }
 
 /// 保存模型组。成员去空、去重；不能直接包含自己。返回组 id。
@@ -4298,8 +4388,18 @@ fn save_group_in(gateway: &mut GatewaySettings, input: &GroupInput) -> anyhow::R
         members,
         hide_members: input.hide_members,
         pick: input.pick.trim().to_string(),
+        image_input_model: match &input.image_input_model {
+            Some(model) => model.trim().to_string(),
+            None => gateway
+                .group(&id)
+                .map(|existing| existing.image_input_model.clone())
+                .unwrap_or_default(),
+        },
         extra: Default::default(),
     };
+    if group.image_input_model.eq_ignore_ascii_case(&own) {
+        bail!("图像输入模型不能是这个组自己");
+    }
     match gateway.groups.iter_mut().find(|known| known.id == id) {
         Some(existing) => {
             // 更新版本写的未知字段跟着原来的组走。
@@ -4383,6 +4483,9 @@ pub fn delete_group(store: &GatewayStore, id: &str) -> anyhow::Result<GatewaySet
         let reference = format!("{GROUP_MODEL_PREFIX}{id}");
         for group in &mut gateway.groups {
             group.members.retain(|member| member.model != reference);
+            if group.image_input_model.eq_ignore_ascii_case(&reference) {
+                group.image_input_model.clear();
+            }
         }
         Ok(())
     })?;
@@ -4596,6 +4699,7 @@ mod tests {
                 subscription_policy: None,
                 strip_responses_image_detail: None,
                 disable_tool_search: None,
+                custom_headers: None,
             },
             "",
             None,
@@ -4643,6 +4747,7 @@ mod tests {
                 subscription_policy: None,
                 strip_responses_image_detail: None,
                 disable_tool_search: None,
+                custom_headers: None,
             },
             "",
             None,

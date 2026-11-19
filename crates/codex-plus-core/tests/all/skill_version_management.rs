@@ -39,7 +39,7 @@ fn reconciling_a_modified_agent_copy_preserves_previous_versions_and_allows_upda
             .local_versions("reviewer")
             .unwrap()
             .into_iter()
-            .map(|v| (v.root, v.revision))
+            .map(|v| (v.root, v.revision.unwrap()))
             .collect::<BTreeMap<_, _>>()
     };
     let stale = revisions();
@@ -121,7 +121,7 @@ fn matching_agent_installs_sync_without_picking_an_agent_and_reject_stale_state(
             .local_versions("alpha")
             .unwrap()
             .into_iter()
-            .map(|v| (v.root, v.revision))
+            .map(|v| (v.root, v.revision.unwrap()))
             .collect()
     };
     let stale = revisions();
@@ -163,7 +163,7 @@ fn retaining_same_name_versions_leaves_files_independent_and_identifies_local_so
             .local_versions("x")
             .unwrap()
             .into_iter()
-            .map(|v| (v.root, v.revision))
+            .map(|v| (v.root, v.revision.unwrap()))
             .collect::<BTreeMap<_, _>>()
     };
     manager.keep_local_versions("x", revisions()).unwrap();
@@ -209,7 +209,8 @@ fn selected_version_archive_restore_export_and_enable_never_overwrite_another_ag
     let path = root.join("claude/alpha");
     fs::create_dir_all(&path).unwrap();
     fs::write(path.join("SKILL.md"), "local").unwrap();
-    let revision = &manager.local_versions("alpha").unwrap()[0].revision;
+    let versions = manager.local_versions("alpha").unwrap();
+    let revision = versions[0].revision.as_deref().unwrap();
     manager
         .enable_local_version("alpha", "claude", revision, "grok")
         .unwrap();
@@ -251,7 +252,10 @@ fn a_local_version_backup_restores_only_to_its_configured_empty_root() {
         .with_agent_dirs(vec![("claude".into(), claude.clone())]);
     fs::create_dir_all(claude.join("alpha")).unwrap();
     fs::write(claude.join("alpha/SKILL.md"), "original").unwrap();
-    let revision = manager.local_versions("alpha").unwrap()[0].revision.clone();
+    let revision = manager.local_versions("alpha").unwrap()[0]
+        .revision
+        .clone()
+        .unwrap();
     manager
         .archive_local_version("alpha", "claude", &revision)
         .unwrap();
@@ -273,5 +277,190 @@ fn a_local_version_backup_restores_only_to_its_configured_empty_root() {
         std::path::Path::new(&backup.backup_path)
             .join("SKILL.md")
             .is_file()
+    );
+}
+
+fn directory_link(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let target: std::path::PathBuf = target.components().collect();
+        let link: std::path::PathBuf = link.components().collect();
+        let result = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "junction creation failed: {result:?}"
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[test]
+fn backup_export_rejects_internal_roots_descendants_and_directory_aliases() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source = root.join("source");
+    let backups = root.join("backups");
+    let shared = root.join("shared");
+    let manager = SkillsManager::new(
+        &source,
+        &backups,
+        root.join("state.json"),
+        root.join("home"),
+    )
+    .with_shared_skills_dir(&shared)
+    .with_agent_dirs(vec![("claude".into(), root.join("claude"))]);
+    fs::create_dir_all(backups.join("alpha-123")).unwrap();
+    fs::write(backups.join("alpha-123/SKILL.md"), "saved").unwrap();
+    for protected in [
+        &source,
+        &backups,
+        &shared,
+        &root.join("home/skills/.codex-plus-backups"),
+        &root.join("claude/.codex-plus-backups"),
+    ] {
+        fs::create_dir_all(protected.join("nested")).unwrap();
+        for directory in [protected.clone(), protected.join("nested")] {
+            let error = manager
+                .export_skill_backup("alpha-123", &directory)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("不能另存到"), "{error}");
+            assert!(!directory.join("alpha").exists());
+        }
+    }
+    let alias = root.join("alias");
+    directory_link(&shared, &alias);
+    assert!(manager.export_skill_backup("alpha-123", &alias).is_err());
+    assert!(!shared.join("alpha").exists());
+    let ordinary = root.join("ordinary");
+    fs::create_dir(&ordinary).unwrap();
+    manager.export_skill_backup("alpha-123", &ordinary).unwrap();
+    assert_eq!(
+        fs::read_to_string(ordinary.join("alpha/SKILL.md")).unwrap(),
+        "saved"
+    );
+    assert_eq!(
+        fs::read_to_string(backups.join("alpha-123/SKILL.md")).unwrap(),
+        "saved"
+    );
+}
+
+#[test]
+fn backup_export_cannot_create_a_missing_managed_root_through_its_parent_alias() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let real = root.join("real");
+    fs::create_dir(&real).unwrap();
+    let alias = root.join("alias");
+    directory_link(&real, &alias);
+    let backups = root.join("backups");
+    fs::create_dir_all(backups.join("alpha-123")).unwrap();
+    fs::write(backups.join("alpha-123/SKILL.md"), "saved").unwrap();
+    let manager = SkillsManager::new(
+        alias.join("alpha"),
+        &backups,
+        root.join("state.json"),
+        root.join("home"),
+    );
+    assert!(manager.export_skill_backup("alpha-123", &real).is_err());
+    assert!(!real.join("alpha").exists());
+}
+
+#[test]
+fn an_uncomparable_location_does_not_hide_other_versions_or_allow_incomplete_reconciliation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let manager = SkillsManager::new(
+        root.join("source"),
+        root.join("backups"),
+        root.join("state.json"),
+        root.join("home"),
+    )
+    .with_agent_dirs(vec![
+        ("claude".into(), root.join("claude")),
+        ("grok".into(), root.join("grok")),
+    ]);
+    for directory in [
+        "source/alpha",
+        "home/skills/alpha",
+        "claude/alpha",
+        "external",
+    ] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+        fs::write(root.join(directory).join("SKILL.md"), "original").unwrap();
+    }
+    let stale = manager
+        .local_versions("alpha")
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.root, v.revision.unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    directory_link(&root.join("external"), &root.join("claude/alpha/nested"));
+    let versions = manager.local_versions("alpha").unwrap();
+    assert_eq!(versions.len(), 3);
+    let json = serde_json::to_value(&versions).unwrap();
+    let bad = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["root"] == "claude")
+        .unwrap();
+    assert!(bad["revision"].is_null());
+    assert!(bad["modifiedAtMs"].is_null());
+    assert!(
+        bad["comparisonError"]
+            .as_str()
+            .unwrap()
+            .contains("符号链接")
+    );
+    assert!(
+        json.as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["root"] != "claude")
+            .all(|v| v["comparisonError"].is_null() && v["revision"].is_string())
+    );
+    let error = manager
+        .reconcile_managed_versions("alpha", "codex", stale.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("无法比较") && error.contains("claude"),
+        "{error}"
+    );
+    assert!(manager.sync_installed_copies("alpha", stale).is_err());
+    assert!(!root.join("backups").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("external/SKILL.md")).unwrap(),
+        "original"
+    );
+
+    let good = versions
+        .iter()
+        .find(|v| v.root == "codex")
+        .unwrap()
+        .revision
+        .as_deref()
+        .unwrap();
+    manager
+        .enable_local_version("alpha", "codex", good, "grok")
+        .unwrap();
+    manager
+        .keep_local_versions("alpha", BTreeMap::from([("codex".into(), good.into())]))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("grok/alpha/SKILL.md")).unwrap(),
+        "original"
+    );
+    assert!(
+        manager
+            .enable_local_version("alpha", "claude", "unavailable", "grok")
+            .is_err()
     );
 }

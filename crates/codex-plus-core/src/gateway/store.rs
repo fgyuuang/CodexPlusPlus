@@ -412,6 +412,11 @@ pub struct GatewayGroup {
     /// 手动模式下选中的成员（成员的模型名）；空串表示第一个成员。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pick: String,
+    /// 图像输入模型（#3150）：请求上下文里带图片时整次改发给它，没图片时照常按组路由。
+    /// 写法同成员（`<供应商 id>/<模型>`、裸模型名或 `group/<组 id>`），可以不是组里的成员。
+    /// 空串表示跟随默认：目录里组的图片能力取各成员交集，路由不看图片。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_input_model: String,
     /// 不认识的字段原样保留。
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -556,6 +561,15 @@ pub struct AgentBinding {
     /// 填了就把识别出的起名请求改发到这个模型（写法同审批模型）；空串表示不改，保持原有行为。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title_model: String,
+    /// 压缩模型（#3142，目前只有 Codex 用）：Codex 的上下文压缩请求改发到这个模型（写法同审批模型），
+    /// 普通对话、工具调用仍用主模型。空串表示跟随当前模型，保持原有行为。
+    /// 只在能安全换模型的压缩形态生效；不可用、协议不兼容、窗口装不下或上游拒绝时回退原模型
+    /// （见 [`crate::gateway::compaction_model`]）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub compaction_model: String,
+    /// 改发到压缩模型时单独用的推理强度（如 low）；空串表示沿用原请求的推理强度。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub compaction_reasoning_effort: String,
     /// 写给 Agent 的上下文窗口（Claude Code 的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -592,6 +606,8 @@ impl Default for AgentBinding {
             unknown_model: UnknownModelPolicy::default(),
             auto_review_model: String::new(),
             title_model: String::new(),
+            compaction_model: String::new(),
+            compaction_reasoning_effort: String::new(),
             context_window: None,
             claude_enable_effort: false,
             pool_exclude: Vec::new(),
@@ -707,6 +723,12 @@ pub struct GatewaySettings {
     /// 开着时供应商页提示可以导入。默认关（opt-in）：关着时不读这些登录文件。
     #[serde(default)]
     pub local_login_discovery: bool,
+    /// Codex 与 Codex++（直连本地代理和网关）之间用 Responses WebSocket（2.7.0 起支持）。
+    /// 默认关（opt-in）：握手阶段回 426，Codex 改走 HTTP/SSE，与 2.6 一致。WS 续接依赖上游保留
+    /// 连接内状态：第三方中转接受了升级却不保留状态时续接请求会丢推理和上下文（#3175），
+    /// 闲置后上游断开也会让续接失败（#3169）。需要更低延迟、上游确实支持时在网关选项里打开。
+    #[serde(default)]
+    pub responses_websocket: bool,
     /// 自动组上改过的设置（键是小写模型名）。没改过的自动组不落盘，跟着供应商池自动变化。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub auto_groups: BTreeMap<String, AutoGroupSettings>,
@@ -762,6 +784,7 @@ impl Default for GatewaySettings {
             auto_models: true,
             model_suffix: true,
             local_login_discovery: false,
+            responses_websocket: false,
             auto_groups: BTreeMap::new(),
             favorite_models: Vec::new(),
             image_models: BTreeMap::new(),
@@ -1662,6 +1685,32 @@ mod tests {
         );
         std::fs::write(&store.path, r#"{"subagentModelFollowRequest":true}"#).unwrap();
         assert!(store.load().unwrap().subagent_model_follow_request);
+    }
+
+    /// #3150：旧文件的组没有 imageInputModel，读成跟随默认；没设时不落键，设了能原样读回。
+    #[test]
+    fn group_image_model_is_optional_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        std::fs::write(
+            &store.path,
+            r#"{"groups":[{"id":"g","name":"G","members":[{"model":"a/m"}]}]}"#,
+        )
+        .unwrap();
+        let mut settings = store.load().unwrap();
+        assert_eq!(settings.groups[0].image_input_model, "");
+        store.save(&settings).unwrap();
+        let text = fs::read_to_string(&store.path).unwrap();
+        assert!(!text.contains("imageInputModel"), "默认值不落键：{text}");
+
+        settings.groups[0].image_input_model = "vision/gpt-6-vision".into();
+        store.save(&settings).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(saved["groups"][0]["imageInputModel"], "vision/gpt-6-vision");
+        let again = store.load().unwrap();
+        assert_eq!(again.groups[0].image_input_model, "vision/gpt-6-vision");
+        assert!(again.groups[0].extra.is_empty(), "认识的字段不进未知字段");
     }
 
     #[test]

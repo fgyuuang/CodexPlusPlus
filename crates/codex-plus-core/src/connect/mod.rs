@@ -2,8 +2,10 @@ pub mod app_server;
 pub mod controls;
 pub mod desktop_sync;
 mod inbox;
+pub mod jiajia_bridge;
 pub mod media;
 pub mod outbound;
+pub mod page;
 pub mod projects;
 pub mod session_store;
 pub mod weixin;
@@ -63,6 +65,15 @@ pub struct WeixinConnectConfig {
     pub sandbox: String,
     #[serde(default)]
     pub codex_path: String,
+    /// 扫码绑定的本人（只有本人能在微信里用加加）。
+    #[serde(default)]
+    pub linked_user_id: String,
+    /// 联系人没自己选过时的模式：`jiajia`（默认）/ `direct`。
+    #[serde(default = "default_mode")]
+    pub default_mode: String,
+    /// 加加的卡片和提醒在没在对话时也推到微信（默认关）。
+    #[serde(default)]
+    pub push_to_weixin: bool,
 }
 
 impl Default for WeixinConnectConfig {
@@ -80,6 +91,9 @@ impl Default for WeixinConnectConfig {
             project_id: String::new(),
             sandbox: default_sandbox(),
             codex_path: String::new(),
+            linked_user_id: String::new(),
+            default_mode: default_mode(),
+            push_to_weixin: false,
         }
     }
 }
@@ -100,7 +114,18 @@ impl WeixinConnectConfig {
         self.project_id = self.project_id.trim().to_string();
         self.sandbox = normalize_sandbox(&self.sandbox);
         self.codex_path = self.codex_path.trim().to_string();
+        self.linked_user_id = self.linked_user_id.trim().to_string();
+        self.default_mode = jiajia_bridge::PeerMode::parse(&self.default_mode)
+            .as_str()
+            .to_string();
         self
+    }
+
+    fn bridge_settings(&self) -> jiajia_bridge::BridgeSettings {
+        jiajia_bridge::BridgeSettings {
+            default_mode: jiajia_bridge::PeerMode::parse(&self.default_mode),
+            push: self.push_to_weixin,
+        }
     }
 }
 
@@ -201,6 +226,9 @@ pub struct SessionDefaults {
     pub project_id: String,
     pub work_dir: String,
     pub sandbox: String,
+    /// 微信默认模式（`jiajia` / `direct`）和「推送到微信」：管理器保存设置后即时生效。
+    pub default_mode: String,
+    pub push_to_weixin: bool,
 }
 
 impl WeixinCodexPath {
@@ -226,7 +254,32 @@ impl WeixinCodexPath {
             config.project_id.clone_from(&defaults.project_id);
             config.work_dir.clone_from(&defaults.work_dir);
             config.sandbox = normalize_sandbox(&defaults.sandbox);
+            config.default_mode = jiajia_bridge::PeerMode::parse(&defaults.default_mode)
+                .as_str()
+                .to_string();
+            config.push_to_weixin = defaults.push_to_weixin;
         }
+    }
+
+    /// 管理器保存过的加加设置；还没保存过（刚启动）时 None，用启动时的配置。
+    fn bridge_settings(&self) -> Option<jiajia_bridge::BridgeSettings> {
+        let saved = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        saved
+            .1
+            .as_ref()
+            .map(|defaults| jiajia_bridge::BridgeSettings {
+                default_mode: jiajia_bridge::PeerMode::parse(&defaults.default_mode),
+                push: defaults.push_to_weixin,
+            })
+    }
+
+    /// 管理器保存过的工作目录（专注模式 /新会话 的默认项目）；没保存过时 None。
+    fn work_dir(&self) -> Option<String> {
+        let saved = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        saved
+            .1
+            .as_ref()
+            .map(|defaults| defaults.work_dir.trim().to_string())
     }
 
     fn apply(&self, config: &mut AppServerConfig) -> bool {
@@ -278,6 +331,51 @@ pub async fn run_weixin_connect_with_outbound(
     codex_path: WeixinCodexPath,
     outbound: outbound::OutboundPolicy,
 ) -> anyhow::Result<()> {
+    let store = ConnectSessionStore::default_for_account(&config.account_id);
+    run_weixin_connect_with_store(config, stop, status, codex_path, outbound, store).await
+}
+
+async fn run_weixin_connect_with_store(
+    config: WeixinConnectConfig,
+    stop: Arc<AtomicBool>,
+    status: SharedWeixinConnectStatus,
+    codex_path: WeixinCodexPath,
+    outbound: outbound::OutboundPolicy,
+    store: ConnectSessionStore,
+) -> anyhow::Result<()> {
+    run_weixin_connect_with_jiajia(
+        config,
+        stop,
+        status,
+        codex_path,
+        outbound,
+        store,
+        Arc::new(jiajia_bridge::LiveJiajia),
+        jiajia_bridge::diagnostic_push_log(),
+    )
+    .await
+}
+
+/// 后台任务的句柄：连接循环不管怎么退出（含 `?` 提前返回）都把它停掉。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_weixin_connect_with_jiajia(
+    config: WeixinConnectConfig,
+    stop: Arc<AtomicBool>,
+    status: SharedWeixinConnectStatus,
+    codex_path: WeixinCodexPath,
+    outbound: outbound::OutboundPolicy,
+    store: ConnectSessionStore,
+    jiajia: Arc<dyn jiajia_bridge::JiajiaPort>,
+    push_log: jiajia_bridge::PushLog,
+) -> anyhow::Result<()> {
     let mut config = config.normalized();
     if config.token.is_empty() {
         bail!("请先扫码登录微信");
@@ -296,9 +394,26 @@ pub async fn run_weixin_connect_with_outbound(
     });
 
     let client = WeixinClient::new(&config.base_url, &config.token, &config.route_tag)?;
-    let store = ConnectSessionStore::default_for_account(&config.account_id);
 
     store.update(ConnectState::recover_interrupted)?;
+
+    // 微信里的加加：模式、命令、审批在消息进直连流程前处理；加加的回复由后台任务转发。
+    let bridge = Arc::new(
+        jiajia_bridge::JiajiaBridge::new(
+            jiajia,
+            client.clone(),
+            store.sibling_path("jiajia"),
+            jiajia_bridge::owner_peer(&config.linked_user_id, &config.allow_from),
+            codex_path.clone(),
+            config.bridge_settings(),
+            push_log,
+        )
+        .with_focus(Arc::new(jiajia_bridge::LiveSessions), &config.work_dir),
+    );
+    bridge.seed_tokens(&store.load()?.context_tokens);
+    let _forwarder = AbortOnDrop(tokio::spawn(
+        Arc::clone(&bridge).run_forwarder(Arc::clone(&stop)),
+    ));
     let mut app_config = AppServerConfig {
         executable: config.codex_path.clone(),
         work_dir,
@@ -355,9 +470,22 @@ pub async fn run_weixin_connect_with_outbound(
             let task_stop = Arc::clone(&stop);
             let task_store = store.clone();
             let task_codex_path = codex_path.clone();
+            let task_bridge = Arc::clone(&bridge);
             let job_key = key.clone();
             let job_peer = peer.clone();
             let job = jobs.spawn(async move {
+                if existing_outbox.is_none() {
+                    let text = message.text().unwrap_or_default();
+                    let routed = tokio::select! {
+                        routed = task_bridge.handle_inbound(&message, &text) => routed,
+                        _ = wait_for_stop(&task_stop) => {
+                            return (key, peer, Err(anyhow::anyhow!("微信连接已停止")));
+                        }
+                    };
+                    if routed == jiajia_bridge::Inbound::Handled {
+                        return (key, peer, Ok(String::new()));
+                    }
+                }
                 let typing_ticket = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     client.start_typing(&message.from_user_id, &message.context_token),
@@ -1532,6 +1660,10 @@ fn default_sandbox() -> String {
     "read-only".to_string()
 }
 
+fn default_mode() -> String {
+    "jiajia".to_string()
+}
+
 fn update_status(
     status: &SharedWeixinConnectStatus,
     config: &WeixinConnectConfig,
@@ -1710,6 +1842,8 @@ mod tests {
             project_id: "project-2".into(),
             work_dir: "next-workspace".into(),
             sandbox: "workspace-write".into(),
+            default_mode: "direct".into(),
+            push_to_weixin: true,
         });
         assert!(config.model.is_empty());
         runtime.apply_defaults(&mut config);
@@ -1718,6 +1852,8 @@ mod tests {
         assert_eq!(config.project_id, "project-2");
         assert_eq!(config.work_dir, "next-workspace");
         assert_eq!(config.sandbox, "workspace-write");
+        assert_eq!(config.default_mode, "direct");
+        assert!(config.push_to_weixin);
         let mut state = ConnectState::default();
         state.thread_ids.insert("peer".into(), "original".into());
         assert_eq!(saved_thread_id(&state, "peer").as_deref(), Some("original"));
@@ -2010,6 +2146,9 @@ mod tests {
             project_id: String::new(),
             sandbox: "read-only".to_string(),
             codex_path: String::new(),
+            linked_user_id: String::new(),
+            default_mode: "jiajia".to_string(),
+            push_to_weixin: false,
         };
         let status: SharedWeixinConnectStatus = Arc::new(Mutex::new(Default::default()));
         let stop = Arc::new(AtomicBool::new(false));

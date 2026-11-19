@@ -15,6 +15,7 @@ import { t, tf } from "./i18n";
 import { providerPoolSections, reorderProviderSlots } from "./provider-pool-layout";
 import { ProviderBalancePoolBadge, RelayBillingPoolBadge, RelayBillingPoolLabel, RelayBillingRetry, useProviderBalance, useRelayBillingProbe } from "./RelayBillingLine";
 import { relayBillingGatewayCacheKey, type RelayBillingProbe } from "./relay-billing";
+import { providerHeadersSummary } from "./relay-headers";
 import {
   glanceAgents,
   defaultProviderAgents,
@@ -40,6 +41,7 @@ import {
   resetCardUsable,
   providerInput,
   skippedAgents,
+  quotaSupported,
   subscriptionBlockReason,
   maskAccountText,
   type GatewayAgentId,
@@ -844,14 +846,15 @@ function PoolRow({
     if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(false);
   };
   const price = priceSummary(entry);
-  // ChatGPT 订阅账号、Copilot 和 SuperGrok 能查额度（ChatGPT API 账号按量计费，没有额度窗口）。
-  const quotaSupported = entry.account === "chatgpt" || entry.account === "copilot" || entry.account === "grok";
+  // 订阅账号和 OpenCode Go、Command Code 等 API Key 套餐能查额度（#3084）；后端给标志，首次查询前就显示这一行。
+  const hasQuota = quotaSupported(entry);
   const testBlocked = subscriptionBlockReason(entry);
   const saveExtras = async (nextPrice: ProviderPrice | null, modelPrices: Record<string, ProviderPrice> | null, proxy: string) => {
     const title = extrasOpen === "proxy" ? t("保存代理") : t("保存价格");
     if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, modelPrices, proxy }, title)) setExtrasOpen(null);
   };
   const keyLimits = keyLimitSummary(entry);
+  const headersSummary = providerHeadersSummary(entry.customHeaders);
   const saveLimits = async (rpm: number | null, concurrency: number | null) => {
     if (await run(`limits:${entry.id}`, "save_gateway_provider_limits", { id: entry.id, rpm, concurrency }, t("保存限速"))) setLimitsOpen(false);
   };
@@ -882,7 +885,7 @@ function PoolRow({
         <div className="gw-pool-main">
           <strong>{maskAccountName(entry.name)}</strong>
           <small>{sub}</small>
-          {quotaSupported ? entry.quota
+          {hasQuota ? entry.quota
             ? <QuotaWindows compact maxAgeSeconds={entry.subscriptionPolicy?.maxAgeSeconds} quota={entry.quota} />
             : <small>{t("额度待刷新")}</small> : null}
           {entry.account === "chatgpt" ? <ResetCardsChip entry={entry} /> : null}
@@ -1005,11 +1008,11 @@ function PoolRow({
               </span>
             </div>
           ) : null}
-          {quotaSupported ? (
+          {hasQuota ? (
             <div className="gw-detail-row gw-quota-detail-row">
               <span className="gw-detail-label">{t("额度")}</span>
               <div className="gw-detail-value gw-chip-row">
-                {entry.account === "chatgpt" ? <AccountQuotaDetails entry={entry} /> : entry.quota ? <QuotaWindows maxAgeSeconds={entry.subscriptionPolicy?.maxAgeSeconds} quota={entry.quota} /> : <span className="gw-muted">{t("尚未取得官方用量")}</span>}
+                {entry.account === "chatgpt" ? <AccountQuotaDetails entry={entry} /> : entry.quota ? <QuotaWindows maxAgeSeconds={entry.subscriptionPolicy?.maxAgeSeconds} quota={entry.quota} /> : <span className="gw-muted">{entry.account ? t("尚未取得官方用量") : t("尚未取得套餐用量")}</span>}
               </div>
               <span className="gw-detail-actions">
                 <button
@@ -1039,7 +1042,7 @@ function PoolRow({
             <summary>
               <ChevronRight aria-hidden="true" className="h-3.5 w-3.5" />
               {t("更多设置")}
-              <span className="gw-pool-more-hint">{t("价格、上下文窗口、思考等级、代理、限速")}</span>
+              <span className="gw-pool-more-hint">{entry.account ? t("价格、上下文窗口、思考等级、代理、限速") : t("价格、上下文窗口、思考等级、代理、限速、请求头")}</span>
             </summary>
           {workbuddy ? (
             <div className="gw-detail-row">
@@ -1127,6 +1130,18 @@ function PoolRow({
               <EditIcon disabled={busy !== null} label={t("编辑限速")} onClick={() => setLimitsOpen(true)} />
             </span>
           </div>
+          {/* 自定义请求头（#3075）：只列名称（值可能是凭据），在编辑弹窗里改；订阅账号不开放。 */}
+          {!entry.account ? (
+            <div className="gw-detail-row">
+              <span className="gw-detail-label">{t("请求头")}</span>
+              <div className="gw-detail-value gw-chip-row">
+                {headersSummary ? <code className="gw-chip" title={t("测试连接、获取模型和实际请求都会带上")}>{headersSummary}</code> : <span className="gw-muted">{t("未设置")}</span>}
+              </div>
+              <span className="gw-detail-actions">
+                <EditIcon disabled={busy !== null} label={t("编辑自定义请求头")} onClick={onEdit} />
+              </span>
+            </div>
+          ) : null}
           </details>
           <div className="gw-detail-row gw-detail-foot">
             <span className="gw-detail-label" />

@@ -264,7 +264,7 @@ mod tests {
         let _guard = settings_path_test_guard();
         let path = default_settings_path();
 
-        assert!(path.ends_with(".codex-session-delete/settings.json"));
+        assert_eq!(path, default_app_state_dir().join("settings.json"));
     }
 
     #[test]
@@ -286,7 +286,7 @@ mod tests {
         let _guard = settings_path_test_guard();
         let path = default_latest_status_path();
 
-        assert!(path.ends_with(".codex-session-delete/latest-status.json"));
+        assert_eq!(path, default_app_state_dir().join("latest-status.json"));
     }
 
     #[test]
@@ -294,7 +294,7 @@ mod tests {
         let _guard = settings_path_test_guard();
         let path = default_diagnostic_log_path();
 
-        assert!(path.ends_with(".codex-session-delete/codex-plus.log"));
+        assert_eq!(path, default_app_state_dir().join("codex-plus.log"));
     }
 
     #[test]
@@ -302,7 +302,10 @@ mod tests {
         let _guard = settings_path_test_guard();
         let path = default_pending_provider_import_path();
 
-        assert!(path.ends_with(".codex-session-delete/pending-provider-import.json"));
+        assert_eq!(
+            path,
+            default_app_state_dir().join("pending-provider-import.json")
+        );
     }
 
     #[test]
@@ -310,18 +313,21 @@ mod tests {
         let _guard = settings_path_test_guard();
         let path = default_pending_remote_control_recovery_path();
 
-        assert!(path.ends_with(".codex-session-delete/pending-remote-control-recovery.json"));
+        assert_eq!(
+            path,
+            default_app_state_dir().join("pending-remote-control-recovery.json")
+        );
     }
 
     #[test]
     fn default_official_account_paths_use_app_state_directory() {
-        assert!(
-            default_official_accounts_path()
-                .ends_with(".codex-session-delete/official-accounts.json")
+        assert_eq!(
+            default_official_accounts_path(),
+            default_app_state_dir().join("official-accounts.json")
         );
-        assert!(
-            default_official_account_secrets_path()
-                .ends_with(".codex-session-delete/official-account-secrets.json")
+        assert_eq!(
+            default_official_account_secrets_path(),
+            default_app_state_dir().join("official-account-secrets.json")
         );
     }
 
@@ -329,7 +335,10 @@ mod tests {
     fn default_official_model_catalog_path_uses_app_state_directory() {
         let path = default_official_model_catalog_path();
 
-        assert!(path.ends_with(".codex-session-delete/official-model-catalog.json"));
+        assert_eq!(
+            path,
+            default_app_state_dir().join("official-model-catalog.json")
+        );
     }
 
     #[test]
@@ -337,7 +346,10 @@ mod tests {
         let _guard = settings_path_test_guard();
         let path = default_pending_manager_navigation_path();
 
-        assert!(path.ends_with(".codex-session-delete/pending-manager-navigation.json"));
+        assert_eq!(
+            path,
+            default_app_state_dir().join("pending-manager-navigation.json")
+        );
     }
 
     // 显式状态目录覆盖是 Windows 多开隔离的前提：平台无关的环境变量，
@@ -367,6 +379,7 @@ mod tests {
     fn default_app_state_dir_honours_explicit_override() {
         // `CODEX_PLUS_STATE_DIR` 是进程级环境变量，用作用域守卫保证并行测试看不到它。
         let _guard = settings_path_test_guard();
+        let previous = default_app_state_dir();
         let scope = StateDirEnvScope::set("/tmp/codex-plus-instance-state");
 
         assert_eq!(
@@ -375,7 +388,7 @@ mod tests {
         );
 
         drop(scope);
-        assert!(default_app_state_dir().ends_with(".codex-session-delete"));
+        assert_eq!(default_app_state_dir(), previous);
     }
 
     /// 测试用：临时设置 `CODEX_PLUS_STATE_DIR`，Drop 时恢复原值。

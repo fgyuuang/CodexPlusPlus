@@ -79,12 +79,17 @@ pub struct GatewayPoolEntry {
     pub upstream_gone: Vec<String>,
     /// 订阅账号的额度（ChatGPT 5 小时 / 每周、Copilot 本月高级请求）；查不到或普通供应商为空。
     pub quota: Option<codex_plus_core::gateway::quota::ProviderQuota>,
+    /// 有额度可查（订阅账号，或 OpenCode Go、Command Code 等 API Key 套餐，#3084）：
+    /// 界面据此在首次查询返回前就显示额度一行和刷新按钮。
+    pub quota_api: bool,
     pub subscription_policy: Option<codex_plus_core::gateway::store::SubscriptionPolicy>,
     pub subscription_block_reason: Option<String>,
     /// 有余额接口的厂商（DeepSeek、Kimi 等，#2793）：卡片用「用量」页同一份余额，不当中转站识别。
     pub balance_api: bool,
     /// new-api 访问令牌（打码，#2793）；没配置为空。令牌原文不传给界面。
     pub newapi_access: Option<apply::NewApiAccessView>,
+    /// 自定义请求头（#3075）：敏感头只给打码后的样子；订阅账号、官方登录等不开放编辑的为空。
+    pub custom_headers: Vec<codex_plus_core::gateway::provider_headers::ProviderHeaderView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -278,11 +283,13 @@ fn pool_entry(
         upstream_new: upstream.0,
         upstream_gone: upstream.1,
         quota: codex_plus_core::gateway::quota::quota_for_relay(relay),
+        quota_api: codex_plus_core::gateway::quota::supports(relay),
         subscription_policy: None,
         subscription_block_reason: None,
         balance_api: codex_plus_core::gateway::balance::has_balance_api(relay)
             || codex_plus_core::gateway::balance::has_workbuddy_usage(source),
         newapi_access: None,
+        custom_headers: codex_plus_core::gateway::provider_headers::view(relay),
     }
 }
 
@@ -1204,6 +1211,16 @@ pub fn save_gateway_local_login_discovery(enabled: bool) -> CommandResult<Option
     respond("网关选项已保存。", "保存网关选项失败", result)
 }
 
+/// 「Codex 用 WebSocket 连接」开关（默认关）：只改握手判断，已建立的 WS 连接用到断开为止。
+#[tauri::command]
+pub fn save_gateway_responses_websocket(enabled: bool) -> CommandResult<Option<GatewayPayload>> {
+    let result = GatewayStore::default().update(|gateway| {
+        gateway.responses_websocket = enabled;
+        Ok(())
+    });
+    respond("网关选项已保存。", "保存网关选项失败", result)
+}
+
 /// 本机已登录、还没进池的订阅账号（供应商页提示导入）。开关关着时不扫描，返回空。
 /// 单独一条命令、不放进 [`GatewayPayload`]：读 sqlite / 登录文件不便宜，payload 每次改动都会重建。
 #[tauri::command]
@@ -1246,6 +1263,64 @@ pub fn save_gateway_model_suffix(enabled: bool) -> CommandResult<Option<GatewayP
         "保存网关选项失败",
         refresh_agents(result),
     )
+}
+
+/// 「本地网关端口」一行的数据（#3082）。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayPortPayload {
+    /// 下次启动使用的端口。
+    pub configured_port: u16,
+    pub default_port: u16,
+    /// 环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 指定的端口；有值时界面禁用输入。
+    pub env_port: Option<u16>,
+    /// 本进程常驻本地服务正在监听的端口；没在跑时为空。
+    pub running_port: Option<u16>,
+    /// 改过端口、还没重启 Codex++：正在监听的端口和下次启动的端口不一样。
+    pub restart_required: bool,
+}
+
+fn gateway_port_payload() -> GatewayPortPayload {
+    let state = codex_plus_core::protocol_proxy::protocol_proxy_port_state();
+    let running_port = codex_plus_core::resident_helper::resident_helper_port();
+    GatewayPortPayload {
+        configured_port: state.configured,
+        default_port: state.default_port,
+        env_port: state.env_override,
+        running_port,
+        restart_required: running_port.is_some_and(|port| port != state.configured),
+    }
+}
+
+#[tauri::command]
+pub fn load_gateway_port() -> CommandResult<GatewayPortPayload> {
+    ok("", gateway_port_payload())
+}
+
+/// 改本地网关端口：只写持久化端口文件，不动正在监听的服务。
+///
+/// 不当场切换：Codex、Claude 等 Agent 的配置里写着旧端口，正在跑的会话也连着旧端口，
+/// 运行中换端口会让它们一起断。重启 Codex++ 后常驻服务按新端口监听，
+/// 启动流程（`start_from_saved_state` → `reapply_if_port_changed`）会把走网关的 Agent 改到新端口。
+#[tauri::command]
+pub async fn save_gateway_port(port: u32) -> CommandResult<GatewayPortPayload> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let running = codex_plus_core::resident_helper::resident_helper_port();
+        codex_plus_core::protocol_proxy::set_custom_protocol_proxy_port(port, running)
+    })
+    .await;
+    match result {
+        Ok(Ok(true)) => ok(
+            "本地网关端口已保存。完全退出 Codex++（含托盘）后重新打开生效；走网关的 Agent 会在启动时改到新端口，没跟上的在「智能体」页重新接入一次。",
+            gateway_port_payload(),
+        ),
+        Ok(Ok(false)) => ok("端口没有变化。", gateway_port_payload()),
+        Ok(Err(error)) => failed(&format!("{error:#}"), gateway_port_payload()),
+        Err(error) => failed(
+            &format!("保存本地网关端口失败：{error}"),
+            gateway_port_payload(),
+        ),
+    }
 }
 
 /// 某个 Agent 的生图模型：空串是自动，`off` 是关闭，其余是 `<供应商 id>/<模型>`。
@@ -2135,6 +2210,7 @@ async fn import_opencode(id: &str, skip_agents: Option<&[String]>) -> anyhow::Re
         subscription_policy: None,
         strip_responses_image_detail: None,
         disable_tool_search: None,
+        custom_headers: None,
     };
     apply::create_provider(
         &GatewayStore::default(),
@@ -3629,6 +3705,7 @@ pub fn provider_page_gateway_call(command: &str, args: serde_json::Value) -> ser
                     arg(&args, "protocol")?,
                     arg::<Option<String>>(&args, "apiKey")?.unwrap_or_default(),
                     arg(&args, "providerId")?,
+                    arg(&args, "customHeaders")?,
                 ),
             )),
             "save_gateway_binding" => to_value(save_gateway_binding(
