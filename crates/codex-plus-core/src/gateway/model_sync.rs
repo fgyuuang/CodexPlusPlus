@@ -265,6 +265,7 @@ fn apply_model_changes(
     let gone = |name: &str| has_model(&removed, name) && !has_model(&list, name);
     provider.model_prices.retain(|name, _| !gone(name));
     provider.model_windows.retain(|name, _| !gone(name));
+    provider.auto_compact.models.retain(|name, _| !gone(name));
     provider.upstream_meta.retain_models(|name| !gone(name));
     provider.relay.model_metadata = prune_model_metadata(&provider.relay.model_metadata, &gone);
     provider.upstream_new.clear();
@@ -466,11 +467,14 @@ fn price_from_match(found: crate::model_pricing::PriceMatch) -> ProviderPrice {
 /// 一键同步：按公开价格表更新一个供应商所有模型的价格。查得到的覆盖（包括手动填过的），
 /// 查不到的保留原值。返回（查到几个，一共几个模型）。
 pub async fn sync_public_prices(store: &GatewayStore, id: &str) -> anyhow::Result<(usize, usize)> {
-    let relay = store
-        .load()?
+    let gateway = store.load()?;
+    let provider = gateway
         .provider(id)
-        .map(|provider| provider.relay.clone())
         .ok_or_else(|| anyhow::anyhow!("供应商不存在：{id}"))?;
+    if crate::gateway::balance::has_workbuddy_usage(&provider.source) {
+        bail!("WorkBuddy 使用积分倍率与实际扣分，不同步公开货币价格");
+    }
+    let relay = &provider.relay;
     let models = crate::gateway::route::relay_models(&relay);
     let (catalog, _) = crate::model_pricing::load_catalog(false).await?;
     let found: Vec<(String, ProviderPrice)> = models
@@ -512,7 +516,9 @@ pub async fn fill_missing_prices(
         .providers
         .iter()
         .filter(|provider| {
-            only.is_none_or(|id| provider.relay.id == id) && provider.price.is_none()
+            only.is_none_or(|id| provider.relay.id == id)
+                && provider.price.is_none()
+                && !crate::gateway::balance::has_workbuddy_usage(&provider.source)
         })
         .map(|provider| {
             let missing = crate::gateway::route::relay_models(&provider.relay)
@@ -592,6 +598,7 @@ mod tests {
             newapi_access: None,
             subscription_policy: None,
             upstream_meta: Default::default(),
+            auto_compact: Default::default(),
             relay: RelayProfile {
                 id: "p".into(),
                 model: "a".into(),
@@ -642,6 +649,7 @@ mod tests {
             newapi_access: None,
             subscription_policy: None,
             upstream_meta: Default::default(),
+            auto_compact: Default::default(),
             relay,
             extra: Default::default(),
         }

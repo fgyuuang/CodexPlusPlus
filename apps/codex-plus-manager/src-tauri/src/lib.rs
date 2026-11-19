@@ -17,10 +17,13 @@ mod global_dictation;
 pub mod install;
 mod lightweight;
 mod local_integrations;
+mod local_provider_gateway;
 pub mod newapi;
 mod provider_lookup_commands;
+mod remote_control_commands;
 mod runtime_health;
 mod shutdown_watchdog;
+mod skill_backup_usage;
 mod tray_panel;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -212,6 +215,23 @@ pub fn run_computer_use_cli(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Codex 拓展页的「社区 / 我发布的 / dsh 插件」分栏：实现在管理器里，经 helper 桥接分发给页面。
+/// helper 跑在本进程里，登记一次即可。
+fn register_codex_bridge_routes() {
+    use codex_plus_core::routes::{HostRouteHandler, register_host_route};
+    let community: HostRouteHandler = std::sync::Arc::new(|payload| {
+        Box::pin(extension_community_commands::bridge_request(payload))
+    });
+    let published: HostRouteHandler = std::sync::Arc::new(|payload| {
+        Box::pin(extension_publish_commands::bridge_request(payload))
+    });
+    let dsh: HostRouteHandler =
+        std::sync::Arc::new(|payload| Box::pin(dsh_plugin_commands::bridge_request(payload)));
+    register_host_route("/extension-market/community", community);
+    register_host_route("/extension-market/published", published);
+    register_host_route("/extension-market/dsh", dsh);
+}
+
 pub fn run() {
     install_panic_logger();
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -223,6 +243,7 @@ pub fn run() {
     let Some(_guard) = acquire_single_instance_guard() else {
         return;
     };
+    register_codex_bridge_routes();
     #[cfg(target_os = "macos")]
     if let Some(root) = codex_plus_core::install::default_install_root() {
         match codex_plus_core::install::macos::migrate_legacy_manager_bundle(&root) {
@@ -329,6 +350,12 @@ pub fn run() {
             codex_plus_core::settings::set_external_settings_change_listener(
                 gateway_commands::notify_settings_changed,
             );
+            // Codex 页面里的「供应商」页经 bridge 调这里的保存 / 切换（core `provider_page`）。
+            codex_plus_core::provider_page::set_provider_page_host(commands::provider_page_host());
+            // Codex 设置页里的「全局听写热键」经 bridge 调这里保存并重新注册（热键回调在管理器进程里）。
+            codex_plus_core::global_dictation::set_apply_host(
+                global_dictation::save_and_apply_config,
+            );
             if start_minimized {
                 set_manager_activation_policy(app.handle(), false);
             }
@@ -345,6 +372,8 @@ pub fn run() {
             // Computer Use 操作后台应用时的悬浮预览（同 Codex 的画中画）。
             cu_pip::start(app.handle().clone());
             commands::start_weixin_connect_from_saved_settings();
+            // 远程控制只恢复已启用的配置。
+            remote_control_commands::start_from_saved_state_in_background();
             cliproxy::start_cliproxy_from_saved_settings(transient);
             // 目录刷新是后台增强能力；失败时仍由核心回退目录保证 Codex 可启动。
             tauri::async_runtime::spawn(async {
@@ -388,6 +417,7 @@ pub fn run() {
             commands::stop_codex_plus,
             commands::load_settings,
             config_doctor_commands::config_doctor_request,
+            remote_control_commands::remote_control_request,
             commands::load_request_logs,
             commands::load_request_flow,
             commands::clear_request_logs,
@@ -477,6 +507,7 @@ pub fn run() {
             gateway_commands::apply_gateway_provider_windows_sync,
             gateway_commands::apply_gateway_provider_reasoning_sync,
             gateway_commands::save_gateway_provider_models,
+            gateway_commands::create_gateway_workbuddy_lane,
             gateway_commands::refresh_gateway_quota,
             gateway_commands::sync_gateway_provider_prices,
             gateway_commands::set_gateway_provider_enabled,
@@ -613,6 +644,17 @@ pub fn run() {
             commands::delete_user_script,
             commands::refresh_skill_catalog,
             commands::list_installed_skills,
+            commands::list_skill_versions,
+            commands::manage_skill_version,
+            commands::list_skill_file_times,
+            commands::find_skill_repository_matches,
+            commands::apply_skill_repository_matches,
+            commands::discover_skill_source_evidence,
+            commands::preview_skill_duplicates,
+            commands::archive_skill_duplicate,
+            commands::preview_skill_in_place_update,
+            commands::discard_skill_in_place_update_preview,
+            commands::execute_skill_in_place_update,
             commands::import_ccs_skills,
             commands::import_local_skills,
             commands::install_skill,
@@ -622,6 +664,7 @@ pub fn run() {
             commands::uninstall_skill,
             commands::restore_skill_backup,
             commands::delete_skill_backup,
+            skill_backup_usage::skill_backup_usage,
             commands::upsert_skill_repo,
             commands::inspect_skill_repo,
             commands::delete_skill_repo,
@@ -767,6 +810,8 @@ pub fn run() {
                         gateway_commands::restore_for_exit();
                         codex_plus_core::claude_local_backend::stop_backend();
                         codex_plus_core::resident_helper::stop_resident_helper();
+                        // 远程控制服务停掉侧车 app-server，别留孤儿进程。
+                        codex_plus_core::remote_control::stop();
                         SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
                         app.exit(0);
                     });

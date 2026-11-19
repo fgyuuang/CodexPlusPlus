@@ -38,6 +38,22 @@ use crate::tools::ToolId;
 
 const JSON: &str = "application/json; charset=utf-8";
 
+/// 读网关状态。文件读不出来（例如字段类型不对、写到一半）时按「全关」继续，
+/// 调用方会回 503「没有开启网关模式」，但错误本身要留一条日志：
+/// 只看那条提示分不清是没开网关还是状态文件坏了。
+fn load_gateway_state() -> GatewaySettings {
+    match GatewayStore::default().load() {
+        Ok(settings) => settings,
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "gateway.state_load_failed",
+                json!({ "message": format!("{error:#}") }),
+            );
+            GatewaySettings::default()
+        }
+    }
+}
+
 /// 把 `/gw/claude/v1/messages` 拆成 (Agent, `/messages`)：去掉 `/v1` 前缀，兼容不带版本的写法。
 pub fn split_gateway_path(path: &str) -> Option<(ToolId, String)> {
     let rest = path.strip_prefix("/gw/")?;
@@ -115,6 +131,7 @@ pub(crate) async fn handle(
     path: &str,
     headers: &str,
     body: &[u8],
+    read_ahead: Vec<u8>,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     // `path` 带查询串：取出 Gemini 的 `?key=` 后去掉，后面的日志、路由都只用路径。
@@ -128,10 +145,9 @@ pub(crate) async fn handle(
         stream.shutdown().await?;
         return Ok(());
     }
-    let gateway = GatewayStore::default()
-        .load()
-        .unwrap_or_default()
-        .with_extension_providers();
+    let gateway = load_gateway_state()
+        .with_extension_providers()
+        .with_native_codex_account(&SettingsStore::default().load().unwrap_or_default());
     let Some(binding) = gateway.active_binding(&agent) else {
         let message = format!(
             "Codex++ 网关模式没有为 {} 开启，请在 Codex++ 里打开网关模式或切回直连供应商",
@@ -195,6 +211,16 @@ pub(crate) async fn handle(
         .await;
     }
     match (&agent, method, tail.as_str()) {
+        (ToolId::Grok | ToolId::Codex | ToolId::Unknown(_), "GET", "/responses") => {
+            crate::responses_websocket::handle(
+                stream,
+                headers,
+                read_ahead,
+                path,
+                ProxyOpener::Gateway(agent),
+            )
+            .await
+        }
         (ToolId::Unknown(_), "POST", "/chat/completions") => {
             handle_claude_messages(
                 stream,
@@ -330,10 +356,9 @@ pub(crate) async fn handle_codex_images_from_helper(
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
-    let gateway = GatewayStore::default()
-        .load()
-        .unwrap_or_default()
-        .with_extension_providers();
+    let gateway = load_gateway_state()
+        .with_extension_providers()
+        .with_native_codex_account(&SettingsStore::default().load().unwrap_or_default());
     handle_images(
         stream,
         &gateway,
@@ -521,7 +546,8 @@ pub(crate) async fn open_responses_for_agent(
     let gateway = GatewayStore::default()
         .load()
         .unwrap_or_default()
-        .with_extension_providers();
+        .with_extension_providers()
+        .with_native_codex_account(&settings);
     let mut request: Value = serde_json::from_str(request_body)?;
     // 起名模型：Codex 给会话起名的请求改发到绑定指定的模型，不落到订阅额度上。
     let title_model = route::title_model_override(&gateway, agent, &request);
@@ -551,7 +577,8 @@ pub(crate) async fn open_responses_for_agent(
             .and_then(Value::as_str)
             .map(str::to_string)
     });
-    let plan = route::resolve_plan(&gateway, agent, model, conversation.as_deref())?;
+    let mut plan = route::resolve_plan(&gateway, agent, model, conversation.as_deref())?;
+    crate::responses_websocket::restrict_plan(&mut plan)?;
     let outcome = pipeline::open(
         &settings,
         &plan,
@@ -619,6 +646,7 @@ fn cooling_response(wait: std::time::Duration) -> UpstreamProxyResponse {
         request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
+        websocket: None,
         response: None,
         capacity_retryable: false,
         capacity_retry_enabled: false,
@@ -1275,6 +1303,7 @@ fn anthropic_usage(body: &[u8]) -> Option<crate::request_log::RequestUsage> {
         output_tokens: number("output_tokens"),
         cached_tokens: cached,
         reasoning_tokens: 0,
+        workbuddy_credits: None,
     })
 }
 
@@ -1338,6 +1367,7 @@ impl AnthropicSseObserver {
                 output_tokens: self.output_tokens,
                 cached_tokens: self.cached_tokens,
                 reasoning_tokens: 0,
+                workbuddy_credits: None,
             }
         })
     }
@@ -1444,6 +1474,13 @@ async fn handle_models(
                     });
                     if id != *model {
                         row["description"] = json!("经 Codex++ 网关转发");
+                    }
+                    // #3107：报真实窗口；Desktop 只按 supports_1m 区分 200k / 1M，不到 1M 显式写 false。
+                    if let Some((window, supports_1m)) = binding
+                        .and_then(|binding| route::claude_desktop_window(gateway, binding, model))
+                    {
+                        row["max_input_tokens"] = json!(window);
+                        row["supports_1m"] = json!(supports_1m);
                     }
                     row
                 })
@@ -1594,6 +1631,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #3107：Claude Desktop 的模型列表按池里配置的窗口报 `max_input_tokens`，到 1M 才 `supports_1m: true`；
+    /// id 保持原别名不加 `[1m]` 后缀，没配窗口的模型两个字段都不写。
+    #[tokio::test]
+    async fn claude_desktop_models_declare_window_and_1m_only_from_one_million() {
+        let relay = crate::settings::RelayProfile {
+            id: "up".to_string(),
+            name: "up".to_string(),
+            relay_mode: crate::settings::RelayMode::PureApi,
+            base_url: "https://up.test/v1".to_string(),
+            api_key: "sk-up".to_string(),
+            model_list: "kimi-k3\nglm-5.3\nplain-model".to_string(),
+            ..Default::default()
+        };
+        let mut provider: crate::gateway::store::GatewayProvider =
+            serde_json::from_value(json!({ "relay": relay })).unwrap();
+        provider.model_windows.insert("kimi-k3".into(), 1_000_000);
+        provider.model_windows.insert("glm-5.3".into(), 400_000);
+        let mut gateway = GatewaySettings {
+            providers: vec![provider],
+            ..GatewaySettings::default()
+        };
+        gateway.bindings.insert(
+            "claude-desktop".to_string(),
+            AgentBinding {
+                enabled: true,
+                model: "kimi-k3".to_string(),
+                ..AgentBinding::default()
+            },
+        );
+        let agent = ToolId::Unknown("claude-desktop".to_string());
+        let response = models_response(&gateway, &agent, false).await;
+        let rows = response["data"].as_array().unwrap();
+        let row = |model: &str| {
+            rows.iter()
+                .find(|row| row["display_name"] == model)
+                .unwrap_or_else(|| panic!("{model}: {rows:?}"))
+        };
+
+        let kimi = row("kimi-k3");
+        assert!(!kimi["id"].as_str().unwrap().contains('['), "{kimi}");
+        assert_eq!(kimi["max_input_tokens"], 1_000_000);
+        assert_eq!(kimi["supports_1m"], true);
+
+        let glm = row("glm-5.3");
+        assert!(!glm["id"].as_str().unwrap().contains('['), "{glm}");
+        assert_eq!(glm["max_input_tokens"], 400_000);
+        assert_eq!(glm["supports_1m"], false);
+
+        let plain = row("plain-model");
+        assert!(plain.get("max_input_tokens").is_none(), "{plain}");
+        assert!(plain.get("supports_1m").is_none(), "{plain}");
+
+        // 选了 1M 选项后发回来的 `<别名>[1m]` 仍还原成原模型。
+        let binding = gateway.binding(&agent).unwrap();
+        let id = format!("{}[1m]", kimi["id"].as_str().unwrap());
+        assert_eq!(
+            route::effective_model(&gateway, binding, "glm-5.3", &id),
+            "kimi-k3"
+        );
     }
 
     #[test]

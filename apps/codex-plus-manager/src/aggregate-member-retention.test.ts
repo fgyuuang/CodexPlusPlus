@@ -6,7 +6,7 @@ import ts from "typescript";
 import { normalizeAggregateMembers, normalizeAggregateDefaultRelayId, isAggregateProfile, isOfficialLoginMemberProfile } from "./aggregate-members.ts";
 import { clampAggregateRoutePriority } from "./aggregate-routes.ts";
 
-const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+const source = readFileSync(new URL("./relay-profile-editing.ts", import.meta.url), "utf8");
 const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const names = ["aggregateMemberCandidates", "normalizeAggregateConfig", "normalizeAggregateRelayProfile",
   "isApiRelayProfile", "isOfficialLoginProfile", "isAggregateRelayProfile", "isCliproxyManagedProfile",
@@ -14,12 +14,12 @@ const names = ["aggregateMemberCandidates", "normalizeAggregateConfig", "normali
 const functions = names.map((name) => {
   const declaration = ast.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === name);
   assert.ok(declaration, name);
-  return declaration.getText(ast);
+  return declaration.getText(ast).replace(/^export /, "");
 });
 const compiled = ts.transpileModule(functions.join("\n"), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText;
-const context = vm.createContext({
+const context = vm.createContext({ exports: {},
   clampAggregateRoutePriority, normalizeAggregateMembers, normalizeAggregateDefaultRelayId, isAggregateProfile, isOfficialLoginMemberProfile,
   aggregateStrategyOptions: [{ value: "failover" }],
   officialLoginModelList: () => [],
@@ -64,19 +64,20 @@ test("deleting a member is still reflected when a remaining API profile exists",
     [{ profileId: "b", weight: 7 }]);
 });
 
-test("an empty known candidate set removes excluded references, while missing settings preserve drafts", () => {
+test("existing profiles remain referenced even when not selectable, while missing settings preserve drafts", () => {
   const aggregate = profile();
   const settings = { relayProfiles: [{ ...api("a"), relayMode: "official" }, aggregate] };
-  assert.deepEqual(run("normalizeAggregateRelayProfile", aggregate, settings).aggregate.members, []);
+  assert.deepEqual(run("normalizeAggregateRelayProfile", aggregate, settings).aggregate.members, [{ profileId: "a", weight: 4 }]);
   assert.deepEqual(run("normalizeAggregateRelayProfile", aggregate, null).aggregate.members,
     aggregate.aggregate.members);
 });
 
 
 test("legacy login-sync data survives aggregate normalization while its inactive control stays hidden", () => {
-  const editor = ast.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === "AggregateRelayProfileEditor");
+  const appAst = ts.createSourceFile("App.tsx", readFileSync(new URL("./App.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const editor = appAst.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === "AggregateRelayProfileEditor");
   assert.ok(editor);
-  const editorText = editor.getText(ast);
+  const editorText = editor.getText(appAst);
   assert.doesNotMatch(editorText, /aggregate\.syncDefaultMemberLogin|aggregate-default-login-sync/);
   assert.match(editorText, /设为默认/);
   for (const syncDefaultMemberLogin of [false, true]) {

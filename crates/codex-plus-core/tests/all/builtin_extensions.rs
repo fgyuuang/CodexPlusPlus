@@ -94,6 +94,13 @@ fn builtins_with_a_setting_use_that_setting_as_their_switch() {
         true
     );
     assert_eq!(builtin(&manager, "session-delete")["enabled"], true);
+    // prompt 参数展开只在带参数发送已有 prompt 时介入，默认开；改设置不用重启。
+    assert_eq!(builtin(&manager, "prompt-args")["enabled"], true);
+    assert_eq!(
+        builtin(&manager, "prompt-args")["setting"],
+        "codexAppPromptArgs"
+    );
+    assert_eq!(builtin(&manager, "prompt-args")["restartRequired"], false);
     assert_eq!(
         builtin(&manager, "session-delete")["params"],
         json!(["codexAppSessionDeleteSkipConfirm"])

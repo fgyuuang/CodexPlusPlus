@@ -15,7 +15,7 @@ export type RecentRequestSummary = {
   successRate: number | null;
   /** 毫秒；没有请求时为 null。 */
   avgDurationMs: number | null;
-  /** 次数最多的模型（优先用 Codex 请求的模型名）；并列取最近出现的那个。 */
+  /** 次数最多的实际上游模型；没有上游记录时回退请求模型，并列取最近出现的那个。 */
   topModel: string | null;
 };
 
@@ -34,7 +34,7 @@ export function summarizeRecentRequests(
   const duration = recent.reduce((sum, entry) => sum + Math.max(0, entry.durationMs), 0);
   const counts = new Map<string, { count: number; latest: number }>();
   for (const entry of recent) {
-    const model = (entry.model || entry.upstreamModel || "").trim();
+    const model = entry.upstreamModel?.trim() || entry.model.trim();
     if (!model) continue;
     const current = counts.get(model) ?? { count: 0, latest: 0 };
     counts.set(model, { count: current.count + 1, latest: Math.max(current.latest, entry.timestampMs) });

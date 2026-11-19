@@ -22,7 +22,7 @@ export type ManagerPageScript = {
   name: string;
   enabled: boolean;
   error?: string;
-  package?: { managerPage?: ManagerPageSummary | null } | null;
+  package?: { managerPage?: ManagerPageSummary | null; routes?: string[] } | null;
 };
 
 export type ManagerExtensionPage = {

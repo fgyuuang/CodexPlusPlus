@@ -81,6 +81,7 @@ export function GatewayPage({
   onTabChange,
   extraSettings,
   onOpenCodexProviderSettings,
+  onOpenLocalOfficialAccounts,
   codexRun,
 }: {
   notify: Notify;
@@ -89,6 +90,8 @@ export function GatewayPage({
   /** 「网关设置」末尾附加的内容：主窗口传进来的新旧共用本地服务设置。 */
   extraSettings?: ReactNode;
   onOpenCodexProviderSettings?: () => void;
+  /** 管理仍被供应商池引用的本地账号库，不混入 Codex 连接页。 */
+  onOpenLocalOfficialAccounts?: () => void;
   /** Codex 行的启动 / 停止：主窗口传进来才显示，不传就只留模型选择与接入开关。 */
   codexRun?: CodexRunControls;
 }) {
@@ -209,7 +212,13 @@ export function GatewayPage({
       {controlledTab ? (
         // 由外层侧栏控制时不显示页内工具条，刷新按钮放进外壳顶栏。
         // 用量页签有自己的刷新（读用量和余额），这里的只刷新网关状态，放在一起会让人以为刷新了用量。
-        <TopbarActions>{tab === "usage" ? null : refreshButton}</TopbarActions>
+        <TopbarActions>
+          {tab === "providers" && onOpenLocalOfficialAccounts
+            && payload?.pool.some((entry) => entry.source?.startsWith("official-account:")) ? (
+            <button className="gw-text-button" onClick={onOpenLocalOfficialAccounts} type="button">{t("本地官方账号库")}</button>
+          ) : null}
+          {tab === "usage" ? null : refreshButton}
+        </TopbarActions>
       ) : (
         <div className="gw-toolbar">
           <nav aria-label={t("本地网关")} className="gw-tabs" role="tablist">

@@ -20,6 +20,7 @@ import {
   parseContextWindow,
   visibleOwnModels,
   pickerSections,
+  prettyModelName,
   providerEnabled,
   qualifiedProvider,
   servingProviders,
@@ -851,6 +852,7 @@ export function Floating({
 /** 模型列表：左侧全部 / 收藏 / 按供应商跳转，右侧分组列出模型；顶部是「默认（不经 Codex++）」与「断开」。
  * 传了 `own` 与 `onPickOwn` 时，池里的模型后面再列一组 Agent 自带的模型（直连，不经 Codex++）。 */
 export function ModelList({
+  native,
   payload,
   exclude,
   selectedModel,
@@ -863,6 +865,7 @@ export function ModelList({
   onPickOwn,
   pinProvider = false,
 }: {
+  native?: GatewayAgentView["nativeModels"];
   payload: GatewayPayload | null;
   exclude: string[];
   selectedModel: string;
@@ -910,7 +913,7 @@ export function ModelList({
   const ownList = onPickOwn ? own : null;
   const sections = useMemo(() => {
     const ownSection = ownPickerSection(ownList, query, avatarOf);
-    const all = withOwnSection(pickerSections(payload, query, avatarOf, exclude, skipGroup, sectionOnly, Boolean(ownSection && (!sectionOnly || sectionOnly === "own"))), ownSection);
+    const all = withOwnSection(pickerSections(payload, query, avatarOf, exclude, skipGroup, sectionOnly, Boolean(ownSection && (!sectionOnly || sectionOnly === "own")), native), ownSection);
     // custom 已在生成时限定目标供应商。
     if (sectionOnly) return all.filter((section) => section.key === sectionOnly || section.key === "custom");
     if (!favoritesOnly) return all;
@@ -919,7 +922,7 @@ export function ModelList({
       .filter((section) => section.key !== "own")
       .map((section) => ({ ...section, items: section.items.filter((item) => isFavoriteModel(favorites, item.model, payload)) }))
       .filter((section) => section.items.length);
-  }, [payload, query, exclude, favoritesOnly, sectionOnly, favorites, skipGroup, ownList]);
+  }, [payload, query, exclude, favoritesOnly, sectionOnly, favorites, skipGroup, ownList, native]);
   const displaySections = useMemo<PickerSection[]>(() => {
     const current = selectedModel.trim();
     if (pinProvider && !favoritesOnly && !sectionOnly && !query.trim() && current && modelDisplay(payload, current, exclude).auto &&
@@ -964,8 +967,8 @@ export function ModelList({
   const choose = (item: PickerItem) => (item.direct && onPickOwn ? onPickOwn(item) : onPick(item));
 
   const filters = useMemo(
-    () => withOwnSection(pickerSections(payload, "", avatarOf, exclude, skipGroup), ownPickerSection(ownList, "", avatarOf)).filter((section) => section.key !== "custom"),
-    [payload, exclude, skipGroup, ownList],
+    () => withOwnSection(pickerSections(payload, "", avatarOf, exclude, skipGroup, null, false, native), ownPickerSection(ownList, "", avatarOf)).filter((section) => section.key !== "custom"),
+    [payload, exclude, skipGroup, ownList, native],
   );
   const total = displaySections.reduce((sum, section) => sum + section.items.length, 0);
   const customCount = displaySections.find((section) => section.key === "custom")?.items.length ?? 0;
@@ -1208,7 +1211,10 @@ function ModelPicker({
     : connected && agent.defaultModelDiffers && agent.defaultSelectionStatus !== "invalid" && !effectiveModel.startsWith("group/")
       ? { title: effectiveModel, sub: "", group: false }
     : modelDisplay(payload, effectiveModel, draft.poolExclude, effectiveSelection);
-  const display = connected && agent.defaultSelectionStatus === "invalid"
+  const nativeModel = agent.nativeModels?.models.some((model) => model.toLowerCase() === effectiveModel.toLowerCase());
+  const display = nativeModel
+    ? { ...baseDisplay, title: prettyModelName(effectiveModel), sub: "当前登录账号", auto: false }
+    : connected && agent.defaultSelectionStatus === "invalid"
     ? { ...baseDisplay, issue: "invalid" as const }
     : connected && agent.defaultSelectionStatus === "available"
       ? { ...baseDisplay, issue: undefined }
@@ -1254,6 +1260,7 @@ function ModelPicker({
       </button>
       <Floating anchorRef={buttonRef} className="gw-model-popover" minHeight={180} onClose={() => onOpenChange(false)} open={open} width={560}>
         <ModelList
+          native={agent.nativeModels}
           exclude={draft.poolExclude}
           head={head}
           onPick={onPick}

@@ -2978,8 +2978,11 @@ pub const MANAGER_REPLACEABLE_PAGES: &[&str] = &[
 /// 拓展的设置页 / 管理器面板经 `codexPlusManager.call(route, payload)` 能调的数据路由（还要清单声明）。
 pub const EXTENSION_PAGE_ROUTES: &[&str] = &crate::agent_pet::ROUTES;
 /// 只由管理器宿主分派；不能经 renderer、普通 bridge 或任意命令透传调用。
-pub const LOCAL_INTEGRATION_ROUTES: &[&str] =
-    &["/local-integrations/cliproxy", "/local-integrations/newapi"];
+pub const LOCAL_INTEGRATION_ROUTES: &[&str] = &[
+    "/local-integrations/cliproxy",
+    "/local-integrations/newapi",
+    "/local-integrations/workbuddy",
+];
 /// 拓展页面经 `codexPlusManager.data(name, params)` 能读的管理器数据（都是只读、不含凭据）。
 pub const MANAGER_DATA_SOURCES: &[&str] = &[
     "requestFlow",

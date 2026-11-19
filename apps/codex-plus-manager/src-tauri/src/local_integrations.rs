@@ -77,6 +77,31 @@ pub async fn call(
         .and_then(Value::as_str)
         .ok_or("缺少服务操作")?;
     let request = payload.get("request").cloned().unwrap_or_else(|| json!({}));
+    let service = route
+        .strip_prefix("/local-integrations/")
+        .ok_or("未开放的服务")?;
+    if matches!(
+        action,
+        "gatewayStatus" | "applyGateway" | "pauseGateway" | "enableGateway" | "testStream"
+    ) || (service == "workbuddy"
+        && matches!(action, "status" | "models" | "apply" | "management"))
+    {
+        let mut result = crate::local_provider_gateway::call(service, action, request).await?;
+        if matches!(
+            action,
+            "applyGateway" | "apply" | "pauseGateway" | "enableGateway"
+        ) {
+            let refreshed = tauri::async_runtime::spawn_blocking(
+                crate::gateway_commands::refresh_local_integration,
+            )
+            .await;
+            if !matches!(refreshed, Ok(Ok(()))) {
+                result["warning"] =
+                    json!("供应商已保存，Agent 配置刷新未完成，请在 Agent 接入页重新连接");
+            }
+        }
+        return Ok(result);
+    }
     macro_rules! invoke {
         ($method:path) => {
             public_result($method().await)

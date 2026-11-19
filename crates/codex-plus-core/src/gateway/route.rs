@@ -23,6 +23,10 @@ use crate::tools::ToolId;
 
 /// 嵌套模型组最多展开几层，防止组互相引用时死循环。
 const MAX_GROUP_DEPTH: usize = 4;
+
+#[cfg(test)]
+#[path = "native_models_tests.rs"]
+mod native_models_tests;
 /// 「缓存有效期内固定」：上次回答后这么久内，同一会话继续先试那个成员。上游的提示词缓存一般保留几分钟到一小时。
 pub const CACHE_STICKY_TTL: Duration = Duration::from_secs(10 * 60);
 /// 「整个会话固定」也不会永远记着：这么久没用的会话忘掉。
@@ -111,14 +115,43 @@ fn serves(relay: &RelayProfile, model: &str) -> bool {
 /// 某个 Agent 能用的池内供应商：打开的，再去掉它「挑选」里排除的。
 pub fn binding_pool_relays<'a>(
     gateway: &'a GatewaySettings,
-    binding: &AgentBinding,
+    binding: &'a AgentBinding,
 ) -> Vec<&'a RelayProfile> {
-    gateway
+    let mut relays: Vec<_> = gateway
         .providers
         .iter()
         .filter(|provider| provider.enabled && !binding.pool_exclude.contains(&provider.relay.id))
         .map(|provider| &provider.relay)
-        .collect()
+        .collect();
+    if let Some(native) = &binding.native_official {
+        relays.retain(|relay| relay.id != native.id);
+        relays.insert(0, native);
+    }
+    relays
+}
+
+/// 原生裸模型占用后，多家自动切换使用独立 ID，避免远程客户端误选来源。
+pub const CODEX_AUTO_MODEL_PREFIX: &str = "codex-plus-auto/";
+
+pub(crate) fn native_model(binding: &AgentBinding, model: &str) -> bool {
+    binding
+        .native_official
+        .as_ref()
+        .is_some_and(|relay| serves(relay, model))
+}
+
+fn native_auto_model<'a>(binding: &AgentBinding, model: &'a str) -> Option<&'a str> {
+    model
+        .strip_prefix(CODEX_AUTO_MODEL_PREFIX)
+        .filter(|model| native_model(binding, model))
+}
+
+fn redundant_native_model(binding: &AgentBinding, model: &str) -> bool {
+    binding.native_official.as_ref().is_some_and(|relay| {
+        model
+            .strip_prefix(&format!("{}/", relay.id))
+            .is_some_and(|upstream| serves(relay, upstream))
+    })
 }
 
 /// 自动组的 id 前缀（`auto:<小写模型名>`），只在内部用（会话固定、轮换进度、界面）；Agent 选它用的是裸模型名。
@@ -266,7 +299,7 @@ pub fn pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<Str
 /// 但成员的供应商全被这个 Agent 的『挑选』排除」时才不列（#2969），否则选了也只会报错。
 /// 本来就展开不了的组（成员模型没人提供等）保持原样列出，由默认模型等环节各自处理。
 /// `advance = false`：只看能不能展开，不推进轮换进度。
-fn group_listed_for_binding(
+pub(crate) fn group_listed_for_binding(
     gateway: &GatewaySettings,
     binding: &AgentBinding,
     group: &GatewayGroup,
@@ -346,6 +379,7 @@ pub fn codex_binding_models(gateway: &GatewaySettings, binding: &AgentBinding) -
         }))
     {
         if !model.is_empty()
+            && !redundant_native_model(binding, &model)
             && !is_disabled_group_model(gateway, &model)
             && !unavailable_registered_model(gateway, binding, &model)
             && !retired_codex_model(gateway, binding, &model)
@@ -386,6 +420,23 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
     for relay in &relays {
         let mut block = Vec::new();
         for model in chat_models(relay) {
+            if binding
+                .native_official
+                .as_ref()
+                .is_some_and(|native| native.id == relay.id)
+            {
+                if fresh(&model) {
+                    block.push(model.clone());
+                }
+                if serving_count(&relays, &model) > 1
+                    && !shared
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(&model))
+                {
+                    shared.push(model);
+                }
+                continue;
+            }
             if is_disabled_group_model(gateway, &model) {
                 let pinned = format!("{}/{model}", relay.id);
                 if !unlisted.contains(&pinned.to_ascii_lowercase()) && fresh(&pinned) {
@@ -444,7 +495,17 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
         shared
             .into_iter()
             .filter(|model| gateway.auto_models && !auto_group_settings(gateway, model).hidden)
+            .filter(|model| {
+                !native_model(binding, model) || active_auto_group(gateway, model).is_some()
+            })
             .filter(|model| !unlisted.contains(&model.to_ascii_lowercase()))
+            .map(|model| {
+                if native_model(binding, &model) {
+                    format!("{CODEX_AUTO_MODEL_PREFIX}{model}")
+                } else {
+                    model
+                }
+            })
             .filter(|model| fresh(model))
             .collect(),
     );
@@ -475,6 +536,52 @@ pub fn model_entry_window(
                 .and_then(|provider| provider.window_for(&upstream))
         })
         .min()
+}
+
+/// 这一项只发给官方账号供应商时，本机 Codex 官方缓存给这些模型的窗口（取最小）。
+/// 有一家不是官方账号、或缓存里没有这个模型时返回 None，不替别家猜窗口（#3161）。
+pub fn official_native_window(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    model: &str,
+) -> Option<u64> {
+    let members = model_entry_members(gateway, binding, model);
+    if members.is_empty() {
+        return None;
+    }
+    members
+        .iter()
+        .map(|(relay, upstream)| {
+            // 只看是不是官方账号供应商（Responses、没有另配 API 地址），不看此刻是否登录：
+            // 目录不能随登录状态来回变。
+            let official = crate::official_login::is_official_login_profile(relay)
+                && relay.protocol == crate::settings::RelayProtocol::Responses
+                && !(!relay.base_url.trim().is_empty()
+                    && (!relay.api_key.trim().is_empty() || relay.uses_no_auth()));
+            official
+                .then(|| crate::model_suffix::native_cache_context_window(upstream))
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min()
+}
+
+/// Agent 模型列表里一项的自动压缩百分比（#3100）：它会发给的各家里单独设过的取最小值
+/// （与窗口取最小一致，宁早勿晚）；都没设返回 None，交给 Agent 默认。
+pub fn model_entry_auto_compact(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    model: &str,
+) -> Option<f64> {
+    model_entry_members(gateway, binding, model)
+        .into_iter()
+        .filter_map(|(relay, upstream)| {
+            gateway
+                .provider(&relay.id)
+                .and_then(|provider| provider.auto_compact_for(&upstream))
+        })
+        .reduce(f64::min)
 }
 
 /// 某家某个模型支持的思考档位（由低到高）：用户在模型资料里写的优先，其次内置模型资料。
@@ -551,6 +658,15 @@ pub(crate) fn codex_model_route(
     relays: &[&RelayProfile],
     model: &str,
 ) -> Option<(usize, String, usize)> {
+    if native_model(binding, model) {
+        return Some((0, model.to_string(), 1));
+    }
+    if let Some(upstream) = native_auto_model(binding, model) {
+        let members = model_entry_members(gateway, binding, model);
+        let (owner, _) = members.first()?;
+        let index = relays.iter().position(|relay| relay.id == owner.id)?;
+        return Some((index, upstream.to_string(), serving_count(relays, upstream)));
+    }
     if binding.selection_for(model).is_some() {
         let members = model_entry_members(gateway, binding, model);
         let (relay, upstream) = members.first()?;
@@ -595,6 +711,12 @@ pub(crate) fn codex_model_members(
 /// 绑定的默认模型：绑定里写了就用它，否则用池里第一个供应商的默认模型。
 pub fn binding_default_model(gateway: &GatewaySettings, binding: &AgentBinding) -> String {
     let (slug, _) = crate::model_suffix::parse_model_suffix(binding.model.trim());
+    if redundant_native_model(binding, &slug) {
+        return slug
+            .split_once('/')
+            .map(|(_, model)| model.to_string())
+            .unwrap_or(slug);
+    }
     if !slug.trim().is_empty() {
         let selection_unavailable = unavailable_registered_model(gateway, binding, &slug);
         if selection_unavailable
@@ -647,6 +769,12 @@ pub fn binding_default_model(gateway: &GatewaySettings, binding: &AgentBinding) 
 
 /// 模型名是否能在池里路由：池里的模型、`group/<id>`，或 `<供应商 id>/<任意模型>`。
 pub fn model_is_routable(gateway: &GatewaySettings, binding: &AgentBinding, model: &str) -> bool {
+    if native_model(binding, model) {
+        return true;
+    }
+    if let Some(upstream) = native_auto_model(binding, model) {
+        return active_auto_group(gateway, upstream).is_some();
+    }
     if is_disabled_group_model(gateway, model) {
         return false;
     }
@@ -662,6 +790,9 @@ pub(super) fn codex_model_available(
     binding: &AgentBinding,
     model: &str,
 ) -> bool {
+    if native_auto_model(binding, model).is_some() {
+        return model_is_routable(gateway, binding, model);
+    }
     match selected_provider(gateway, binding, model) {
         Ok(Some(_)) => true,
         Err(_) => false,
@@ -797,12 +928,37 @@ pub fn claude_desktop_alias(model: &str, has_effort: bool) -> String {
     format!("{CLAUDE_EFFORT_ALIAS_PREFIX}{}", alias_number(model))
 }
 
+/// Claude Desktop 把网关模型标成 1M 上下文的门槛（#3107）。
+///
+/// Desktop 网关模式的 `/v1/models` 发现逻辑（app.asar `[custom-3p] Gateway /v1/models`）只认一个布尔：
+/// 行里 `supports_1m` 是布尔就用它，否则看 `max_input_tokens >= 1e6`；数值本身不保留，
+/// 没有别的档位（256K / 400K 这类窗口无法告诉它）。所以不到 1M 的模型绝不能标 1M，
+/// 否则 Desktop 会把自动压缩推迟到超出上游真实窗口。
+pub const CLAUDE_DESKTOP_1M_WINDOW: u64 = 1_000_000;
+
+/// Claude Desktop `/v1/models` 一行里声明窗口的字段 `(max_input_tokens, supports_1m)`：
+/// 窗口取 [`model_entry_window`]（模型组按最短的那家），达到 [`CLAUDE_DESKTOP_1M_WINDOW`] 才算 1M。
+/// 池里没写窗口时 None，什么都不声明，Desktop 按它自带的 200k。
+///
+/// 标了 1M 的模型 Desktop 会多给一个 `<id>[1m]` 的 1M 选项，id 本身不用加后缀；
+/// 选中后发回来的 `<id>[1m]` 由 [`claude_alias_target`] 剥掉后缀再还原。
+pub fn claude_desktop_window(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    model: &str,
+) -> Option<(u64, bool)> {
+    let window = model_entry_window(gateway, binding, model)?;
+    Some((window, window >= CLAUDE_DESKTOP_1M_WINDOW))
+}
+
 /// 把 Claude Desktop 发来的别名还原成真实模型名；不是别名、或别名对不上这个绑定的任何模型时 None。
 fn claude_alias_target(
     gateway: &GatewaySettings,
     binding: &AgentBinding,
     requested: &str,
 ) -> Option<String> {
+    // Desktop 的 1M 选项 id 是 `<别名>[1m]`（见 [`claude_desktop_window`]）：先剥掉窗口后缀再对别名。
+    let (requested, _) = crate::model_suffix::parse_model_suffix(requested);
     let digits = [CLAUDE_ALIAS_PREFIX, CLAUDE_EFFORT_ALIAS_PREFIX]
         .iter()
         .find_map(|prefix| {
@@ -984,7 +1140,7 @@ fn should_log_model_rewrite(agent: &str, requested: &str) -> bool {
 /// 按裸模型处理，不拆前缀；没人声明整串时才当成「供应商 id/模型」。
 fn qualified_provider<'a>(
     gateway: &'a GatewaySettings,
-    binding: &AgentBinding,
+    binding: &'a AgentBinding,
     model: &str,
 ) -> Option<(&'a RelayProfile, String)> {
     qualified_in(&binding_pool_relays(gateway, binding), model)
@@ -996,6 +1152,9 @@ pub(super) fn has_explicit_model_identity(
     model: &str,
 ) -> bool {
     let (model, _) = crate::model_suffix::parse_model_suffix(model.trim());
+    if native_auto_model(binding, &model).is_some() {
+        return true;
+    }
     if binding.selection_for(&model).is_some() {
         return true;
     }
@@ -1027,7 +1186,9 @@ pub(super) fn model_identity_kind(
     binding: &AgentBinding,
     model: &str,
 ) -> &'static str {
-    if binding.selection_for(model).is_some() {
+    if native_auto_model(binding, model).is_some() {
+        "group"
+    } else if binding.selection_for(model).is_some() {
         "provider"
     } else if group_by_model(gateway, model).is_some() {
         "group"
@@ -1065,9 +1226,15 @@ fn declared_by_any(relays: &[&RelayProfile], model: &str) -> bool {
 /// 已登记的选择不能因供应商变化或完整原生名称冲突而改派。
 fn selected_provider<'a>(
     gateway: &'a GatewaySettings,
-    binding: &AgentBinding,
+    binding: &'a AgentBinding,
     model: &str,
 ) -> anyhow::Result<Option<(&'a RelayProfile, String)>> {
+    if native_model(binding, model) {
+        return Ok(binding
+            .native_official
+            .as_ref()
+            .map(|relay| (relay, model.to_string())));
+    }
     let Some(selection) = binding.selection_for(model) else {
         return Ok(None);
     };
@@ -1168,6 +1335,11 @@ fn expand_model(
     visiting: &mut Vec<String>,
     advance: bool,
 ) -> Vec<(RelayProfile, String)> {
+    if let Some(upstream) = native_auto_model(binding, model) {
+        return active_auto_group(gateway, upstream)
+            .map(|group| expand_group(gateway, binding, &group, depth, visiting, advance))
+            .unwrap_or_default();
+    }
     if is_disabled_group_model(gateway, model) {
         return Vec::new();
     }
@@ -1552,6 +1724,14 @@ fn resolve_plan_with(
     let default_model = binding_default_model(gateway, binding);
     let (model, mapped_to_default) =
         effective_model_detailed(gateway, binding, &default_model, requested_model);
+    let (requested_slug, _) = crate::model_suffix::parse_model_suffix(requested_model.trim());
+    if *agent == ToolId::Codex && requested_slug.starts_with(CODEX_AUTO_MODEL_PREFIX) {
+        let upstream = native_auto_model(binding, &requested_slug)
+            .context("多家自动切换入口已不可用，请重新选择模型")?;
+        if active_auto_group(gateway, upstream).is_none() {
+            bail!("多家自动切换入口已停用：{requested_model}");
+        }
+    }
     let selected = selected_provider(gateway, binding, &model)?;
     if selected.is_none() && is_disabled_group_model(gateway, &model) {
         bail!("模型组 {model} 已停用");
@@ -1563,7 +1743,11 @@ fn resolve_plan_with(
 
     let group = selected
         .is_none()
-        .then(|| group_for(gateway, &model))
+        .then(|| {
+            native_auto_model(binding, &model)
+                .and_then(|upstream| active_auto_group(gateway, upstream))
+                .or_else(|| group_for(gateway, &model))
+        })
         .flatten();
     let group_id = group.as_ref().map(|group| group.id.clone());
     let sticky_ttl = group.as_ref().and_then(|group| sticky_ttl(group.sticky));
@@ -1662,6 +1846,7 @@ fn resolve_plan_with(
     let cooldown_off = crate::extension_gateway::builtin_replaced("builtin:key-cooldown");
     let breaker_off = crate::extension_gateway::builtin_replaced("builtin:key-breaker");
     let rate_limit_off = crate::extension_gateway::builtin_replaced("builtin:local-rate-limit");
+    let pinned_key = crate::responses_websocket::pinned_key();
     for (relay, upstream_model) in permitted {
         let provider = gateway.provider(&relay.id);
         let window = provider.and_then(|provider| provider.window_for(&upstream_model));
@@ -1688,9 +1873,18 @@ fn resolve_plan_with(
             limits,
         };
         for key in order.available {
+            if pinned_key.as_ref().is_some_and(|pinned| pinned != &key.key) {
+                continue;
+            }
             candidates.push(candidate(key));
         }
         for key in order.waiting {
+            if pinned_key
+                .as_ref()
+                .is_some_and(|pinned| pinned != &key.candidate.key)
+            {
+                continue;
+            }
             let bypass = match key.reason {
                 // 自己在冷却的 Key 可能同时赶上供应商熔断：熔断没关掉时仍按熔断拦着。
                 key_pool::WaitReason::Cooling => {
@@ -1769,6 +1963,7 @@ mod tests {
             models_checked_at_ms: 0,
             newapi_access: None,
             upstream_meta: Default::default(),
+            auto_compact: Default::default(),
             subscription_policy: None,
             relay: RelayProfile {
                 id: id.to_string(),
@@ -2233,6 +2428,65 @@ mod tests {
             routed(&gateway, "claude-gw-0000000000")[0].1,
             "deepseek-v4-pro"
         );
+    }
+
+    /// #3107：Desktop 只认「是不是 1M」，所以窗口到 1M 才标 1M；256K / 400K 这类只报真实窗口、
+    /// 明确不标 1M。模型组按最短的那家算。
+    #[test]
+    fn desktop_window_marks_1m_only_from_one_million() {
+        let mut gateway = gateway("kimi-k3");
+        let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        assert_eq!(claude_desktop_window(&gateway, &binding, "kimi-k3"), None);
+
+        for (window, expected) in [
+            (200_000, false),
+            (400_000, false),
+            (999_999, false),
+            (1_000_000, true),
+            (2_000_000, true),
+        ] {
+            gateway.providers[1]
+                .model_windows
+                .insert("kimi-k3".into(), window);
+            assert_eq!(
+                claude_desktop_window(&gateway, &binding, "kimi-k3"),
+                Some((window, expected)),
+                "{window}"
+            );
+        }
+
+        // 组里一家 1M、一家 400K：按 400K 报，不标 1M。
+        gateway.providers[1]
+            .model_windows
+            .insert("kimi-k3".into(), 1_000_000);
+        gateway.providers[0]
+            .model_windows
+            .insert("deepseek-v4-flash".into(), 400_000);
+        assert_eq!(
+            claude_desktop_window(&gateway, &binding, "group/fast"),
+            Some((400_000, false))
+        );
+    }
+
+    /// #3107：Desktop 给 1M 模型出的 1M 选项 id 是 `<别名>[1m]`，两种别名带后缀都能还原成原模型。
+    #[test]
+    fn desktop_1m_variant_ids_route_back_to_original_model() {
+        let gateway = gateway("deepseek-v4-pro");
+        let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        for has_effort in [false, true] {
+            let alias = claude_desktop_alias("kimi-k3", has_effort);
+            for id in [
+                alias.clone(),
+                format!("{alias}[1m]"),
+                format!("{alias}[1M]"),
+            ] {
+                assert_eq!(
+                    effective_model(&gateway, &binding, "deepseek-v4-pro", &id),
+                    "kimi-k3",
+                    "{id}"
+                );
+            }
+        }
     }
 
     /// 有思考档位的模型用 mythos-gw- 别名（Desktop 才出思考等级菜单），旧的 claude-gw- 别名仍能还原。

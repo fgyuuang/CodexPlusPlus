@@ -5,11 +5,19 @@
 ## 项目概述
 
 本仓库是 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 fork。
-当前整合目标 v2.6.7（正式提交 `e63ff6c9`），实际交付源码位于 `D:/pro/codexpp-v266-integration-20261112`。
-本轮整合与验收边界见 `docs/reports/2026-11-09-v2.4.0-provider-recovery.md`，实际交付以 release job 为准。
+当前源码整合目标为正式 v2.7.2（`70fb845e`），主开发目录 `D:/pro/codex-plus-plus`。为保留原合并及恢复记录，分支仍名为 `codex/sync-v2.7.1-20261117`；以实际 `MERGE_HEAD` 和源码版本为准。
+2026-11-18 本轮限源码整合、验证和贡献准备。现行说明见 `docs/reports/2026-11-18-v2.7.2-contribution-audit.md`；上次 2.7.1 的发布证据仍只对应旧输入。未提交的合并不得再次直接 merge/rebase。对外贡献从干净上游基线按功能组织，本分支用于保留个人 fork 历史。
 
 本地扩展了聚合供应商路由与模型别名、认证与会话隔离、插件市场保留等功能，
 详见 `docs/local-features.md` —— 每次上游合并后必须逐条确认回归。
+
+### 2026-11-17 上一轮整合边界
+
+用户授权集合所有本地开发成果、核对五条对话并同步最新正式版 `v2.7.1`（`d5dcad3b`），本条覆盖历史章节中的旧目标版本。原分支 `feat/reset-cards-2.6.10` 的 `b8dd3208` 保持不动；当前工作分支已执行 `merge --no-commit --no-ff`，不要在待提交合并上再次 merge/rebase。合并前变化保存在 `output/sync-v271-20261117` 和保留的 stash，不能清理。
+
+本轮不运行 release、不安装依赖、不部署、不重启应用、不动真实登录及外部服务数据、不提交或推送。后续模型先读整合报告与已有日志，按发布工作流接续，不重复本轮审计。WorkBuddy Manager 的压缩/恢复改动位于独立仓库 `D:/pro/workbuddy-manager`，插件的完整管理页也有独立交付边界，不能称为已包含在本仓库二进制中。
+
+管理器采用上游精简入口：增强功能设置在 Codex 中，管理器保留总开关和独立模式补丁；本地 Fast、启动、容量重试、额度继续等开关在 Codex 设置页保留。供应商编辑使用 `relay-profile-editing.ts` 共用实现，先组装 provider-editing 分片，再组装 renderer；注入页复用运行时模型目录，不能打入静态目录中的模型指令。
 
 ### 优先采用上游实现
 
@@ -84,6 +92,25 @@
 - **扫描调度**：拓展插入的节点必须带 `data-codex-plus-ext` 属性，否则会触发自喂扫描循环
   （issue #1960）。选择器按「有归属/无归属」两档登记，不要按脚本逐个登记，会耗尽配额。
 - 改分片后必须跑 `node scripts/assemble-renderer-inject.mjs` 重新组装产物。
+
+## 注入 Codex 的界面：和 Codex 原生一样
+
+注入到 Codex 里的界面（拓展页、供应商页、任务面板等 `renderer-inject` 分片）要尽量复用 Codex 自己的样式，
+做得和 Codex 原生组件一样，减少割裂感。
+
+- **先量原生组件再动手**：在隔离 Codex 实例（独立 `--user-data-dir` + 调试端口）里找到同类原生组件，
+  用 CDP 读计算样式和它 class 引用的 CSS 变量（尺寸、圆角、内边距、颜色、阴影、模糊），照着实现，不自己另定一套。
+- **不用原生 HTML 控件**：`<select>` 这类控件的弹出层不跟主题，样子也和 Codex 不一样。下拉、菜单复用
+  `10-style.js` 里的 `.codex-plus-menu-trigger` / `.codex-plus-menu-popover` / `.codex-plus-menu-item`
+  （照 Codex「更改权限」「推理强度」菜单实测），用法见 `41-extension-sources.js` 的排序菜单。
+- **颜色、阴影引用 Codex 变量并给兜底**，浅色主题会自动跟着变，例如：
+  - `--color-surface-elevated-secondary`：浮层底
+  - `--shadow-dropdown-overlay`：已包含 0.5px 描边
+  - `--color-token-list-hover-background`：悬停底色
+  - `--color-text-tertiary`：次要文字
+- **按键在 window 捕获阶段接**：Codex 会在 document 捕获阶段把按键截进输入框。
+- **改了 CSS 不用手动加版本号**：`installStyle` 按样式全文哈希判断，同页重新注入也会换成新样式表。
+- 交付前把截图和对应的原生组件并排对照。
 
 ## 测试约定
 
@@ -209,3 +236,13 @@ git push -u fork HEAD
 ## 2026-11-13 最新版与分支修复
 
 用户明确要求修复时追上最新正式版本。本轮核对最新为 v2.6.7，采用已成功构建的 v2.6.6 源码继续合并；不覆盖 C 盘原工作区的待提交合并，不自动提交、推送或重启。历史并行授权不扩展为本轮新的子代理请求。
+
+## 2026-11-16 仓库迁移说明
+
+主开发入口为 D:/pro/codex-plus-plus。2026-11-16 后续历史收敛已将公共 Git 数据库移至主目录自己的 .git，当前目录是独立主工作区，不再依赖旧 2.4.0 目录。历史材料实际集中在 D:/pro/codex-plus-plus/history；旧 D:/pro/codex-plus-plus-history 空壳及旧 v269 联接也已收纳到 history/consolidation-20261116，不再作为外部入口。两个独立插件源码目录已归档于 history/plugins，已安装用户包和外部服务数据未迁移，后续开发或贡献前先提取所需源码。迁移文档中关于 Git 依赖旧目录的描述是已替代的阶段记录。
+
+本次进行了迁移、C/D 盘编译缓存清理、历史工作区归档及 Git 主工作区整理，没有合并、提交或推送。历史章节中的分支名与基线只适用于其原整合任务，后续操作先核对当前实际分支及用户本轮目标。最新目录与保留边界见 history/README.md、docs/reports/2026-11-16-history-consolidation.md；先前迁移与空间审计报告保留阶段证据。
+
+原 C:/Users/fgy/Documents/codex-plus-plus 只保留被 PSForge 工具进程占用的日志及迁移指引，已不是开发仓库。所有仓库操作应显式使用 D 盘主开发目录。既有安全、测试、发布规则继续适用。
+
+用户明确要求仅保留当前开发基线，不再持续复制整套旧源码。history 只保存本地历史材料，不得在其中开发、编译或作为下一轮升级基线；它通过 .git/info/exclude 的 /history/ 排除，不提交或推送其中的备份与私有配置。旧工作区的独有修改保存为恢复补丁及小型压缩包，基准提交由 refs/archive/20261116/* 保护；这不代表维护多条开发路线。迁移重复副本的删除被自动审批阻止，保留在 history/legacy，并记录为待清理，不能报告已删除。

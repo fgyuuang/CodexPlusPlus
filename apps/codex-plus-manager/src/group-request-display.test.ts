@@ -39,7 +39,7 @@ test("实际请求行在多组再次改名后更新正文与悬停提示，并�
     for (const [index, entry] of entries.entries()) {
       const html = renderToStaticMarkup(createElement(component.exports.FlowRequestRow, { entry, payload, now: 3 }));
       assert.ok(html.includes(names[index]));
-      assert.ok(html.includes(`title="${names[index]} → upstream-model"`));
+      assert.ok(html.includes(`title="${names[index]} → Upstream-Model"`));
       assert.ok(!html.includes(entry.model));
     }
     assert.equal(JSON.stringify(entries), originals);
@@ -47,5 +47,5 @@ test("实际请求行在多组再次改名后更新正文与悬停提示，并�
   const ordinary = renderToStaticMarkup(createElement(component.exports.FlowRequestRow, {
     entry: { ...entries[0], model: "provider/raw-model" }, payload, now: 3,
   }));
-  assert.ok(ordinary.includes("provider/raw-model"));
+  assert.ok(ordinary.includes("provider/Raw-Model"));
 });

@@ -77,6 +77,23 @@ function payload(): GatewayPayload {
 
 const initials = (name: string) => name.slice(0, 2).toUpperCase();
 
+test("Codex 当前登录账号保留裸模型，重复账号项隐藏，自动组使用独立 ID", () => {
+  const data = payload();
+  data.pool.push({ ...data.pool[0], id: "login", name: "登录账号", models: ["deepseek-v4-pro"], official: true });
+  data.autoGroups = [{ id: "auto:deepseek-v4-pro", name: "deepseek-v4-pro", mode: "inOrder", members: [{ model: "deepseek/deepseek-v4-pro", weight: 1 }, { model: "login/deepseek-v4-pro", weight: 1 }], hidden: false, customized: false }];
+  const native = { providerId: "login", models: ["deepseek-v4-pro", "native-next"] };
+  const sections = pickerSections(data, "", initials, [], undefined, null, false, native);
+  const nativeSection = sections.find((section) => section.key === "native");
+  assert.deepEqual(nativeSection?.items.map((item) => item.model), native.models);
+  assert.equal(nativeSection?.items[0].defaultModelSelection, undefined);
+  assert.equal(sections.some((section) => section.items.some((item) => item.model === "login/deepseek-v4-pro")), false);
+  assert.ok(sections.some((section) => section.items.some((item) => item.model === "deepseek/deepseek-v4-pro")));
+  assert.ok(sections.find((section) => section.key === "auto")?.items.some((item) => item.model === "codex-plus-auto/deepseek-v4-pro"));
+  assert.equal(modelDisplay(data, "codex-plus-auto/deepseek-v4-pro").auto, true);
+  assert.equal(modelDisplay(data, "codex-plus-auto/deepseek-v4-pro").title, prettyModelName("deepseek-v4-pro"));
+  assert.equal(pickerSections(data, "", initials).some((section) => section.key === "native"), false, "其他 Agent 和组编辑沿用原规则");
+});
+
 test("上下文窗口支持 k / M 写法", () => {
   assert.equal(parseContextWindow(""), null);
   assert.equal(parseContextWindow("200000"), 200000);
@@ -425,10 +442,10 @@ test("上一个请求的路由说明：先列计划，再逐个尝试，最后�
   const data = withActivity();
   const lines = routeNarrative("claude", data.activity!.agents[0].last!, data);
   assert.deepEqual(lines.map((line) => line.tone), ["muted", "step", "step", "ok"]);
-  assert.deepEqual(lines[0].args, ["Claude Code", "claude-sonnet-5", "Daily", "DeepSeek/deepseek-v4-flash, GLM/glm-5.3"]);
+  assert.deepEqual(lines[0].args, ["Claude Code", "Claude-Sonnet-5", "Daily", "DeepSeek/DeepSeek-V4-Flash, GLM/GLM-5.3"]);
   // 失败原因是界面文案，标成 { zh } 交给界面翻译；供应商名、Key id 原样显示。
   assert.deepEqual(lines[2].args, ["DeepSeek", "key-1", { zh: "被限流" }, " · HTTP 429"]);
-  assert.deepEqual(lines[3].args, ["GLM", "glm-5.3", "1.2 s"]);
+  assert.deepEqual(lines[3].args, ["GLM", "GLM-5.3", "1.2 s"]);
 });
 
 test("调度表的状态按模型：「刚用过」只标在真正被请求的模型上，冷却按整家供应商", () => {

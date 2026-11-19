@@ -31,6 +31,8 @@
     loadedAt: codexModelCatalogLoadedAt,
     source: previousCodexModelCatalogRuntime?.source || "",
     settingsKey: previousCodexModelCatalogRuntime?.settingsKey || "",
+    // 当前成功快照是在哪套供应商 / 目录指纹下读到的；判断不出归属时为空。
+    catalogIdentity: previousCodexModelCatalogRuntime?.catalogIdentity || "",
     retryAt: previousCodexModelCatalogRuntime?.retryAt || 0,
     failure: previousCodexModelCatalogRuntime?.failure || null,
     modelListRequests: previousCodexModelCatalogRuntime?.modelListRequests || new Map(),
@@ -158,6 +160,10 @@
       (aggregate?.members || []).map((member) => fields(profiles.find((entry) => entry?.id === member.relayId)))]);
   }
 
+  function codexModelCatalogIdentity(settings) {
+    return JSON.stringify([codexModelSettingsSource(settings), codexModelSettingsKey(settings)]);
+  }
+
   function refreshCodexModelCatalogForSettings(previous, next) {
     if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return;
     const source = codexModelSettingsSource(next);
@@ -176,6 +182,7 @@
     if (sourceChanged) {
       codexModelCatalog = { status: "loading", model: "", default_model: "", models: [], sources: [] };
       codexModelCatalogRuntime.catalog = codexModelCatalog;
+      codexModelCatalogRuntime.catalogIdentity = "";
       window.__codexPlusModelPickerGroupsRuntime?.catalogChanged?.({ sourceChanged: true });
     }
     codexModelCatalogLoadedAt = codexModelCatalogRuntime.loadedAt = 0;
@@ -218,7 +225,9 @@
 
   scheduleCodexModelCatalogRetry();
 
-  async function loadCodexModelCatalog(force = false) {
+  // timeoutMs 不传时按准备读取的默认 2 秒截止：模型列表、白名单解锁等读不到也能降级，桥接卡住时不能拖住原生请求。
+  // 只有新建聊天读运行时上下文（读不到就开不了聊天，#3137）才显式放宽到 codexBridgePreparationReadTimeoutMs。
+  async function loadCodexModelCatalog(force = false, timeoutMs) {
     if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return codexModelCatalog;
     if (!force && codexModelCatalogPromise) return codexModelCatalogPromise;
     if (!force && Date.now() < codexModelCatalogRuntime.retryAt) return codexModelCatalogRuntime.failure || codexModelCatalog;
@@ -226,12 +235,14 @@
     const revision = ++codexModelCatalogRevision;
     const current = () => revision === codexModelCatalogRevision
       && window.__codexPlusModelCatalogRuntime === codexModelCatalogRuntime;
+    let identity = "";
     if (codexPlusBackendSettingsLoaded) {
       codexModelCatalogRuntime.source = codexModelSettingsSource(codexPlusBackendSettings);
       codexModelCatalogRuntime.settingsKey = codexModelSettingsKey(codexPlusBackendSettings);
+      identity = codexModelCatalogIdentity(codexPlusBackendSettings);
     }
     let failedCatalog = null;
-    const request = readCodexAppServerPreparation("/codex-model-catalog", {})
+    const request = readCodexAppServerPreparation("/codex-model-catalog", {}, timeoutMs)
       .then(async (result) => {
         if (!current()) return codexModelCatalog;
         const nextCatalog = result && typeof result === "object" ? result : { status: "failed", models: [] };
@@ -241,7 +252,7 @@
         }
         if (!nextCatalog.models.length && nextCatalog.status === "not_configured") {
           try {
-            const settingsResp = await readCodexAppServerPreparation("/settings/get", {});
+            const settingsResp = await readCodexAppServerPreparation("/settings/get", {}, timeoutMs);
             if (settingsResp && settingsResp.relayProfiles && Array.isArray(settingsResp.relayProfiles)) {
               const activeId = settingsResp.activeRelayId || "";
               const profile = settingsResp.relayProfiles.find(p => p.id === activeId);
@@ -267,6 +278,7 @@
           model.startsWith("group/") && metadata?.displayName !== previousMetadata[model]?.displayName);
         window.__codexPlusModelPickerGroupsRuntime?.catalogChanged?.(previousCatalog, nextCatalog);
         codexModelCatalog = codexModelCatalogRuntime.catalog = nextCatalog;
+        codexModelCatalogRuntime.catalogIdentity = identity;
         codexModelCatalogLoadedAt = codexModelCatalogRuntime.loadedAt = Date.now();
         codexModelCatalogRuntime.retryAt = 0;
         codexModelCatalogRuntime.failure = null;
@@ -585,6 +597,17 @@
       descriptor.priority = metadata.priority;
       changed = true;
     }
+    // 图片输入能力（#3042）：只在目录/元数据明确声明时覆盖，没声明保留原生描述符的值。
+    const modalities = codexPlusModelInputModalities(metadata);
+    if (modalities && JSON.stringify(descriptor.inputModalities ?? null) !== JSON.stringify(modalities)) {
+      descriptor.inputModalities = modalities;
+      changed = true;
+    }
+    const original = codexPlusModelImageDetailOriginal(metadata);
+    if (original !== null && descriptor.supportsImageDetailOriginal !== original) {
+      descriptor.supportsImageDetailOriginal = original;
+      changed = true;
+    }
     if (Array.isArray(metadata.supportedReasoningEfforts) && metadata.supportedReasoningEfforts.length > 0) {
       const nextEfforts = modelReasoningEfforts(modelName);
       if (JSON.stringify(descriptor.supportedReasoningEfforts || []) !== JSON.stringify(nextEfforts)) {
@@ -610,6 +633,8 @@
     const officialTemplate = capabilitySlug && Array.isArray(availableModels)
       ? availableModels.find((item) => String(item?.model || item?.slug || "").trim().toLowerCase() === capabilitySlug.toLowerCase())
       : null;
+    const modalities = codexPlusModelInputModalities(metadata);
+    const original = codexPlusModelImageDetailOriginal(metadata);
     return {
       ...(officialTemplate && typeof officialTemplate === "object" ? { ...officialTemplate } : {}),
       model: modelName,
@@ -630,7 +655,27 @@
       ...(Array.isArray(metadata?.serviceTiers)
         ? { serviceTiers: metadata.serviceTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry) }
         : {}),
+      // 图片输入能力只带目录/元数据里声明过的；没声明不写，不替未知模型宣称收图，
+      // 与此前的原生行为一致。
+      ...(modalities ? { inputModalities: modalities } : {}),
+      ...(original !== null ? { supportsImageDetailOriginal: original } : {}),
     };
+  }
+
+  // 元数据里声明的输入模态（camelCase / snake_case 都认），没声明返回 null。
+  function codexPlusModelInputModalities(metadata) {
+    const declared = Array.isArray(metadata?.inputModalities) ? metadata.inputModalities
+      : Array.isArray(metadata?.input_modalities) ? metadata.input_modalities : null;
+    if (!declared) return null;
+    return declared.filter((modality) => typeof modality === "string" && modality.trim())
+      .map((modality) => modality.trim());
+  }
+
+  // 是否支持原图细节（`detail: "original"`），没声明返回 null。
+  function codexPlusModelImageDetailOriginal(metadata) {
+    if (typeof metadata?.supportsImageDetailOriginal === "boolean") return metadata.supportsImageDetailOriginal;
+    if (typeof metadata?.supports_image_detail_original === "boolean") return metadata.supports_image_detail_original;
+    return null;
   }
 
   function modelArrayLooksPatchable(value, allowEmpty = false) {
@@ -1230,8 +1275,21 @@
     }
   }
 
+  // 强制刷新失败（如桥接迟回超时，#3137）时，只有成功快照与当前供应商、目录指纹完全一致才退回它；
+  // 设置未加载、快照归属不明、换过供应商或改过目录配置，一律返回原失败，绝不混用别家的目录。
+  function codexModelCatalogSnapshotAfterFailure(failure) {
+    const snapshot = codexModelCatalog;
+    if (failure?.status !== "failed" || snapshot === failure || snapshot?.status !== "ok"
+        || !codexPlusBackendSettingsLoaded) return failure;
+    const identity = codexModelCatalogRuntime.catalogIdentity;
+    if (!identity || identity !== codexModelCatalogIdentity(codexPlusBackendSettings)) return failure;
+    sendCodexPlusDiagnostic("model_catalog_snapshot_fallback", { message: String(failure.message || "") });
+    return snapshot;
+  }
+
   async function codexThreadRuntimeContext(params) {
-    const catalog = await loadCodexModelCatalog(true);
+    const catalog = codexModelCatalogSnapshotAfterFailure(
+      await loadCodexModelCatalog(true, codexBridgePreparationReadTimeoutMs));
     const runtime = catalog.runtimeContext;
     if (!runtime && catalog.status === "failed") {
       throw new Error(catalog.message || "读取上下文配置失败，请稍后重新发送");

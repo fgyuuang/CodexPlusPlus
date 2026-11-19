@@ -36,18 +36,19 @@ test("厂商余额：几张卡片同时要只查一次，之后在有效期内�
   assert.equal(calls, 2, "点刷新强制重查");
 });
 
-test("厂商余额：「用量」页只要查过就用缓存，查不到时保留上次的结果，并通知订阅者", async () => {
+test("厂商余额：缓存过期重新查询，查询失败时保留上次的结果并通知订阅者", async () => {
   resetProviderBalancesForTest();
   const seen: number[] = [];
   const unsubscribe = subscribeProviderBalances((balances) => seen.push(balances.length));
   await loadProviderBalances(async () => ({ balances: [deepseek] }));
   const cache = cachedProviderBalances();
   cache.at -= PROVIDER_BALANCE_TTL_MS * 10;
+  const staleAt = cache.at;
   let calls = 0;
-  await loadProviderBalances(async () => { calls += 1; return { balances: [] }; }, { maxAge: null });
-  assert.equal(calls, 0);
-  const kept = await loadProviderBalances(async () => { throw new Error("offline"); }, { force: true });
+  const kept = await loadProviderBalances(async () => { calls += 1; throw new Error("offline"); });
+  assert.equal(calls, 1, "过期数据触发重查");
   assert.deepEqual(kept, [deepseek]);
+  assert.equal(cache.at, staleAt, "失败不延长旧余额的有效期");
   assert.deepEqual(seen, [1, 1]);
   unsubscribe();
 });
@@ -73,11 +74,18 @@ test("DeepSeek 等厂商的卡片余额和「用量」页共用一份查询，�
   assert.match(providers, /<ProviderBalancePoolBadge balance=\{vendorBalance\.balance\}/);
   // 卡片和「用量」页都走共享缓存，不各自直接调后端。
   assert.match(billingLine, /loadProviderBalances\(\(\) => invoke<[^>]+>\("load_gateway_balances"\), \{ force \}\)/);
-  assert.match(usage, /loadProviderBalances\(\r?\n?\s*\(\) => invoke<[^>]+>\("load_gateway_balances"\),\r?\n?\s*\{ force, maxAge: null \},/);
+  assert.match(usage, /loadProviderBalances\(\r?\n?\s*\(\) => invoke<[^>]+>\("load_gateway_balances"\),\r?\n?\s*\{ force \},/);
   assert.doesNotMatch(usage, /memo\.balances/);
   // 同一个徽章和刷新按钮。
   assert.match(billingLine, /export function ProviderBalancePoolBadge[\s\S]*?className="gw-billing-status"[\s\S]*?className="gw-quota-badge"[\s\S]*?RelayBillingRefreshButton/);
-  assert.match(commands, /balance_api: codex_plus_core::gateway::balance::has_balance_api\(relay\),/);
+  assert.match(commands, /balance_api: codex_plus_core::gateway::balance::has_balance_api\(relay\)/);
+});
+
+test("用量页复用 Key 和账号池余额视图，并明确 Key 消耗的累计口径", () => {
+  assert.match(usage, /balance\.scope === "key"[\s\S]*?<ProviderBalancePoolBadge balance=\{balance\}/);
+  assert.match(billingLine, /balance\.poolAmount/);
+  assert.match(billingLine, /Key 累计消耗/);
+  assert.match(billingLine, /并非所选时间段或账号池的消耗/);
 });
 
 test("new-api 访问令牌：详情里可设置，弹窗用密码框、只显示打码，命令已注册", () => {

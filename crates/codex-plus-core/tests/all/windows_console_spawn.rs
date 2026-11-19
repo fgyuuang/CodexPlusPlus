@@ -56,6 +56,16 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     // macOS 分支：cfg 属性离调用点超过 CFG_LOOKBACK_LINES 行。
     (
+        "crates/codex-plus-core/src/task_board.rs",
+        "Command::new(\"osascript\")",
+        "文件夹选择器的 macOS 编译分支，不会在 Windows 上执行",
+    ),
+    (
+        "crates/codex-plus-core/src/task_board.rs",
+        "Command::new(program).args(&args).output()",
+        "文件夹选择器的 Linux 编译分支，不会在 Windows 上执行",
+    ),
+    (
         "crates/codex-plus-core/src/gateway/sessions.rs",
         "Command::new(\"open\")",
         "#[cfg(target_os = \"macos\")] 块里用「终端」打开 .command 文件",

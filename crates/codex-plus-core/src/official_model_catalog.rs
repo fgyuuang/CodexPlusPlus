@@ -5,9 +5,10 @@
 //! 官方条目、Codex bundled catalog 和仓库内置兼容条目。
 
 use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -309,11 +310,59 @@ pub fn visible_official_model_slugs_for_settings(settings: &BackendSettings) -> 
     visible_slugs(&entries)
 }
 
+// 每个模型会多次查询官方身份；只缓存这一只读集合，避免重复解析整个账号目录。
+// 不缓存模型目录响应：价格、运行时上下文、供应商失败与配置变更仍实时读取。
+struct TrustedSlugCache {
+    fingerprint: u64,
+    slugs: Arc<HashSet<String>>,
+}
+
+static TRUSTED_SLUG_CACHE: OnceLock<Mutex<Option<TrustedSlugCache>>> = OnceLock::new();
+
+fn trusted_slug_fingerprint() -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let settings_path = crate::paths::default_settings_path();
+    settings_path.hash(&mut hasher);
+    // 设置可能等长快速改写；哈希内容确保切换账号立即生效。
+    std::fs::read(settings_path).ok().hash(&mut hasher);
+    let catalog_path = official_model_catalog_path();
+    catalog_path.hash(&mut hasher);
+    std::fs::metadata(catalog_path)
+        .ok()
+        .map(|meta| (meta.len(), meta.modified().ok()))
+        .hash(&mut hasher);
+    std::env::var_os("CODEX_HOME").hash(&mut hasher);
+    hasher.finish()
+}
+
 pub fn is_trusted_official_model(model: &str) -> bool {
-    let normalized = model.trim();
-    trusted_official_model_slugs()
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(normalized))
+    let model = model.trim().to_ascii_lowercase();
+    if model.is_empty() {
+        return false;
+    }
+    let fingerprint = trusted_slug_fingerprint();
+    let cache = TRUSTED_SLUG_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let cached = cache.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = cached.as_ref()
+            && entry.fingerprint == fingerprint
+        {
+            return entry.slugs.contains(&model);
+        }
+    }
+    let slugs = Arc::new(
+        trusted_official_model_slugs()
+            .into_iter()
+            .map(|slug| slug.to_ascii_lowercase())
+            .collect::<HashSet<_>>(),
+    );
+    let found = slugs.contains(&model);
+    // 文件在读取期间变化时不发布快照，下次查询重新构建。
+    if trusted_slug_fingerprint() == fingerprint {
+        *cache.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some(TrustedSlugCache { fingerprint, slugs });
+    }
+    found
 }
 
 pub fn official_model_metadata(slug: &str) -> Option<Value> {
@@ -1022,6 +1071,77 @@ fn now_ts() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_slug_cache_reuses_snapshot_and_follows_account_and_catalog_changes() {
+        let _guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        struct Restore(Option<PathBuf>, Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::paths::set_settings_path_for_tests(self.0.take());
+                crate::paths::set_official_model_catalog_path_for_tests(self.1.take());
+            }
+        }
+        let settings_path = temp.path().join("settings.json");
+        let catalog_path = temp.path().join("catalog.json");
+        let _restore = Restore(
+            crate::paths::set_settings_path_for_tests(Some(settings_path)),
+            crate::paths::set_official_model_catalog_path_for_tests(Some(catalog_path.clone())),
+        );
+        let store = SettingsStore::default();
+        let mut settings = BackendSettings {
+            active_official_account_id: "account-a".into(),
+            ..BackendSettings::default()
+        };
+        store.save(&settings).unwrap();
+        let snapshot = |id: &str, slug: &str| CachedOfficialCatalog {
+            account_id: id.into(),
+            fetched_at: 1,
+            client_version: "1.0.0".into(),
+            etag: None,
+            source: "test".into(),
+            models: vec![json!({"slug": slug})],
+        };
+        let mut catalog = CatalogCacheFile::default();
+        catalog
+            .accounts
+            .insert("account-a".into(), snapshot("account-a", "test-official-a"));
+        catalog
+            .accounts
+            .insert("account-b".into(), snapshot("account-b", "test-official-b"));
+        save_cache(&catalog).unwrap();
+        assert!(is_trusted_official_model("TEST-OFFICIAL-A"));
+        let cached = || {
+            TRUSTED_SLUG_CACHE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .slugs
+                .clone()
+        };
+        let first = cached();
+        assert!(is_trusted_official_model("test-official-a"));
+        assert!(Arc::ptr_eq(&first, &cached()), "重复查询应复用解析结果");
+        settings = store.load().unwrap();
+        settings.active_official_account_id = "account-b".into();
+        store.save(&settings).unwrap();
+        assert!(!is_trusted_official_model("test-official-a"));
+        assert!(is_trusted_official_model("test-official-b"));
+        catalog.accounts.insert(
+            "account-b".into(),
+            snapshot("account-b", "test-official-updated"),
+        );
+        save_cache(&catalog).unwrap();
+        assert!(!is_trusted_official_model("test-official-b"));
+        assert!(is_trusted_official_model("test-official-updated"));
+        // 无效文件必须撤销旧账号授予，不能继续沿用成功快照。
+        std::fs::write(catalog_path, "invalid").unwrap();
+        assert!(!is_trusted_official_model("test-official-updated"));
+    }
 
     #[test]
     fn parses_future_and_hidden_entries_without_a_fixed_model_list() {

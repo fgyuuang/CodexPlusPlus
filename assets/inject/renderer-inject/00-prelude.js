@@ -398,9 +398,9 @@
   const upstreamWorktreeDialogClass = "codex-upstream-worktree-dialog";
   const upstreamBranchOptionAttribute = "data-codex-upstream-branch-option";
   const styleId = "codex-delete-style";
-  // 改 10-style.js 里的任何 CSS 都要把它 +1：installStyle 靠这个版本号判断
-  // 页面里已有的 <style> 是否过期，不升的话新样式在旧标签存在时会被直接跳过。
-  const codexDeleteStyleVersion = "38";
+  // 样式表版本的前缀。installStyle 会再拼上样式全文的哈希，改 CSS 不用再手动 +1；
+  // 只有样式表结构本身要强制换新（与内容无关）时才动它。
+  const codexDeleteStyleVersion = "41";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
   const codexPlusPageClass = "codex-plus-page-overlay";
@@ -410,6 +410,12 @@
   const codexPlusRailNavId = "codex-plus-rail-nav";
   const codexPlusRailExtensionsId = "codex-plus-rail-extensions";
   const codexPlusRailSponsorId = "codex-plus-rail-sponsor";
+  // 「供应商」：在 Codex 里直接增删改切 Codex 的供应商（43-provider-page.js）。
+  const codexPlusRailProviderId = "codex-plus-rail-provider";
+  // 「远程控制」：在 Codex 里开关远程控制、给手机配对、管理设备（45-remote-control-page.js）。
+  const codexPlusRailRemoteId = "codex-plus-rail-remote";
+  // 「任务面板」：记下要做什么、看清每件事到了哪一步（47-task-board-page.js）。
+  const codexPlusRailTasksId = "codex-plus-rail-tasks";
   const codexPlusRailPluginMarketId = "codex-plus-rail-plugin-market";
   const codexPlusSidebarPluginMarketId = "codex-plus-sidebar-plugin-market";
   const codexPlusPluginMarketTab = "plugin-market";
@@ -417,6 +423,9 @@
   const codexPlusRailDestinationSelector = "[data-sidebar-destination]";
   const codexPlusExtensionsTab = "extensions";
   const codexPlusSponsorTab = "sponsor";
+  const codexPlusProviderTab = "provider";
+  const codexPlusRemoteControlTab = "remote-control";
+  const codexPlusTaskBoardTab = "task-board";
   // Codex 的界面缩放是给内层布局节点设 CSS zoom，不是改 documentElement。
   // 我们的 overlay 挂在 body 下、落在那棵缩放子树之外，只能自己读这个变量跟随。
   const codexPlusWindowZoomVar = "--codex-window-zoom";
@@ -454,9 +463,9 @@
   const codexThreadScrollRestoreWindowMs = 3200;
   const codexThreadScrollRestoreDelaysMs = [0, 80, 220, 500, 1000, 1800, 2800];
   const codexThreadScrollUserIntentWindowMs = 1200;
-  const codexThreadScrollProgrammaticGuardVersion = "dispatcher:2";
+  const codexThreadScrollProgrammaticGuardVersion = "dispatcher:3";
   const codexThreadScrollRouteHooksVersion = "dispatcher:3";
-  const codexThreadScrollListenerVersion = "5";
+  const codexThreadScrollListenerVersion = "6";
   const codexThreadScrollUserIntentVersion = "dispatcher:2";
   const codexPlusDreamSkinStyleId = "codex-dream-skin-style";
   const codexPlusDreamSkinPlatform = String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || "macos");

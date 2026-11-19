@@ -88,6 +88,8 @@ export type GatewayPoolEntry = {
   modelWindows?: Record<string, number>;
   /** 没单独写窗口的模型用的窗口；都没有就用模型自带资料。 */
   contextWindow?: number | null;
+  /** 自动压缩阈值（#3100）：窗口的百分比，按模型 + 默认值；没设时为空，用 Codex 默认。旧版后端没有。 */
+  autoCompact?: { models?: Record<string, number>; fallback?: number | null } | null;
   /** 网关供应商单独走的 HTTP 代理，空串表示不单独走代理。 */
   proxy?: string;
   /** 主动限速：每个 Key 每分钟最多请求数；没有或 null 表示不限。旧版后端没有。 */
@@ -188,16 +190,21 @@ export type ResetCredits = {
 };
 
 /** 能用的重置卡张数；没有读数时返回 null（界面显示「尚未查询」，不要当成 0）。 */
-export function usableResetCardCount(entry?: GatewayPoolEntry | null): number | null {
+export function resetCardUsable(card: ResetCredit, now = Date.now()): boolean {
+  return card.usable && card.status === "available"
+    && (card.expiresAtMs == null || (Number.isFinite(card.expiresAtMs) && card.expiresAtMs > now));
+}
+
+export function usableResetCardCount(entry?: GatewayPoolEntry | null, now = Date.now()): number | null {
   const cards = entry?.resetCredits;
   if (!cards) return null;
   if (!cards.credits?.length) return cards.applicableAvailableCount ?? cards.availableCount ?? null;
-  return cards.credits.filter((card) => card.usable).length;
+  return cards.credits.filter((card) => resetCardUsable(card, now)).length;
 }
 
 /** 能用的卡里最近的一张到期时间；没有到期时间的卡不算（null 表示不会因到期丢失）。 */
-export function soonestResetCardExpiry(entry?: GatewayPoolEntry | null): number | null {
-  const cards = entry?.resetCredits?.credits?.filter((card) => card.usable) ?? [];
+export function soonestResetCardExpiry(entry?: GatewayPoolEntry | null, now = Date.now()): number | null {
+  const cards = entry?.resetCredits?.credits?.filter((card) => resetCardUsable(card, now)) ?? [];
   const expiries = cards
     .map((card) => card.expiresAtMs)
     .filter((at): at is number => typeof at === "number" && at > 0);
@@ -245,6 +252,7 @@ export type GatewayDisconnectPreview = {
 };
 
 export type GatewayAgentView = {
+  nativeModels?: { providerId: string; models: string[] } | null;
   agent: GatewayAgentId;
   name: string;
   /** 本机 CLI 版本，后台探测完成前为空。 */
@@ -720,11 +728,17 @@ export function pickerSections(
   skipGroup?: string,
   sectionOnly: string | null = null,
   hasOwnMatch = false,
+  native?: GatewayAgentView["nativeModels"],
 ): PickerSection[] {
   if (!payload) return [];
   const query = rawQuery.trim().toLowerCase();
   const sections: PickerSection[] = [];
   const providers = agentPoolProviders(payload, exclude);
+  const isNative = (model: string) => Boolean(native?.models.some((known) => known.toLowerCase() === model.toLowerCase()));
+  const nativeItems = (native?.models ?? [])
+    .filter((model) => matches(query, model, "当前登录账号"))
+    .map((model) => ({ model, label: prettyModelName(model), sub: "当前登录账号", avatar: "" }));
+  if (nativeItems.length) sections.push({ key: "native", title: "当前登录账号", avatar: "", items: nativeItems });
   // 多家都有的模型：每家名下那份固定发给这一家（`<供应商 id>/<模型>`）；它的自动组生效时另列一份裸名，
   // 选它按自动组的方式走。只有一家的模型用裸名。隐藏了成员的组，成员不单独列出。与写给 Codex 的模型列表一致。
   const unlisted = unlistedModels(payload);
@@ -734,10 +748,11 @@ export function pickerSections(
     const items = entry.models
       .filter((model) => providerHit || matches(query, model, `${entry.id}/${model}`))
       .flatMap((model) => {
+        if (entry.id === native?.providerId && isNative(model)) return [];
         const groupDisabled = Boolean(disabledGroup(payload, model));
         const multi = servingProviders(payload, model, exclude).length > 1;
         if (multi && !groupDisabled && !shared.some((known) => known.toLowerCase() === model.toLowerCase())) shared.push(model);
-        const value = multi || groupDisabled ? `${entry.id}/${model}` : model;
+        const value = multi || groupDisabled || isNative(model) ? `${entry.id}/${model}` : model;
         if (unlisted.has(value.toLowerCase())) return [];
         return [{
           model: value,
@@ -751,7 +766,7 @@ export function pickerSections(
   const autoItems = shared
     .filter((model) => activeAutoGroup(payload, model))
     .map((model) => ({
-      model,
+      model: isNative(model) ? `codex-plus-auto/${model}` : model,
       label: prettyModelName(model),
       sub: servingProviders(payload, model, exclude).map((entry) => maskAccountName(entry.name)).join(" → "),
       avatar: "",
@@ -826,6 +841,10 @@ export function groupDisplayName(payload: GatewayPayload | null, model: string):
 /** 一个模型名在按钮上的显示：模型名 + 提供它的供应商；模型组显示组名。空串用池里第一个模型。 */
 export function modelDisplay(payload: GatewayPayload | null, model: string, exclude: string[] = [], selection?: DefaultModelSelection | null): ModelView {
   const title = model.trim() || agentModels(payload, exclude)[0] || "";
+  if (title.startsWith("codex-plus-auto/")) {
+    const upstream = title.slice("codex-plus-auto/".length);
+    return { title: prettyModelName(upstream), sub: servingProviders(payload, upstream, exclude).map((entry) => maskAccountName(entry.name)).join(" → "), group: false, auto: true };
+  }
   const selectedModel = modelSlugFromRowName(title);
   if (selection && selectedModel.toLowerCase() === `${selection.providerId}/${modelSlugFromRowName(selection.upstreamModel)}`.toLowerCase()) {
     const provider = payload?.pool.find((entry) => entry.id === selection.providerId);
@@ -1089,6 +1108,25 @@ export function memberStatus(payload: GatewayPayload | null, relayId: string, no
     if (!left) return { state: "cooling", text: quota ? "额度耗尽" : "被限流", args: [] };
     return { state: "cooling", text: quota ? "额度耗尽 · {0} 后恢复" : "被限流 · {0} 后恢复", args: [left] };
   }
+  // 冷却记录随进程消失；重新查到的官方窗口仍须参与状态，不能退回绿色套餐名。
+  if (entry?.account && entry.quota) {
+    const quota = entry.quota;
+    const maxAge = entry.subscriptionPolicy?.maxAgeSeconds ?? 600;
+    const exhausted = quota.windows.filter(window =>
+      quotaWindowFresh(quota, window, nowMs, maxAge) && window.usedPercent >= 100);
+    if (exhausted.length) {
+      const resets = exhausted.map(window => window.resetsAtMs).filter((reset): reset is number => reset !== null);
+      const left = resets.length === exhausted.length ? formatRemaining(Math.max(...resets) - nowMs) : "";
+      return left
+        ? { state: "cooling", text: "额度耗尽 · {0} 后恢复", args: [left] }
+        : { state: "cooling", text: "额度耗尽", args: [] };
+    }
+    const fresh = quota.updatedAtMs <= nowMs && nowMs - quota.updatedAtMs <= maxAge * 1000;
+    if (fresh && (quota.officialAllowed === false
+      || (quota.officialLimitReached === true && quota.officialAllowed !== true))) {
+      return { state: "cooling", text: "订阅额度受限", args: [] };
+    }
+  }
   // 最近 10 分钟内由它回答过的 Agent 请求：显示「Codex 刚用过」。
   const answered = activity
     .filter((agent) => agent.last?.result === "answered" && agent.last.steps.at(-1)?.relayId === relayId && nowMs - agent.last.finishedAtMs < RECENT_USE_MS)
@@ -1127,8 +1165,9 @@ export type NarrativeLine = { tone: "muted" | "step" | "ok" | "fail"; text: stri
 export function routeNarrative(agent: string, record: RouteRecordView, payload: GatewayPayload | null): NarrativeLine[] {
   const lines: NarrativeLine[] = [];
   const who = agentName(agent);
-  const requested = groupDisplayName(payload, record.requestedModel || record.model) ?? (record.requestedModel || record.model);
-  const plan = record.planned.map((member) => `${maskAccountName(member.relayName)}/${groupDisplayName(payload, member.model) ?? member.model}`).join(", ");
+  const displayModel = (model: string) => model.trim() ? modelDisplay(payload, model).title || model : "";
+  const requested = displayModel(record.requestedModel || record.model);
+  const plan = record.planned.map((member) => `${maskAccountName(member.relayName)}/${displayModel(member.model) || member.model}`).join(", ");
   if (record.groupId) {
     const group = payload?.groups.find((item) => item.id === record.groupId);
     lines.push({ tone: "muted", text: "{0} 请求 {1}，交给模型组「{2}」：{3}", args: [who, requested, group?.name ?? record.groupId, plan] });
@@ -1139,7 +1178,7 @@ export function routeNarrative(agent: string, record: RouteRecordView, payload: 
   record.steps.forEach((step, index) => {
     const last = index === record.steps.length - 1;
     if (step.outcome === "answered") {
-      lines.push({ tone: "ok", text: "{0}（{1}）回答，用时 {2}。", args: [maskAccountName(step.relayName), groupDisplayName(payload, step.model) ?? step.model, formatElapsed(record.elapsedMs)] });
+      lines.push({ tone: "ok", text: "{0}（{1}）回答，用时 {2}。", args: [maskAccountName(step.relayName), displayModel(step.model) || step.model, formatElapsed(record.elapsedMs)] });
       return;
     }
     const reason = { zh: step.outcome === "transport" ? "连不上" : failureLabel(step.failure) || "出错" };
@@ -1473,6 +1512,8 @@ export type UsageCounts = {
   timedCalls?: number;
   /** 其中成功的生图请求；旧版后端没有，没有时也不写（视为 0）。 */
   images?: number;
+  /** 实际回传的 WorkBuddy 积分；旧记录没有该字段。 */
+  workbuddyCredits?: number;
 };
 export type UsageCost = { currency: string; amount: number };
 export type UsageDay = UsageCounts & { date: string };
@@ -1486,7 +1527,20 @@ export type UsageSummary = {
   byModel: UsageGroup[];
   costs: UsageCost[];
 };
-export type ProviderBalance = { providerId: string; provider: string; baseUrl: string; amount?: number | null; currency: string; error?: string | null; note?: string | null };
+export type ProviderBalance = { providerId: string; provider: string; baseUrl: string; amount?: number | null; currency: string; error?: string | null; note?: string | null; scope?: string | null; poolAmount?: number | null; poolCoverage?: string | null; poolNote?: string | null; poolRegisteredAt?: number; keyUsed?: number | null; workbuddyModelRates?: Record<string, number> };
+
+export type WorkBuddyRealm = "cn" | "global";
+
+export function isWorkBuddyProvider(source?: string): boolean {
+  return source === "workbuddy" || source === "codex:managed-workbuddy" || source === "workbuddy:cn" || source === "workbuddy:global";
+}
+
+export function workbuddyModelRate(rates: Record<string, number> | undefined, model: string): string {
+  // The Manager exposes unprefixed domestic IDs and global:… IDs.
+  const key = model.includes(":") ? model : `cn:${model}`;
+  const rate = rates?.[key];
+  return typeof rate === "number" && Number.isFinite(rate) && rate >= 0 ? `×${rate}` : "";
+}
 export type UsageRange = "today" | "7d" | "30d" | "all";
 
 /** 统计范围从哪一刻开始（本地时间当天零点往前推）；「全部」没有起点。 */
@@ -1500,6 +1554,7 @@ export function usageRangeStart(range: UsageRange, now: Date = new Date()): numb
 
 /** 一条请求的费用：不到一分钱时多留几位，免得都显示成 0.00。 */
 export function formatRequestCost(cost: UsageCost): string {
+  if (cost.currency === "积分") return workbuddyCreditsText(cost.amount);
   if (cost.amount <= 0) return "—";
   if (cost.amount >= 0.01) return formatMoney(cost.amount, cost.currency);
   return `${currencySymbol(cost.currency)}${cost.amount.toPrecision(2)}`;
@@ -1547,6 +1602,11 @@ export function averageDuration(counts: UsageCounts): number | null {
 /** 多币种费用连起来：`$3.22 + ¥1.50`；没有费用为空串。 */
 export function costText(costs: UsageCost[] | undefined): string {
   return (costs ?? []).filter((cost) => cost.amount > 0).map((cost) => formatMoney(cost.amount, cost.currency)).join(" + ");
+}
+
+export function workbuddyCreditsText(amount: number | undefined): string {
+  if (amount === undefined || !Number.isFinite(amount) || amount < 0) return "";
+  return `${Number(amount.toPrecision(6))} 积分`;
 }
 
 /** 柱状图的纵轴上限：取 1 / 2 / 5 × 10ⁿ 里不小于最大值的那个，刻度好读。 */

@@ -409,7 +409,7 @@ try {
             $script:distSnapshot = @(Get-Snapshot -Dist)
             Write-Json (Join-Path $jobDirectory 'frontend.json') @{ indexModifiedAt=$index.LastWriteTimeUtc.ToString('o'); expectedUiText=$request.expectedUiText; files=$script:distSnapshot }
             Assert-Inputs
-            Invoke-Step 'release' $request.cargo @('build', '--workspace', '--release', '-j', "$($request.jobs)")
+            Invoke-Step 'release' $request.cargo @('build', '--workspace', '--release', '-j', "$($request.jobs)", '--timings')
             Assert-NoCompiler
             Assert-Inputs
             $script:state['runtimeDependencies'] = @(Get-RuntimeDependencySnapshot)

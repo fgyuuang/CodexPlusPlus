@@ -752,9 +752,8 @@ fn should_auto_start(settings: &CliproxyIntegrationSettings, transient: bool) ->
 
 pub fn start_cliproxy_from_saved_settings(transient: bool) {
     if transient
-        || codex_plus_core::user_scripts::default_user_script_manager()
-            .authorize_local_integration("bundled:local-cliproxy", "/local-integrations/cliproxy")
-            .is_err()
+        || !codex_plus_core::user_scripts::default_user_script_manager()
+            .route_declared("/local-integrations/cliproxy")
     {
         return;
     }
@@ -1344,6 +1343,14 @@ fn openai_api_base_url(service_url: &str) -> String {
     } else {
         format!("{service_url}/v1")
     }
+}
+
+/// 凭据在宿主内使用，不经拓展页面传回。
+pub(crate) fn gateway_connection() -> anyhow::Result<(String, String)> {
+    let layout = Layout::configured()?;
+    let connection = connection_info(&layout)?;
+    let secrets = load_secrets(&layout)?.context("请先保存 CLIProxyAPI API Key")?;
+    Ok((openai_api_base_url(&connection.base_url), secrets.api_key))
 }
 
 #[derive(Debug)]

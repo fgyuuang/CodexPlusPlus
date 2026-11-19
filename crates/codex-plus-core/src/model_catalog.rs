@@ -42,28 +42,15 @@ struct CodexConfig {
 }
 
 pub async fn read_codex_model_catalog() -> Value {
-    let home = codex_home_dir();
-    let settings_path = crate::paths::default_settings_path();
-    let mut loaded_settings = None;
-    if settings_path.exists() {
-        if let Ok(settings) = SettingsStore::new(settings_path).load() {
-            let profile = settings.active_relay_profile();
-            if profile.id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID
-                && let Some(catalog) = live_gateway_model_catalog(&home, &profile)
-            {
-                return model_catalog_with_prices(catalog, Some(&settings), &home);
-            }
-            let catalog = relay_profile_model_catalog_value(&home, &settings);
-            if catalog
-                .get("models")
-                .and_then(Value::as_array)
-                .is_some_and(|models| !models.is_empty())
-            {
-                return model_catalog_with_prices(catalog, Some(&settings), &home);
-            }
-            loaded_settings = Some(settings);
+    // 本地解析不能占住 CDP 接收循环；设置、状态和其它桥接调用仍可及时响应。
+    let local = tokio::task::spawn_blocking(read_local_codex_model_catalog).await;
+    let (home, loaded_settings) = match local {
+        Ok(Ok(catalog)) => return catalog,
+        Ok(Err(fallback)) => fallback,
+        Err(error) => {
+            return json!({"status": "failed", "models": [], "message": format!("读取本地模型目录失败：{error}")});
         }
-    }
+    };
     let env = std::env::vars_os()
         .filter_map(|(name, value)| {
             let name = name.into_string().ok()?;
@@ -98,6 +85,32 @@ pub async fn read_codex_model_catalog() -> Value {
     };
     let catalog = read_codex_model_catalog_from_home(&home, &env, client).await;
     model_catalog_with_prices(catalog, loaded_settings.as_ref(), &home)
+}
+
+fn read_local_codex_model_catalog() -> Result<Value, (PathBuf, Option<BackendSettings>)> {
+    let home = codex_home_dir();
+    let settings_path = crate::paths::default_settings_path();
+    let mut loaded_settings = None;
+    if settings_path.exists() {
+        if let Ok(settings) = SettingsStore::new(settings_path).load() {
+            let profile = settings.active_relay_profile();
+            if profile.id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID
+                && let Some(catalog) = live_gateway_model_catalog(&home, &profile)
+            {
+                return Ok(model_catalog_with_prices(catalog, Some(&settings), &home));
+            }
+            let catalog = relay_profile_model_catalog_value(&home, &settings);
+            if catalog
+                .get("models")
+                .and_then(Value::as_array)
+                .is_some_and(|models| !models.is_empty())
+            {
+                return Ok(model_catalog_with_prices(catalog, Some(&settings), &home));
+            }
+            loaded_settings = Some(settings);
+        }
+    }
+    Err((home, loaded_settings))
 }
 
 fn gateway_catalog_config(home: &Path) -> Option<(CodexConfig, HashMap<String, String>, PathBuf)> {

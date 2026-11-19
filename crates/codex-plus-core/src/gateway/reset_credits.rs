@@ -10,11 +10,16 @@
 //! 只在内存缓存；重启后重新查。读不到就当作「不知道」，不显示成 0 张。
 
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use serde::Serialize;
+use anyhow::Context;
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::settings::RelayProfile;
 
@@ -60,10 +65,19 @@ pub struct ResetCreditsView {
 impl ResetCreditsView {
     /// 现在能用的张数：优先用逐张判定的结果，没有明细时才退回汇总数。
     pub fn usable_count(&self) -> Option<u64> {
+        self.usable_count_at(now_ms())
+    }
+
+    fn usable_count_at(&self, now: u64) -> Option<u64> {
         if self.credits.is_empty() {
             return self.applicable_available_count.or(self.available_count);
         }
-        Some(self.credits.iter().filter(|credit| credit.usable).count() as u64)
+        Some(
+            self.credits
+                .iter()
+                .filter(|credit| credit.usable && credit.expires_at_ms.is_none_or(|at| at > now))
+                .count() as u64,
+        )
     }
 }
 
@@ -107,7 +121,104 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<String, ResetCreditsView>> {
 
 /// 读缓存；没查过返回 `None`（界面上不显示成 0 张）。
 pub fn cached(relay_id: &str) -> Option<ResetCreditsView> {
-    lock().get(relay_id).cloned()
+    let mut view = lock().get(relay_id).cloned()?;
+    let now = now_ms();
+    for credit in &mut view.credits {
+        credit.usable &= credit.expires_at_ms.is_none_or(|at| at > now);
+    }
+    Some(view)
+}
+
+/// 只落盘操作标识，不保存登录凭据。按官方账号隔离，使同账号的多个供应商引用共用一次操作。
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RedemptionJournal {
+    pending: Option<String>,
+    completed: Vec<String>,
+}
+
+struct Redemption {
+    _lock: File,
+    path: PathBuf,
+    journal: RedemptionJournal,
+    request_id: String,
+    caller_id: String,
+    completed: bool,
+}
+
+impl Redemption {
+    fn open(root: &Path, account_id: &str, caller_id: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !account_id.trim().is_empty(),
+            "缺少官方账号标识，未发送重置请求"
+        );
+        anyhow::ensure!(valid_request_id(caller_id), "重置请求标识无效");
+        fs::create_dir_all(root)?;
+        let name = format!("{:x}", Sha256::digest(account_id.as_bytes()));
+        let path = root.join(format!("{name}.json"));
+        // 锁稳定的独立文件；不等待另一个联网请求，避免阻塞异步运行时。
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join(format!("{name}.lock")))?;
+        FileExt::try_lock_exclusive(&file).context("该账号已有重置操作正在处理，请稍后重试")?;
+        let journal: RedemptionJournal = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("重置操作记录损坏，未发送请求")?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                RedemptionJournal::default()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            journal.pending.as_deref().is_none_or(valid_request_id)
+                && journal.completed.len() <= 64
+                && journal.completed.iter().all(|id| valid_request_id(id)),
+            "重置操作记录无效，未发送请求"
+        );
+        let completed = journal.completed.iter().any(|id| id == caller_id);
+        let request_id = journal
+            .pending
+            .clone()
+            .unwrap_or_else(|| caller_id.to_string());
+        let mut operation = Self {
+            _lock: file,
+            path,
+            journal,
+            request_id,
+            caller_id: caller_id.to_string(),
+            completed,
+        };
+        if !completed {
+            operation.journal.pending = Some(operation.request_id.clone());
+            operation.save()?; // 持久成功后才允许 POST；重启/切页后复用未确认操作。
+        }
+        Ok(operation)
+    }
+
+    fn save(&self) -> anyhow::Result<()> {
+        crate::settings::atomic_write(&self.path, &serde_json::to_vec(&self.journal)?)
+            .context("无法保存重置操作记录，未确认本次结果")
+    }
+
+    fn finish(&mut self, outcome: ConsumeOutcome) -> anyhow::Result<()> {
+        if outcome == ConsumeOutcome::Unknown {
+            return Ok(());
+        }
+        for id in [&self.request_id, &self.caller_id] {
+            if !self.journal.completed.contains(id) {
+                self.journal.completed.push(id.clone());
+            }
+        }
+        if self.journal.completed.len() > 64 {
+            self.journal
+                .completed
+                .drain(..self.journal.completed.len() - 64);
+        }
+        self.journal.pending = None;
+        self.save()
+    }
 }
 
 pub fn record(relay_id: &str, view: ResetCreditsView) {
@@ -143,7 +254,7 @@ fn count(value: Option<&Value>) -> Option<u64> {
 pub fn parse_credits(value: &Value, now: u64) -> Option<ResetCreditsView> {
     let object = value.as_object()?;
     let raw = object.get("credits")?;
-    // 没有 `credits` 数组说明接口换了形状；空数组是合法的「一张都没有」。
+    // 没有 `credits` 数组说明接口换了形状；空数组若没有汇总数，仍保持未知。
     let list = raw.as_array()?;
     if list.len() > MAX_CREDITS {
         return None;
@@ -266,8 +377,35 @@ pub async fn consume(relay: &RelayProfile, request_id: &str) -> anyhow::Result<C
         anyhow::bail!("只有 ChatGPT 订阅账号能使用重置卡");
     }
     let credential = crate::official_login::resolve_official_credential_for_quota(relay).await?;
+    let mut operation = Redemption::open(
+        &crate::paths::default_app_state_dir().join("reset-credit-operations"),
+        &credential.account_id,
+        request_id,
+    )?;
+    if operation.completed {
+        return Ok(ConsumeOutcome::AlreadyRedeemed);
+    }
     let url = format!("{CHATGPT_RESET_CREDITS_URL}{CHATGPT_RESET_CONSUME_SUFFIX}");
-    let mut request = client_for(relay)?
+    let outcome = send_redemption(
+        &client_for(relay)?,
+        &url,
+        &credential,
+        &operation.request_id,
+    )
+    .await?;
+    // 结果不确定也清缓存：下次读到的才是服务端的真实状态。
+    forget(&relay.id);
+    operation.finish(outcome)?;
+    Ok(outcome)
+}
+
+async fn send_redemption(
+    client: &reqwest::Client,
+    url: &str,
+    credential: &crate::official_login::OfficialCredential,
+    request_id: &str,
+) -> anyhow::Result<ConsumeOutcome> {
+    let mut request = client
         .post(url)
         .bearer_auth(&credential.access_token)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -278,7 +416,7 @@ pub async fn consume(relay: &RelayProfile, request_id: &str) -> anyhow::Result<C
     let response = request.send().await?;
     let status = response.status();
     if status.as_u16() == 401 || status.as_u16() == 403 {
-        anyhow::bail!("登录凭据失效，未使用重置卡");
+        anyhow::bail!("登录凭据无效，请恢复登录后重试同一操作");
     }
     if !status.is_success() {
         anyhow::bail!("使用重置卡失败：HTTP {}", status.as_u16());
@@ -289,8 +427,6 @@ pub async fn consume(relay: &RelayProfile, request_id: &str) -> anyhow::Result<C
         Some("already_redeemed") => ConsumeOutcome::AlreadyRedeemed,
         _ => ConsumeOutcome::Unknown,
     };
-    // 结果不确定也清缓存：下次读到的才是服务端的真实状态。
-    forget(&relay.id);
     Ok(outcome)
 }
 
@@ -344,11 +480,11 @@ mod tests {
         assert_eq!(view.available_count, Some(3));
         assert_eq!(view.applicable_available_count, Some(2));
         assert_eq!(view.total_earned_count, Some(5));
-        assert_eq!(view.usable_count(), Some(2));
+        assert_eq!(view.usable_count_at(now), Some(2));
     }
 
     #[test]
-    fn empty_list_is_zero_cards_not_unknown() {
+    fn empty_list_without_summary_remains_unknown() {
         let view = parse_credits(&json!({ "credits": [] }), 1).unwrap();
         assert!(view.credits.is_empty());
         assert_eq!(view.available_count, None);
@@ -369,5 +505,134 @@ mod tests {
         assert!(!valid_request_id("bad\nid"));
         assert!(!valid_request_id(&"x".repeat(200)));
         assert!(valid_request_id(&new_request_id()));
+    }
+
+    #[test]
+    fn cached_card_availability_expires_at_the_boundary() {
+        let view =
+            parse_credits(&json!({ "credits": [card("a", "available", Some(2))] }), 1).unwrap();
+        assert_eq!(view.usable_count_at(1999), Some(1));
+        assert_eq!(view.usable_count_at(2000), Some(0));
+    }
+
+    #[test]
+    fn pending_redemption_survives_restart_and_a_new_caller_id() {
+        let root = tempfile::tempdir().unwrap();
+        let first = Redemption::open(root.path(), "account-a", "first-request").unwrap();
+        assert_eq!(first.request_id, "first-request");
+        drop(first);
+        let mut retry = Redemption::open(root.path(), "account-a", "new-page-request").unwrap();
+        assert_eq!(retry.request_id, "first-request");
+        retry.finish(ConsumeOutcome::Unknown).unwrap();
+        drop(retry);
+        let mut confirmed = Redemption::open(root.path(), "account-a", "after-restart").unwrap();
+        assert_eq!(confirmed.request_id, "first-request");
+        confirmed.finish(ConsumeOutcome::Reset).unwrap();
+        drop(confirmed);
+        let replay = Redemption::open(root.path(), "account-a", "after-restart").unwrap();
+        assert!(replay.completed);
+        drop(replay);
+        let next = Redemption::open(root.path(), "account-a", "next-operation").unwrap();
+        assert!(!next.completed);
+        assert_eq!(next.request_id, "next-operation");
+    }
+
+    #[test]
+    fn redemptions_serialize_per_account_and_isolate_accounts() {
+        let root = tempfile::tempdir().unwrap();
+        let first = Redemption::open(root.path(), "account-a", "one").unwrap();
+        assert!(Redemption::open(root.path(), "account-a", "two").is_err());
+        let other = Redemption::open(root.path(), "account-b", "two").unwrap();
+        assert_eq!(other.request_id, "two");
+        drop(first);
+    }
+
+    #[test]
+    fn corrupt_redemption_journal_does_not_silently_start_a_new_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let first = Redemption::open(root.path(), "account-a", "one").unwrap();
+        let path = first.path.clone();
+        drop(first);
+        fs::write(path, b"broken").unwrap();
+        assert!(Redemption::open(root.path(), "account-a", "two").is_err());
+        assert!(Redemption::open(root.path(), "", "two").is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_http_outcome_reuses_the_saved_id_on_retry() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/consume", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut ids = Vec::new();
+            for code in ["unrecognized_outcome", "already_redeemed"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 2048];
+                loop {
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(boundary) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..boundary]).to_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:").map(str::trim))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if bytes.len() >= boundary + 4 + length {
+                            let body: Value =
+                                serde_json::from_slice(&bytes[boundary + 4..boundary + 4 + length])
+                                    .unwrap();
+                            ids.push(body["redeem_request_id"].as_str().unwrap().to_string());
+                            break;
+                        }
+                    }
+                }
+                let body = serde_json::json!({ "code": code }).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+            ids
+        });
+        let root = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let credential = crate::official_login::OfficialCredential {
+            account_scope: None,
+            access_token: "test-only".into(),
+            account_id: "test-account".into(),
+        };
+        let mut first =
+            Redemption::open(root.path(), &credential.account_id, "original-request").unwrap();
+        let outcome = send_redemption(&client, &url, &credential, &first.request_id)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConsumeOutcome::Unknown);
+        first.finish(outcome).unwrap();
+        drop(first);
+        let mut retry =
+            Redemption::open(root.path(), &credential.account_id, "new-page-request").unwrap();
+        let outcome = send_redemption(&client, &url, &credential, &retry.request_id)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConsumeOutcome::AlreadyRedeemed);
+        retry.finish(outcome).unwrap();
+        drop(retry);
+        assert!(
+            Redemption::open(root.path(), &credential.account_id, "new-page-request")
+                .unwrap()
+                .completed
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            ["original-request", "original-request"]
+        );
     }
 }

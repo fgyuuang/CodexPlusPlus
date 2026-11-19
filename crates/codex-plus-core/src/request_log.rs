@@ -47,6 +47,9 @@ pub struct RequestUsage {
     pub cached_tokens: u64,
     #[serde(default)]
     pub reasoning_tokens: u64,
+    /// WorkBuddy Manager 随终态回传的实际扣费。None 表示没有记录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workbuddy_credits: Option<f64>,
 }
 
 impl RequestUsage {
@@ -154,6 +157,9 @@ pub struct RequestLogEntry {
     /// 未验证的响应改写、转换/压缩链路不发此标记；不证明失败尝试的计费。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_response_evidence: Option<String>,
+    /// 已校验并送达客户端的最终响应 ID，不是本地请求日志的 id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response_id: Option<String>,
     /// 网关模式下发起请求的 Agent（claude / grok）；Codex 直连代理的旧记录为空。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -620,7 +626,13 @@ pub fn clear_request_logs_at(path: &Path) -> std::io::Result<()> {
 }
 
 /// 强证据不使用旧解析器的 cached=0 回退，也不把 HTTP 200 当作完成。
-pub(crate) fn final_response_usage(value: &Value) -> Option<RequestUsage> {
+#[derive(Clone, Debug)]
+pub(crate) struct FinalResponseUsage {
+    pub usage: RequestUsage,
+    pub response_id: Option<String>,
+}
+
+pub(crate) fn final_response_usage(value: &Value) -> Option<FinalResponseUsage> {
     let response = value.get("response").unwrap_or(value);
     if response.get("status").and_then(Value::as_str) != Some("completed")
         || response.get("error").is_some_and(|error| !error.is_null())
@@ -635,8 +647,18 @@ pub(crate) fn final_response_usage(value: &Value) -> Option<RequestUsage> {
         .pointer("/input_tokens_details/cached_tokens")?
         .as_u64()?;
     let parsed = usage_from_responses_usage(usage)?;
-    (cached <= parsed.input_tokens && parsed.reasoning_tokens <= parsed.output_tokens)
-        .then_some(parsed)
+    (cached <= parsed.input_tokens && parsed.reasoning_tokens <= parsed.output_tokens).then(|| {
+        FinalResponseUsage {
+            usage: parsed,
+            response_id: response
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| {
+                    !id.is_empty() && id.len() <= 256 && id.bytes().all(|b| b.is_ascii_graphic())
+                })
+                .map(str::to_owned),
+        }
+    })
 }
 
 /// 从非流式 Responses JSON（或 `response.completed` 的 data）里提取 usage。
@@ -666,7 +688,15 @@ fn usage_from_responses_usage(usage: &Value) -> Option<RequestUsage> {
         output_tokens,
         cached_tokens,
         reasoning_tokens,
+        workbuddy_credits: workbuddy_credits(usage),
     })
+}
+
+pub(crate) fn workbuddy_credits(usage: &Value) -> Option<f64> {
+    usage
+        .get("workbuddy_credits")
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
 }
 
 /// 从任意响应 JSON 里尽力提取 usage（含 chat completions 的 prompt/completion 字段）。
@@ -710,6 +740,7 @@ pub fn usage_from_usage_value(usage: &Value) -> Option<RequestUsage> {
         output_tokens,
         cached_tokens,
         reasoning_tokens,
+        workbuddy_credits: workbuddy_credits(usage),
     })
 }
 
@@ -790,9 +821,11 @@ mod tests {
                 output_tokens: 200,
                 cached_tokens: 900,
                 reasoning_tokens: 50,
+                workbuddy_credits: None,
             }),
             cache_hit_ratio: None,
             final_response_evidence: None,
+            final_response_id: None,
             agent: None,
         }
     }
@@ -801,12 +834,17 @@ mod tests {
     fn final_response_evidence_round_trip_and_legacy_absence() {
         let legacy = serde_json::to_value(entry("legacy")).unwrap();
         assert!(legacy.get("finalResponseEvidence").is_none());
+        assert!(legacy.get("finalResponseId").is_none());
         let mut row: RequestLogEntry = serde_json::from_value(legacy).unwrap();
         assert!(row.final_response_evidence.is_none());
+        assert!(row.final_response_id.is_none());
         row.final_response_evidence = Some(FINAL_RESPONSE_EVIDENCE_V1.to_string());
+        row.final_response_id = Some("resp_delivered".to_string());
         let raw = serde_json::to_value(row).unwrap();
         assert_eq!(raw["finalResponseEvidence"], "final-response-v1");
+        assert_eq!(raw["finalResponseId"], "resp_delivered");
         let parsed: RequestLogEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.final_response_id.as_deref(), Some("resp_delivered"));
         assert_eq!(
             parsed.final_response_evidence.as_deref(),
             Some("final-response-v1")
@@ -818,7 +856,26 @@ mod tests {
         let complete = json!({"status":"completed","usage":{
             "input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}
         }});
-        assert_eq!(final_response_usage(&complete).unwrap().cached_tokens, 0);
+        assert_eq!(
+            final_response_usage(&complete).unwrap().usage.cached_tokens,
+            0
+        );
+        for (id, expected) in [
+            ("resp_ok", Some("resp_ok")),
+            ("", None),
+            ("two words", None),
+            (&"x".repeat(257), None),
+        ] {
+            let mut response = complete.clone();
+            response["id"] = json!(id);
+            assert_eq!(
+                final_response_usage(&response)
+                    .unwrap()
+                    .response_id
+                    .as_deref(),
+                expected
+            );
+        }
         for pointer in [
             "/status",
             "/usage/input_tokens",

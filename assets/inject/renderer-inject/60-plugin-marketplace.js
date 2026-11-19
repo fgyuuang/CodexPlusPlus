@@ -1336,6 +1336,10 @@
   }
 
   function currentThreadScrollSessionId() {
+    // 侧栏选中项可能晚于历史挂载更新，只读取当前滚动容器内的会话标记。
+    const marked = currentThreadScroller()?.querySelector("[data-above-composer-conversation-id]");
+    const mountedId = normalizedCodexThreadUuid(marked?.getAttribute("data-above-composer-conversation-id"));
+    if (mountedId) return mountedId;
     return validThreadScrollSessionKey(currentSessionRef().session_id)
       || validThreadScrollSessionKey(codexPlusCurrentSessionId());
   }
@@ -1643,7 +1647,9 @@
       Element.prototype.scrollTo = function codexThreadScrollGuardedScrollTo(...args) {
         const top = scrollToRequestedTop(args, this);
         if (top != null && window.__codexThreadScrollHandlers?.shouldBlockAutobottom?.(this, top)) return;
-        return originals.elementScrollTo.apply(this, args);
+        const result = originals.elementScrollTo.apply(this, args);
+        if (top != null) window.__codexThreadScrollHandlers?.didScroll?.(this);
+        return result;
       };
     }
     originals.elementScroll = originals.elementScroll || Element.prototype.scroll;
@@ -1698,6 +1704,14 @@
     }
   }
 
+  function restoreThreadScrollAfterProgrammaticScroll(scroller) {
+    const runtime = threadScrollRuntime();
+    if (runtime.applyingRestore || runtime.resumeSessionId || document.visibilityState === "hidden"
+        || !activeThreadScrollRestoreLock() || scroller !== runtime.activeScroller) return;
+    // ResizeObserver 内的原生补偿晚于本帧 scroll 事件，直接在原调用返回前恢复锚点。
+    restoreThreadScrollPosition(runtime.activeSessionId);
+  }
+
   function bindThreadScrollListener(scroller) {
     const runtime = threadScrollRuntime();
     const currentUsesWindow = !runtime.activeScroller || runtime.activeScroller === document.scrollingElement || runtime.activeScroller === document.documentElement || runtime.activeScroller === document.body;
@@ -1710,7 +1724,13 @@
       runtime.scrollListenerVersion = "";
       listenerReplaced = true;
     }
-    runtime.scrollListener = runtime.scrollListener || (() => scheduleThreadScrollSave());
+    runtime.scrollListener = runtime.scrollListener || (() => {
+      // 原生 footer 的补偿在绘制前触发 scroll，不能等下一轮定时恢复才校正。
+      if (document.visibilityState !== "hidden" && !runtime.resumeSessionId && activeThreadScrollRestoreLock()) {
+        restoreThreadScrollPosition(runtime.activeSessionId);
+      }
+      scheduleThreadScrollSave();
+    });
     runtime.scrollListenerVersion = codexThreadScrollListenerVersion;
     if (!listenerReplaced && runtime.activeScroller === scroller && runtime.scrollListenerUsesWindow === nextUsesWindow) return;
     if (runtime.activeScroller) {
@@ -1842,10 +1862,12 @@
       runtime.userScrollIntentUntil = 0;
       if (runtime.userCancelledRestoreSessionId !== nextSessionId) runtime.userCancelledRestoreSessionId = "";
       scheduleThreadScrollRestore(nextSessionId);
+      restoreThreadScrollPosition(nextSessionId);
       return;
     }
     runtime.activeSessionId = nextSessionId;
     if (forceRestore && !userScrollIntentActive() && !threadScrollRestoreCancelledForSession(nextSessionId)) scheduleThreadScrollRestore(nextSessionId);
+    if (activeThreadScrollRestoreLock(nextSessionId)) restoreThreadScrollPosition(nextSessionId);
   }
 
   function scheduleThreadScrollSyncAttempts(forceRestore = true) {
@@ -1924,6 +1946,7 @@
     window.__codexThreadScrollHandlers = {
       shouldBlockAutobottom: shouldBlockThreadScrollAutobottom,
       shouldBlockIntoView: shouldBlockThreadScrollIntoView,
+      didScroll: restoreThreadScrollAfterProgrammaticScroll,
       markUserIntent: markThreadScrollUserIntent,
       markKeyboardIntent: markThreadScrollKeyboardIntent,
       markPointerIntent: markThreadScrollPointerIntent,
