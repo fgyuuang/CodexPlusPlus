@@ -517,6 +517,85 @@ fn avatar_images_are_checked_stored_and_replaced() {
     });
 }
 
+/// 微信那边用的几个口子：聊天记录位置、是否配置过、在微信里处理掉的卡片标成已处理（网页跟着灰掉）。
+#[test]
+fn weixin_bridge_helpers_report_cursor_and_resolve_cards() {
+    use codex_plus_core::remote_control::jiajia::Jiajia;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut store = Store::open(dir.path());
+        store.push(chat("user", "你好"));
+        let mut card = chat("notice", "「部署」要运行命令");
+        card.request = Some(json!({ "threadId": "t", "title": "部署", "request": { "id": 7 } }));
+        store.push(card);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let jiajia = Jiajia::new(dir.path().to_path_buf(), std::sync::Weak::new());
+        assert!(!jiajia.is_configured());
+        let (rev, last) = jiajia.cursor();
+        assert_eq!((rev, last), (2, 2));
+        let mut updates = jiajia.subscribe();
+        jiajia.resolve_card(2);
+        assert!(updates.has_changed().unwrap(), "改了要通知订阅方");
+        let changed = jiajia.changed_since(rev);
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].resolved);
+        assert_eq!(jiajia.cursor(), (3, 2), "改旧记录只动变更序号");
+        jiajia.resolve_card(99);
+        assert_eq!(jiajia.cursor().0, 3, "没有这条就什么也不做");
+    });
+    assert!(Store::open(dir.path()).messages[1].resolved, "写回了文件");
+}
+
+/// 网页提供的显示名称不是微信来源证明。
+#[test]
+fn focus_thread_rejects_web_messages_with_a_weixin_display_name() {
+    use codex_plus_core::remote_control::devices::Principal;
+    use codex_plus_core::remote_control::jiajia::tools::activity_label;
+    use codex_plus_core::remote_control::jiajia::{Jiajia, WEIXIN_SENDER};
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let jiajia = Jiajia::new(dir.path().to_path_buf(), std::sync::Weak::new());
+        let args = json!({ "thread": "11111111" });
+        let error = jiajia
+            .call_tool("focus_thread", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("只在微信里有效"), "{error}");
+
+        jiajia
+            .update_settings(&json!({ "configured": true }))
+            .await
+            .unwrap();
+        jiajia
+            .send(
+                "网页上问一句",
+                Some(WEIXIN_SENDER.into()),
+                Principal::Master,
+            )
+            .await
+            .unwrap();
+        assert!(!jiajia.last_sender_is_weixin());
+        let error = jiajia
+            .call_tool("focus_thread", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("只在微信里有效"), "{error}");
+        assert!(jiajia.take_focus_request().is_none());
+        assert_eq!(activity_label("focus_thread"), "正在切换微信专注");
+    });
+}
+
 #[test]
 fn thread_views_are_summarized_for_the_model() {
     use codex_plus_core::remote_control::jiajia::tools::{relative_time, summarize_view};
@@ -595,6 +674,7 @@ fn mcp_proxy_lists_tools_and_forwards_calls() {
         "read_thread",
         "send_to_thread",
         "new_thread",
+        "focus_thread",
         "stop_thread",
         "set_thread_settings",
         "watch",

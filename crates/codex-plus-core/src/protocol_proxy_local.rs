@@ -3472,10 +3472,14 @@ mod direct_official_auth_tests {
                 assert_eq!(dispatch["detail"]["upstreamModel"], "gpt-6.1-sol");
                 assert!(!events.contains(expected_token));
                 assert!(request.contains("\"model\":\"gpt-6.1-sol\""));
+                let expected_version = crate::gateway::chatgpt_backend::select_codex_version(
+                    Some("0.166.0"),
+                    crate::codex_cli_version::installed_codex_version_cached().as_deref(),
+                );
                 assert!(
                     request
                         .to_ascii_lowercase()
-                        .contains("\r\nversion: 0.166.0\r\n")
+                        .contains(&format!("\r\nversion: {expected_version}\r\n"))
                 );
             } else {
                 assert!(request.contains("\"model\":\"gpt-image-2\""));

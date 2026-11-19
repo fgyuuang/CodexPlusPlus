@@ -577,10 +577,14 @@ pub(crate) async fn open_responses_for_agent(
             .and_then(Value::as_str)
             .map(str::to_string)
     });
-    let mut plan = route::resolve_plan(&gateway, agent, model, conversation.as_deref())?;
+    let mut plan =
+        route::resolve_plan_for_request(&gateway, agent, model, conversation.as_deref(), &request)?;
     crate::responses_websocket::restrict_plan(&mut plan)?;
-    let outcome = pipeline::open(
+    // 压缩模型（#3142）：压缩请求先改发到绑定里的压缩模型，失败回退原模型；没配置时照原样走。
+    let (outcome, compaction_notes) = super::compaction_model::open(
         &settings,
+        &gateway,
+        agent,
         &plan,
         GatewayRequest {
             responses_body: request,
@@ -598,6 +602,7 @@ pub(crate) async fn open_responses_for_agent(
             client,
             queue_timeout: key_pool::LIMIT_QUEUE_TIMEOUT,
         },
+        conversation.as_deref(),
     )
     .await?;
     let trace = outcome.trace;
@@ -612,6 +617,8 @@ pub(crate) async fn open_responses_for_agent(
                 merged.relay_name = trace.relay_name;
                 merged.upstream_model = trace.upstream_model;
             }
+            // 请求日志标出这次压缩用了哪个模型、有没有回退（只是说明，不算重试）。
+            merged.retry_reasons.extend(compaction_notes);
             response.request_trace = Some(merged);
             Ok((response, slot))
         }
@@ -976,7 +983,13 @@ async fn handle_claude_messages(
     request_log.set_agent(&agent);
     let live_request_id = request_log.entry.id.clone();
 
-    let plan = match route::resolve_plan(gateway, &agent, &client_model, session.as_deref()) {
+    let plan = match route::resolve_plan_for_request(
+        gateway,
+        &agent,
+        &client_model,
+        session.as_deref(),
+        &request,
+    ) {
         Ok(plan) => plan,
         Err(error) => {
             let message = crate::protocol_proxy::error_chain(&error);
@@ -1399,7 +1412,7 @@ async fn handle_claude_count_tokens(
         .unwrap_or_default()
         .to_string();
     // 只是数 token，不真正发请求：用预览，别推进模型组轮换和 Key 轮询的进度。
-    if let Ok(plan) = route::preview_plan(gateway, &agent, &model, None)
+    if let Ok(plan) = route::preview_plan_for_request(gateway, &agent, &model, None, &request)
         && let Some(candidate) = plan.candidates.first()
         && candidate.relay.protocol == crate::settings::RelayProtocol::AnthropicMessages
     {

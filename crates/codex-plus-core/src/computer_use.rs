@@ -2315,7 +2315,13 @@ mod tests {
         assert_eq!(left, right);
         assert_eq!(left["args"][0], "--codex-plus-cu-mcp");
         assert_eq!(left["command"], runtime.self_command());
-        assert!(left.get("env").is_none());
+        match crate::paths::state_dir_override() {
+            Some(dir) => assert_eq!(
+                left["env"][crate::paths::STATE_DIR_ENV],
+                dir.to_string_lossy().as_ref()
+            ),
+            None => assert!(left.get("env").is_none()),
+        }
     }
 
     #[test]

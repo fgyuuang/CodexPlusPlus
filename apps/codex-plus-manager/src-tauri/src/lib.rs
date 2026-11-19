@@ -25,6 +25,7 @@ mod runtime_health;
 mod shutdown_watchdog;
 mod skill_backup_usage;
 mod tray_panel;
+pub mod weixin_connect_bridge;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -215,8 +216,8 @@ pub fn run_computer_use_cli(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Codex 拓展页的「社区 / 我发布的 / dsh 插件」分栏：实现在管理器里，经 helper 桥接分发给页面。
-/// helper 跑在本进程里，登记一次即可。
+/// Codex 拓展页的「社区 / 我发布的 / dsh 插件」分栏、Codex 里的「微信连接」页：实现在管理器里，
+/// 经 helper 桥接分发给页面。helper 跑在本进程里，登记一次即可。
 fn register_codex_bridge_routes() {
     use codex_plus_core::routes::{HostRouteHandler, register_host_route};
     let community: HostRouteHandler = std::sync::Arc::new(|payload| {
@@ -227,9 +228,13 @@ fn register_codex_bridge_routes() {
     });
     let dsh: HostRouteHandler =
         std::sync::Arc::new(|payload| Box::pin(dsh_plugin_commands::bridge_request(payload)));
+    // 扫码会话和运行中的微信连接都在本进程内存里，与管理器微信页共用同一组命令函数。
+    let weixin: HostRouteHandler =
+        std::sync::Arc::new(|payload| Box::pin(weixin_connect_bridge::bridge_request(payload)));
     register_host_route("/extension-market/community", community);
     register_host_route("/extension-market/published", published);
     register_host_route("/extension-market/dsh", dsh);
+    register_host_route(codex_plus_core::connect::page::BRIDGE_ROUTE, weixin);
 }
 
 pub fn run() {
@@ -480,12 +485,15 @@ pub fn run() {
             gateway_commands::reset_gateway_model_selections,
             gateway_commands::save_gateway_model_suffix,
             gateway_commands::save_gateway_local_login_discovery,
+            gateway_commands::save_gateway_responses_websocket,
             gateway_commands::scan_gateway_local_logins,
             gateway_commands::save_gateway_auto_group,
             gateway_commands::set_gateway_auto_group_enabled,
             gateway_commands::save_gateway_auto_models,
             gateway_commands::save_gateway_favorites,
             gateway_commands::save_gateway_options,
+            gateway_commands::load_gateway_port,
+            gateway_commands::save_gateway_port,
             gateway_commands::save_gateway_subagent_model_policy,
             gateway_commands::reset_gateway_key_health,
             gateway_commands::create_gateway_provider,

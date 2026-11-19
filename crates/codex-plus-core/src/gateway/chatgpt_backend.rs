@@ -359,7 +359,13 @@ pub fn codex_version(codex_home: &Path) -> String {
         std::fs::read(crate::official_model_catalog::official_model_catalog_path())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    codex_version_with_catalog(codex_home, official_catalog.as_ref())
+    select_codex_version(
+        Some(&codex_version_with_catalog(
+            codex_home,
+            official_catalog.as_ref(),
+        )),
+        crate::codex_cli_version::installed_codex_version_cached().as_deref(),
+    )
 }
 
 fn codex_version_with_catalog(codex_home: &Path, official_catalog: Option<&Value>) -> String {
@@ -393,6 +399,20 @@ fn codex_version_with_catalog(codex_home: &Path, official_catalog: Option<&Value
     }
     crate::official_model_catalog::latest_client_version(versions)
         .unwrap_or_else(|| crate::model_catalog::OFFICIAL_MODELS_CLIENT_VERSION.to_string())
+}
+
+/// 版本选择：缓存版本、安装版本、内置基线三者按 semver 取最新，非法值忽略。
+/// 结果只保留 `X.Y.Z`（预发布版的 Codex CLI 请求官方目录时也这样发）。
+pub fn select_codex_version(cached: Option<&str>, installed: Option<&str>) -> String {
+    use crate::codex_cli_version::CodexVersion;
+    let builtin = crate::model_catalog::OFFICIAL_MODELS_CLIENT_VERSION;
+    [Some(builtin), cached, installed]
+        .into_iter()
+        .flatten()
+        .filter_map(CodexVersion::parse)
+        .max()
+        .map(|version| version.whole())
+        .unwrap_or_else(|| builtin.to_string())
 }
 
 /// Codex CLI 的 User-Agent：`codex_cli_rs/0.159.0 (Mac OS 26.0.0; arm64) Apple_Terminal/455`。
@@ -826,6 +846,7 @@ mod tests {
             Some("B2")
         );
         assert_eq!(codex_prompt_from_models(&cache, "x"), None);
+        // 安装版本由环境决定，这里只断言缓存版本是下限。
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("models_cache.json"), cache.to_string()).unwrap();
         assert_eq!(codex_version_with_catalog(temp.path(), None), "0.170.2");
@@ -916,6 +937,48 @@ mod tests {
         }
         std::fs::write(temp.path().join("models_cache.json"), "{invalid").unwrap();
         assert_eq!(codex_version_with_catalog(temp.path(), None), builtin);
+        // 读不到缓存时 codex_version 也不改写任何文件。
+        let temp = tempfile::tempdir().unwrap();
+        let cache = json!({"client_version": "0.124.0"}).to_string();
+        std::fs::write(temp.path().join("models_cache.json"), &cache).unwrap();
+        let _ = codex_version(temp.path());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("models_cache.json")).unwrap(),
+            cache,
+            "版本选择不改写客户端缓存"
+        );
+    }
+
+    #[test]
+    fn newer_installed_codex_beats_an_old_models_cache() {
+        // #3178：缓存停在 0.164.0，本机已装 0.169.1 → 用 0.169.1。
+        assert_eq!(
+            select_codex_version(Some("0.164.0"), Some("0.169.1")),
+            "0.169.1"
+        );
+        // Desktop 内置的预发布 CLI 也比旧缓存新；发出去只带 X.Y.Z。
+        assert_eq!(
+            select_codex_version(Some("0.164.0"), Some("0.169.0-alpha.11.1")),
+            "0.169.0"
+        );
+        // 缓存更新时仍用缓存；安装版本是同号预发布时不降级。
+        assert_eq!(
+            select_codex_version(Some("0.170.2"), Some("0.169.1")),
+            "0.170.2"
+        );
+        assert_eq!(
+            select_codex_version(Some("0.169.0"), Some("0.169.0-alpha.11.1")),
+            "0.169.0"
+        );
+        // 安装版本低于基线或不合法时不起作用。
+        let builtin = crate::model_catalog::OFFICIAL_MODELS_CLIENT_VERSION;
+        assert_eq!(select_codex_version(None, Some("0.100.0")), builtin);
+        assert_eq!(
+            select_codex_version(Some("0.124.0"), Some("garbage")),
+            builtin
+        );
+        // 没有缓存、只有安装版本。
+        assert_eq!(select_codex_version(None, Some("0.169.1")), "0.169.1");
     }
 
     #[test]

@@ -179,7 +179,7 @@ import { diagnosticFacts, filterLogEntries, formatLogTime, parseLogText } from "
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { paletteShortcut } from "./command-palette-model";
 import { SessionsView, sessionDeleteSucceeded } from "./GatewaySessions";
-import { agentName, groupDisplayName, modelDisplay, formatQueueWait, formatRequestCost, formatTokens, isWorkBuddyProvider, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, foreignCompactionDropped, FOREIGN_COMPACTION_DROPPED_REASON, usageRangeStart, importCandidates, draftFromBinding, bindingFromDraft, validateDraft, type GatewayPayload, type ImportCandidate, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
+import { agentName, groupDisplayName, modelDisplay, formatQueueWait, formatRequestCost, formatTokens, isWorkBuddyProvider, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, foreignCompactionDropped, FOREIGN_COMPACTION_DROPPED_REASON, compactionNote, parseCompactionNote, type CompactionNote, usageRangeStart, relayFilterFromFocus, relayFilterArgs, type RelayFilter, importCandidates, draftFromBinding, bindingFromDraft, validateDraft, type GatewayPayload, type ImportCandidate, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { UsageTabs, onOpenRequestLog, type RequestLogFocus } from "./UsageTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
@@ -197,7 +197,7 @@ import { AgentDashboard, type DashboardAgent, type DashboardStat, type Dashboard
 import { TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-model";
 import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
-import { RemoteControlPage } from "./RemoteControlPage";
+import { RemoteControlPage, remoteControlRequest } from "./RemoteControlPage";
 import { announceBackendSettingsChanged } from "./settings-events";
 import { PluginMarketScreen } from "./PluginMarketScreen";
 import { defaultMarketSort, parseMarketTime, relativeAge, sortMarketScripts, type LocalScriptState, type ScriptMarketSort } from "./script-market-model";
@@ -306,6 +306,7 @@ import {
 } from "./aggregate-members";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
 import { NativeAuthControl, SavedAuthAccountField } from "./NativeAuthControls";
+import { RelayHeaderRows } from "./RelayHeaderRows";
 import { relayBillingCacheKey, relayBillingProbeEligible, type RelayBillingProbe } from "./relay-billing";
 import { RelayBillingLine, RelayBillingRetry, useRelayBillingProbe } from "./RelayBillingLine";
 import { apiKeyPreview, createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
@@ -812,6 +813,9 @@ export type BackendSettings = WhaleBalanceSettings & {
   weixinConnectProjectId: string;
   weixinConnectSandbox: "read-only" | "workspace-write" | "danger-full-access";
   weixinConnectCodexPath: string;
+  weixinConnectLinkedUserId: string;
+  weixinConnectDefaultMode: "jiajia" | "direct";
+  weixinConnectPushToWeixin: boolean;
   relayBaseUrl: string;
   relayApiKey: string;
   relayProfiles: RelayProfile[];
@@ -1767,8 +1771,8 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   // 跨客户端协作属于应用级能力，各工具下共用同一组任务。
   { id: "agentCollaboration", get label() { return t("Agent 协作"); }, icon: GitBranch, badge: "实验" },
   { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验" },
-  // 远程控制：在浏览器（之后是手机）里操控 Codex 桌面的会话，属于应用级工具。
-  { id: "remoteControl", get label() { return t("远程控制"); }, icon: Smartphone, badge: "实验" },
+  // 远程控制：在浏览器或手机上操控 Codex 的会话。和「微信连接」同是「在手机上用 Codex」，挂在侧栏 Codex 下面、紧跟微信连接。
+  { id: "remoteControl", get label() { return t("远程控制"); }, icon: Smartphone, badge: "实验", tool: "codex" },
   // 网关：任意 Agent 经 Codex++ 接入任意供应商，与具体 Agent 无关，是应用级页面。
   { id: "hub", get label() { return t("总览"); }, icon: Waypoints },
   // 先有供应商，再接 Agent；路由是进阶设置，放在 Agent 接入之后。
@@ -1797,7 +1801,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ id: string; routes: Route[] }> = [
   // 「连接与供应商」紧跟概览：直连模式的老用户每天在这里切供应商，想改用网关也从这里开始。
   { id: "overview", routes: ["overview", "relay"] },
-  { id: "enhance", routes: ["claude", "claudePatch", "enhance", "dreamSkin", "pluginMarket", "weixin", "multiLaunch"] },
+  { id: "enhance", routes: ["claude", "claudePatch", "enhance", "dreamSkin", "pluginMarket", "weixin", "remoteControl", "multiLaunch"] },
   // Codex 设置（含安装维护）在齿轮的设置模式里，不再占 Agent 的页签。
 ];
 const routeTool = (routeId: Route) => routes.find((candidate) => candidate.id === routeId)?.tool;
@@ -1811,7 +1815,7 @@ const lastAgentRoute = new Map<string, Route>();
  * Computer Use 同时接入 Claude Code / Claude Desktop / DSH 等多个客户端，不属于任何一个 Agent，
  * 所以和 Agent 协作一样放在「工具」里，而不是重复出现在每个 Agent 的「扩展」分组里。
  */
-const globalNavigationRoutes: Route[] = ["home", "extension", "hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewayUsage", "gatewaySettings", "requestLog", "sessions", "context", "skills", "userScripts", "computerUse", "remoteControl", "agentCollaboration", "agentCache", "recommendations", "about", "settings"];
+const globalNavigationRoutes: Route[] = ["home", "extension", "hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewayUsage", "gatewaySettings", "requestLog", "sessions", "context", "skills", "userScripts", "computerUse", "agentCollaboration", "agentCache", "recommendations", "about", "settings"];
 /** 侧栏「网关」分组：任意 Agent 经 Codex++ 接入任意供应商。 */
 // 「用量」并进全局管理：统计（gatewayUsage）与请求日志（requestLog）是同一页的两个页签。
 const gatewayNavigationRoutes: Route[] = ["hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewaySettings"];
@@ -1820,7 +1824,7 @@ const managementNavigationRoutes: Route[] = ["userScripts", "gatewayUsage", "ses
 /** 侧栏里同一个入口的别名路由：请求日志是「用量」页的第二个页签。 */
 const navAliasRoute: Partial<Record<Route, Route>> = { requestLog: "gatewayUsage" };
 /** 侧栏「工具」分组：服务所有 Agent，但与供应商无关。关于、整体设置放在侧栏底部。 */
-const toolNavigationRoutes: Route[] = ["computerUse", "agentCollaboration", "agentCache", "remoteControl"];
+const toolNavigationRoutes: Route[] = ["computerUse", "agentCollaboration", "agentCache"];
 /**
  * 只在管理其他 Agent 时才有用的页面：只管理 Codex 时不进侧栏和命令面板。
  * Agent 协作要多个 Agent；Computer Use 接入的是 Claude Code、Claude Desktop 等，Codex 自带 Computer Use。
@@ -1967,6 +1971,9 @@ const defaultSettings: BackendSettings = {
   weixinConnectProjectId: "",
   weixinConnectSandbox: "read-only",
   weixinConnectCodexPath: "",
+  weixinConnectLinkedUserId: "",
+  weixinConnectDefaultMode: "jiajia",
+  weixinConnectPushToWeixin: false,
   relayBaseUrl: "",
   relayApiKey: "",
   relayProfiles: [
@@ -3830,8 +3837,9 @@ const fetchSub2ApiBilling = async (profile: RelayProfile) => {
         return true;
       }
       const destination = managerNavigationDestination(navigation);
-      if (destination.route === "enhance" || destination.route === "pluginMarket") setActiveTool("codex");
+      if (destination.route === "enhance" || destination.route === "pluginMarket" || destination.route === "weixin") setActiveTool("codex");
       setRoute(destination.route);
+      if (destination.route === "weixin") await refreshWeixinStatus(true);
       return true;
     } catch (error) {
       logDiagnostic("manager.navigation_failed", { error: stringifyError(error) });
@@ -7084,6 +7092,18 @@ function WeixinConnectScreen({
   const [resetPeerId, setResetPeerId] = useState("");
   const [resetPending, setResetPending] = useState(false);
   const [resetMessage, setResetMessage] = useState("");
+  // 加加跑在远程控制里：没开时微信里的加加不可用，这里提示一下（null = 还没读到）。
+  const [remoteControlRunning, setRemoteControlRunning] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    remoteControlRequest("status")
+      .then((value) => { if (!disposed) setRemoteControlRunning(Boolean(value.running)); })
+      .catch(() => { if (!disposed) setRemoteControlRunning(null); });
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -7364,6 +7384,41 @@ function WeixinConnectScreen({
                 <RefreshCw className={catalogLoading ? "animate-spin" : ""} />
               </button>
             </div>
+          </SettingRow>
+        </CxCard>
+      </CxSection>
+
+      {/* 加加：没自己选过模式的联系人默认交给加加（远程控制没开时自动退回直连）；推送默认关。 */}
+      <CxSection
+        aside={remoteControlRunning === null ? null : (
+          <CxBadge tone={remoteControlRunning ? "ok" : "neutral"}>{remoteControlRunning ? t("远程控制已开") : t("远程控制未开")}</CxBadge>
+        )}
+        id="weixin-section-jiajia"
+        title={t("加加")}
+      >
+        <CxCard className="weixin-settings-card">
+          <SettingRow
+            description={remoteControlRunning === false
+              ? t("加加需要先打开远程控制；没开时消息先按直连处理")
+              : t("没单独选过的联系人用这个模式；在微信里发 /加加 或 /直连 可单独切换")}
+            title={t("微信默认模式")}
+          >
+            <AppSelect
+              ariaLabel={t("微信默认模式")}
+              onChange={(next) => onFormChange({ ...form, weixinConnectDefaultMode: next })}
+              options={[
+                { value: "jiajia", label: t("加加") },
+                { value: "direct", label: t("直连") },
+              ]}
+              value={form.weixinConnectDefaultMode}
+            />
+          </SettingRow>
+          <SettingRow description={t("没在对话时，加加的审批卡片和提醒也发到微信；回复数字即可审批")} title={t("推送到微信")}>
+            <Switch
+              label={t("推送到微信")}
+              on={form.weixinConnectPushToWeixin}
+              onToggle={() => onFormChange({ ...form, weixinConnectPushToWeixin: !form.weixinConnectPushToWeixin })}
+            />
           </SettingRow>
         </CxCard>
       </CxSection>
@@ -8064,7 +8119,21 @@ function requestLogRetryLabel(entry: RequestLogEntry) {
   const queue = queued === null ? "" : tf("限速排队 {0}", [formatQueueWait(queued)]);
   // 换上游后去掉了别家签发的压缩上下文：较早的对话内容上游已看不到，必须让用户看得见。
   const compaction = foreignCompactionDropped(entry.retryReasons) ? t("已去掉别家压缩上下文") : "";
-  return [base, queue, compaction].filter(Boolean).join(" · ") || "-";
+  // 压缩请求改发到了压缩模型，或回退到了原模型（#3142）。
+  const note = compactionNote(entry.retryReasons);
+  const compactModel = note ? (note.kind === "model" ? t("压缩模型") : t("压缩回退原模型")) : "";
+  return [base, queue, compaction, compactModel].filter(Boolean).join(" · ") || "-";
+}
+
+/** 压缩模型说明的展示文字（#3142）。 */
+function compactionNoteText(note: CompactionNote): string {
+  if (note.kind === "model") return tf("压缩改用 {0}", [note.model]);
+  const reason = note.reason === "unavailable" ? t("压缩模型不可用")
+    : note.reason === "incompatible" ? t("压缩形态与压缩模型的上游不兼容")
+    : note.reason === "window" ? t("压缩模型的窗口装不下待压缩内容")
+    : note.reason === "failed" ? t("压缩模型的上游拒绝或出错")
+    : note.reason;
+  return tf("压缩模型 {0} 未使用（{1}），已用原模型", [note.model, reason]);
 }
 
 /** 重试原因的展示：网关记的限速排队换成「限速排队 Xs」，去掉别家压缩上下文换成说明，其它原样。 */
@@ -8074,6 +8143,8 @@ function requestLogRetryReasons(entry: RequestLogEntry): string {
       if (reason === FOREIGN_COMPACTION_DROPPED_REASON) {
         return t("已去掉别家签发的压缩上下文，较早的对话内容不可用");
       }
+      const note = parseCompactionNote(reason);
+      if (note) return compactionNoteText(note);
       if (!reason.startsWith(QUEUE_REASON_PREFIX)) return reason;
       const queued = queueWaitMs([reason]);
       return queued === null ? reason : tf("限速排队 {0}", [formatQueueWait(queued)]);
@@ -8114,9 +8185,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
   const [query, setQuery] = useState("");
   // 时间段、供应商、模型在后端筛：日志只读最近 REQUEST_LOG_LIMIT 条，先截再筛会漏。
   const [range, setRange] = useState<UsageRange>(initialFocus.range ?? "all");
-  const [relayFilter, setRelayFilter] = useState<{ id: string; label: string } | null>(
-    initialFocus.relayId ? { id: initialFocus.relayId, label: initialFocus.relayLabel || initialFocus.relayId } : null,
-  );
+  const [relayFilter, setRelayFilter] = useState<RelayFilter | null>(() => relayFilterFromFocus(initialFocus));
   const [modelFilter, setModelFilter] = useState(initialFocus.model ?? "");
   const [more, setMore] = useState(false);
   const [oldestMs, setOldestMs] = useState<number | null>(null);
@@ -8145,7 +8214,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
     limit: REQUEST_LOG_LIMIT,
     sinceMs: sinceMs ?? null,
     agent: agentScope === "all" ? null : agentScope,
-    relayId: relayFilter?.id ?? null,
+    ...relayFilterArgs(relayFilter),
     model: modelFilter || null,
   };
   // 自动刷新的定时器拿最新的筛选条件；序号保证只认最后一次读取。
@@ -8176,7 +8245,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [range, agentScope, relayFilter?.id, modelFilter]);
+  }, [range, agentScope, filterArgs.relayId, filterArgs.relayUnknown, modelFilter]);
 
   useEffect(() => {
     if (!autoRefresh) return;
@@ -8356,7 +8425,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
         <div className="request-log-chips">
           {relayFilter ? (
             <button className="request-log-chip" onClick={() => setRelayFilter(null)} title={t("去掉这个筛选")} type="button">
-              {tf("供应商：{0}", [relayFilter.label])}
+              {tf("供应商：{0}", [relayFilter.unknown ? t("未知") : relayFilter.label])}
               <X aria-hidden="true" className="h-3 w-3" />
             </button>
           ) : null}
@@ -8434,7 +8503,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                       ) : null}
                     </span>
                     <span
-                      className={entry.autoRetries > 0 || queueWaitMs(entry.retryReasons) !== null || foreignCompactionDropped(entry.retryReasons) ? "request-log-retry" : "request-log-muted"}
+                      className={entry.autoRetries > 0 || queueWaitMs(entry.retryReasons) !== null || foreignCompactionDropped(entry.retryReasons) || compactionNote(entry.retryReasons)?.kind === "fallback" ? "request-log-retry" : "request-log-muted"}
                       title={requestLogRetryReasons(entry)}
                     >
                       {requestLogRetryLabel(entry)}
@@ -15839,58 +15908,7 @@ const fetchSub2ApiRate = async () => {
             {showApiFields ? (
               <Field className="relay-field-custom-headers" label={t("自定义请求头")}>
                 <div className="relay-custom-headers">
-                  {(profile.customHeaders || []).map((row, index) => (
-                    <div className="relay-custom-header-row" key={`custom-header-${index}`}>
-                      <Input
-                        aria-label={t("请求头名称")}
-                        value={row.key}
-                        onChange={(event) => {
-                          const next = (profile.customHeaders || []).slice();
-                          next[index] = { ...next[index], key: event.currentTarget.value };
-                          updateDraft({ customHeaders: next });
-                        }}
-                        placeholder="X-Tenant"
-                      />
-                      <Input
-                        aria-label={t("请求头值")}
-                        value={row.value}
-                        onChange={(event) => {
-                          const next = (profile.customHeaders || []).slice();
-                          next[index] = { ...next[index], value: event.currentTarget.value };
-                          updateDraft({ customHeaders: next });
-                        }}
-                        placeholder={t("请求头值")}
-                      />
-                      <Button
-                        aria-label={t("删除这一项")}
-                        onClick={() =>
-                          updateDraft({
-                            customHeaders: (profile.customHeaders || []).filter((_, i) => i !== index),
-                          })
-                        }
-                        size="sm"
-                        type="button"
-                        variant="secondary"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  ))}
-                  <div className="relay-custom-headers-actions">
-                    <Button
-                      onClick={() =>
-                        updateDraft({
-                          customHeaders: [...(profile.customHeaders || []), { key: "", value: "" }],
-                        })
-                      }
-                      size="sm"
-                      type="button"
-                      variant="secondary"
-                    >
-                      <Plus className="h-4 w-4" />
-                      {t("添加请求头")}
-                    </Button>
-                  </div>
+                  <RelayHeaderRows onChange={(customHeaders) => updateDraft({ customHeaders })} rows={profile.customHeaders || []} />
                   <span className="hint-line">
                     {t("自定义请求头会同时用于测试连接、模型列表与实际代理请求。")}
                   </span>

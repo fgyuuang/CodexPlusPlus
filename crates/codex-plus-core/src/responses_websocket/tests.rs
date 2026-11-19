@@ -92,6 +92,12 @@ impl Fixture {
             json!({"relayProfiles":profiles,"activeRelayId":active}).to_string(),
         )
         .unwrap();
+        // WS 默认关（`responsesWebsocket`）；这些用例测的是打开之后的行为。
+        let enabled: GatewaySettings = serde_json::from_value(
+            json!({"version":3,"responsesWebsocket":true,"autoModels":false}),
+        )
+        .unwrap();
+        GatewayStore::default().save(&enabled).unwrap();
         Self {
             previous,
             _gateway: gateway,
@@ -104,7 +110,7 @@ impl Fixture {
     }
     fn gateway_profiles(&self, relays: Vec<Value>) {
         let settings: GatewaySettings = serde_json::from_value(json!({
-            "version":3,"bindings":{"codex":{"enabled":true,"model":"ws-model","token":"local-test",
+            "version":3,"responsesWebsocket":true,"bindings":{"codex":{"enabled":true,"model":"ws-model","token":"local-test",
                 "autoReviewModel":"review-model","extraModels":["review-model"]}},
             "providers":relays.into_iter().map(|relay| json!({
                 "relay":relay,"keyConcurrency":1
@@ -334,7 +340,14 @@ async fn helper_ws_dead_connection_rejects_cached_continuation_without_replay() 
     let mut continuation = create("");
     continuation["previous_response_id"] = json!("cached");
     send(&mut ws, continuation).await;
-    assert_eq!(next(&mut ws).await["status"], 400);
+    let error = next(&mut ws).await;
+    assert_eq!(error["status"], 400);
+    // 标准错误码：Codex 收到后重连并发完整上下文，不把它当失败显示（#3169）。
+    assert_eq!(
+        error["error"]["code"], "previous_response_not_found",
+        "{error}"
+    );
+    assert_eq!(error["error"]["param"], "previous_response_id");
     send(&mut ws, create("")).await;
     assert_eq!(next(&mut ws).await["response"]["id"], "fresh");
     ws.close(None).await.unwrap();
@@ -673,17 +686,24 @@ async fn gateway_ws_authenticates_inherits_child_model_and_releases_key_slots() 
         None,
     )
     .unwrap();
-    assert_eq!(
-        key_pool::limit_state(
-            &plan.candidates[0].key,
-            KeyLimits {
-                concurrency: Some(1),
-                rpm: None
-            },
-            std::time::Instant::now()
-        ),
-        KeyLimitState::Free
-    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if key_pool::limit_state(
+                &plan.candidates[0].key,
+                KeyLimits {
+                    concurrency: Some(1),
+                    rpm: None,
+                },
+                std::time::Instant::now(),
+            ) == KeyLimitState::Free
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("completed responses must release the key slot");
     parent.close(None).await.unwrap();
     child.close(None).await.unwrap();
     drop(parent);
@@ -1081,6 +1101,63 @@ fn websocket_error_without_http_status_preserves_failure_classification() {
             expected
         );
     }
+}
+
+#[tokio::test]
+async fn helper_ws_is_off_by_default_and_upgrade_gets_426() {
+    if isolated("helper_ws_is_off_by_default_and_upgrade_gets_426").await {
+        return;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _fixture = Fixture::new(profile(listener.local_addr().unwrap()));
+    // 没打开 `responsesWebsocket`（旧配置、新装）：握手阶段回 426，Codex 走 HTTP，与 2.6 一致。
+    let gateway: GatewaySettings =
+        serde_json::from_value(json!({"version":3,"autoModels":false})).unwrap();
+    assert!(!gateway.responses_websocket);
+    GatewayStore::default().save(&gateway).unwrap();
+    let (url, task) = helper(1).await;
+    assert_eq!(
+        upgrade_status(&format!("{url}/v1/responses")).await,
+        "HTTP/1.1 426 Upgrade Required"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "关着时不应连上游"
+    );
+    finish(task).await;
+}
+
+#[tokio::test]
+async fn helper_ws_unknown_previous_response_asks_for_full_context_without_upstream() {
+    if isolated("helper_ws_unknown_previous_response_asks_for_full_context_without_upstream").await
+    {
+        return;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _fixture = Fixture::new(profile(listener.local_addr().unwrap()));
+    let (url, task) = helper(1).await;
+    let mut ws = client(&format!("{url}/v1/responses"), &[]).await;
+    let mut continuation = create("");
+    continuation["previous_response_id"] = json!("resp_from_another_connection");
+    continuation["input"] =
+        json!([{"type":"function_call_output","call_id":"call_1","output":"ok"}]);
+    send(&mut ws, continuation).await;
+    let error = next(&mut ws).await;
+    assert_eq!(
+        error["error"]["code"], "previous_response_not_found",
+        "{error}"
+    );
+    // 没见过的续接不发给任何上游：那边没有前文，只带增量会丢上下文。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    ws.close(None).await.unwrap();
+    drop(ws);
+    finish(task).await;
 }
 
 mod lifecycle;
