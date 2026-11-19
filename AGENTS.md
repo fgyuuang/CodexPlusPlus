@@ -5,8 +5,8 @@
 ## 项目概述
 
 本仓库是 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 fork。
-当前源码整合目标为正式 v2.7.2（`70fb845e`），主开发目录 `D:/pro/codex-plus-plus`。为保留原合并及恢复记录，分支仍名为 `codex/sync-v2.7.1-20261117`；以实际 `MERGE_HEAD` 和源码版本为准。
-2026-11-18 本轮限源码整合、验证和贡献准备。现行说明见 `docs/reports/2026-11-18-v2.7.2-contribution-audit.md`；上次 2.7.1 的发布证据仍只对应旧输入。未提交的合并不得再次直接 merge/rebase。对外贡献从干净上游基线按功能组织，本分支用于保留个人 fork 历史。
+2026-11-19：当前主开发目录为 `D:/pro/codex-plus-plus`，开发主线为 `codex/development-mainline-v2.8.0`，已完成 v2.8.0 合并和发布，用户正在验收。发布输入树为 `636857558fb71e7c7ca88000bd015adb08acf1d3`；与源码无关的后续文档更新不改变该发布证据。上游贡献从独立干净基线拆分，材料见 `output/contributions-v280-20261119/README.md`。下列旧版合并、发布和推送限制为历史记录，以本段和用户当前指令为准。
+历史记录：2026-11-18 本轮限源码整合、验证和贡献准备。现行说明见 `docs/reports/2026-11-18-v2.7.2-contribution-audit.md`；上次 2.7.1 的发布证据仍只对应旧输入。未提交的合并不得再次直接 merge/rebase。对外贡献从干净上游基线按功能组织，本分支用于保留个人 fork 历史。
 
 本地扩展了聚合供应商路由与模型别名、认证与会话隔离、插件市场保留等功能，
 详见 `docs/local-features.md` —— 每次上游合并后必须逐条确认回归。
