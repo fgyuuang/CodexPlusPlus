@@ -198,9 +198,10 @@ test("总览：读取中、空池、全部关闭分开显示；最近请求没�
 });
 
 test("路由说明的失败原因按标记翻译，不再按「是不是汉字开头」猜", () => {
-  const hub = read("HubOverview.tsx");
-  assert.doesNotMatch(hub, /一-龥/);
-  assert.match(hub, /typeof arg === "object" \? t\(arg\.zh\) : arg/);
+  const route = read("RequestRouteDetails.tsx");
+  assert.doesNotMatch(route, /一-龥/);
+  assert.match(route, /failureLabel\(step\.failure\)/);
+  assert.match(route, /\$\{t\(reason\)\}/);
   assert.match(read("GatewayModelMatrix.tsx"), /\.join\(t\("、"\)\)/);
   assert.match(read("GatewayProviders.tsx"), /\$\{keyLabel\(entry\.keys, key\.keyId\)\}\$\{t\("："\)\}/);
 });
@@ -322,7 +323,7 @@ test("用量与请求日志并成一页：两个页签各是一条路由，统�
   assert.match(app, /match: \["gatewayUsage", "requestLog"\]/, "在请求页签时侧栏「用量」也是选中");
   assert.match(app, /useEffect\(\(\) => onOpenRequestLog\(\(focus\) => \{/);
   assert.match(read("GatewayUsage.tsx"), /onClick=\{\(\) => openRequestLog\(split === "agent"/);
-  assert.match(read("GatewayUsage.tsx"), /\{ relayId: group\.key, relayLabel: maskAccountName\(group\.label\), range \}/, "按供应商 id 精确筛，时间段跟着统计页");
+  assert.match(read("GatewayUsage.tsx"), /\{ relayId: group\.key, relayLabel: name, range \}/, "按供应商 id 精确筛，时间段和显示名跟着统计页");
   assert.match(read("GatewayUsage.tsx"), /\{ model: group\.key, range \}/);
   assert.match(app, /invoke<RequestLogsResult>\("load_request_logs", filterRef\.current\)/, "时间段、供应商、模型在后端筛，先截 300 条再筛会漏");
   assert.match(app, /entry\.statusCode \|\| \(entry\.success \? "OK" : "ERR"\)/);

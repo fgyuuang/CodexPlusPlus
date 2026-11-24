@@ -25,7 +25,7 @@ fn fixture() -> GatewaySettings {
         enabled: true,
         model: "login/future-native".into(),
         native_official: Some(RelayProfile {
-            id: "login".into(), name: "当前登录账号".into(),
+            id: "login".into(), name: "ChatGPT Pro · example-user@example.test".into(),
             relay_mode: RelayMode::Official, protocol: RelayProtocol::Responses,
             model: "future-native".into(), model_list: "future-native\nnative-only".into(),
             auth_contents: json!({"codex_plus_official_account_ref": "account-a", "codex_plus_gateway": true}).to_string(),
@@ -52,7 +52,15 @@ fn native_catalog_deduplicates_login_and_keeps_sources_and_automatic_entry() {
     let metadata: Value = serde_json::from_str(&catalog.model_metadata).unwrap();
     assert_eq!(
         metadata["future-native"]["codex_plus_group"],
-        "当前登录账号"
+        "ChatGPT Pro · ex****er@example.test"
+    );
+    assert_eq!(metadata["future-native"]["codex_plus_group_id"], "login");
+    assert_eq!(metadata["future-native"]["codex_plus_native_account"], true);
+    assert_eq!(metadata["other/future-native"]["codex_plus_group"], "other");
+    assert!(
+        metadata["other/future-native"]
+            .get("codex_plus_native_account")
+            .is_none()
     );
     assert!(
         !metadata["future-native"]["display_name"]
@@ -217,6 +225,7 @@ fn native_projection_tracks_login_instead_of_scheduling_primary() {
         Some("account-a")
     );
     assert!(!native.model_list.is_empty());
+    assert_eq!(native.name, "login");
     settings.active_official_account_id = "account-b".into();
     let projected = projected.with_native_codex_account(&settings);
     let native = projected
@@ -226,6 +235,7 @@ fn native_projection_tracks_login_instead_of_scheduling_primary() {
         .as_ref()
         .unwrap();
     assert_eq!(native.id, "other");
+    assert_eq!(native.name, "other");
     assert_eq!(
         crate::gateway::official_accounts::account_ref(native).as_deref(),
         Some("account-b")

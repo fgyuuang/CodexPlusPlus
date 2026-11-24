@@ -2241,6 +2241,23 @@
         -webkit-backdrop-filter: blur(8px);
       }
       .codex-plus-extensions-sort-menu { top: calc(100% + 4px); right: 0; }
+      .codex-plus-work-gateway-search {
+        min-width: 0;
+        margin: 4px 5px;
+        padding: 6px 9px;
+        border: 1px solid var(--codex-plus-border);
+        border-radius: 8px;
+        background: transparent;
+        color: inherit;
+        font-size: 13px;
+      }
+      .codex-plus-work-gateway-list { min-height: 0; overflow-y: auto; }
+      .codex-plus-work-gateway-heading {
+        padding: 5px 8px 2px;
+        color: var(--color-text-tertiary, var(--codex-plus-muted));
+        font-size: 11px;
+        overflow-wrap: anywhere;
+      }
       .codex-plus-menu-item {
         display: flex;
         align-items: center;

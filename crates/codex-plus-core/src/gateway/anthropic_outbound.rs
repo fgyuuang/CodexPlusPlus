@@ -671,13 +671,9 @@ impl ResponsesSseToAnthropicSse {
 
     fn finish_message(&mut self, response: &Value, output: &mut String) {
         let usage = anthropic_usage(response.get("usage"));
-        self.usage = Some(crate::request_log::RequestUsage {
-            input_tokens: usage.input_tokens + usage.cache_read_input_tokens,
-            output_tokens: usage.output_tokens,
-            cached_tokens: usage.cache_read_input_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
-            workbuddy_credits: usage.workbuddy_credits,
-        });
+        self.usage = response
+            .get("usage")
+            .and_then(crate::request_log::usage_from_usage_value);
         let stop_reason = stop_reason(response, self.emitted_tool_use);
         push_event(
             output,
@@ -717,8 +713,6 @@ struct AnthropicUsage {
     input_tokens: u64,
     cache_read_input_tokens: u64,
     output_tokens: u64,
-    reasoning_tokens: u64,
-    workbuddy_credits: Option<f64>,
 }
 
 /// Responses usage → Anthropic usage：Anthropic 的 `input_tokens` 不含缓存命中部分。
@@ -735,8 +729,6 @@ fn anthropic_usage(usage: Option<&Value>) -> AnthropicUsage {
         input_tokens: total_input.saturating_sub(cached),
         cache_read_input_tokens: cached,
         output_tokens: number("/output_tokens"),
-        reasoning_tokens: number("/output_tokens_details/reasoning_tokens"),
-        workbuddy_credits: usage.and_then(crate::request_log::workbuddy_credits),
     }
 }
 

@@ -141,7 +141,7 @@ export function hubFeed(payload: GatewayPayload | null): HubFeedItem[] {
 function feedItem(agent: string, record: RouteRecordView): HubFeedItem {
   const answered = [...record.steps].reverse().find((step) => step.outcome === "answered");
   const target = answered ?? record.steps[record.steps.length - 1] ?? record.planned[0];
-  const rerouted = record.result === "answered" && record.steps.length > 1;
+  const rerouted = record.result === "answered" && record.steps.filter((step) => step.outcome !== "skipped").length > 1;
   return {
     agent,
     // 老记录或直接转发的请求可能没记请求的模型名，退回实际发出的模型。
@@ -154,24 +154,8 @@ function feedItem(agent: string, record: RouteRecordView): HubFeedItem {
   };
 }
 
-/** 网关记下的「最后一次路由」和请求日志里那条请求的结束时间最多差这么多，才算同一条。 */
-const ROUTE_MATCH_MS = 5_000;
-
-/**
- * 总览「最近请求」里哪几条能展开看路由经过：网关为每个 Agent 记着最后一次路由，
- * 对应日志里这个 Agent 最近一次结束的请求（结束时间对得上才算）。返回 请求 id → 路由记录。
- */
-export function routeRecordsByEntry(payload: GatewayPayload | null, entries: FlowEntry[]): Map<string, RouteRecordView> {
-  const records = new Map<string, RouteRecordView>();
-  for (const agent of payload?.activity?.agents ?? []) {
-    const record = agent.last;
-    if (!record) continue;
-    const entry = entries
-      .filter((item) => flowAgent(item) === agent.agent && flowStatus(item) !== "running")
-      .sort((left, right) => right.timestampMs - left.timestampMs)[0];
-    if (entry && Math.abs(entry.timestampMs - record.finishedAtMs) <= ROUTE_MATCH_MS) records.set(entry.id, record);
-  }
-  return records;
+export function completedRoute(entry: FlowEntry): RouteRecordView | null {
+  return flowStatus(entry) === "running" ? null : entry.route ?? null;
 }
 
 /** hub 卡片上的四个数：请求、换上游、冷却中的 Key、熔断中的供应商。 */

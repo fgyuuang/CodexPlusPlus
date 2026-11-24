@@ -1642,6 +1642,7 @@
   function scanDeferred() {
     installCodexCapacityRetry();
     installCodexModelRequestBridgePatch();
+    runScanStep(installCodexPlusWorkGateway);
     // 内置拓展登记的扫描步骤（桌宠与大肥鱼、梦皮、侧聊保存……）：拓展卸下时步骤跟着撤掉，不再由扫描循环直接点名调用。
     // 已删会话的行过滤（会话删除）、对话宽度、滚动位置恢复也都是内置拓展经公开的 ctx.onScan 登记的步骤。
     runCodexPlusScanSteps();

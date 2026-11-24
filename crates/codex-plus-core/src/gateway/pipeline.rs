@@ -118,7 +118,7 @@ pub async fn open(
     plan: &RoutePlan,
     request: GatewayRequest<'_>,
 ) -> anyhow::Result<GatewayOutcome> {
-    let mut recorder = RouteRecorder::new(plan);
+    let mut recorder = RouteRecorder::new(plan, request.live_request_id);
     let mut result = open_candidates(settings, plan, request, &mut recorder).await;
     if let Ok(outcome) = &mut result
         && let GatewayUpstream::Pipeline(response) = &mut outcome.upstream
@@ -202,6 +202,7 @@ async fn open_candidates(
             }
         }
     }
+    recorder.candidates(&pending);
     let mut last_error: Option<anyhow::Error> = None;
     // 主动限速：第一次因为候选都满了而排队的时刻，和累计排了多久。
     let mut queue_started: Option<Instant> = None;
@@ -225,6 +226,7 @@ async fn open_candidates(
                     crate::gateway::store::GatewaySettings::default()
                 };
             if let Err(blocked) = dispatch_gate.check(&gateway, &candidate.relay) {
+                recorder.step(candidate, "skipped", Some("subscription_limit"), None);
                 match &blocked.action {
                     &crate::gateway::store::SubscriptionLimitAction::ApiFallback
                     | &crate::gateway::store::SubscriptionLimitAction::NextPermitted => {

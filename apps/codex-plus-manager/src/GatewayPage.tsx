@@ -59,6 +59,7 @@ import "./GatewayPage.css";
 import { CxBadge, CxCard, CxRow, CxSection } from "./cx-layout";
 import { Menu, MenuItem } from "./ManagementPages";
 import { AgentGlyph } from "./HubOverview";
+import { RecentRouteFeed } from "./RoutingObservatory";
 
 type Tab = "agents" | "sessions" | "providers" | "routing" | "usage" | "gateway";
 export type GatewayTab = Tab;
@@ -264,6 +265,19 @@ const STICKY_OPTIONS: GroupSticky[] = ["cache", "session", "off"];
 
 /** 路由页：你建的组和自动组，每张卡片上直接改路由方式、会话固定、隐藏成员，手动模式下点成员锁定。 */
 function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; busy: string | null; run: Run }) {
+  const [view, setView] = useState<"settings" | "requests">(() =>
+    import.meta.env.DEV && new URLSearchParams(window.location.search).get("previewRoute") === "gatewayRouting"
+      ? "requests" : "settings");
+  return <>
+    <nav className="tp-tabs cx-pills" aria-label={t("路由")} role="group">
+      <button aria-pressed={view === "settings"} data-active={view === "settings"} onClick={() => setView("settings")} type="button">{t("调度设置")}</button>
+      <button aria-pressed={view === "requests"} data-active={view === "requests"} onClick={() => setView("requests")} type="button">{t("请求路由")}</button>
+    </nav>
+    {view === "settings" ? <RoutingSettings payload={payload} busy={busy} run={run} /> : <RecentRouteFeed payload={payload} />}
+  </>;
+}
+
+function RoutingSettings({ payload, busy, run }: { payload: GatewayPayload | null; busy: string | null; run: Run }) {
   const [editing, setEditing] = useState<GatewayGroupEntry | "new" | null>(null);
   const [query, setQuery] = useState("");
   const autoOn = payload?.gateway.autoModels !== false;

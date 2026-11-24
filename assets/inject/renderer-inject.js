@@ -452,7 +452,7 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "48";
+  const codexAppServerModelRequestPatchVersion = "49";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "8";
@@ -3166,6 +3166,23 @@
         -webkit-backdrop-filter: blur(8px);
       }
       .codex-plus-extensions-sort-menu { top: calc(100% + 4px); right: 0; }
+      .codex-plus-work-gateway-search {
+        min-width: 0;
+        margin: 4px 5px;
+        padding: 6px 9px;
+        border: 1px solid var(--codex-plus-border);
+        border-radius: 8px;
+        background: transparent;
+        color: inherit;
+        font-size: 13px;
+      }
+      .codex-plus-work-gateway-list { min-height: 0; overflow-y: auto; }
+      .codex-plus-work-gateway-heading {
+        padding: 5px 8px 2px;
+        color: var(--color-text-tertiary, var(--codex-plus-muted));
+        font-size: 11px;
+        overflow-wrap: anywhere;
+      }
       .codex-plus-menu-item {
         display: flex;
         align-items: center;
@@ -6720,11 +6737,22 @@
         if (managed) resumeParams = applyCodexManagedSessionConnection("thread/resume", resumeParams, hostId);
         state.resuming = ++codexThreadProviderResumeSequence;
         try {
-          const resumed = await sendRequest("thread/resume", resumeParams,
-            { ...options, __codexPlusProviderResume: state.resuming });
+          const sendResume = (next) => {
+            signal?.throwIfAborted();
+            if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+            return sendRequest("thread/resume", next, { ...options, __codexPlusProviderResume: state.resuming });
+          };
+          const resumed = await (managed
+            ? sendCodexManagedResumeWithFallback("thread/resume", resumeParams, hostId, sendResume)
+            : sendResume(resumeParams));
           signal?.throwIfAborted();
-          if (resumed.modelProvider !== targetProvider) throw new Error("会话尚未切换到目标供应商，请重试");
           if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+          if (managed && sourceProvider === "openai" && resumed.modelProvider === "openai") {
+            state.pending = null;
+            if (resumeBeforeTurn) throw new Error("此聊天已按官方来源恢复；请切回官方会话网关，或新建聊天使用当前聚合供应商");
+            return null;
+          }
+          if (resumed.modelProvider !== targetProvider) throw new Error("会话尚未切换到目标供应商，请重试");
           state.client = client;
           state.preparedProvider = targetProvider;
         } finally {
@@ -7043,14 +7071,8 @@
     return connection;
   }
 
-  function applyCodexManagedSessionConnection(method, params, hostId) {
-    if (hostId !== "local" || !["thread/start", "thread/resume", "thread/fork"].includes(method)
-        || !params || typeof params !== "object" || Array.isArray(params)) return params;
-    // 原生继承分支禁止同时传 config；其父会话已经持有连接快照。
-    if (method === "thread/fork" && params.experimentalPredictionMode === true) return params;
-    const connection = codexManagedSessionConnection();
-    if (!connection) return params;
-    const config = { ...(params.config || {}) };
+  function codexConfigWithoutManagedProvider(contents) {
+    const config = { ...contents };
     if (config.model_providers && typeof config.model_providers === "object") {
       config.model_providers = { ...config.model_providers };
       delete config.model_providers.codex_plus_managed;
@@ -7062,6 +7084,17 @@
         delete config[key];
       }
     }
+    return config;
+  }
+
+  function applyCodexManagedSessionConnection(method, params, hostId) {
+    if (hostId !== "local" || !["thread/start", "thread/resume", "thread/fork"].includes(method)
+        || !params || typeof params !== "object" || Array.isArray(params)) return params;
+    // 原生继承分支禁止同时传 config；其父会话已经持有连接快照。
+    if (method === "thread/fork" && params.experimentalPredictionMode === true) return params;
+    const connection = codexManagedSessionConnection();
+    if (!connection) return params;
+    const config = codexConfigWithoutManagedProvider(params.config);
     config.model_provider = connection.provider;
     config["model_providers.codex_plus_managed"] = {
       name: "custom",
@@ -7074,6 +7107,26 @@
     const next = { ...params, modelProvider: connection.provider, config };
     delete next.model_provider;
     return next;
+  }
+
+  async function sendCodexManagedResumeWithFallback(method, params, hostId, send) {
+    if (hostId !== "local") return send(params);
+    if (method === "send-cli-request-for-host" && params?.method
+        && ![params.hostId, params.host_id].some((host) => typeof host === "string" && host !== "local")) {
+      return sendCodexManagedResumeWithFallback(params.method, params.params, hostId,
+        (next) => send(next === params.params ? params : { ...params, params: next }));
+    }
+    if (method !== "thread/resume" || !params?.threadId || params.modelProvider !== "codex_plus_managed"
+        || [params.hostId, params.host_id].some((host) => typeof host === "string" && host !== "local")) return send(params);
+    try {
+      return await send(params);
+    } catch (error) {
+      // 原生明确拒绝了恢复，才允许用原 provider 重试；连接超时等结果未知时不重试。
+      if (!String(error?.message ?? error).includes("Cannot change this thread's model provider from `openai` to `codex_plus_managed` on resume")) throw error;
+      const next = { ...params, modelProvider: "openai", config: codexConfigWithoutManagedProvider(params.config) };
+      delete next.model_provider;
+      return send(next);
+    }
   }
 
   async function prepareCodexManagedSessionConnection(method, params, hostId, sendRequest) {
@@ -7288,7 +7341,13 @@
     // 已加载 resume 忽略连接覆盖，必须先卸载空闲会话再恢复。
     await sendRequest("thread/unsubscribe", { threadId }, recoveryOptions);
     assertCodexManagedSessionConnection(signature);
-    const result = await sendRequest("thread/resume", protectedParams, recoveryOptions);
+    const result = await sendCodexManagedResumeWithFallback("thread/resume", protectedParams, "local", (next) => {
+      assertCodexManagedSessionConnection(signature);
+      return sendRequest("thread/resume", next, recoveryOptions);
+    });
+    if (result?.modelProvider === "openai" && read.thread.modelProvider === "openai") {
+      throw new Error("此聊天已按官方来源恢复；请切回官方会话网关，或新建聊天使用当前聚合供应商");
+    }
     if (result?.modelProvider !== "codex_plus_managed") throw new Error("会话未采用受管连接配置");
     return result;
   }
@@ -15750,6 +15809,7 @@ ${key} = ${value}`]);
     formatQueueWait: () => formatQueueWait,
     formatRemaining: () => formatRemaining,
     formatRequestCost: () => formatRequestCost,
+    formatRequestPrice: () => formatRequestPrice,
     formatTokens: () => formatTokens,
     gatewayPresets: () => gatewayPresets,
     glanceAgents: () => glanceAgents,
@@ -15822,6 +15882,7 @@ ${key} = ${value}`]);
     unlistedModels: () => unlistedModels,
     usableResetCardCount: () => usableResetCardCount,
     usageDayStats: () => usageDayStats,
+    usageProviderLabel: () => usageProviderLabel,
     usageRangeStart: () => usageRangeStart,
     validateDraft: () => validateDraft,
     validateProviderDraft: () => validateProviderDraft,
@@ -16308,6 +16369,7 @@ ${key} = ${value}`]);
     };
   }
   var GROUP_MODEL_PREFIX = "group/";
+  var CODEX_AUTO_MODEL_PREFIX = "codex-plus-auto/";
   function groupModelId(id) {
     return `${GROUP_MODEL_PREFIX}${id}`;
   }
@@ -16352,19 +16414,26 @@ ${key} = ${value}`]);
     const entry = agentPoolProviders(payload, exclude).find((item) => item.id.toLowerCase() === prefix);
     return entry ? { entry, model: model.slice(index + 1).trim() } : null;
   }
-  function modelRoutable(payload, model, exclude = []) {
+  function modelRoutable(payload, model, exclude = [], native) {
+    const slug = modelSlugFromRowName(model);
+    if (slug.startsWith(CODEX_AUTO_MODEL_PREFIX)) {
+      const upstream = slug.slice(CODEX_AUTO_MODEL_PREFIX.length);
+      if (native?.models.some((known) => known.toLowerCase() === upstream.toLowerCase())) {
+        return Boolean(activeAutoGroup(payload, upstream)) && servingProviders(payload, upstream, exclude).length > 1;
+      }
+    }
     if (disabledGroup(payload, model)) return false;
     const lower = model.trim().toLowerCase();
     return agentModels(payload, exclude).some((known) => known.toLowerCase() === lower) || qualifiedProvider(payload, model.trim(), exclude) !== null;
   }
-  function validateDraft(draft, payload, retainedModel, retainedSelection) {
+  function validateDraft(draft, payload, retainedModel, retainedSelection, native) {
     if (payload) {
       if (!agentPoolProviders(payload, draft.poolExclude).length) return "供应商池是空的，先到「供应商」里添加";
       const model = draft.model.trim();
       const retainedDisabledModel = draft.model === retainedModel && disabledGroup(payload, model);
       const retainedProvider = retainedSelection && payload.pool.find((entry) => entry.id === retainedSelection.providerId);
       const retainedUnavailableModel = draft.model === retainedModel && retainedSelection && modelSlugFromRowName(model).toLowerCase() === `${retainedSelection.providerId}/${modelSlugFromRowName(retainedSelection.upstreamModel)}`.toLowerCase() && (retainedSelection.providerRemoved || !retainedProvider || !providerEnabled(retainedProvider) || draft.poolExclude.includes(retainedProvider.id));
-      if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude)) return "供应商池里没有这个模型";
+      if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude, native)) return "供应商池里没有这个模型";
     }
     const window = parseContextWindow(draft.contextWindow);
     if (window !== null && (!Number.isFinite(window) || window < 1e3)) return "上下文窗口格式不对，例如 200000、200k 或 1M";
@@ -16432,8 +16501,10 @@ ${key} = ${value}`]);
     const sections = [];
     const providers = agentPoolProviders(payload, exclude);
     const isNative = (model) => Boolean(native?.models.some((known) => known.toLowerCase() === model.toLowerCase()));
-    const nativeItems = (native?.models ?? []).filter((model) => matches(query, model, "当前登录账号")).map((model) => ({ model, label: prettyModelName(model), sub: "当前登录账号", avatar: "" }));
-    if (nativeItems.length) sections.push({ key: "native", title: "当前登录账号", avatar: "", items: nativeItems });
+    const nativeName = native?.accountName?.trim() || "当前登录账号";
+    const nativeAvatar = native?.accountName ? avatar(nativeName) : "";
+    const nativeItems = (native?.models ?? []).filter((model) => matches(query, model, nativeName)).map((model) => ({ model, label: prettyModelName(model), sub: nativeName, avatar: nativeAvatar }));
+    if (nativeItems.length) sections.push({ key: "native", title: nativeName, avatar: nativeAvatar, items: nativeItems });
     const unlisted = unlistedModels(payload);
     const shared = [];
     for (const entry of providers) {
@@ -16457,7 +16528,7 @@ ${key} = ${value}`]);
       if (items.length) sections.push({ key: `provider:${entry.id}`, title: maskAccountName(entry.name), avatar: avatar(entry.name), items });
     }
     const autoItems = shared.filter((model) => activeAutoGroup(payload, model)).map((model) => ({
-      model: isNative(model) ? `codex-plus-auto/${model}` : model,
+      model: isNative(model) ? `${CODEX_AUTO_MODEL_PREFIX}${model}` : model,
       label: prettyModelName(model),
       sub: servingProviders(payload, model, exclude).map((entry) => maskAccountName(entry.name)).join(" → "),
       avatar: ""
@@ -16513,8 +16584,8 @@ ${key} = ${value}`]);
   }
   function modelDisplay(payload, model, exclude = [], selection) {
     const title = model.trim() || agentModels(payload, exclude)[0] || "";
-    if (title.startsWith("codex-plus-auto/")) {
-      const upstream = title.slice("codex-plus-auto/".length);
+    if (title.startsWith(CODEX_AUTO_MODEL_PREFIX)) {
+      const upstream = title.slice(CODEX_AUTO_MODEL_PREFIX.length);
       return { title: prettyModelName(upstream), sub: servingProviders(payload, upstream, exclude).map((entry2) => maskAccountName(entry2.name)).join(" → "), group: false, auto: true };
     }
     const selectedModel = modelSlugFromRowName(title);
@@ -16799,6 +16870,10 @@ ${key} = ${value}`]);
     }
     record.steps.forEach((step, index) => {
       const last = index === record.steps.length - 1;
+      if (step.outcome === "skipped") {
+        lines.push({ tone: "step", text: "{0} 被订阅额度策略跳过。", args: [maskAccountName(step.relayName)] });
+        return;
+      }
       if (step.outcome === "answered") {
         lines.push({ tone: "ok", text: "{0}（{1}）回答，用时 {2}。", args: [maskAccountName(step.relayName), displayModel(step.model) || step.model, formatElapsed(record.elapsedMs)] });
         return;
@@ -16808,7 +16883,7 @@ ${key} = ${value}`]);
       lines.push({
         tone: last ? "fail" : "step",
         text: last ? "{0} 的 Key {1} {2}{3}，错误交回给 {4}。" : "{0} 的 Key {1} {2}{3}，换下一个。",
-        args: last ? [maskAccountName(step.relayName), step.keyId, reason, status, who] : [maskAccountName(step.relayName), step.keyId, reason, status]
+        args: last ? [maskAccountName(step.relayName), step.keyId ?? "-", reason, status, who] : [maskAccountName(step.relayName), step.keyId ?? "-", reason, status]
       });
     });
     if (record.result === "cooling") {
@@ -17028,6 +17103,11 @@ ${key} = ${value}`]);
     if (!draft.model.trim() && splitModels(draft.modelList).length === 0) return "至少填一个模型";
     return proxyAddressError(draft.proxy) ?? providerHeadersValidationMessage(draft.customHeaders ?? []);
   }
+  function usageProviderLabel(pool, id, label) {
+    if (label !== "当前登录账号" && !id.startsWith("local-official-")) return label;
+    const provider = pool?.find((entry) => entry.id === id);
+    return provider && provider.name !== "当前登录账号" ? provider.name : "Codex (官方)";
+  }
   function isWorkBuddyProvider(source) {
     return source === "workbuddy" || source === "codex:managed-workbuddy" || source === "workbuddy:cn" || source === "workbuddy:global";
   }
@@ -17055,6 +17135,9 @@ ${key} = ${value}`]);
     if (cost.amount <= 0) return "—";
     if (cost.amount >= 0.01) return formatMoney(cost.amount, cost.currency);
     return `${currencySymbol(cost.currency)}${cost.amount.toPrecision(2)}`;
+  }
+  function formatRequestPrice(amount, currency) {
+    return amount === 0 ? formatMoney(amount, currency) : `${currencySymbol(currency)}${Number(amount.toPrecision(8))}`;
   }
   function formatTokens(value) {
     if (value >= 1e9) return `${trimNumber(value / 1e9)}B`;
@@ -18600,7 +18683,8 @@ ${key} = ${value}`]);
     const payload = state.payload;
     const previous = payload?.gateway?.bindings?.codex;
     const draft = codexPlusGatewayModel.draftFromBinding(previous);
-    const issue = codexPlusGatewayModel.validateDraft(draft, payload);
+    const native = payload?.agents?.find((agent) => agent.agent === "codex")?.nativeModels;
+    const issue = codexPlusGatewayModel.validateDraft(draft, payload, undefined, null, native);
     if (issue) {
       codexPlusGatewaySetStatus(`${issue}（请先在供应商池里添加可用的供应商，或在 Codex++「Agent 接入」里调整默认模型）`, "error");
       return renderCodexPlusProviderPage();
@@ -20524,8 +20608,20 @@ ${key} = ${value}`]);
   const codexPlusTaskStatusLabel = (status) => codexPlusTaskStatuses.find((entry) => entry.id === status)?.label || status;
   const codexPlusTaskIsOpen = (task) => task.status !== "done" && task.status !== "cancelled";
 
-  function codexPlusTaskProjectName(project) {
+  function codexPlusTaskProjectKey(path) {
+    const normalized = String(path || "").replace(/\\/g, "/").replace(/^\/\/\?\/UNC\//i, "//").replace(/^\/\/\?\//, "");
+    const key = normalized.replace(/\/+$/, "") || normalized;
+    return /^(?:[a-z]:|\/\/)/i.test(key) ? key.toLowerCase() : key;
+  }
+
+  function codexPlusTaskProjectName(project, data = codexPlusTaskBoardState.data) {
     if (!project) return "";
+    const key = codexPlusTaskProjectKey(project);
+    const names = new Set();
+    for (const [path, name] of data?.nativeProjects || []) {
+      if (name.trim() && codexPlusTaskProjectKey(path) === key) names.add(name.trim());
+    }
+    if (names.size) return [...names].join(" / ");
     const parts = String(project).split(/[\\/]+/).filter(Boolean);
     return parts[parts.length - 1] || String(project);
   }
@@ -20545,7 +20641,7 @@ ${key} = ${value}`]);
   function codexPlusTaskMatches(task, query) {
     const words = String(query || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
     if (!words.length) return true;
-    const haystack = [codexPlusTaskKey(task.id), String(task.id), task.title, task.body, task.project || ""].join("\n").toLowerCase();
+    const haystack = [codexPlusTaskKey(task.id), String(task.id), task.title, task.body, task.project || "", codexPlusTaskProjectName(task.project)].join("\n").toLowerCase();
     return words.every((word) => haystack.includes(word));
   }
 
@@ -20792,19 +20888,20 @@ ${key} = ${value}`]);
   }
 
   /**
-   * 项目候选：本任务当前的项目、其它任务用过的项目、core 给的最近在 Codex 里用过的项目（`projects`），去重。
-   * 已经选中的排最前；其余按「任务里用过的」在前、最近对话的在后。
+   * 项目候选：当前选择、原生项目、任务使用过的目录、近期对话目录，按路径去重。
    */
   function codexPlusTaskProjectChoices(task, data = codexPlusTaskBoardState.data) {
-    const key = (path) => String(path).replace(/[\\/]+$/, "");
     const seen = new Set();
     const list = [];
     const add = (path) => {
-      if (!path || typeof path !== "string" || seen.has(key(path))) return;
-      seen.add(key(path));
+      if (typeof path !== "string" || !path.trim()) return;
+      const key = codexPlusTaskProjectKey(path);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
       list.push(path);
     };
     add(task?.project);
+    (data?.nativeProjects || []).forEach(([path]) => add(path));
     const tasks = Array.isArray(data?.tasks) ? [...data.tasks].sort((a, b) => b.updatedAt - a.updatedAt) : [];
     tasks.forEach((item) => add(item.project));
     (Array.isArray(data?.projects) ? data.projects : []).forEach(add);
@@ -20814,9 +20911,12 @@ ${key} = ${value}`]);
   /** 详情里的项目菜单：候选项目、「不指定」、「选择其他文件夹…」。 */
   function codexPlusTaskProjectMenu(task) {
     const choices = codexPlusTaskProjectChoices(task);
-    const current = task.project ? String(task.project).replace(/[\\/]+$/, "") : "";
-    const rows = choices.map((path) => `<button type="button" role="menuitemradio" aria-checked="${String(path.replace(/[\\/]+$/, "") === current)}" data-codex-task-project="${escapeHtml(path)}" title="${escapeHtml(path)}">
-        ${codexPlusTaskIcons.folder}<span class="codex-plus-task-menu-label">${escapeHtml(codexPlusTaskProjectName(path))}</span><span class="codex-plus-task-menu-hint">${escapeHtml(path)}</span></button>`).join("");
+    const current = codexPlusTaskProjectKey(task.project);
+    const rows = choices.map((path) => {
+      const label = escapeHtml(codexPlusTaskProjectName(path));
+      return `<button type="button" role="menuitemradio" aria-checked="${String(codexPlusTaskProjectKey(path) === current)}" data-codex-task-project="${escapeHtml(path)}" title="${label} (${escapeHtml(path)})">
+        ${codexPlusTaskIcons.folder}<span class="codex-plus-task-menu-label">${label}</span><span class="codex-plus-task-menu-hint">${escapeHtml(path)}</span></button>`;
+    }).join("");
     return `<div class="codex-plus-task-menu codex-plus-task-project-menu" role="menu" aria-label="选择项目">
         ${rows || '<p class="codex-plus-task-menu-empty">还没有在 Codex 里用过的项目</p>'}
         <div class="codex-plus-task-menu-separator" role="separator"></div>
@@ -21217,7 +21317,8 @@ ${key} = ${value}`]);
     const state = codexPlusTaskBoardState;
     if (!document.querySelector("[data-codex-task-main]") || document.hidden) return;
     void codexPlusTaskRequest("list").then((data) => {
-      if (JSON.stringify([data.tasks, data.runs]) === JSON.stringify([state.data?.tasks, state.data?.runs])) return;
+      const signature = (board) => JSON.stringify([board?.tasks, board?.runs, board?.projects, board?.nativeProjects]);
+      if (signature(data) === signature(state.data)) return;
       state.data = data;
       state.error = "";
       renderCodexPlusTaskBoard();
@@ -24971,7 +25072,10 @@ ${key} = ${value}`]);
         codexModelCatalogLoadedAt = codexModelCatalogRuntime.loadedAt = Date.now();
         codexModelCatalogRuntime.retryAt = 0;
         codexModelCatalogRuntime.failure = null;
-        if (changed) refreshCodexNativeModelQueries();
+        if (changed) {
+          refreshCodexNativeModelQueries();
+          scheduleDeferredScan();
+        }
         renderCodexPlusMenu();
         syncCodexPlusGroupModelQueries();
         scheduleCodexModelWhitelistRefresh();
@@ -26172,7 +26276,8 @@ ${key} = ${value}`]);
       }
       let result;
       try {
-        result = await sendAppServerRequestThroughExchange(client, method, nextParams, () => originalSendRequest(method, nextParams, options));
+        result = await sendAppServerRequestThroughExchange(client, method, nextParams,
+          (next) => originalSendRequest(method, next, options));
         noteCodexGatewayThreadStart(String(method || ""), nextParams, result, client.hostId, gatewayGeneration);
         verifyCodexPureApiResumeResult(String(method || ""), nextParams, result, client.hostId);
         noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
@@ -26226,13 +26331,18 @@ ${key} = ${value}`]);
    * 内核分片还没初始化（页面早期、只抽前面分片的测试）时读中间件表会落进暂时性死区，按没有中间件处理。
    */
   async function sendAppServerRequestThroughExchange(client, method, params, send) {
+    const managedResume = method === "thread/resume" ? params
+      : method === "send-cli-request-for-host" && params?.method === "thread/resume" ? params.params : null;
+    const dispatch = () => managedResume?.modelProvider === "codex_plus_managed"
+      ? sendCodexManagedResumeWithFallback(method, params, client.hostId, send)
+      : send(params);
     let wanted = false;
     try {
       wanted = codexPlusExtensionInterceptors.has("codex/exchange");
     } catch {}
-    if (!wanted) return send();
-    const exchange = await codexPlusRunWaterfall("codex/exchange", { method, params, hostId: client.hostId, send });
-    return typeof exchange?.send === "function" ? exchange.send() : send();
+    if (!wanted) return dispatch();
+    const exchange = await codexPlusRunWaterfall("codex/exchange", { method, params, hostId: client.hostId, send: dispatch });
+    return typeof exchange?.send === "function" ? exchange.send() : dispatch();
   }
 
   // 账号额度用尽后，上游会把输入框和发送按钮一起锁死（coreRateLimitBlocked /
@@ -27309,7 +27419,8 @@ ${key} = ${value}`]);
       }
       let result;
       try {
-        result = await sendAppServerRequestThroughExchange(client, method, nextParams, () => originalSendRequest.call(client, method, nextParams, options));
+        result = await sendAppServerRequestThroughExchange(client, method, nextParams,
+          (next) => originalSendRequest.call(client, method, next, options));
         noteCodexGatewayThreadStart(String(method || ""), nextParams, result, client.hostId, gatewayGeneration);
         verifyCodexPureApiResumeResult(String(method || ""), nextParams, result, client.hostId);
         noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
@@ -29935,6 +30046,203 @@ ${key} = ${value}`]);
     },
   };
   if (globalThis.__codexPlusBuiltinInactive?.has("model-picker-groups")) codexPlusModelPickerScan();
+  const codexPlusWorkGatewayProject = 'form button[data-composer-navigation-target="workspace-project"]';
+  const codexPlusWorkGatewayMarker = '[data-codex-plus-ext="work-gateway"]';
+  const codexPlusWorkGatewayProjects = new WeakMap();
+
+  function codexPlusWorkGatewayProps(node, matches) {
+    const key = Object.keys(node || {}).find((name) => name.startsWith("__reactFiber$"));
+    for (let fiber = node?.[key], depth = 0; fiber && depth < 60; fiber = fiber.return, depth += 1) {
+      if (matches(fiber.memoizedProps)) return fiber.memoizedProps;
+    }
+    return null;
+  }
+
+  function codexPlusWorkGatewayDirectory(project) {
+    const state = codexPlusWorkGatewayProps(project?.form || project?.closest?.("form"), (p) => !!p?.state?.runLocationState)?.state;
+    const run = state?.runLocationState;
+    if (!project?.isConnected || state?.isTemporaryChat || state?.composerProps?.conversationOrigin !== "tpp"
+        || state.composerProps.workspaceAgent || state.composerProps.targetGizmoId
+        || !["cloud", "local"].includes(run?.effectiveLocation)
+        || run.unavailableReasons?.local != null
+        || (run.effectiveLocation === "cloud" && run.unavailableReasons?.local !== null && run.canChooseLocation !== true)) return "";
+    const props = codexPlusWorkGatewayProps(project, (p) => p?.isWorkHome === true && typeof p.isLocalWorkComposer === "boolean");
+    return props?.hostId === "local" && props.isLocalWorkComposer === (run.effectiveLocation === "local") && typeof props.cwd === "string"
+      && /^(?:[A-Za-z]:[\\/]|\/(?!\/))/.test(props.cwd) ? props.cwd : "";
+  }
+
+  function codexPlusWorkGatewayModels() {
+    if (!codexGatewaySessionRoutingEnabled()) return [];
+    const models = codexModelCatalog.models;
+    const metadata = codexModelCatalog.modelMetadata;
+    if (!Array.isArray(models)) return [];
+    return models.filter((model) => {
+      if (typeof model !== "string" || metadata?.[model]?.hidden === true) return false;
+      // `/` also occurs in bare upstream model names. Only the catalog can attest a provider pin.
+      const slash = model.indexOf("/");
+      const providerPin = slash > 0 && slash < model.length - 1
+        && metadata?.[model]?.codex_plus_group_id === model.slice(0, slash);
+      return (/^(?:group|codex-plus-auto)\/\S/.test(model) || /^[^:/]+:\S/.test(model) || providerPin)
+        && codexRemoteSessionTargetProvider(model);
+    });
+  }
+
+  function codexPlusWorkGatewayMenuEntries() {
+    return codexPlusWorkGatewayModels().map(model => {
+      const metadata = codexModelCatalog.modelMetadata?.[model];
+      const label = codexPlusModelDisplayName(metadata, model);
+      const parsed = codexPlusModelPickerSplitLabel(label);
+      return {
+        model,
+        label: parsed.name || label,
+        group: metadata?.codex_plus_group || (model.startsWith("group/") ? "group" : model.startsWith("codex-plus-auto/") ? "auto" : "gateway"),
+        favorite: metadata?.codex_plus_favorite === true,
+      };
+    }).sort((a, b) => Number(b.favorite) - Number(a.favorite));
+  }
+
+  async function codexPlusOpenWorkGatewayDraft(project, model) {
+    const cwd = codexPlusWorkGatewayDirectory(project);
+    const target = () => codexPlusWorkGatewayModels().includes(model) ? codexRemoteSessionTargetProvider(model) : "";
+    const modelProvider = target();
+    if (!cwd || !modelProvider) return false;
+    const client = await codexPlusAppServerClient("local");
+    const connection = await codexGatewayConnectionGeneration();
+    if (!connection.active || codexPlusWorkGatewayDirectory(project) !== cwd || target() !== modelProvider) return false;
+    // 只开本机空白对话，不转移 Work 的正文、附件、工具或权限设置。
+    const result = await client.sendRequest("thread/start", { cwd, model, modelProvider }, { timeoutMs: 20000 });
+    const id = result?.thread?.id;
+    if (!/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(id || "") || result.model !== model || result.modelProvider !== modelProvider
+        || codexPlusWorkGatewayDirectory(project) !== cwd || target() !== modelProvider) return false;
+    window.dispatchEvent(new MessageEvent("message", { data: { type: "navigate-to-route", path: `/local/${id}` } }));
+    return true;
+  }
+
+  function installCodexPlusWorkGateway() {
+    const project = [...document.querySelectorAll(codexPlusWorkGatewayProject)]
+      .find((button) => button.getClientRects().length && codexPlusWorkGatewayDirectory(button));
+    const models = project && codexPlusWorkGatewayModels();
+    const host = models?.length ? project.parentElement : null;
+    for (const node of document.querySelectorAll(codexPlusWorkGatewayMarker)) {
+      if (node.parentElement !== host || node.dataset.generation !== String(codexPlusRuntimeGeneration)
+          || codexPlusWorkGatewayProjects.get(node) !== project) {
+        node.querySelector("[popover]")?.hidePopover();
+        node.remove();
+      }
+      else return;
+    }
+    if (!host || typeof HTMLElement.prototype.showPopover !== "function") return;
+    const zh = /^zh\b/i.test(document.documentElement.lang || navigator.language);
+    const label = zh ? "网关模型" : "Gateway models";
+    const action = zh ? "在本机 Codex 中打开新对话" : "Open a new local Codex chat";
+    const wrapper = document.createElement("span");
+    wrapper.dataset.codexPlusExt = "work-gateway";
+    wrapper.dataset.generation = String(codexPlusRuntimeGeneration);
+    codexPlusWorkGatewayProjects.set(wrapper, project);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = project.className;
+    button.textContent = label;
+    button.title = action;
+    button.setAttribute("aria-label", `${label}: ${action}`);
+    button.setAttribute("aria-expanded", "false");
+    button.setAttribute("aria-haspopup", "dialog");
+    const panel = document.createElement("div");
+    panel.className = "codex-plus-menu-popover";
+    panel.setAttribute("popover", "auto");
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", button.getAttribute("aria-label"));
+    Object.assign(panel.style, { position: "fixed", inset: "auto", margin: "0", border: "0", overflow: "hidden",
+      width: "min(340px, calc(100vw - 16px))", maxHeight: "min(320px, 45vh)", display: "none" });
+    button.popoverTargetElement = panel;
+    const keyboard = (event) => {
+      if (event.target?.classList?.contains("codex-plus-work-gateway-search")
+          && panel.contains(event.target) && !["Tab", "Escape"].includes(event.key)) event.stopPropagation();
+    };
+    panel.addEventListener("beforetoggle", (event) => {
+      const open = event.newState === "open";
+      panel.style.display = open ? "flex" : "none";
+      button.dataset.state = open ? "open" : "closed";
+      button.setAttribute("aria-expanded", String(open));
+      if (!open) {
+        window.removeEventListener("keydown", keyboard, true);
+        return;
+      }
+      window.addEventListener("keydown", keyboard, true);
+      const rect = button.getBoundingClientRect();
+      panel.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - 348))}px`;
+      const above = rect.top;
+      const below = innerHeight - rect.bottom;
+      const openAbove = above >= 270 || above >= below;
+      panel.style.top = openAbove ? "auto" : `${rect.bottom + 4}px`;
+      panel.style.bottom = openAbove ? `${innerHeight - rect.top + 4}px` : "auto";
+      panel.style.maxHeight = `min(320px, ${Math.max(0, (openAbove ? above : below) - 12)}px)`;
+      panel.replaceChildren();
+      const search = document.createElement("input");
+      search.type = "search";
+      search.placeholder = zh ? "查找模型或供应商" : "Find a model or provider";
+      search.setAttribute("aria-label", search.placeholder);
+      search.className = "codex-plus-work-gateway-search";
+      const list = document.createElement("div");
+      list.className = "codex-plus-work-gateway-list";
+      const groupLabels = { group: zh ? "模型组" : "Model groups", auto: zh ? "自动组" : "Automatic groups", gateway: label };
+      const render = () => {
+        const query = search.value.trim().toLocaleLowerCase();
+        const groups = new Map();
+        for (const entry of codexPlusWorkGatewayMenuEntries()) {
+          const group = Object.hasOwn(groupLabels, entry.group) ? groupLabels[entry.group] : entry.group;
+          if (!`${entry.label} ${entry.model} ${group}`.toLocaleLowerCase().includes(query)) continue;
+          if (!groups.has(group)) groups.set(group, []);
+          groups.get(group).push(entry);
+        }
+        list.replaceChildren();
+        if (!groups.size) {
+          const empty = document.createElement("p");
+          empty.className = "codex-plus-work-gateway-heading";
+          empty.textContent = zh ? "没有匹配的网关模型" : "No matching gateway models";
+          list.append(empty);
+        }
+        for (const [group, entries] of groups) {
+          const section = document.createElement("section");
+          section.setAttribute("aria-label", group);
+          const heading = document.createElement("div");
+          heading.className = "codex-plus-work-gateway-heading";
+          heading.textContent = group;
+          section.append(heading);
+          for (const entry of entries) section.append(makeItem(entry));
+          list.append(section);
+        }
+      };
+      function makeItem(entry) {
+        const { model } = entry;
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "codex-plus-menu-item";
+        const name = document.createElement("span");
+        name.className = "codex-plus-menu-item-label";
+        name.textContent = entry.label;
+        item.title = model;
+        item.append(name);
+        item.addEventListener("click", async () => {
+          if (button.disabled) return;
+          panel.hidePopover();
+          button.disabled = true;
+          try {
+            if (await codexPlusOpenWorkGatewayDraft(project, model)) return;
+          } catch { /* 失败时不改派到云端。 */ }
+          finally { button.disabled = false; }
+          showToast(zh ? "未打开本机网关对话，请检查当前项目与网关连接。" : "Could not open a local gateway chat. Check the project and gateway connection.", null);
+        });
+        return item;
+      }
+      search.addEventListener("input", render);
+      panel.append(search, list);
+      render();
+      requestAnimationFrame(() => { if (button.getAttribute("aria-expanded") === "true") search.focus({ preventScroll: true }); });
+    });
+    wrapper.append(button, panel);
+    project.after(wrapper);
+  }
   function normalizeWorkspacePath(path) {
     const normalized = String(path || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
     return normalized || String(path || "").trim();
@@ -41622,6 +41930,7 @@ ${key} = ${value}`]);
   function scanDeferred() {
     installCodexCapacityRetry();
     installCodexModelRequestBridgePatch();
+    runScanStep(installCodexPlusWorkGateway);
     // 内置拓展登记的扫描步骤（桌宠与大肥鱼、梦皮、侧聊保存……）：拓展卸下时步骤跟着撤掉，不再由扫描循环直接点名调用。
     // 已删会话的行过滤（会话删除）、对话宽度、滚动位置恢复也都是内置拓展经公开的 ctx.onScan 登记的步骤。
     runCodexPlusScanSteps();
@@ -46518,6 +46827,7 @@ ${key} = ${value}`]);
       '[class*="user-message"]',
       '[class*="UserMessage"]',
       ".composer-footer",
+      codexPlusWorkGatewayProject,
       selectors.appHeader,
       selectors.archiveNav,
       selectors.pluginNavButton,

@@ -403,13 +403,18 @@ async fn settings_payload_fingerprint_follows_model_catalog_fields() {
 async fn internal_catalog_source_identity_tracks_connection_without_public_exposure() {
     use codex_plus_core::settings::{RelayApiKey, RelayMode};
 
-    async fn read(settings: BackendSettings, path: &str) -> Value {
-        let ctx = BridgeContext::new(
-            Arc::new(FakeSettings::with_settings(settings)),
-            Arc::new(FakeRuntime::default()),
-            Arc::new(FakeData::default()),
-        );
-        handle_bridge_request(ctx, path, json!({})).await
+    fn read(
+        settings: BackendSettings,
+        path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + '_>> {
+        Box::pin(async move {
+            let ctx = BridgeContext::new(
+                Arc::new(FakeSettings::with_settings(settings)),
+                Arc::new(FakeRuntime::default()),
+                Arc::new(FakeData::default()),
+            );
+            handle_bridge_request(ctx, path, json!({})).await
+        })
     }
     let mut settings = settings_with_secret_profile("model");
     settings.relay_profiles[0].relay_mode = RelayMode::PureApi;

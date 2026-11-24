@@ -7,12 +7,13 @@ export type UsageRoute = "gatewayUsage" | "requestLog";
 
 /** 统计表里点一行，切到「请求」页签并按它筛选：Agent、供应商（id 与显示名）或模型，时间段跟着统计页。 */
 export type RequestLogFocus = {
-  agent?: "codex" | "claude" | "grok";
+  agent?: string;
   relayId?: string;
   relayLabel?: string;
   /** 点的是「未知」供应商行（请求没有供应商归属）；relayId 为空时靠它区分于「全部供应商」。 */
   relayUnknown?: boolean;
   model?: string;
+  date?: string;
   range?: UsageRange;
 };
 

@@ -401,7 +401,7 @@ test("首页：状态、精选推荐、其他赞助商、常用入口；广告�
 test("Codex 在「经网关」和「直连」之间一键切换：切到网关沿用上次接入设置，切回直连先预览还原", () => {
   const app = functionSource("App");
   // 切到网关：和「Agent 接入」开关同一条命令，沿用上次的绑定；池空或模型不在池里时说明原因并带去对应页面。
-  assert.match(app, /const draft = draftFromBinding\(previous\);\n\s*const issue = validateDraft\(draft, payload\);/);
+  assert.match(app, /const draft = draftFromBinding\(previous\);\n\s*const native = payload\?\.agents\?\.find\(\(agent\) => agent\.agent === "codex"\)\?\.nativeModels;\n\s*const issue = validateDraft\(draft, payload, undefined, null, native\);/);
   assert.match(app, /invoke<GatewayResult>\("save_gateway_binding", \{ agent: "codex", binding: \{ \.\.\.bindingFromDraft\(draft, previous\), enabled: true \}, reconnect: true \}\)/);
   assert.match(app, /onConnect=\{\(\) => void connectCodexGateway\(\)\}/);
   const hint = functionSource("LegacyRelayGatewayHint");

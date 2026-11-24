@@ -281,7 +281,9 @@ impl ResponsesSseToGeminiSse {
 
     fn finish_message(&mut self, response: &Value, output: &mut String) {
         let usage = responses_usage(response.get("usage"));
-        self.usage = Some(usage.request_usage());
+        self.usage = response
+            .get("usage")
+            .and_then(crate::request_log::usage_from_usage_value);
         // 最后一块不放内容（空 parts 的块 Gemini CLI 只读 finishReason 与 usage，不会当成内容）。
         let chunk = json!({
             "candidates": [{

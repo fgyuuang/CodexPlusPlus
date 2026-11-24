@@ -1938,6 +1938,7 @@ ${key} = ${value}`]);
     formatQueueWait: () => formatQueueWait,
     formatRemaining: () => formatRemaining,
     formatRequestCost: () => formatRequestCost,
+    formatRequestPrice: () => formatRequestPrice,
     formatTokens: () => formatTokens,
     gatewayPresets: () => gatewayPresets,
     glanceAgents: () => glanceAgents,
@@ -2010,6 +2011,7 @@ ${key} = ${value}`]);
     unlistedModels: () => unlistedModels,
     usableResetCardCount: () => usableResetCardCount,
     usageDayStats: () => usageDayStats,
+    usageProviderLabel: () => usageProviderLabel,
     usageRangeStart: () => usageRangeStart,
     validateDraft: () => validateDraft,
     validateProviderDraft: () => validateProviderDraft,
@@ -2496,6 +2498,7 @@ ${key} = ${value}`]);
     };
   }
   var GROUP_MODEL_PREFIX = "group/";
+  var CODEX_AUTO_MODEL_PREFIX = "codex-plus-auto/";
   function groupModelId(id) {
     return `${GROUP_MODEL_PREFIX}${id}`;
   }
@@ -2540,19 +2543,26 @@ ${key} = ${value}`]);
     const entry = agentPoolProviders(payload, exclude).find((item) => item.id.toLowerCase() === prefix);
     return entry ? { entry, model: model.slice(index + 1).trim() } : null;
   }
-  function modelRoutable(payload, model, exclude = []) {
+  function modelRoutable(payload, model, exclude = [], native) {
+    const slug = modelSlugFromRowName(model);
+    if (slug.startsWith(CODEX_AUTO_MODEL_PREFIX)) {
+      const upstream = slug.slice(CODEX_AUTO_MODEL_PREFIX.length);
+      if (native?.models.some((known) => known.toLowerCase() === upstream.toLowerCase())) {
+        return Boolean(activeAutoGroup(payload, upstream)) && servingProviders(payload, upstream, exclude).length > 1;
+      }
+    }
     if (disabledGroup(payload, model)) return false;
     const lower = model.trim().toLowerCase();
     return agentModels(payload, exclude).some((known) => known.toLowerCase() === lower) || qualifiedProvider(payload, model.trim(), exclude) !== null;
   }
-  function validateDraft(draft, payload, retainedModel, retainedSelection) {
+  function validateDraft(draft, payload, retainedModel, retainedSelection, native) {
     if (payload) {
       if (!agentPoolProviders(payload, draft.poolExclude).length) return "供应商池是空的，先到「供应商」里添加";
       const model = draft.model.trim();
       const retainedDisabledModel = draft.model === retainedModel && disabledGroup(payload, model);
       const retainedProvider = retainedSelection && payload.pool.find((entry) => entry.id === retainedSelection.providerId);
       const retainedUnavailableModel = draft.model === retainedModel && retainedSelection && modelSlugFromRowName(model).toLowerCase() === `${retainedSelection.providerId}/${modelSlugFromRowName(retainedSelection.upstreamModel)}`.toLowerCase() && (retainedSelection.providerRemoved || !retainedProvider || !providerEnabled(retainedProvider) || draft.poolExclude.includes(retainedProvider.id));
-      if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude)) return "供应商池里没有这个模型";
+      if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude, native)) return "供应商池里没有这个模型";
     }
     const window = parseContextWindow(draft.contextWindow);
     if (window !== null && (!Number.isFinite(window) || window < 1e3)) return "上下文窗口格式不对，例如 200000、200k 或 1M";
@@ -2620,8 +2630,10 @@ ${key} = ${value}`]);
     const sections = [];
     const providers = agentPoolProviders(payload, exclude);
     const isNative = (model) => Boolean(native?.models.some((known) => known.toLowerCase() === model.toLowerCase()));
-    const nativeItems = (native?.models ?? []).filter((model) => matches(query, model, "当前登录账号")).map((model) => ({ model, label: prettyModelName(model), sub: "当前登录账号", avatar: "" }));
-    if (nativeItems.length) sections.push({ key: "native", title: "当前登录账号", avatar: "", items: nativeItems });
+    const nativeName = native?.accountName?.trim() || "当前登录账号";
+    const nativeAvatar = native?.accountName ? avatar(nativeName) : "";
+    const nativeItems = (native?.models ?? []).filter((model) => matches(query, model, nativeName)).map((model) => ({ model, label: prettyModelName(model), sub: nativeName, avatar: nativeAvatar }));
+    if (nativeItems.length) sections.push({ key: "native", title: nativeName, avatar: nativeAvatar, items: nativeItems });
     const unlisted = unlistedModels(payload);
     const shared = [];
     for (const entry of providers) {
@@ -2645,7 +2657,7 @@ ${key} = ${value}`]);
       if (items.length) sections.push({ key: `provider:${entry.id}`, title: maskAccountName(entry.name), avatar: avatar(entry.name), items });
     }
     const autoItems = shared.filter((model) => activeAutoGroup(payload, model)).map((model) => ({
-      model: isNative(model) ? `codex-plus-auto/${model}` : model,
+      model: isNative(model) ? `${CODEX_AUTO_MODEL_PREFIX}${model}` : model,
       label: prettyModelName(model),
       sub: servingProviders(payload, model, exclude).map((entry) => maskAccountName(entry.name)).join(" → "),
       avatar: ""
@@ -2701,8 +2713,8 @@ ${key} = ${value}`]);
   }
   function modelDisplay(payload, model, exclude = [], selection) {
     const title = model.trim() || agentModels(payload, exclude)[0] || "";
-    if (title.startsWith("codex-plus-auto/")) {
-      const upstream = title.slice("codex-plus-auto/".length);
+    if (title.startsWith(CODEX_AUTO_MODEL_PREFIX)) {
+      const upstream = title.slice(CODEX_AUTO_MODEL_PREFIX.length);
       return { title: prettyModelName(upstream), sub: servingProviders(payload, upstream, exclude).map((entry2) => maskAccountName(entry2.name)).join(" → "), group: false, auto: true };
     }
     const selectedModel = modelSlugFromRowName(title);
@@ -2987,6 +2999,10 @@ ${key} = ${value}`]);
     }
     record.steps.forEach((step, index) => {
       const last = index === record.steps.length - 1;
+      if (step.outcome === "skipped") {
+        lines.push({ tone: "step", text: "{0} 被订阅额度策略跳过。", args: [maskAccountName(step.relayName)] });
+        return;
+      }
       if (step.outcome === "answered") {
         lines.push({ tone: "ok", text: "{0}（{1}）回答，用时 {2}。", args: [maskAccountName(step.relayName), displayModel(step.model) || step.model, formatElapsed(record.elapsedMs)] });
         return;
@@ -2996,7 +3012,7 @@ ${key} = ${value}`]);
       lines.push({
         tone: last ? "fail" : "step",
         text: last ? "{0} 的 Key {1} {2}{3}，错误交回给 {4}。" : "{0} 的 Key {1} {2}{3}，换下一个。",
-        args: last ? [maskAccountName(step.relayName), step.keyId, reason, status, who] : [maskAccountName(step.relayName), step.keyId, reason, status]
+        args: last ? [maskAccountName(step.relayName), step.keyId ?? "-", reason, status, who] : [maskAccountName(step.relayName), step.keyId ?? "-", reason, status]
       });
     });
     if (record.result === "cooling") {
@@ -3216,6 +3232,11 @@ ${key} = ${value}`]);
     if (!draft.model.trim() && splitModels(draft.modelList).length === 0) return "至少填一个模型";
     return proxyAddressError(draft.proxy) ?? providerHeadersValidationMessage(draft.customHeaders ?? []);
   }
+  function usageProviderLabel(pool, id, label) {
+    if (label !== "当前登录账号" && !id.startsWith("local-official-")) return label;
+    const provider = pool?.find((entry) => entry.id === id);
+    return provider && provider.name !== "当前登录账号" ? provider.name : "Codex (官方)";
+  }
   function isWorkBuddyProvider(source) {
     return source === "workbuddy" || source === "codex:managed-workbuddy" || source === "workbuddy:cn" || source === "workbuddy:global";
   }
@@ -3243,6 +3264,9 @@ ${key} = ${value}`]);
     if (cost.amount <= 0) return "—";
     if (cost.amount >= 0.01) return formatMoney(cost.amount, cost.currency);
     return `${currencySymbol(cost.currency)}${cost.amount.toPrecision(2)}`;
+  }
+  function formatRequestPrice(amount, currency) {
+    return amount === 0 ? formatMoney(amount, currency) : `${currencySymbol(currency)}${Number(amount.toPrecision(8))}`;
   }
   function formatTokens(value) {
     if (value >= 1e9) return `${trimNumber(value / 1e9)}B`;

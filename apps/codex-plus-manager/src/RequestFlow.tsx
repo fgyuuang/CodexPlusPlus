@@ -7,7 +7,7 @@ import "./flow-provider-colors.css";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { t, tf } from "./i18n";
-import { agentName, formatElapsed, formatTokens, modelDisplay, maskAccountName, relativeTime, type GatewayPayload } from "./gateway-model";
+import { agentName, formatElapsed, formatTokens, modelDisplay, maskAccountName, relativeTime, usageProviderLabel, type GatewayPayload } from "./gateway-model";
 import { AgentIcon } from "./gateway-ui";
 import { clockTime, flowAgent, flowElapsed, flowStatus, returningLinks, type FlowEntry } from "./request-flow-model";
 import "./RequestFlow.css";
@@ -16,7 +16,7 @@ import "./RequestFlow.css";
  * 按间隔轮询 `load_request_flow`，窗口不可见时不读。
  * 返回最近的请求（开始时间倒序），动画直接使用当前进行中的状态。
  */
-export function useRequestFlow(intervalMs: number, limit = 30): { entries: FlowEntry[]; loaded: boolean } {
+export function useRequestFlow(intervalMs: number, limit = 30, includeThreadTitles = false): { entries: FlowEntry[]; loaded: boolean } {
   const [entries, setEntries] = useState<FlowEntry[]>([]);
   const [loaded, setLoaded] = useState(false);
 
@@ -26,7 +26,7 @@ export function useRequestFlow(intervalMs: number, limit = 30): { entries: FlowE
     const tick = async () => {
       if (document.visibilityState === "visible") {
         try {
-          const result = await invoke<{ entries?: FlowEntry[] }>("load_request_flow", { limit });
+          const result = await invoke<{ entries?: FlowEntry[] }>("load_request_flow", includeThreadTitles ? { limit, includeThreadTitles } : { limit });
           if (cancelled) return;
           const next = result.entries ?? [];
           setEntries(next);
@@ -42,7 +42,7 @@ export function useRequestFlow(intervalMs: number, limit = 30): { entries: FlowE
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [intervalMs, limit]);
+  }, [intervalMs, limit, includeThreadTitles]);
 
   return { entries, loaded };
 }
@@ -55,7 +55,7 @@ export function useRequestFlow(intervalMs: number, limit = 30): { entries: FlowE
 export function FlowRequestRow({ entry, payload, now = Date.now() }: { entry: FlowEntry; payload: GatewayPayload | null; now?: number }) {
   const status = flowStatus(entry);
   const agent = flowAgent(entry);
-  const relay = maskAccountName(entry.relayName || entry.relayId || "");
+  const relay = maskAccountName(usageProviderLabel(payload?.pool, entry.relayId ?? "", entry.relayName || entry.relayId || ""));
   const requested = entry.model ? modelDisplay(payload, entry.model).title || entry.model : "";
   const upstream = entry.upstreamModel ? modelDisplay(payload, entry.upstreamModel).title || entry.upstreamModel : "";
   const model = upstream || requested || "—";

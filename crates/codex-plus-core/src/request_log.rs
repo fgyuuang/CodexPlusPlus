@@ -5,6 +5,9 @@
 //! 只保存模型名、token 计数和错误摘要，避免把会话内容写进明文日志。
 
 use serde::{Deserialize, Serialize};
+#[path = "request_log_context.rs"]
+mod context;
+pub use context::RequestContextSummary;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -45,6 +48,9 @@ pub struct RequestUsage {
     pub output_tokens: u64,
     #[serde(default)]
     pub cached_tokens: u64,
+    /// Whether the provider explicitly supplied a cache count, including zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens_known: Option<bool>,
     #[serde(default)]
     pub reasoning_tokens: u64,
     /// WorkBuddy Manager 随终态回传的实际扣费。None 表示没有记录。
@@ -53,9 +59,17 @@ pub struct RequestUsage {
 }
 
 impl RequestUsage {
+    pub fn reported_cached_tokens(&self, verified_final_response: bool) -> Option<u64> {
+        let known = self
+            .cached_tokens_known
+            .unwrap_or(self.cached_tokens > 0 || verified_final_response || self.input_tokens == 0);
+        (known && self.cached_tokens <= self.input_tokens).then_some(self.cached_tokens)
+    }
+
     /// 缓存命中率（cached / input），没有输入 token 时为 None。
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        (self.input_tokens > 0).then(|| self.cached_tokens as f64 / self.input_tokens as f64)
+        let cached = self.reported_cached_tokens(false)?;
+        (self.input_tokens > 0).then(|| cached as f64 / self.input_tokens as f64)
     }
 }
 
@@ -151,6 +165,8 @@ pub struct RequestLogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<RequestUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_summary: Option<RequestContextSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_ratio: Option<f64>,
     /// `final-response-v1`：内置原生 Responses 链路已写出完整成功响应，
     /// input/output/cached 均显式存在，路由与模型绑定最后一次 middleware 后发送。
@@ -160,6 +176,8 @@ pub struct RequestLogEntry {
     /// 已校验并送达客户端的最终响应 ID，不是本地请求日志的 id。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<crate::gateway::activity::RouteRecord>,
     /// 网关模式下发起请求的 Agent（claude / grok）；Codex 直连代理的旧记录为空。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -256,7 +274,13 @@ pub fn finish_request(entry: &RequestLogEntry) {
     if let Ok(mut live) = live_requests().lock() {
         live.remove(&entry.id);
     }
-    let _ = append_request_log(entry);
+    if let Some(route) = crate::gateway::activity::take_request_route(&entry.id) {
+        let mut entry = entry.clone();
+        entry.route = Some(route);
+        let _ = append_request_log(&entry);
+    } else {
+        let _ = append_request_log(entry);
+    }
     // 单元测试里默认路径指向真实用户状态目录，同样不写。
     if !(cfg!(test) && log_path_override().is_none()) {
         crate::gateway::usage::record_entry(entry);
@@ -440,6 +464,8 @@ pub fn read_request_logs(limit: usize) -> std::io::Result<Vec<RequestLogEntry>> 
 pub struct RequestLogFilter {
     /// 只要这个时间之后开始的请求。
     pub since_ms: Option<u64>,
+    /// 本地完成日期，与用量热力图使用相同的分桶时间。
+    pub completed_date: Option<String>,
     pub agent: Option<String>,
     pub relay_id: Option<String>,
     /// 只要没有供应商归属（`relay_id` 为空）的请求：对应用量统计「按供应商」里的「未知」行，和不筛供应商是两回事。
@@ -469,6 +495,15 @@ impl RequestLogFilter {
                 .model
                 .as_deref()
                 .is_none_or(|model| entry.usage_model().eq_ignore_ascii_case(model.trim()))
+            && self.completed_date.as_deref().is_none_or(|date| {
+                let completed = if entry.timestamp_ms > 0 {
+                    entry.timestamp_ms
+                } else {
+                    started
+                };
+                entry.state.as_deref() != Some("running")
+                    && crate::gateway::usage::local_day(completed) == date
+            })
     }
 }
 
@@ -680,8 +715,7 @@ fn usage_from_responses_usage(usage: &Value) -> Option<RequestUsage> {
     let cached_tokens = usage
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64));
     let reasoning_tokens = usage
         .pointer("/output_tokens_details/reasoning_tokens")
         .and_then(Value::as_u64)
@@ -689,7 +723,8 @@ fn usage_from_responses_usage(usage: &Value) -> Option<RequestUsage> {
     Some(RequestUsage {
         input_tokens,
         output_tokens,
-        cached_tokens,
+        cached_tokens: cached_tokens.unwrap_or(0),
+        cached_tokens_known: Some(cached_tokens.is_some()),
         reasoning_tokens,
         workbuddy_credits: workbuddy_credits(usage),
     })
@@ -732,8 +767,7 @@ pub fn usage_from_usage_value(usage: &Value) -> Option<RequestUsage> {
             usage
                 .pointer("/input_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
-        })
-        .unwrap_or(0);
+        });
     let reasoning_tokens = usage
         .pointer("/completion_tokens_details/reasoning_tokens")
         .and_then(Value::as_u64)
@@ -741,7 +775,8 @@ pub fn usage_from_usage_value(usage: &Value) -> Option<RequestUsage> {
     Some(RequestUsage {
         input_tokens,
         output_tokens,
-        cached_tokens,
+        cached_tokens: cached_tokens.unwrap_or(0),
+        cached_tokens_known: Some(cached_tokens.is_some()),
         reasoning_tokens,
         workbuddy_credits: workbuddy_credits(usage),
     })
@@ -751,6 +786,23 @@ pub fn usage_from_usage_value(usage: &Value) -> Option<RequestUsage> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn completed_date_uses_finish_time_and_excludes_running_entries() {
+        let mut request = entry("cross-midnight");
+        request.started_at_ms = 1_790_000_000_000;
+        request.timestamp_ms = request.started_at_ms + 86_400_000;
+        let filter = RequestLogFilter {
+            completed_date: Some(crate::gateway::usage::local_day(request.timestamp_ms)),
+            ..RequestLogFilter::default()
+        };
+        assert!(filter.matches(&request));
+        request.state = Some("running".into());
+        assert!(!filter.matches(&request));
+        request.state = None;
+        request.timestamp_ms = 0;
+        assert!(!filter.matches(&request));
+    }
 
     #[tokio::test]
     async fn account_status_follows_only_its_own_request_scope() {
@@ -825,10 +877,13 @@ mod tests {
                 cached_tokens: 900,
                 reasoning_tokens: 50,
                 workbuddy_credits: None,
+                cached_tokens_known: Some(true),
             }),
             cache_hit_ratio: None,
+            context_summary: None,
             final_response_evidence: None,
             final_response_id: None,
+            route: None,
             agent: None,
         }
     }

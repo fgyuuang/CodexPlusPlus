@@ -393,6 +393,14 @@
   list-style: none;
 }
 
+.hub-routing-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.hub-routing-filters .cx-search { max-width: 100%; flex: 0 1 290px; min-width: 0; }
+.hub-routing-filters .cx-search input { min-width: 0; }
+.hub-routing-more { display: inline-flex; align-items: center; gap: 4px; padding: 4px 7px; color: hsl(var(--muted-foreground)); font-size: 12px; }
+.hub-routing-filters .hub-routing-more { margin-inline-start: auto; }
+.hub-routing-more:hover { color: hsl(var(--foreground)); }
+.hub-routing-more svg { width: 13px; height: 13px; }
+
 .hub-flow-list > li {
   border-top: 1px solid hsl(var(--border));
 }
@@ -438,48 +446,9 @@
   transform: rotate(180deg);
 }
 
-/* 展开后的路由经过：一行一步，圆点颜色表示这一步的结果。 */
-.shell .hub-feed-trace {
-  display: grid;
-  gap: 6px;
-  margin: 0;
-  padding: 2px 16px 12px 44px;
-  list-style: none;
-}
-
-.shell .hub-feed-trace li {
-  position: relative;
-  padding-left: 16px;
-  color: hsl(var(--foreground));
-  font-size: 12.5px;
-  line-height: 1.55;
-}
-
-.shell .hub-feed-trace li::before {
-  position: absolute;
-  top: 0.55em;
-  left: 0;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: hsl(var(--foreground));
-  content: "";
-}
-
-.shell .hub-feed-trace li[data-tone="muted"] {
-  color: hsl(var(--muted-foreground));
-}
-
-.shell .hub-feed-trace li[data-tone="muted"]::before {
-  background: hsl(var(--muted-foreground) / 0.6);
-}
-
-.shell .hub-feed-trace li[data-tone="ok"]::before {
-  background: hsl(var(--status-success));
-}
-
-.shell .hub-feed-trace li[data-tone="fail"]::before {
-  background: hsl(var(--status-error));
+.shell .hub-feed-route {
+  padding-inline: 14px;
+  min-width: 0;
 }
 
 .hub-stats {

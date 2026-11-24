@@ -85,9 +85,13 @@ test("Codex 当前登录账号保留裸模型，重复账号项隐藏，自动�
   const data = payload();
   data.pool.push({ ...data.pool[0], id: "login", name: "登录账号", models: ["deepseek-v4-pro"], official: true });
   data.autoGroups = [{ id: "auto:deepseek-v4-pro", name: "deepseek-v4-pro", mode: "inOrder", members: [{ model: "deepseek/deepseek-v4-pro", weight: 1 }, { model: "login/deepseek-v4-pro", weight: 1 }], hidden: false, customized: false }];
-  const native = { providerId: "login", models: ["deepseek-v4-pro", "native-next"] };
+  const native = { providerId: "login", accountName: "ChatGPT Pro · ex****er@example.test", models: ["deepseek-v4-pro", "native-next"] };
   const sections = pickerSections(data, "", initials, [], undefined, null, false, native);
   const nativeSection = sections.find((section) => section.key === "native");
+  assert.equal(nativeSection?.title, native.accountName);
+  assert.equal(nativeSection?.avatar, initials(native.accountName));
+  assert.equal(nativeSection?.items[0].sub, native.accountName);
+  assert.equal(pickerSections(data, "example.test", initials, [], undefined, null, false, native)[0]?.key, "native");
   assert.deepEqual(nativeSection?.items.map((item) => item.model), native.models);
   assert.equal(nativeSection?.items[0].defaultModelSelection, undefined);
   assert.equal(sections.some((section) => section.items.some((item) => item.model === "login/deepseek-v4-pro")), false);
@@ -96,6 +100,35 @@ test("Codex 当前登录账号保留裸模型，重复账号项隐藏，自动�
   assert.equal(modelDisplay(data, "codex-plus-auto/deepseek-v4-pro").auto, true);
   assert.equal(modelDisplay(data, "codex-plus-auto/deepseek-v4-pro").title, prettyModelName("deepseek-v4-pro"));
   assert.equal(pickerSections(data, "", initials).some((section) => section.key === "native"), false, "其他 Agent 和组编辑沿用原规则");
+});
+
+test("Codex 可把当前登录账号的同名模型切换为自动组默认模型", () => {
+  const data = payload();
+  const slug = "gpt-6.2-sol";
+  data.pool[0].models.push(slug);
+  data.pool[1].models.push(slug);
+  const group = { id: `auto:${slug}`, name: slug, mode: "inOrder" as const, members: [{ model: `deepseek/${slug}`, weight: 1 }, { model: `glm/${slug}`, weight: 1 }], hidden: false, customized: false };
+  data.autoGroups = [group];
+  const native = { providerId: "login", models: [slug] };
+  const item = pickerSections(data, slug, initials, [], undefined, null, false, native)
+    .find((section) => section.key === "auto")!.items[0];
+  const previous = { ...blankBinding(), model: slug };
+  const draft = { ...draftFromBinding(previous), model: item.providerModel ?? item.model };
+  const validate = (model = draft.model, poolExclude: string[] = []) =>
+    validateDraft({ ...draft, model, poolExclude }, data, previous.model, null, native);
+  assert.equal(validate(), null);
+  const binding = bindingFromDraft(draft, previous, item);
+  assert.equal(binding.model, `codex-plus-auto/${slug}`);
+  assert.equal(binding.defaultModelSelection, null);
+  const missing = "供应商池里没有这个模型";
+  assert.equal(validateDraft(draft, data), missing, "仅识别 Codex 原生模型的自动组别名");
+  assert.equal(validate("codex-plus-auto/unknown"), missing);
+  assert.equal(validate(draft.model, ["glm"]), missing);
+  group.hidden = true;
+  assert.equal(validate(), missing);
+  group.hidden = false;
+  data.gateway.autoModels = false;
+  assert.equal(validate(), missing);
 });
 
 test("上下文窗口支持 k / M 写法", () => {
@@ -710,6 +743,25 @@ test("起名模型随绑定草稿往返，空值和旧版后端缺字段都当�
   assert.equal(binding.titleModel, "kimi/kimi-k3");
   assert.equal(draftFromBinding(binding).titleModel, "kimi/kimi-k3");
   assert.equal(bindingFromDraft({ ...draft, titleModel: "  " }, binding).titleModel, "");
+});
+
+test("Codex 起名选择器区分当前官方账号与同名自动组", () => {
+  const agents = readFileSync(new URL("./GatewayAgents.tsx", import.meta.url), "utf8");
+  assert.match(agents, /title=\{t\("起名模型"\)\}[\s\S]*?<TierPicker\s+[^/]*native=\{agent\.nativeModels\}[^/]*value=\{draft\.titleModel\}/);
+  assert.match(agents.slice(agents.indexOf("function TierPicker(")), /<ModelList\s+[\s\S]*?native=\{native\}/);
+
+  const data = payload();
+  const model = "gpt-6-luna";
+  const native = { providerId: "deepseek", models: [model] };
+  for (const entry of data.pool.slice(0, 2)) entry.models.push(model);
+  data.autoGroups = [{ id: `auto:${model}`, name: model, mode: "inOrder", members: [{ model: `deepseek/${model}`, weight: 1 }, { model: `glm/${model}`, weight: 1 }], hidden: false, customized: false }];
+  const sections = pickerSections(data, model, initials, [], undefined, null, false, native);
+  const local = sections.find((section) => section.key === "native")!.items[0];
+  const auto = sections.find((section) => section.key === "auto")!.items[0];
+  const binding = blankBinding();
+  const saved = (titleModel: string) => draftFromBinding(bindingFromDraft({ ...draftFromBinding(binding), titleModel }, binding)).titleModel;
+  assert.equal(saved(local.model), model);
+  assert.equal(saved(auto.model), `codex-plus-auto/${model}`);
 });
 
 test("压缩模型（#3142）随绑定草稿往返，旧版后端缺字段当成跟随当前模型", () => {

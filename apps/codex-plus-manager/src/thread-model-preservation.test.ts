@@ -10,6 +10,44 @@ const requestPatchVersion = readFileSync(new URL(
   "../../../assets/inject/renderer-inject/00-prelude.js", import.meta.url), "utf8")
   .match(/const codexAppServerModelRequestPatchVersion = "([^"]+)";/)![1];
 
+describe("legacy OpenAI thread recovery", () => {
+  const sendResume = new Function(`${source.slice(
+    source.indexOf("  function codexConfigWithoutManagedProvider("),
+    source.indexOf("  async function prepareCodexManagedSessionConnection("),
+  )}\nreturn sendCodexManagedResumeWithFallback;`)();
+  const rejection = "Cannot change this thread's model provider from `openai` to `codex_plus_managed` on resume";
+  const params = { threadId: "legacy", modelProvider: "codex_plus_managed", model: "saved",
+    config: { model_provider: "codex_plus_managed", model_providers: { codex_plus_managed: {}, other: {} },
+      "model_providers.codex_plus_managed.base_url": "managed", approval_policy: "never" } };
+
+  it("retries exactly once with the original provider and no managed transport overrides", async () => {
+    const wrapper = { hostId: "local", method: "thread/resume", params, requestId: "r" };
+    const calls: any[] = [];
+    const result = await sendResume("send-cli-request-for-host", wrapper, "local", (next: any) => {
+      calls.push(next);
+      if (calls.length === 1) throw new Error(rejection);
+      return { modelProvider: "openai" };
+    });
+    assert.deepEqual(result, { modelProvider: "openai" });
+    assert.deepEqual(calls, [wrapper, { ...wrapper, params: { threadId: "legacy", modelProvider: "openai",
+      model: "saved", config: { model_providers: { other: {} }, approval_policy: "never" } } }]);
+  });
+
+  it("does not replay ambiguous failures, unrelated provider errors or remote resumes", async () => {
+    for (const [host, next, message] of [
+      ["local", params, "connection timed out"],
+      ["local", params, rejection.replace("`openai`", "`custom`")],
+      ["remote", params, rejection],
+      ["local", { ...params, host_id: "remote" }, rejection],
+    ] as const) {
+      const error = new Error(message);
+      let calls = 0;
+      await assert.rejects(sendResume("thread/resume", next, host, () => { calls++; throw error; }), error);
+      assert.equal(calls, 1);
+    }
+  });
+});
+
 function runtime(mode = "pureApi", providerSyncEnabled = false) {
   return new Function("codexPlusBackendSettings", "codexModelCatalog", "sendCodexPlusDiagnostic",
     `${override}\nreturn applyCodexRemoteSessionProviderOverride;`)(
@@ -692,6 +730,7 @@ describe("settings-driven catalog refresh ownership", () => {
         invalidateQueries: async (options: any) => { invalidated.push(options.queryKey); },
       }),
       codexPlusModelPickerCatalogChanged() {}, renderCodexPlusMenu() {}, scheduleCodexModelWhitelistRefresh() {},
+      scheduleDeferredScan() {},
       syncCodexPlusGroupModelQueries() {},
       sendCodexPlusDiagnostic() {},
     });

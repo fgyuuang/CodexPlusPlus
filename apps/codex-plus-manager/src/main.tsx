@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 // 旧版系统 WebKit 的 API 兜底必须最先执行（#2753），见 legacy-webkit.ts。
 import "./legacy-webkit";
 import { Component, type ErrorInfo, type ReactNode } from "react";
@@ -59,9 +60,7 @@ class StartupErrorBoundary extends Component<{ children: ReactNode }, { error: E
   }
 }
 
-const app = document.getElementById("app");
-
-if (app instanceof HTMLElement) {
+function mountApp(app: HTMLElement) {
   // 只有主窗口去掉了系统标题栏；托盘面板、悬浮预览本来就没有标题栏。
   if (window.location.hash !== "#tray-panel" && window.location.hash !== "#cu-pip") applyMacTitlebarClass();
   // 同一个前端也用于 Computer Use 的悬浮预览窗口（`#cu-pip`）和托盘快捷面板（`#tray-panel`）。
@@ -70,4 +69,15 @@ if (app instanceof HTMLElement) {
       {window.location.hash === "#tray-panel" ? <TrayPanel /> : window.location.hash === "#cu-pip" ? <CuPipWindow /> : <App />}
     </StartupErrorBoundary>,
   );
+}
+
+const app = document.getElementById("app");
+if (app instanceof HTMLElement) {
+  if (import.meta.env.DEV && !("__TAURI_INTERNALS__" in window)
+    && new URLSearchParams(location.search).has("previewRoute")) {
+    void import("../preview/quota-usage").then(({ installUsagePreviewMocks }) => {
+      installUsagePreviewMocks();
+      mountApp(app);
+    });
+  } else mountApp(app);
 }

@@ -372,7 +372,9 @@ impl ResponsesSseToChatSse {
 
     fn finish_message(&mut self, response: &Value, output: &mut String) {
         let usage = responses_usage(response.get("usage"));
-        self.usage = Some(usage.request_usage());
+        self.usage = response
+            .get("usage")
+            .and_then(crate::request_log::usage_from_usage_value);
         let reason = finish_reason(response, self.next_tool_index > 0);
         self.ensure_started(output);
         let chunk = self.chunk(json!({}), Some(reason));
@@ -859,7 +861,6 @@ pub(crate) struct ResponsesUsage {
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_tokens: u64,
     pub(crate) total_tokens: u64,
-    pub(crate) workbuddy_credits: Option<f64>,
 }
 
 pub(crate) fn responses_usage(usage: Option<&Value>) -> ResponsesUsage {
@@ -876,22 +877,10 @@ pub(crate) fn responses_usage(usage: Option<&Value>) -> ResponsesUsage {
         output_tokens,
         reasoning_tokens: number("/output_tokens_details/reasoning_tokens").unwrap_or(0),
         total_tokens: number("/total_tokens").unwrap_or(input_tokens + output_tokens),
-        workbuddy_credits: usage.and_then(crate::request_log::workbuddy_credits),
     }
 }
 
 impl ResponsesUsage {
-    /// 请求日志用的 usage：与 Anthropic 那边一致，input 含缓存命中。
-    pub(crate) fn request_usage(&self) -> RequestUsage {
-        RequestUsage {
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
-            cached_tokens: self.cached_tokens,
-            reasoning_tokens: self.reasoning_tokens,
-            workbuddy_credits: self.workbuddy_credits,
-        }
-    }
-
     /// Chat 的 usage：`prompt_tokens` 同样含缓存命中，`completion_tokens` 含推理。
     fn chat_usage(&self) -> Value {
         json!({

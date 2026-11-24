@@ -163,7 +163,7 @@ pub fn quota_for_relay(relay: &RelayProfile) -> Option<ProviderQuota> {
     cache.readings.get(&key).cloned()
 }
 
-fn official_quota_key(relay: &RelayProfile) -> Option<String> {
+pub(super) fn official_quota_key(relay: &RelayProfile) -> Option<String> {
     // 账号库引用不携带 token；同一引用共享额度，但不借用当前登录的身份。
     if super::official_accounts::is_reference(relay) {
         return super::official_accounts::account_ref(relay)
@@ -754,6 +754,8 @@ where
     let result = fetch().await;
     if let Ok(Some(quota)) = &result {
         record_for_relay(relay, quota.clone());
+        #[cfg(not(test))]
+        super::quota_history::record_refresh(relay, quota).await;
     }
     *flight
         .outcome

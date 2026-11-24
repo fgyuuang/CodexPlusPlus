@@ -249,6 +249,7 @@ fn reset_after_from_body(text: &str) -> Option<Duration> {
 #[derive(Debug, Clone, Default)]
 struct KeyHealth {
     cooldown_until: Option<Instant>,
+    quota_cooldown_started_at: Option<Instant>,
     /// 停用时 Key 的指纹；指纹变化（用户改了 Key）即解除。
     disabled_fingerprint: Option<u64>,
     consecutive_rate_limits: u32,
@@ -530,6 +531,7 @@ pub fn record_failure(key: &KeyRef, class: &FailureClass, now: Instant) -> bool 
     entry.last_failure_at_ms = Some(now_unix_ms());
     match class {
         FailureClass::RateLimited { retry_after } => {
+            entry.quota_cooldown_started_at = None;
             entry.consecutive_rate_limits = entry.consecutive_rate_limits.saturating_add(1);
             let backoff = retry_after.unwrap_or_else(|| {
                 let exponent = entry.consecutive_rate_limits.saturating_sub(1).min(10);
@@ -542,9 +544,11 @@ pub fn record_failure(key: &KeyRef, class: &FailureClass, now: Instant) -> bool 
         }
         FailureClass::QuotaExhausted { reset_after } => {
             entry.cooldown_until = Some(now + reset_after.unwrap_or(QUOTA_DEFAULT_COOLDOWN));
+            entry.quota_cooldown_started_at = Some(now);
         }
         FailureClass::AuthInvalid if key.key_id == OFFICIAL_KEY_ID => {
             entry.cooldown_until = Some(now + OFFICIAL_AUTH_COOLDOWN);
+            entry.quota_cooldown_started_at = None;
         }
         FailureClass::AuthInvalid => {
             entry.disabled_fingerprint = Some(key.fingerprint);
@@ -571,6 +575,7 @@ pub fn record_success(key: &KeyRef, conversation: Option<&str>) {
     {
         entry.consecutive_rate_limits = 0;
         entry.cooldown_until = None;
+        entry.quota_cooldown_started_at = None;
         // 能成功就说明凭据是好的（例如刚刷新过）。
         entry.disabled_fingerprint = None;
     }
@@ -586,6 +591,25 @@ pub fn record_success(key: &KeyRef, conversation: Option<&str>) {
             (key.relay_id.clone(), conversation.to_string()),
             key.key_id.clone(),
         );
+    }
+}
+
+/// 只解除本次重置前已存在的官方额度冷却，保留并发失败和其他健康状态。
+pub(super) fn clear_official_quota_cooldown(relay_id: &str, reset_started_at: Instant) {
+    let mut state = lock();
+    if let Some(entry) = state
+        .keys
+        .get_mut(&(relay_id.into(), OFFICIAL_KEY_ID.into()))
+        && entry
+            .quota_cooldown_started_at
+            .is_some_and(|since| since <= reset_started_at)
+    {
+        entry.cooldown_until = None;
+        entry.quota_cooldown_started_at = None;
+        if entry.last_failure.as_deref() == Some("quota_exhausted") {
+            entry.last_failure = None;
+            entry.last_failure_at_ms = None;
+        }
     }
 }
 
@@ -915,6 +939,39 @@ mod tests {
             map.insert(*name, HeaderValue::from_str(value).unwrap());
         }
         map
+    }
+
+    #[test]
+    fn quota_reset_clears_only_the_selected_accounts_previous_quota_cooldown() {
+        let official = |id: &str| KeyRef {
+            relay_id: id.to_string(),
+            key_id: OFFICIAL_KEY_ID.into(),
+            fingerprint: 0,
+        };
+        let selected = official("kp-reset-selected");
+        let other = official("kp-reset-other");
+        let now = Instant::now();
+        let exhausted = FailureClass::QuotaExhausted { reset_after: None };
+        for key in [&selected, &other] {
+            record_failure(key, &exhausted, now);
+        }
+        clear_official_quota_cooldown(&selected.relay_id, now);
+        assert!(cooling_remaining(&selected, now).is_none());
+        assert!(cooling_remaining(&other, now).is_some());
+
+        let later = now + Duration::from_secs(1);
+        record_failure(&selected, &exhausted, later);
+        clear_official_quota_cooldown(&selected.relay_id, now);
+        assert!(cooling_remaining(&selected, later).is_some());
+
+        for failure in [
+            FailureClass::RateLimited { retry_after: None },
+            FailureClass::AuthInvalid,
+        ] {
+            record_failure(&selected, &failure, later);
+            clear_official_quota_cooldown(&selected.relay_id, later);
+            assert!(cooling_remaining(&selected, later).is_some());
+        }
     }
 
     #[test]

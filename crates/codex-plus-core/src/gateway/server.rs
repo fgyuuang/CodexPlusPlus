@@ -1006,6 +1006,7 @@ async fn handle_claude_messages(
         }
     };
     let input_estimate = dialect.estimate_input_tokens(&request);
+    request_log.record_context(&responses_body);
     let outcome = pipeline::open(
         &settings,
         &plan,
@@ -1309,12 +1310,15 @@ async fn write_native(
 fn anthropic_usage(body: &[u8]) -> Option<crate::request_log::RequestUsage> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let usage = value.get("usage")?;
-    let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let number = |key: &str| usage.get(key).and_then(Value::as_u64);
     let cached = number("cache_read_input_tokens");
     Some(crate::request_log::RequestUsage {
-        input_tokens: number("input_tokens") + cached + number("cache_creation_input_tokens"),
-        output_tokens: number("output_tokens"),
-        cached_tokens: cached,
+        input_tokens: number("input_tokens")?
+            .saturating_add(cached.unwrap_or(0))
+            .saturating_add(number("cache_creation_input_tokens").unwrap_or(0)),
+        output_tokens: number("output_tokens")?,
+        cached_tokens: cached.unwrap_or(0),
+        cached_tokens_known: Some(cached.is_some()),
         reasoning_tokens: 0,
         workbuddy_credits: None,
     })
@@ -1326,9 +1330,10 @@ struct AnthropicSseObserver {
     buffer: String,
     started: bool,
     stopped: bool,
-    input_tokens: u64,
-    cached_tokens: u64,
-    output_tokens: u64,
+    uncached_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    cache_creation_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 }
 
 impl AnthropicSseObserver {
@@ -1359,29 +1364,33 @@ impl AnthropicSseObserver {
             if let Some(usage) = usage {
                 let number = |key: &str| usage.get(key).and_then(Value::as_u64);
                 if let Some(input) = number("input_tokens") {
-                    self.input_tokens = input
-                        + number("cache_read_input_tokens").unwrap_or(0)
-                        + number("cache_creation_input_tokens").unwrap_or(0);
+                    self.uncached_tokens = Some(input);
                 }
                 if let Some(cached) = number("cache_read_input_tokens") {
-                    self.cached_tokens = cached;
+                    self.cached_tokens = Some(cached);
+                }
+                if let Some(created) = number("cache_creation_input_tokens") {
+                    self.cache_creation_tokens = Some(created);
                 }
                 if let Some(output) = number("output_tokens") {
-                    self.output_tokens = output;
+                    self.output_tokens = Some(output);
                 }
             }
         }
     }
 
     fn usage(&self) -> Option<crate::request_log::RequestUsage> {
-        (self.input_tokens > 0 || self.output_tokens > 0).then(|| {
-            crate::request_log::RequestUsage {
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                cached_tokens: self.cached_tokens,
-                reasoning_tokens: 0,
-                workbuddy_credits: None,
-            }
+        let cached_tokens = self.cached_tokens.unwrap_or(0);
+        Some(crate::request_log::RequestUsage {
+            input_tokens: self
+                .uncached_tokens?
+                .saturating_add(cached_tokens)
+                .saturating_add(self.cache_creation_tokens.unwrap_or(0)),
+            output_tokens: self.output_tokens?,
+            cached_tokens,
+            cached_tokens_known: Some(self.cached_tokens.is_some()),
+            reasoning_tokens: 0,
+            workbuddy_credits: None,
         })
     }
 }

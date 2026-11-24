@@ -179,9 +179,11 @@ import { diagnosticFacts, filterLogEntries, formatLogTime, parseLogText } from "
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { paletteShortcut } from "./command-palette-model";
 import { SessionsView, sessionDeleteSucceeded } from "./GatewaySessions";
-import { agentName, groupDisplayName, modelDisplay, formatQueueWait, formatRequestCost, formatTokens, isWorkBuddyProvider, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, foreignCompactionDropped, FOREIGN_COMPACTION_DROPPED_REASON, compactionNote, parseCompactionNote, type CompactionNote, usageRangeStart, relayFilterFromFocus, relayFilterArgs, type RelayFilter, importCandidates, draftFromBinding, bindingFromDraft, validateDraft, type GatewayPayload, type ImportCandidate, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
+import { agentName, groupDisplayName, modelDisplay, formatQueueWait, formatRequestCost, formatRequestPrice, formatTokens, isWorkBuddyProvider, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, foreignCompactionDropped, FOREIGN_COMPACTION_DROPPED_REASON, compactionNote, parseCompactionNote, type CompactionNote, usageRangeStart, relayFilterFromFocus, relayFilterArgs, type RelayFilter, importCandidates, draftFromBinding, bindingFromDraft, validateDraft, type GatewayPayload, type ImportCandidate, type GatewayResult, type RequestUsagePricing, type UsageCost, type UsageRange } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { UsageTabs, onOpenRequestLog, type RequestLogFocus } from "./UsageTabs";
+import { RequestRouteDetails } from "./RequestRouteDetails";
+import type { RouteRecordView } from "./gateway-model";
 import { noticeDuration, noticeTone } from "./notice-model";
 import { agentTabGroups, agentTarget, pageVisibleForTool } from "./page-groups";
 import { TopbarActions } from "./TopbarActions";
@@ -314,6 +316,7 @@ import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-he
 import { sessionProviderForProtocol } from "./relay-session";
 import { historyRecoveryStatusLabel, type FrontendRecoveryReport } from "./history-recovery-report";
 import { usePopoverLayer } from "./use-popover-layer";
+import { summarizeWeixinFailures } from "./weixin-queue-model";
 import { resolveAnchoredMenuLayout, type AnchoredMenuLayout } from "./popover-layer";
 import { providerAvatarText, resolveProviderName } from "./provider-name";
 import {
@@ -1081,6 +1084,7 @@ type RequestLogUsage = {
   inputTokens: number;
   outputTokens: number;
   cachedTokens?: number;
+  cachedTokensKnown?: boolean;
   reasoningTokens?: number;
 };
 
@@ -1127,8 +1131,10 @@ type RequestLogEntry = {
   streamOutcome?: string | null;
   usage?: RequestLogUsage | null;
   cacheHitRatio?: number | null;
+  route?: RouteRecordView | null;
   /** 按供应商里填的价格估算的费用（后端读日志时补上；没填价格时没有）。 */
   cost?: UsageCost | null;
+  pricing?: RequestUsagePricing | null;
 };
 
 type RequestLogsResult = {
@@ -2435,7 +2441,7 @@ const fetchSub2ApiBilling = async (profile: RelayProfile) => {
   // 「会话」页默认看所有 Agent；切到 Codex 页签才是带删除 / 归档 / 修复的完整会话管理。
   const [sessionTab, setSessionTab] = useState<SessionTab>("all");
   /** 请求日志打开时的 Agent 过滤（从 Agent 概览跳过去时设置，用一次就清掉）。 */
-  const [requestLogAgentFilter, setRequestLogAgentFilter] = useState<"all" | "codex" | "claude" | "grok">("all");
+  const [requestLogAgentFilter, setRequestLogAgentFilter] = useState("all");
   const [requestLogFocus, setRequestLogFocus] = useState<RequestLogFocus>({});
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -5864,7 +5870,8 @@ disableWatcher: () => watcherAction("disable_watcher")
       const payload = loaded.gateway && Array.isArray(loaded.pool) ? (loaded as GatewayPayload) : null;
       const previous = payload?.gateway.bindings?.codex;
       const draft = draftFromBinding(previous);
-      const issue = validateDraft(draft, payload);
+      const native = payload?.agents?.find((agent) => agent.agent === "codex")?.nativeModels;
+      const issue = validateDraft(draft, payload, undefined, null, native);
       if (issue) {
         await showNotice(t("切换到网关"), t(issue), "failed");
         void navigate(issue.includes("供应商池是空的") ? "gatewayProviders" : "gateway");
@@ -7209,8 +7216,7 @@ function WeixinConnectScreen({
   const codexPhase = {
     stopped: t("已停止"), checking: t("检查中"), ready: t("就绪"), error: t("异常"),
   }[status?.codexState ?? "stopped"] ?? status?.codexState;
-  const pendingCount = inbox?.messages.filter((item) => item.state === "pending").length ?? 0;
-  const failedMessages = inbox?.messages.filter((item) => item.state === "failed") ?? [];
+  const { failedMessages, blockedCount } = summarizeWeixinFailures(inbox?.messages ?? []);
 
 
   const { CxBadge, CxCard, CxRow, CxSection, CxStatusIcon } = AgentCx;
@@ -7278,6 +7284,20 @@ function WeixinConnectScreen({
           </CxRow>
         </div>
       </CxCard>
+
+      {failedMessages.length > 0 ? (
+        <div className="weixin-queue-hint" id="weixin-failure-notice">
+          <div role="status">
+            <strong>{t("失败消息")} · {failedMessages.length}</strong>
+            {blockedCount > 0 ? <div>{tf("另有 {0} 条后续消息正在等待处理；请重试或跳过前面的失败消息。", [blockedCount])}</div> : null}
+          </div>
+          <button className="cx-secondary" onClick={() => {
+            const failures = document.getElementById("weixin-failed-messages");
+            failures?.focus({ preventScroll: true });
+            failures?.scrollIntoView({ block: "start" });
+          }} type="button">{t("失败消息")}</button>
+        </div>
+      ) : null}
 
       {qr?.qrContent ? (
         <CxSection title={qr.qrStatus === "scaned" ? t("已扫码，请在手机上确认") : t("微信扫码登录")}>
@@ -7564,8 +7584,7 @@ function WeixinConnectScreen({
                 <Button onClick={() => onPairing(peer, "revoke")} size="sm" variant="outline">{t("撤销")}</Button>
               </div>
             )) : <small>{t("暂无额外批准的联系人")}</small>}
-            <strong>{t("失败消息")} <span className="weixin-inbox-count">{failedMessages.length}</span></strong>
-            {failedMessages.length && pendingCount ? <p className="weixin-queue-hint">{tf("另有 {0} 条后续消息正在等待处理；请重试或跳过前面的失败消息。", [pendingCount])}</p> : null}
+            <strong id="weixin-failed-messages" tabIndex={-1}>{t("失败消息")} <span className="weixin-inbox-count">{failedMessages.length}</span></strong>
             {failedMessages.length ? failedMessages.map((item) => (
               <div className="weixin-failed-row" key={item.key}>
                 <code>{item.peerId}</code>
@@ -8079,6 +8098,20 @@ function formatRequestLogTokens(value?: number | null) {
   return String(value);
 }
 
+function requestActualCharge(pricing?: RequestUsagePricing | null) {
+  return pricing?.actualMeters.map(meter => tf("{0} 积分", [Number(meter.amount.toPrecision(8))])).join(" + ") ?? "";
+}
+
+function requestEstimateStatus(status: RequestUsagePricing["estimateStatus"]) {
+  switch (status) {
+    case "missing-rate": return t("未配置模型价格");
+    case "unknown-cache": return t("缓存用量未上报");
+    case "unknown-tier": return t("账单档位未知");
+    case "no-usage": return t("用量未上报");
+    default: return "-";
+  }
+}
+
 /** 缓存命中率展示：≥99% 保留一位小数，只有完全命中才显示 100%。 */
 function formatRequestLogCacheHitRatio(
   inputTokens?: number | null,
@@ -8087,7 +8120,8 @@ function formatRequestLogCacheHitRatio(
 ) {
   const input = inputTokens ?? 0;
   const cached = cachedTokens ?? 0;
-  if (input <= 0 || cached <= 0) return "-";
+  if (input <= 0) return "-";
+  if (cached <= 0) return "0%";
   if (cached >= input) return "100%";
   const percent = (ratio ?? cached / input) * 100;
   if (percent >= 99) return `${percent.toFixed(1)}%`;
@@ -8177,7 +8211,7 @@ function requestLogErrorSummary(error: string): string {
   return text.split("\n")[0] ?? text;
 }
 
-function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeInitialAgent }: { initialAgent?: "all" | "codex" | "claude" | "grok"; initialFocus?: RequestLogFocus; onConsumeInitialAgent?: () => void }) {
+function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeInitialAgent }: { initialAgent?: string; initialFocus?: RequestLogFocus; onConsumeInitialAgent?: () => void }) {
   const payload = useGatewayPayload(10_000);
   const [entries, setEntries] = useState<RequestLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -8187,14 +8221,20 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
   const [range, setRange] = useState<UsageRange>(initialFocus.range ?? "all");
   const [relayFilter, setRelayFilter] = useState<RelayFilter | null>(() => relayFilterFromFocus(initialFocus));
   const [modelFilter, setModelFilter] = useState(initialFocus.model ?? "");
+  const [completedDate, setCompletedDate] = useState(initialFocus.date ?? "");
   const [more, setMore] = useState(false);
   const [oldestMs, setOldestMs] = useState<number | null>(null);
   const [filter, setFilter] = useState<"all" | "running" | "success" | "failed" | "retried">("all");
   const [sessionFilter, setSessionFilter] = useState("all");
-  const [agentFilter, setAgentFilter] = useState<"all" | "codex" | "claude" | "grok">(initialAgent);
+  const [agentFilter, setAgentFilter] = useState(initialAgent);
   // 只管理 Codex 时固定看 Codex 的请求，不出现 Agent 筛选。
   const codexOnly = singleAgent(useAgentFocus()) === "codex";
   const agentScope = codexOnly ? "codex" : agentFilter;
+  const requestAgents = [...new Set(["codex", "claude", "grok",
+    ...(payload?.agents.map(item => item.agent) ?? []),
+    ...entries.map(requestLogAgent),
+    agentFilter,
+  ])].filter(agent => agent !== "all");
   // 初始过滤只用一次：之后从侧栏进来仍是「全部」。
   useEffect(() => { if (initialAgent !== "all" || Object.keys(initialFocus).length) onConsumeInitialAgent?.(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -8212,7 +8252,8 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
   const sinceMs = usageRangeStart(range);
   const filterArgs = {
     limit: REQUEST_LOG_LIMIT,
-    sinceMs: sinceMs ?? null,
+    sinceMs: completedDate ? null : sinceMs ?? null,
+    completedDate: completedDate || null,
     agent: agentScope === "all" ? null : agentScope,
     ...relayFilterArgs(relayFilter),
     model: modelFilter || null,
@@ -8236,16 +8277,16 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
         setError(result.message || t("读取请求日志失败。"));
       }
     } catch (cause) {
-      setError(String(cause));
+      if (id === latestLoad.current) setError(String(cause));
     } finally {
-      setLoading(false);
+      if (id === latestLoad.current) setLoading(false);
     }
   };
 
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [range, agentScope, filterArgs.relayId, filterArgs.relayUnknown, modelFilter]);
+  }, [range, agentScope, filterArgs.relayId, filterArgs.relayUnknown, modelFilter, completedDate]);
 
   useEffect(() => {
     if (!autoRefresh) return;
@@ -8301,7 +8342,8 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
   }, [sessionFilter, sessions]);
 
   // 筛的时间段（或点进来的那一项）比日志里最早的一条还早：日志里看到的比统计少。
-  const partial = oldestMs !== null && (sinceMs ?? 0) < oldestMs && (range !== "all" || relayFilter !== null || modelFilter !== "");
+  const dateStart = completedDate ? new Date(`${completedDate}T00:00:00`).getTime() : undefined;
+  const partial = oldestMs !== null && (dateStart ?? sinceMs ?? 0) < oldestMs && (Boolean(completedDate) || range !== "all" || relayFilter !== null || modelFilter !== "");
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -8374,12 +8416,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
               className="request-log-select"
               menuWidth={160}
               onChange={(next) => setAgentFilter(next)}
-              options={[
-                { value: "all", label: t("全部 Agent") },
-                { value: "codex", label: "Codex" },
-                { value: "claude", label: "Claude Code" },
-                { value: "grok", label: "Grok" },
-              ] as AppSelectOption<typeof agentFilter>[]}
+              options={[{ value: "all", label: t("全部 Agent") }, ...requestAgents.map(agent => ({ value: agent, label: agentName(agent) }))]}
               size="sm"
               value={agentFilter}
             />}
@@ -8387,7 +8424,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
               ariaLabel={t("时间段")}
               className="request-log-select"
               menuWidth={140}
-              onChange={(next) => setRange(next)}
+              onChange={(next) => { setCompletedDate(""); setRange(next); }}
               options={[
                 { value: "all", label: t("全部时间") },
                 { value: "today", label: t("今天") },
@@ -8421,8 +8458,11 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
         value={filter}
       />
 
-      {relayFilter || modelFilter ? (
+      {relayFilter || modelFilter || completedDate ? (
         <div className="request-log-chips">
+          {completedDate ? <button className="request-log-chip" onClick={() => setCompletedDate("")} title={t("去掉这个筛选")} type="button">
+            {completedDate}<X aria-hidden="true" className="h-3 w-3" />
+          </button> : null}
           {relayFilter ? (
             <button className="request-log-chip" onClick={() => setRelayFilter(null)} title={t("去掉这个筛选")} type="button">
               {tf("供应商：{0}", [relayFilter.unknown ? t("未知") : relayFilter.label])}
@@ -8531,9 +8571,9 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                         <span>
                           {entry.state === "running" ? (
                             <span className="request-log-muted">{(isImageRequest(entry) ? t("生成中") : t("流式中"))}</span>
-                          ) : entry.usage?.cachedTokens ? (
+                          ) : entry.usage && (entry.usage.cachedTokensKnown ?? Boolean(entry.usage.cachedTokens)) ? (
                             <>
-                              {formatRequestLogTokens(entry.usage.cachedTokens)}
+                              {formatRequestLogTokens(entry.usage.cachedTokens ?? 0)}
                               <small>
                                 {" · "}
                                 {formatRequestLogCacheHitRatio(
@@ -8545,9 +8585,12 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                             </>
                           ) : "-"}
                         </span>
-                        <span className="request-log-muted">{entry.cost ? formatRequestCost(entry.cost)
-                          : entry.state !== "running" && payload?.pool.some(provider => provider.id === entry.relayId && isWorkBuddyProvider(provider.source))
-                            ? t("积分未上报") : "-"}</span>
+                        <span className="request-log-muted">{requestActualCharge(entry.pricing)
+                          || (entry.pricing?.estimate
+                            ? tf("估算 {0}", [formatRequestPrice(entry.pricing.estimate.amount, entry.pricing.estimate.currency)])
+                            : !entry.pricing && entry.cost ? formatRequestCost(entry.cost)
+                              : entry.state !== "running" && payload?.pool.some(provider => provider.id === entry.relayId && isWorkBuddyProvider(provider.source))
+                                ? t("积分未上报") : "-")}</span>
                       </>
                     )}
                     <span className="request-log-duration">
@@ -8565,6 +8608,8 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                   </button>
                   {expanded === entry.id ? (
                     <div className="request-log-detail">
+                      <RequestRouteDetails entry={entry} agent={agentName(requestLogAgent(entry))}
+                        groupLabel={payload?.groups.find(group => group.id === entry.route?.groupId)?.name} />
                       <dl>
                         <div><dt>{t("请求 ID")}</dt><dd><code>{entry.id}</code></dd></div>
                         <div>
@@ -8578,7 +8623,6 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                         <div><dt>{t("上游协议")}</dt><dd>{entry.wireApi || "-"}</dd></div>
                         <div><dt>{t("请求模型")}</dt><dd>{requested || "-"}</dd></div>
                         <div><dt>{t("上游模型")}</dt><dd>{upstream || "-"}</dd></div>
-                        <div><dt>{t("首字耗时")}</dt><dd>{entry.firstTokenMs == null ? (entry.state === "running" ? t("进行中") : "-") : formatRequestLogDuration(entry.firstTokenMs)}</dd></div>
                         <div><dt>{t("尝试次数")}</dt><dd>{entry.attempts || "-"}</dd></div>
                         <div><dt>{t("自动重试")}</dt><dd>{entry.autoRetries}</dd></div>
                         <div><dt>{t("重试原因")}</dt><dd>{requestLogRetryReasons(entry) || "-"}</dd></div>
@@ -8604,6 +8648,21 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                         <div><dt>{t("流式")}</dt><dd>{entry.stream ? "SSE" : "JSON"}</dd></div>
                         <div><dt>{t("流结果")}</dt><dd>{entry.streamOutcome || "-"}</dd></div>
                         <div><dt>{t("推理 tokens")}</dt><dd>{formatRequestLogTokens(entry.usage?.reasoningTokens)}</dd></div>
+                        {entry.pricing ? (
+                          <>
+                            <div><dt>{t("实际扣费")}</dt><dd>{requestActualCharge(entry.pricing) || t("未上报")}</dd></div>
+                            {entry.pricing.rate ? (
+                              <div><dt>{t("当前单价（每百万 Token）")}</dt><dd>{tf("输入 {0}，缓存输入 {1}，输出 {2}", [
+                                formatRequestPrice(entry.pricing.rate.inputPerMillion, entry.pricing.rate.currency),
+                                formatRequestPrice(entry.pricing.rate.cachedInputPerMillion, entry.pricing.rate.currency),
+                                formatRequestPrice(entry.pricing.rate.outputPerMillion, entry.pricing.rate.currency),
+                              ])}</dd></div>
+                            ) : null}
+                            <div><dt>{t("估算费用")}</dt><dd>{entry.pricing.estimate
+                              ? formatRequestPrice(entry.pricing.estimate.amount, entry.pricing.estimate.currency)
+                              : requestEstimateStatus(entry.pricing.estimateStatus)}</dd></div>
+                          </>
+                        ) : null}
                         <div><dt>{t("错误")}</dt><dd>{entry.error || "-"}</dd></div>
                       </dl>
                     </div>

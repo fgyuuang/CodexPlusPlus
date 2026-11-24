@@ -224,7 +224,8 @@
     const payload = state.payload;
     const previous = payload?.gateway?.bindings?.codex;
     const draft = codexPlusGatewayModel.draftFromBinding(previous);
-    const issue = codexPlusGatewayModel.validateDraft(draft, payload);
+    const native = payload?.agents?.find((agent) => agent.agent === "codex")?.nativeModels;
+    const issue = codexPlusGatewayModel.validateDraft(draft, payload, undefined, null, native);
     if (issue) {
       codexPlusGatewaySetStatus(`${issue}（请先在供应商池里添加可用的供应商，或在 Codex++「Agent 接入」里调整默认模型）`, "error");
       return renderCodexPlusProviderPage();

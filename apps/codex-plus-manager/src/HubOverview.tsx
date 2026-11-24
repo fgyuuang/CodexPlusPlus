@@ -11,17 +11,16 @@ import {
   formatMoney,
   formatTokens,
   pendingImportCount,
-  routeNarrative,
   type GatewayPayload,
-  type RouteRecordView,
   type UsageSummary,
 } from "./gateway-model";
-import { hubAgents, hubLinks, hubPoolState, hubProviders, hubTotals, routeRecordsByEntry, successRate, type CodexSummary, type HubLink } from "./hub-overview-model";
+import { completedRoute, hubAgents, hubLinks, hubPoolState, hubProviders, hubTotals, successRate, type CodexSummary, type HubLink } from "./hub-overview-model";
 import { AGENT_ICONS, APP_LOGO_URL, Avatar, KeyCount, MemberStatusLabel, agentIconIsColor, makeRun, type Notify, type Run } from "./gateway-ui";
 import { publishGatewayPayload, useGatewayPayload } from "./gateway-store";
 import { AgentConnectDialog } from "./GatewayAgents";
 import { busyLinks, liveFlowRoutes, flowRoutePosition, flowAgent, pulseHops, type FlowEntry, type LiveFlowRoute } from "./request-flow-model";
 import { FlowRequestRow, useRequestFlow } from "./RequestFlow";
+import { RequestRouteDetails } from "./RequestRouteDetails";
 import { agentVisible, singleAgent } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
 import { ProviderAdder } from "./GatewayProviders";
@@ -103,7 +102,6 @@ export function HubOverview({
     [flowEntries.filter((entry) => entry.state === "running").map((entry) => `${entry.id}:${entry.relayId}:${entry.phase}:${entry.firstTokenMs}:${entry.estimatedOutputTokens}`).join("|")],
   );
   const feed = flowEntries.slice(0, FEED_LIMIT);
-  const routeRecords = routeRecordsByEntry(payload, feed);
   const connected = agents.filter((agent) => agent.enabled).length;
   // 「接入 Agent」「添加供应商」就地弹窗，不跳到对应页面。
   const [adding, setAdding] = useState<"agent" | "provider" | "import" | null>(null);
@@ -217,7 +215,7 @@ export function HubOverview({
           ) : feed.length === 0 ? (
             <CxEmpty title={t("还没有请求经过网关")} detail={t("在已接入的 Agent 里发一条消息试试。")} />
           ) : (
-            <ul className="hub-flow-list">{feed.map((entry) => <FeedRow entry={entry} key={entry.id} payload={payload} record={routeRecords.get(entry.id) ?? null} />)}</ul>
+            <RouteFeedRows entries={feed} payload={payload} />
           )}
         </CxCard>
       </CxSection>
@@ -260,10 +258,15 @@ function AgentNode({ agent, onOpen }: { agent: ReturnType<typeof hubAgents>[numb
   );
 }
 
-/** 一条最近请求；对得上网关路由记录的那条能点开，列出这次怎么走的：计划、每次尝试、最后谁回答。 */
-function FeedRow({ entry, record, payload }: { entry: FlowEntry; record: RouteRecordView | null; payload: GatewayPayload | null }) {
+function RouteFeedRows({ entries, payload }: { entries: FlowEntry[]; payload: GatewayPayload | null }) {
+  return <ul className="hub-flow-list">{entries.map(entry => <FeedRow entry={entry} key={entry.id} payload={payload} />)}</ul>;
+}
+
+/** 一条最近请求。只有本身保存了路由的请求能展开候选和尝试。 */
+function FeedRow({ entry, payload }: { entry: FlowEntry; payload: GatewayPayload | null }) {
   const [open, setOpen] = useState(false);
   const agent = flowAgent(entry);
+  const record = completedRoute(entry);
   return (
     <li data-open={open}>
       <button aria-expanded={open} className="hub-flow-toggle" disabled={!record} onClick={() => setOpen(!open)} type="button">
@@ -271,11 +274,10 @@ function FeedRow({ entry, record, payload }: { entry: FlowEntry; record: RouteRe
         <ChevronDown aria-hidden className="hub-feed-chevron h-3.5 w-3.5" />
       </button>
       {open && record ? (
-        <ol className="hub-feed-trace">
-          {routeNarrative(agent, record, payload).map((line, index) => (
-            <li data-tone={line.tone} key={index}>{tf(line.text, line.args.map((arg) => (typeof arg === "object" ? t(arg.zh) : arg)))}</li>
-          ))}
-        </ol>
+        <div className="hub-feed-route">
+          <RequestRouteDetails entry={entry} agent={agentName(agent)}
+            groupLabel={payload?.groups.find(group => group.id === entry.route?.groupId)?.name} />
+        </div>
       ) : null}
     </li>
   );

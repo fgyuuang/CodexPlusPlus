@@ -178,10 +178,11 @@ fn unix_ms(time: SystemTime) -> Option<u64> {
 }
 
 /// 不写配置、不触发模型探测。`helper_running` 必须来自常驻 helper 的实际状态。
+/// `runtime_gateway` 应包含写入 Agent 模型目录时使用的拓展供应商。
 pub fn inspect(
     ctx: &ApplyContext,
     agent: &ToolId,
-    gateway: &GatewaySettings,
+    runtime_gateway: &GatewaySettings,
     helper_running: bool,
     activity: &ActivitySnapshot,
 ) -> AgentDiagnostics {
@@ -192,7 +193,7 @@ pub fn inspect(
         .find(|current| current.agent == agent.as_str());
     let last = current.and_then(|current| current.last.as_ref());
     let in_flight = current.map_or(0, |current| current.in_flight.len() as u64);
-    let binding = gateway.binding(agent);
+    let binding = runtime_gateway.binding(agent);
     let enabled = binding.is_some_and(|binding| binding.enabled);
     let mut config = Inspection::new(ctx, agent);
     if let Some(binding) = binding.filter(|_| enabled) {
@@ -201,7 +202,7 @@ pub fn inspect(
             ToolId::Claude => claude(&mut config, binding),
             ToolId::Grok => grok(&mut config, binding),
             _ => match agents::spec(agent.as_str()) {
-                Some(spec) => generic(&mut config, spec, gateway, binding),
+                Some(spec) => generic(&mut config, spec, runtime_gateway, binding),
                 None => config.add(Path::new(""), "", "unsupported_agent", None, None),
             },
         }

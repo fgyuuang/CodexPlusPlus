@@ -1,8 +1,8 @@
 /** 本地网关 · 用量：额度、余额、费用 / token / 缓存 / 调用 / 耗时、按天的柱状图与 Agent 占比，以及按供应商 / 模型 / Agent 的明细表。 */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
-import { RefreshCw } from "lucide-react";
+import { ChartColumn, ChartLine, ChevronLeft, ChevronRight, RefreshCw } from "lucide-react";
 import { getLanguage, t, tf } from "./i18n";
 import {
   agentName,
@@ -19,6 +19,7 @@ import {
   quotaEntries,
   shortDate,
   usageDayStats,
+  usageProviderLabel,
   isWorkBuddyProvider,
   workbuddyCreditsText,
   type GatewayPayload,
@@ -28,7 +29,7 @@ import {
   type UsageSummary,
   maskAccountName,
 } from "./gateway-model";
-import { AGENT_ICONS, Avatar, QuotaWindows, type Notify, type Run } from "./gateway-ui";
+import { AGENT_ICONS, Avatar, type Notify, type Run } from "./gateway-ui";
 import { successRate } from "./hub-overview-model";
 import { openRequestLog } from "./UsageTabs";
 import { TopbarActions } from "./TopbarActions";
@@ -38,16 +39,22 @@ import { singleAgent } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
 import { CxCard, CxEmpty, CxRow, CxSection, CxStats } from "./cx-layout";
 import { Menu, MenuItem } from "./ManagementPages";
+import { UsageVisuals } from "./UsageVisuals";
+import { QuotaCards } from "./ProviderQuotaPanel";
 
-const memo: { range: UsageRange; summary: UsageSummary | null } = { range: "30d", summary: null };
+type LoadedUsage = { range: UsageRange; summary: UsageSummary };
+const memo: { range: UsageRange; loaded: LoadedUsage | null } = { range: "30d", loaded: null };
 
 export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayload | null; busy: string | null; run: Run; notify: Notify }) {
   const [range, setRangeState] = useState<UsageRange>(memo.range);
-  const [summary, setSummary] = useState<UsageSummary | null>(memo.summary);
+  const [loaded, setLoaded] = useState(memo.loaded);
+  const [failedRange, setFailedRange] = useState<UsageRange>();
+  const summary = loaded?.range === range ? loaded.summary : null;
   // 余额和供应商池卡片共用一份（#2793），谁先查到另一边直接用。
   const [balances, setBalances] = useState<ProviderBalance[] | null>(cachedProviderBalances().balances);
   const [loadingBalances, setLoadingBalances] = useState(false);
   const [split, setSplit] = useState<"provider" | "model" | "agent">("provider");
+  const [chartStyle, setChartStyle] = useState<"bar" | "line">("bar");
   // 只管理 Codex 时不按 Agent 拆分：没有占比条，也没有「按 Agent」页签。
   const codexOnly = singleAgent(useAgentFocus()) === "codex";
 
@@ -55,18 +62,23 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
   const latest = useRef(0);
   const load = async (next: UsageRange) => {
     const id = ++latest.current;
+    setFailedRange(undefined);
     try {
       const result = await invoke<{ status: string; message: string } & Partial<UsageSummary>>("load_gateway_usage", { range: next });
       if (id !== latest.current) return;
       if (result.status !== "ok" || !result.totals) {
+        setFailedRange(next);
         await notify(t("读取用量失败"), result.message, "failed");
         return;
       }
-      const value = result as UsageSummary;
-      memo.summary = value;
-      setSummary(value);
+      const value = { range: next, summary: result as UsageSummary };
+      memo.loaded = value;
+      setLoaded(value);
     } catch (error) {
-      if (id === latest.current) await notify(t("调用失败"), String(error), "failed");
+      if (id === latest.current) {
+        setFailedRange(next);
+        await notify(t("调用失败"), String(error), "failed");
+      }
     }
   };
   const loadBalances = async (force: boolean) => {
@@ -173,8 +185,16 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
 
       <p className="gw-muted">{t("统计经过 Codex++ 代理并返回 usage 的请求；不包含未经过代理的原生聊天历史。订阅剩余额度与 Token 累计是不同指标。")}</p>
       <CxCard className="gw-chart-card">
-        <UsageChart summary={summary} />
-        {!codexOnly && summary && summary.byAgent.length > 0 ? <AgentShare groups={summary.byAgent} /> : null}
+        <UsageChartPages label={t(range === "today" ? "每小时 token" : "每天 token")}
+          controls={<div className="mg-segmented gw-chart-format" role="group" aria-label={t("图表样式")}>
+            {([["bar", ChartColumn, t("柱状图")], ["line", ChartLine, t("折线图")]] as const).map(([style, Icon, name]) =>
+              <button key={style} type="button" aria-label={name} aria-pressed={chartStyle === style} data-active={chartStyle === style}
+                title={name} onClick={() => setChartStyle(style)}><Icon aria-hidden="true" /></button>)}
+          </div>}
+          distribution={<UsageVisuals summary={summary} range={range} failed={failedRange === range} codexOnly={codexOnly} payload={payload} />}>
+          <UsageChart key={range} summary={summary} range={range} style={chartStyle} />
+          {!codexOnly && summary && summary.byAgent.length > 0 ? <AgentShare groups={summary.byAgent} /> : null}
+        </UsageChartPages>
       </CxCard>
 
       <CxSection
@@ -220,17 +240,17 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
             const share = total / tokenTotal;
             const groupHit = cacheHitRate(group);
             const providerEntry = payload?.pool.find((entry) => entry.id === group.key);
-            const name = split === "agent" ? agentName(group.key) : split === "model" ? groupDisplayName(payload, group.key) ?? prettyModelName(group.label) : maskAccountName(group.label);
+            const name = split === "agent" ? agentName(group.key) : split === "model" ? groupDisplayName(payload, group.key) ?? prettyModelName(group.label) : maskAccountName(t(usageProviderLabel(payload?.pool, group.key, group.label)));
             return (
               <div
                 className="gw-usage-row gw-usage-row-link"
                 key={group.key || "-"}
                 // 点一行看这一项的每条请求：按 Agent、供应商 id 或模型名筛，时间段跟着这里选的。
                 onClick={() => openRequestLog(split === "agent"
-                  ? { agent: group.key === "claude" || group.key === "grok" ? group.key : "codex", range }
+                  ? { agent: group.key || "codex", range }
                   : split === "provider"
                     ? group.key
-                      ? { relayId: group.key, relayLabel: maskAccountName(group.label), range }
+                      ? { relayId: group.key, relayLabel: name, range }
                       : { relayUnknown: true, relayLabel: t("未知"), range }
                     : { model: group.key, range })}
                 onKeyDown={(event) => { if (event.key === "Enter") (event.currentTarget as HTMLElement).click(); }}
@@ -242,7 +262,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
                   {split === "agent" ? (
                     AGENT_ICONS[group.key] ? <img alt="" className="gw-usage-agent" data-agent-icon={group.key} src={AGENT_ICONS[group.key]} /> : <Avatar name={group.label} size="sm" />
                   ) : (
-                    <Avatar baseUrl={providerEntry?.baseUrl} name={(split === "model" ? name : group.label) || "?"} size="sm" />
+                    <Avatar baseUrl={providerEntry?.baseUrl} name={name || "?"} size="sm" />
                   )}
                   <strong title={split === "model" || split === "provider" ? name : group.label}>{name || t("未知")}</strong>
                 </span>
@@ -264,30 +284,10 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
 
       {/* 额度（#3084）：订阅账号和 OpenCode Go、Command Code 等套餐的时间窗口，和供应商池卡片同一份缓存。 */}
       {quotas.length ? (
-        <CxSection count={quotas.length} title={t("额度")}>
-          <CxCard>
-            {quotas.map((entry) => (
-              <CxRow
-                icon={<Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />}
-                key={entry.id}
-                title={maskAccountName(entry.name)}
-              >
-                {entry.quota
-                  ? <QuotaWindows compact maxAgeSeconds={entry.subscriptionPolicy?.maxAgeSeconds} quota={entry.quota} />
-                  : <small className="gw-usage-balance-missing">{t("额度待刷新")}</small>}
-                <button
-                  aria-label={t("刷新额度")}
-                  className="gw-icon-button"
-                  disabled={busy !== null}
-                  onClick={() => void run(`quota:${entry.id}`, "refresh_gateway_quota", { id: entry.id }, t("刷新额度"), true)}
-                  title={t("刷新额度")}
-                  type="button"
-                >
-                  <RefreshCw className={busy === `quota:${entry.id}` ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
-                </button>
-              </CxRow>
-            ))}
-          </CxCard>
+        <CxSection count={quotas.length} title={t("配额窗口")}>
+          <QuotaCards entries={quotas} busy={busy} refresh={entry =>
+            void run(`quota:${entry.id}`, "refresh_gateway_quota", { id: entry.id }, t("刷新额度"), true)
+          } />
         </CxSection>
       ) : null}
 
@@ -333,18 +333,83 @@ function AgentShare({ groups }: { groups: UsageGroup[] }) {
   );
 }
 
-/**
- * 按天的柱状图：自下而上是未命中缓存的输入、缓存读取、输出，叠在一起；纵轴按 1 / 2 / 5 取整画两条刻度线。
- * 鼠标移到某一天（整列都是感应区，矮柱子也好指）：这一列高亮、其余变暗，上方浮出当天的明细卡。
- * 没有请求的日子只画一条底线，提示里也只说「没有请求」。
- */
-function UsageChart({ summary }: { summary: UsageSummary | null }) {
-  const days = summary?.days ?? [];
+function UsageChartPages({ label, controls, distribution, children }: {
+  label: string; controls: React.ReactNode; distribution: React.ReactNode; children: React.ReactNode;
+}) {
+  const [page, setPage] = useState(0);
+  const id = useId();
+  const viewport = useRef<HTMLDivElement>(null);
+  const panels = useRef<HTMLDivElement[]>([]);
+  const tabs = useRef<HTMLButtonElement[]>([]);
+  const labels = [label, t("用量分布")];
+  const go = (index: number) => {
+    const node = viewport.current;
+    if (!node) return;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    node.scrollTo({ left: node.clientWidth * index, behavior: reduceMotion ? "auto" : "smooth" });
+  };
+  useLayoutEffect(() => {
+    const node = viewport.current;
+    const panel = panels.current[page];
+    if (!node || !panel) return;
+    const fit = () => { node.style.height = `${Math.ceil(panel.getBoundingClientRect().height)}px`; };
+    fit();
+    if (typeof ResizeObserver !== "function") return;
+    const observer = new ResizeObserver(fit);
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [page, children, distribution]);
+  return <>
+    <div className="gw-chart-switch">
+      <div className="mg-segmented gw-chart-tabs" role="tablist" aria-label={t("用量图表")}>
+        {labels.map((name, index) => <button key={index} id={`${id}-tab-${index}`}
+          ref={node => { if (node) tabs.current[index] = node; }}
+          type="button" role="tab" aria-selected={page === index} data-active={page === index}
+          aria-controls={`${id}-panel-${index}`} tabIndex={page === index ? 0 : -1}
+          onClick={() => go(index)} onKeyDown={event => {
+            if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+            event.preventDefault();
+            const next = 1 - index;
+            tabs.current[next]?.focus();
+            go(next);
+          }}>{name}</button>)}
+      </div>
+      <div className="gw-chart-page-actions">
+        <div className="gw-chart-format-slot" style={{ visibility: page === 0 ? "visible" : "hidden" }}>{controls}</div>
+        <button className="gw-icon-button" type="button" disabled={page === 0} title={t("上一张图")}
+          aria-label={t("上一张图")} onClick={() => go(0)}><ChevronLeft aria-hidden="true" /></button>
+        <button className="gw-icon-button" type="button" disabled={page === 1} title={t("下一张图")}
+          aria-label={t("下一张图")} onClick={() => go(1)}><ChevronRight aria-hidden="true" /></button>
+      </div>
+    </div>
+    <div className="gw-chart-pages" ref={viewport} onScroll={event => {
+      const node = event.currentTarget;
+      if (node.clientWidth) setPage(Number(node.scrollLeft >= node.clientWidth / 2));
+    }}>
+      {[children, distribution].map((content, index) => <div key={index} ref={node => { if (node) panels.current[index] = node; }}
+        className="gw-chart-page" role="tabpanel" id={`${id}-panel-${index}`} aria-labelledby={`${id}-tab-${index}`}
+        aria-hidden={page !== index} inert={page !== index}>{content}</div>)}
+    </div>
+  </>;
+}
+
+function UsageChart({ summary, range, style }: { summary: UsageSummary | null; range: UsageRange; style: "bar" | "line" }) {
+  const hourly = range === "today";
   const english = getLanguage() === "en";
   const [hover, setHover] = useState<number | null>(null);
+  const collected = new Map(summary?.hours?.map(bucket => [bucket.hour, bucket]));
+  const trackedCalls = [...collected.values()].reduce((total, bucket) => total + bucket.calls, 0);
+  const partial = hourly && trackedCalls < (summary?.totals.calls ?? 0);
+  const hourText = (hour: number) => `${String(hour).padStart(2, "0")}:00`;
+  const days = hourly ? Array.from({ length: 24 }, (_, hour) => ({
+    calls: 0, errors: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0,
+    ...collected.get(hour), date: hourText(hour),
+  })) : summary?.days ?? [];
+  const label = (date: string) => hourly ? date : shortDate(date, english);
+  const currentHour = new Date().getHours();
   const top = niceCeiling(Math.max(0, ...days.map((day) => day.inputTokens + day.outputTokens)));
   const stats = usageDayStats(days);
-  const labels = new Set(axisLabelIndexes(days.length, 7));
+  const labels = new Set(hourly ? [0, 4, 8, 12, 16, 20, 23] : axisLabelIndexes(days.length, 7));
   const width = 1000;
   const height = 180;
   const slot = days.length ? width / days.length : 0;
@@ -352,19 +417,28 @@ function UsageChart({ summary }: { summary: UsageSummary | null }) {
   const active = hover !== null ? days[hover] : undefined;
   const activeLeft = hover !== null && days.length ? ((hover + 0.5) / days.length) * 100 : 0;
   const scale = (value: number) => (value / top) * height;
+  const line: string[][] = [];
+  let run: string[] | undefined;
+  if (style === "line" && summary) days.forEach((day, index) => {
+    if (hourly && !day.calls && (index > currentHour || partial)) { run = undefined; return; }
+    if (!run) { run = []; line.push(run); }
+    run.push(`${(index + .5) * slot},${Math.max(1, Math.min(height - 1, height - scale(day.inputTokens + day.outputTokens)))}`);
+  });
   return (
     <div className="gw-chart" data-hovering={active ? "true" : undefined} onMouseLeave={() => setHover(null)}>
       <div className="gw-chart-head">
-        <strong>{t("每天 token")}</strong>
+        {style === "line" ? <span className="gw-chart-legend"><span><i data-kind="total" />{t("Token 合计")}</span></span> :
         <span className="gw-chart-legend">
           <span><i data-kind="input" />{t("输入（未命中缓存）")}</span>
           <span><i data-kind="cache" />{t("缓存读取")}</span>
           <span><i data-kind="output" />{t("输出")}</span>
-        </span>
+        </span>}
         {stats.peak ? (
           <span className="gw-chart-facts">
-            <span>{tf("峰值 {0} · {1}", [shortDate(stats.peak.date, english), formatTokens(stats.peak.inputTokens + stats.peak.outputTokens)])}</span>
-            {days.length > 1 ? <span>{tf("{0} 天有请求 · 日均 {1}", [stats.activeDays, formatTokens(stats.dailyAverage)])}</span> : null}
+            <span>{tf("峰值 {0} · {1}", [label(stats.peak.date), formatTokens(stats.peak.inputTokens + stats.peak.outputTokens)])}</span>
+            {hourly
+              ? <span>{tf("{0} 个小时有已记录请求", [stats.activeDays])}</span>
+              : days.length > 1 ? <span>{tf("{0} 天有请求 · 日均 {1}", [stats.activeDays, formatTokens(stats.dailyAverage)])}</span> : null}
           </span>
         ) : null}
       </div>
@@ -372,16 +446,21 @@ function UsageChart({ summary }: { summary: UsageSummary | null }) {
         {[1, 0.5].map((ratio) => (
           <span className="gw-chart-grid" key={ratio} style={{ top: `${(1 - ratio) * 100}%` }}><em>{formatTokens(top * ratio)}</em></span>
         ))}
-        <svg aria-label={t("每天用量")} preserveAspectRatio="none" role="img" viewBox={`0 0 ${width} ${height}`}>
+        <svg aria-label={t(hourly ? "每小时用量" : "每天用量")} preserveAspectRatio="none" role="img" viewBox={`0 0 ${width} ${height}`}>
+          {line.map((points, index) => <path className="gw-token-line" key={index}
+            d={`M${points.join(" L")}${points.length === 1 ? " h0.01" : ""}`} />)}
+          {style === "line" && hover !== null ? <line className="gw-token-cursor"
+            x1={(hover + .5) * slot} x2={(hover + .5) * slot} y1={0} y2={height} /> : null}
           {days.map((day, index) => {
             const x = index * slot + (slot - barWidth) / 2;
             const cached = Math.min(day.cachedTokens, day.inputTokens);
             const segments: Array<[string, number]> = [["gw-bar-input", day.inputTokens - cached], ["gw-bar-cache", cached], ["gw-bar-output", day.outputTokens]];
             let y = height;
             return (
-              <g className="gw-bar" data-active={hover === index ? "true" : undefined} data-empty={day.calls === 0 ? "true" : undefined} key={day.date}>
+              <g className="gw-bar" data-active={hover === index ? "true" : undefined} data-empty={day.calls === 0 ? "true" : undefined}
+                data-future={hourly && day.calls === 0 && index > currentHour ? "true" : undefined} key={day.date}>
                 <rect className="gw-bar-hit" height={height} width={slot} x={index * slot} y={0} onMouseEnter={() => setHover(index)} />
-                {day.calls === 0 ? (
+                {style === "line" ? null : day.calls === 0 ? (
                   <rect className="gw-bar-empty" height={2} width={barWidth} x={x} y={height - 2} />
                 ) : (
                   segments.map(([className, value]) => {
@@ -396,9 +475,9 @@ function UsageChart({ summary }: { summary: UsageSummary | null }) {
         </svg>
         {active ? (
           <div className="gw-chart-tip" data-edge={activeLeft < 18 ? "start" : activeLeft > 82 ? "end" : undefined} role="status" style={{ left: `${activeLeft}%` }}>
-            <strong>{shortDate(active.date, english)}</strong>
+            <strong>{hourly && hover !== null ? `${active.date} – ${hourText(hover + 1)}` : label(active.date)}</strong>
             {active.calls === 0 ? (
-              <p>{t("没有请求")}</p>
+              <p>{t(hourly && hover !== null && hover > currentHour ? "时段尚未开始" : partial ? "无小时记录" : "没有请求")}</p>
             ) : (
               <dl>
                 <div><dt><i data-kind="total" />{t("合计")}</dt><dd>{formatTokens(active.inputTokens + active.outputTokens)}</dd></div>
@@ -412,8 +491,11 @@ function UsageChart({ summary }: { summary: UsageSummary | null }) {
         ) : null}
       </div>
       <div className="gw-chart-axis">
-        {days.map((day, index) => (labels.has(index) || hover === index ? <span data-active={hover === index ? "true" : undefined} key={day.date} style={{ left: `${((index + 0.5) / days.length) * 100}%` }}>{shortDate(day.date, english)}</span> : null))}
+        {days.map((day, index) => (labels.has(index) || hover === index ? <span data-active={hover === index ? "true" : undefined} key={day.date} style={{ left: `${((index + 0.5) / days.length) * 100}%` }}>{label(day.date)}</span> : null))}
       </div>
+      {partial ? <p className="gw-chart-coverage">{trackedCalls
+        ? tf("小时图覆盖 {0}/{1} 次调用，其余只计入当天合计。", [trackedCalls, summary?.totals.calls ?? 0])
+        : t("今天的用量只有按天汇总，尚无可展示的小时记录。")}</p> : null}
     </div>
   );
 }

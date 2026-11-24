@@ -76,6 +76,7 @@ function fixture(layout = "sidebar") {
     codexPlusSidebarNavId: "codex-plus-sidebar-nav", codexPlusMenuId: "codex-plus-menu", codexPlusPageClass: "codex-plus-page",
     codexPlusRailNavId: "codex-plus-rail-nav", codexPlusRailExtensionsId: "codex-plus-rail-extensions", codexPlusRailSponsorId: "codex-plus-rail-sponsor", codexPlusRailProviderId: "codex-plus-rail-provider", codexPlusRailRemoteId: "codex-plus-rail-remote", codexPlusRailWeixinId: "codex-plus-rail-weixin", codexPlusRailTasksId: "codex-plus-rail-tasks",
     codexPlusRailSelector: 'nav[data-app-navigation-rail]', codexPlusRailDestinationSelector: "[data-sidebar-destination]",
+    codexPlusWorkGatewayProject: 'form button[data-composer-navigation-target="workspace-project"]',
     codexPlusDefaultExtensionIconPath: "", codexPlusLogoDataUrl: "", codexPlusExtensionConstants: { extensionAttribute: "data-codex-plus-ext" },
     codexPlusBackendStatus: { status: "ok" }, codexPlusActiveEntry: () => "", setCodexPlusSidebarNavActive() {},
     closeCodexPlusPage() {}, closeCodexPlusPageAfterNativeNavigation() {}, clearPluginMarketplaceQueryCache() {},

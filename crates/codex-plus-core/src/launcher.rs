@@ -2192,6 +2192,7 @@ impl LaunchHooks for DefaultLaunchHooks {
 /// 听写 helper 的凭据文件名。Claude 汉化的注入脚本按同一路径读取，
 /// 两边改动必须同步（见 assets/claude-localization/hook.js）。
 const DICTATION_HELPER_RECEIPT: &str = "dictation-helper.json";
+const CONTEXT_PREVIEW_RECEIPT: &str = "request-context-preview-helper.json";
 
 /// helper 运行期间把端口与能力令牌写进用户态目录。
 ///
@@ -2208,6 +2209,42 @@ fn write_dictation_helper_receipt(helper_port: u16) {
         helper_port,
         crate::dictation::helper_token(),
     );
+    write_dictation_helper_receipt_at(
+        &crate::paths::default_app_state_dir().join(CONTEXT_PREVIEW_RECEIPT),
+        helper_port,
+        crate::request_context_preview::token(),
+    );
+}
+
+pub async fn request_context_preview(
+    request: crate::request_context_preview::PreviewRequest,
+) -> anyhow::Result<crate::request_context_preview::PreviewResponse> {
+    #[derive(serde::Deserialize)]
+    struct Receipt {
+        port: u16,
+        token: String,
+    }
+    let path = crate::paths::default_app_state_dir().join(CONTEXT_PREVIEW_RECEIPT);
+    let receipt: Receipt = serde_json::from_slice(&std::fs::read(path)?)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}{}",
+        receipt.port,
+        crate::request_context_preview::PATH
+    );
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    Ok(client
+        .post(endpoint)
+        .bearer_auth(receipt.token)
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
 }
 
 fn write_dictation_helper_receipt_at(path: &Path, helper_port: u16, token: &str) {
@@ -2245,6 +2282,10 @@ fn write_dictation_helper_receipt_at(path: &Path, helper_port: u16, token: &str)
 /// 误删。凭据整体只在 helper 停止时清理，与旧行为一致。
 fn remove_dictation_helper_receipt_for_port(helper_port: u16) {
     remove_dictation_helper_receipt_at_for_port(&dictation_helper_receipt_path(), helper_port);
+    remove_dictation_helper_receipt_at_for_port(
+        &crate::paths::default_app_state_dir().join(CONTEXT_PREVIEW_RECEIPT),
+        helper_port,
+    );
 }
 
 fn remove_dictation_helper_receipt_at_for_port(path: &Path, helper_port: u16) {
@@ -2348,6 +2389,15 @@ pub(crate) async fn handle_helper_connection_on(
         );
         stream.shutdown().await?;
         return Ok(());
+    }
+    if path == crate::request_context_preview::PATH && listener == HelperListener::Loopback {
+        return crate::request_context_preview::serve(
+            &mut stream,
+            method,
+            &request_headers,
+            &request.body,
+        )
+        .await;
     }
     if path == "/dictation/claude-stream" {
         let settings = SettingsStore::default().load().unwrap_or_default();
@@ -3083,8 +3133,10 @@ impl ProxyRequestLog {
                 stream_outcome: None,
                 usage: None,
                 cache_hit_ratio: None,
+                context_summary: None,
                 final_response_evidence: None,
                 final_response_id: None,
+                route: None,
                 agent: None,
             },
             written: false,
@@ -3100,6 +3152,19 @@ impl ProxyRequestLog {
     pub(crate) fn set_agent(&mut self, agent: &crate::tools::ToolId) {
         self.entry.agent = Some(agent.as_str().to_string());
         self.update_running();
+    }
+
+    pub(crate) fn record_context(&mut self, responses: &Value) {
+        if !self.silent {
+            if let (Some(agent), Some(session)) =
+                (self.entry.agent.as_deref(), self.entry.thread_id.as_deref())
+            {
+                crate::request_context_preview::record(agent, session, &self.entry.id, responses);
+            }
+            self.entry.context_summary =
+                crate::request_log::RequestContextSummary::from_responses(responses);
+            self.update_running();
+        }
     }
 
     /// 网关自己写出响应（不经 `UpstreamProxyResponse`）时记录路由痕迹。
@@ -3412,6 +3477,9 @@ async fn handle_protocol_proxy_connection_inner(
         }
         ProxyOpener::Gateway(agent) => {
             request_log.set_agent(agent);
+            if let Some(request) = &request_json {
+                request_log.record_context(request);
+            }
             crate::gateway::server::open_responses_for_agent(
                 agent,
                 path,

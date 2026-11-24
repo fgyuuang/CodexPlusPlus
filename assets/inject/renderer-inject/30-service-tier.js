@@ -639,11 +639,22 @@
         if (managed) resumeParams = applyCodexManagedSessionConnection("thread/resume", resumeParams, hostId);
         state.resuming = ++codexThreadProviderResumeSequence;
         try {
-          const resumed = await sendRequest("thread/resume", resumeParams,
-            { ...options, __codexPlusProviderResume: state.resuming });
+          const sendResume = (next) => {
+            signal?.throwIfAborted();
+            if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+            return sendRequest("thread/resume", next, { ...options, __codexPlusProviderResume: state.resuming });
+          };
+          const resumed = await (managed
+            ? sendCodexManagedResumeWithFallback("thread/resume", resumeParams, hostId, sendResume)
+            : sendResume(resumeParams));
           signal?.throwIfAborted();
-          if (resumed.modelProvider !== targetProvider) throw new Error("会话尚未切换到目标供应商，请重试");
           if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+          if (managed && sourceProvider === "openai" && resumed.modelProvider === "openai") {
+            state.pending = null;
+            if (resumeBeforeTurn) throw new Error("此聊天已按官方来源恢复；请切回官方会话网关，或新建聊天使用当前聚合供应商");
+            return null;
+          }
+          if (resumed.modelProvider !== targetProvider) throw new Error("会话尚未切换到目标供应商，请重试");
           state.client = client;
           state.preparedProvider = targetProvider;
         } finally {
@@ -962,14 +973,8 @@
     return connection;
   }
 
-  function applyCodexManagedSessionConnection(method, params, hostId) {
-    if (hostId !== "local" || !["thread/start", "thread/resume", "thread/fork"].includes(method)
-        || !params || typeof params !== "object" || Array.isArray(params)) return params;
-    // 原生继承分支禁止同时传 config；其父会话已经持有连接快照。
-    if (method === "thread/fork" && params.experimentalPredictionMode === true) return params;
-    const connection = codexManagedSessionConnection();
-    if (!connection) return params;
-    const config = { ...(params.config || {}) };
+  function codexConfigWithoutManagedProvider(contents) {
+    const config = { ...contents };
     if (config.model_providers && typeof config.model_providers === "object") {
       config.model_providers = { ...config.model_providers };
       delete config.model_providers.codex_plus_managed;
@@ -981,6 +986,17 @@
         delete config[key];
       }
     }
+    return config;
+  }
+
+  function applyCodexManagedSessionConnection(method, params, hostId) {
+    if (hostId !== "local" || !["thread/start", "thread/resume", "thread/fork"].includes(method)
+        || !params || typeof params !== "object" || Array.isArray(params)) return params;
+    // 原生继承分支禁止同时传 config；其父会话已经持有连接快照。
+    if (method === "thread/fork" && params.experimentalPredictionMode === true) return params;
+    const connection = codexManagedSessionConnection();
+    if (!connection) return params;
+    const config = codexConfigWithoutManagedProvider(params.config);
     config.model_provider = connection.provider;
     config["model_providers.codex_plus_managed"] = {
       name: "custom",
@@ -993,6 +1009,26 @@
     const next = { ...params, modelProvider: connection.provider, config };
     delete next.model_provider;
     return next;
+  }
+
+  async function sendCodexManagedResumeWithFallback(method, params, hostId, send) {
+    if (hostId !== "local") return send(params);
+    if (method === "send-cli-request-for-host" && params?.method
+        && ![params.hostId, params.host_id].some((host) => typeof host === "string" && host !== "local")) {
+      return sendCodexManagedResumeWithFallback(params.method, params.params, hostId,
+        (next) => send(next === params.params ? params : { ...params, params: next }));
+    }
+    if (method !== "thread/resume" || !params?.threadId || params.modelProvider !== "codex_plus_managed"
+        || [params.hostId, params.host_id].some((host) => typeof host === "string" && host !== "local")) return send(params);
+    try {
+      return await send(params);
+    } catch (error) {
+      // 原生明确拒绝了恢复，才允许用原 provider 重试；连接超时等结果未知时不重试。
+      if (!String(error?.message ?? error).includes("Cannot change this thread's model provider from `openai` to `codex_plus_managed` on resume")) throw error;
+      const next = { ...params, modelProvider: "openai", config: codexConfigWithoutManagedProvider(params.config) };
+      delete next.model_provider;
+      return send(next);
+    }
   }
 
   async function prepareCodexManagedSessionConnection(method, params, hostId, sendRequest) {
@@ -1207,7 +1243,13 @@
     // 已加载 resume 忽略连接覆盖，必须先卸载空闲会话再恢复。
     await sendRequest("thread/unsubscribe", { threadId }, recoveryOptions);
     assertCodexManagedSessionConnection(signature);
-    const result = await sendRequest("thread/resume", protectedParams, recoveryOptions);
+    const result = await sendCodexManagedResumeWithFallback("thread/resume", protectedParams, "local", (next) => {
+      assertCodexManagedSessionConnection(signature);
+      return sendRequest("thread/resume", next, recoveryOptions);
+    });
+    if (result?.modelProvider === "openai" && read.thread.modelProvider === "openai") {
+      throw new Error("此聊天已按官方来源恢复；请切回官方会话网关，或新建聊天使用当前聚合供应商");
+    }
     if (result?.modelProvider !== "codex_plus_managed") throw new Error("会话未采用受管连接配置");
     return result;
   }

@@ -1,32 +1,35 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { beginResetCardOperation, finishResetCardOperation, pendingResetCardOperation } from "./reset-card-operation.ts";
+import { parseResetCardOperation, resetCardAction, type ResetCardOperation } from "./reset-card-operation.ts";
 import { resetCardUsable, soonestResetCardExpiry, usableResetCardCount, type GatewayPoolEntry } from "./gateway-model.ts";
 
-function storage() {
-  const values = new Map<string, string>();
-  return { getItem: (key: string) => values.get(key) ?? null,
-    setItem: (key: string, value: string) => { values.set(key, value); }, removeItem: (key: string) => { values.delete(key); } };
-}
+const ready: ResetCardOperation = { status: "ready", confirmation: "a".repeat(64) };
+const pending: ResetCardOperation = { status: "pending", confirmation: "b".repeat(64) };
+const damaged: ResetCardOperation = { status: "damaged", confirmation: "c".repeat(64) };
 
-test("切页或重建调用方后复用未确认标识，成功后才允许新操作", () => {
-  const disk = storage();
-  assert.equal(beginResetCardOperation(disk, "a", () => "first"), "first");
-  assert.equal(pendingResetCardOperation(disk, "a"), "first");
-  assert.equal(beginResetCardOperation(disk, "a", () => "second"), "first");
-  assert.equal(beginResetCardOperation(disk, "b", () => "other"), "other");
-  finishResetCardOperation(disk, "a", "wrong");
-  assert.equal(pendingResetCardOperation(disk, "a"), "first");
-  finishResetCardOperation(disk, "a", "first");
-  assert.equal(beginResetCardOperation(disk, "a", () => "second"), "second");
+test("仅接受后端已知状态的精确操作确认标识", () => {
+  for (const value of [ready, pending, damaged]) assert.deepEqual(parseResetCardOperation(value), value);
+  for (const value of [null, {}, "pending", { ...pending, confirmation: "B".repeat(64) }, { ...pending, confirmation: true }, { ...pending, status: "unknown" }]) {
+    assert.equal(parseResetCardOperation(value), null);
+  }
 });
 
-test("存储失败或损坏时阻止创建新的消费请求", () => {
-  const disk = storage();
-  disk.setItem("codexpp:reset-card-operation:a", "bad\nid");
-  assert.throws(() => beginResetCardOperation(disk, "a", () => "new"));
-  const unavailable = { ...storage(), setItem: () => { throw Error("unavailable"); } };
-  assert.throws(() => beginResetCardOperation(unavailable, "a", () => "new"));
+test("新消费、待确认重试和损坏修复走不同确认路径", () => {
+  assert.equal(resetCardAction(ready, { ...ready }, "consume"), "start");
+  assert.equal(resetCardAction(pending, { ...pending }, "consume"), "retry");
+  assert.equal(resetCardAction(ready, ready, "abandon"), null);
+  assert.equal(resetCardAction(pending, pending, "abandon"), "abandon");
+  assert.equal(resetCardAction(damaged, damaged, "abandon"), "abandon");
+  assert.equal(resetCardAction(damaged, damaged, "consume"), null);
+});
+
+test("另一窗口变更操作后，不修改放弃目标或将重试升级成新消费", () => {
+  const otherPending: ResetCardOperation = { ...pending, confirmation: "d".repeat(64) };
+  assert.equal(resetCardAction(pending, otherPending, "consume"), null);
+  assert.equal(resetCardAction(pending, otherPending, "abandon"), null);
+  assert.equal(resetCardAction(pending, ready, "consume"), null);
+  assert.equal(resetCardAction(ready, pending, "consume"), null);
+  assert.equal(resetCardAction(null, ready, "consume"), null);
 });
 
 test("到期时不再信任旧 usable，未知张数保持 null", () => {

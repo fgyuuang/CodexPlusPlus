@@ -9,9 +9,9 @@ import { CSS as DndCSS } from "@dnd-kit/utilities";
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { beginResetCardOperation, finishResetCardOperation, pendingResetCardOperation } from "./reset-card-operation";
+import { parseResetCardOperation, resetCardAction, type ResetCardOperation } from "./reset-card-operation";
 import { Check, ChevronRight, Copy, GripVertical, Pencil, Plus, RefreshCw, Search, X, Zap } from "lucide-react";
-import { t, tf } from "./i18n";
+import { getLanguage, t, tf } from "./i18n";
 import { providerPoolSections, reorderProviderSlots } from "./provider-pool-layout";
 import { ProviderBalancePoolBadge, RelayBillingPoolBadge, RelayBillingPoolLabel, RelayBillingRetry, useProviderBalance, useRelayBillingProbe } from "./RelayBillingLine";
 import { relayBillingGatewayCacheKey, type RelayBillingProbe } from "./relay-billing";
@@ -78,7 +78,7 @@ import { gatewayJump } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
 import { singleAgent, visibleAgents } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
-import { AccountQuotaDetails, ProviderQuotaTimeline } from "./ProviderQuotaPanel";
+import { AccountQuotaDetails } from "./ProviderQuotaPanel";
 
 /** 能在网关里直接登录的订阅。 */
 type AccountKind = "chatgpt" | "chatgpt-api" | "copilot" | "grok" | `sub:${string}`;
@@ -122,52 +122,89 @@ const MODEL_CHIP_COLLAPSE = 8;
 /** 重置卡的时间只到分钟；缺失时间由调用方分别标注。 */
 function creditTime(value: number | null | undefined, missing: string): string {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return missing;
-  return new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+  return new Date(value).toLocaleString(getLanguage() === "en" ? "en-US" : "zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-/**
- * ChatGPT 账号的「额度重置卡」，信息口径对齐 CLIProxyAPI 配额页：剩几张、每张什么时候到手、
- * 什么时候过期，按用户确认用掉一张。
- *
- * 未确认的标识由页面存储及后端账号记录共同保留，切页或重启后仍复用同一次操作。
- */
+async function readResetCardOperation(id: string): Promise<ResetCardOperation> {
+  const result = await invoke<{ status: string; resetOperation?: unknown }>("preview_gateway_reset_operation", { id });
+  const operation = parseResetCardOperation(result.resetOperation);
+  if (result.status !== "ok" || !operation) throw new Error("Unable to read the current reset-card operation");
+  return operation;
+}
+
+/** 账号级后端记录是唯一操作状态；页面关闭或供应商别名切换均不改变它。 */
 function ResetCreditsRow({ entry, busy, run }: { entry: GatewayPoolEntry; busy: string | null; run: Run }) {
   const cards = entry.resetCredits ?? null;
   const usable = usableResetCardCount(entry);
   const soonest = soonestResetCardExpiry(entry);
-  const [requestId, setRequestId] = useState<string | null>(null);
+  const [operation, setOperation] = useState<ResetCardOperation | null>(null);
   const [operationError, setOperationError] = useState("");
+  const [working, setWorking] = useState(false);
+  const [operationRefresh, setOperationRefresh] = useState(0);
   const consuming = useRef(false);
   const [, tick] = useState(0);
   useEffect(() => {
-    try { setRequestId(pendingResetCardOperation(localStorage, entry.id)); setOperationError(""); }
-    catch { setOperationError(t("无法读取上次重置操作，请先核实结果")); }
-    const timer = setInterval(() => tick((value) => value + 1), 1000);
+    const timer = setInterval(() => tick((value) => value + 1), 30_000);
     return () => clearInterval(timer);
   }, [entry.id]);
+  useEffect(() => {
+    if (working) return;
+    let live = true;
+    void readResetCardOperation(entry.id).then((current) => {
+      if (live) setOperation(current);
+    }).catch(() => {
+      if (live) {
+        setOperation(null);
+        setOperationError(t("无法读取上次重置操作，请先核实结果"));
+      }
+    });
+    return () => { live = false; };
+  }, [entry.id, operationRefresh, working]);
   const asking = useRef(false);
   // 展开详情、还没有读数或读数超过两分钟才真的打上游：这一步只读，不消耗卡。
   useEffect(() => {
     if (!entry.enabled || asking.current) return;
     if (cards && Date.now() - cards.observedAtMs < 120_000) return;
     asking.current = true;
-    void run(`cards:${entry.id}`, "refresh_gateway_reset_credits", { id: entry.id }, t("刷新重置卡"), true)
+    void run(`cards:${entry.id}`, "refresh_gateway_reset_credits", { id: entry.id }, t("刷新重置卡"), true, { background: true, quiet: true })
       .finally(() => { asking.current = false; });
   }, [entry.id, entry.enabled, cards?.observedAtMs]);
-  const consume = async () => {
+  const act = async (action: "consume" | "abandon") => {
     if (consuming.current) return;
     consuming.current = true;
+    setWorking(true);
+    setOperationError("");
     try {
-      const ok = await appConfirm(t("将消耗 1 张重置卡，请确认后重置账号额度。未确认的上次操作会优先核实。"), { title: t("重置 Codex 配额"), confirmText: t("确认重置"), danger: true });
+      const current = await readResetCardOperation(entry.id);
+      setOperation(current);
+      const mode = resetCardAction(operation, current, action);
+      if (!mode) {
+        setOperationError(t("无法读取上次重置操作，请先核实结果"));
+        return;
+      }
+      const ok = mode === "abandon"
+        ? await appConfirm(t("放弃后，上次未确认的重置操作不再重试，下次使用会发起新的请求。若上次其实已经生效，可能会再扣一张重置卡。建议先刷新额度确认上次是否已重置。"), { title: t("放弃上次重置操作"), confirmText: t("放弃并重新开始"), danger: true })
+        : mode === "retry"
+          ? await appConfirm(t("上次结果未确认：再点一次会用同一请求标识重试"), { title: t("核实上次重置操作"), confirmText: t("核实上次操作"), danger: true })
+          : await appConfirm(t("将消耗 1 张重置卡，请确认后重置账号额度。未确认的上次操作会优先核实。"), { title: t("重置 Codex 配额"), confirmText: t("确认重置"), danger: true });
       if (!ok) return;
-      const id = beginResetCardOperation(localStorage, entry.id, () => crypto.randomUUID());
-      setRequestId(id);
-      const done = await run(`consume:${entry.id}`, "consume_gateway_reset_card", { id: entry.id, requestId: id }, t("使用重置卡"), true);
-      if (done) { finishResetCardOperation(localStorage, entry.id, id); setRequestId(null); }
-      setOperationError("");
-    } catch { setOperationError(t("重置操作未确认，请保留原操作并稍后重试")); }
-    finally { consuming.current = false; }
+      const args = { id: entry.id, confirmation: current.confirmation };
+      setOperation(null);
+      if (mode === "abandon") {
+        await run(`consume:${entry.id}`, "abandon_gateway_reset_operation", args, t("放弃上次重置操作"));
+      } else {
+        await run(`consume:${entry.id}`, "consume_gateway_reset_card", args, t(mode === "retry" ? "核实上次操作" : "使用重置卡"));
+      }
+    } catch {
+      setOperation(null);
+      setOperationError(t("无法读取上次重置操作，请先核实结果"));
+    } finally {
+      consuming.current = false;
+      setWorking(false);
+    }
   };
+  const pending = operation?.status === "pending";
+  const damaged = operation?.status === "damaged";
   const listed = (cards?.credits ?? []).filter((card) => resetCardUsable(card)).sort((a, b) => (a.expiresAtMs ?? Infinity) - (b.expiresAtMs ?? Infinity));
   return (
     <div className="gw-detail-row gw-reset-row">
@@ -195,14 +232,18 @@ function ResetCreditsRow({ entry, busy, run }: { entry: GatewayPoolEntry; busy: 
             )}
           </>
         )}
-        {requestId ? <span className="gw-reset-pending">{t("上次结果未确认：再点一次会用同一请求标识重试")}</span> : null}
+        {pending ? <span className="gw-reset-pending">{t("上次结果未确认：再点一次会用同一请求标识重试")}</span> : null}
+        {damaged ? <span className="gw-reset-pending">{t("无法读取上次重置操作，请先核实结果")}</span> : null}
         {operationError ? <span role="alert" className="gw-reset-pending">{operationError}</span> : null}
       </div>
       <span className="gw-detail-actions">
         <button
           className="gw-text-button gw-sync-button"
-          disabled={busy !== null}
-          onClick={() => void run(`cards:${entry.id}`, "refresh_gateway_reset_credits", { id: entry.id }, t("刷新重置卡"), true)}
+          disabled={busy !== null || working}
+          onClick={() => void run(`cards:${entry.id}`, "refresh_gateway_reset_credits", { id: entry.id }, t("刷新重置卡"), true).finally(() => {
+            setOperationError("");
+            setOperationRefresh((value) => value + 1);
+          })}
           type="button"
         >
           <RefreshCw className={busy === `cards:${entry.id}` ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
@@ -210,13 +251,24 @@ function ResetCreditsRow({ entry, busy, run }: { entry: GatewayPoolEntry; busy: 
         </button>
         <button
           className="gw-text-button"
-          disabled={busy !== null || (!usable && !requestId)}
-          onClick={() => void consume()}
-          title={requestId ? t("核实上次重置操作") : usable ? t("消耗一张重置卡，重置账号额度") : t("没有可用的重置卡")}
+          disabled={busy !== null || working || !operation || damaged || (!usable && !pending)}
+          onClick={() => void act("consume")}
+          title={pending ? t("核实上次重置操作") : usable ? t("消耗一张重置卡，重置账号额度") : t("没有可用的重置卡")}
           type="button"
         >
-          {requestId ? t("核实上次操作") : t("重置额度")}
+          {pending ? t("核实上次操作") : t("重置额度")}
         </button>
+        {pending || damaged ? (
+          <button
+            className="gw-text-button"
+            disabled={busy !== null || working}
+            onClick={() => void act("abandon")}
+            title={t("放弃上次未确认的重置操作，下次使用发起新的请求")}
+            type="button"
+          >
+            {t("放弃并重新开始")}
+          </button>
+        ) : null}
       </span>
     </div>
   );
@@ -387,7 +439,6 @@ export function ProvidersView({
           ) : null}
         </div>
       ) : null}
-      <ProviderQuotaTimeline entries={visible.filter(entry => entry.account === "chatgpt")} />
       {localLogins.length && localDismissed !== localKey ? (
         <LocalLoginsCard busy={busy !== null} found={localLogins} onDismiss={() => setLocalDismissed(localKey)} onImport={importLocal} pending={loginPending} />
       ) : null}
@@ -1012,7 +1063,7 @@ function PoolRow({
             <div className="gw-detail-row gw-quota-detail-row">
               <span className="gw-detail-label">{t("额度")}</span>
               <div className="gw-detail-value gw-chip-row">
-                {entry.account === "chatgpt" ? <AccountQuotaDetails entry={entry} /> : entry.quota ? <QuotaWindows maxAgeSeconds={entry.subscriptionPolicy?.maxAgeSeconds} quota={entry.quota} /> : <span className="gw-muted">{entry.account ? t("尚未取得官方用量") : t("尚未取得套餐用量")}</span>}
+                <AccountQuotaDetails entry={entry} />
               </div>
               <span className="gw-detail-actions">
                 <button

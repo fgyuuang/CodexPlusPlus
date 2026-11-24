@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use fs2::FileExt;
@@ -82,13 +82,22 @@ impl ResetCreditsView {
 }
 
 /// 消费的结果。`Unknown` 必须按「可能已扣、也可能没扣」处理：让用户保留同一请求标识，
-/// 不要另建一次操作。
+/// 不要另建一次操作。其余都是确定结果，未确认操作随之结束。
+///
+/// code 与官方 codex `ConsumeRateLimitResetCreditCode` 一致：
+/// `reset` / `nothing_to_reset` / `no_credit` / `already_redeemed`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumeOutcome {
     /// 这次真的重置了。
     Reset,
     /// 同一请求标识之前已经重置过，这次没有重复扣。
     AlreadyRedeemed,
+    /// 账号没有可用的重置卡，没有扣卡。
+    NoCredit,
+    /// 当前额度不需要重置，没有扣卡。
+    NothingToReset,
+    /// 服务端明确拒绝（4xx，认证失败与 409 除外），没有扣卡；带 HTTP 状态码。
+    Rejected(u16),
     /// 服务端返回了别的 code：不能断言成功，也不能断言失败。
     Unknown,
 }
@@ -98,8 +107,21 @@ impl ConsumeOutcome {
         match self {
             Self::Reset => "reset",
             Self::AlreadyRedeemed => "alreadyRedeemed",
+            Self::NoCredit => "noCredit",
+            Self::NothingToReset => "nothingToReset",
+            Self::Rejected(_) => "rejected",
             Self::Unknown => "unknown",
         }
+    }
+
+    /// 确定结果：这次操作已经结束，不必（也不应）再用同一标识重试。
+    pub fn settled(self) -> bool {
+        self != Self::Unknown
+    }
+
+    /// 卡确实用在了这次操作上（本次或此前同一标识）。
+    pub fn redeemed(self) -> bool {
+        matches!(self, Self::Reset | Self::AlreadyRedeemed)
     }
 }
 
@@ -135,6 +157,145 @@ pub fn cached(relay_id: &str) -> Option<ResetCreditsView> {
 struct RedemptionJournal {
     pending: Option<String>,
     completed: Vec<String>,
+    /// 已结束、被放弃的标识，或损坏记录修复时生成的本地版本标识。
+    #[serde(default)]
+    settled: Vec<String>,
+}
+
+/// 每份记录最多留多少个已结束的标识。
+const JOURNAL_HISTORY: usize = 64;
+
+impl RedemptionJournal {
+    fn valid(&self) -> bool {
+        self.pending.as_deref().is_none_or(valid_request_id)
+            && self.completed.len() <= JOURNAL_HISTORY
+            && self.completed.iter().all(|id| valid_request_id(id))
+            && self.settled.len() <= JOURNAL_HISTORY
+            && self.settled.iter().all(|id| valid_request_id(id))
+    }
+}
+
+fn remember(list: &mut Vec<String>, id: &str) {
+    if !list.iter().any(|value| value == id) {
+        list.push(id.to_owned());
+    }
+    if list.len() > JOURNAL_HISTORY {
+        list.drain(..list.len() - JOURNAL_HISTORY);
+    }
+}
+
+/// 拿到账号的独占锁，返回锁、记录路径和读记录文件的原始结果（解析由调用方决定）。
+fn lock_journal(
+    root: &Path,
+    account_id: &str,
+) -> anyhow::Result<(File, PathBuf, std::io::Result<Vec<u8>>)> {
+    anyhow::ensure!(
+        !account_id.trim().is_empty(),
+        "缺少官方账号标识，未发送重置请求"
+    );
+    fs::create_dir_all(root)?;
+    let name = format!("{:x}", Sha256::digest(account_id.as_bytes()));
+    let path = root.join(format!("{name}.json"));
+    // 锁稳定的独立文件；不等待另一个联网请求，避免阻塞异步运行时。
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(format!("{name}.lock")))?;
+    FileExt::try_lock_exclusive(&file).context("该账号已有重置操作正在处理，请稍后重试")?;
+    let bytes = fs::read(&path);
+    Ok((file, path, bytes))
+}
+
+fn save_journal(path: &Path, journal: &RedemptionJournal) -> anyhow::Result<()> {
+    crate::settings::atomic_write(path, &serde_json::to_vec(journal)?)
+        .context("无法保存重置操作记录，未确认本次结果")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OperationStatus {
+    Ready,
+    Pending,
+    Damaged,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationPreview {
+    pub status: OperationStatus,
+    pub confirmation: String,
+}
+
+/// 预览的标识不暴露账号或请求 ID。执行时持同一把账号锁重新比较，旧确认不能应用于新记录。
+fn read_operation(
+    account_id: &str,
+    bytes: std::io::Result<Vec<u8>>,
+) -> anyhow::Result<(OperationPreview, Option<RedemptionJournal>)> {
+    let mut digest = Sha256::new();
+    digest.update(Sha256::digest(account_id.as_bytes()));
+    let journal = match bytes {
+        Ok(bytes) => {
+            digest.update([1]);
+            digest.update(&bytes);
+            serde_json::from_slice::<RedemptionJournal>(&bytes)
+                .ok()
+                .filter(RedemptionJournal::valid)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            digest.update([0]);
+            Some(RedemptionJournal::default())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let status = match &journal {
+        Some(journal) if journal.pending.is_some() => OperationStatus::Pending,
+        Some(_) => OperationStatus::Ready,
+        None => OperationStatus::Damaged,
+    };
+    Ok((
+        OperationPreview {
+            status,
+            confirmation: format!("{:x}", digest.finalize()),
+        },
+        journal,
+    ))
+}
+
+fn require_confirmation(preview: &OperationPreview, confirmation: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        preview.confirmation == confirmation,
+        "重置操作已变化，未执行；请核实当前状态后重新确认"
+    );
+    Ok(())
+}
+
+fn preview_in(root: &Path, account_id: &str) -> anyhow::Result<OperationPreview> {
+    let (_lock, _, bytes) = lock_journal(root, account_id)?;
+    Ok(read_operation(account_id, bytes)?.0)
+}
+
+fn abandon_in(root: &Path, account_id: &str, confirmation: &str) -> anyhow::Result<()> {
+    let (_lock, path, bytes) = lock_journal(root, account_id)?;
+    let (preview, journal) = read_operation(account_id, bytes)?;
+    require_confirmation(&preview, confirmation)?;
+    anyhow::ensure!(
+        preview.status != OperationStatus::Ready,
+        "没有未确认的重置操作"
+    );
+    let mut journal = journal.unwrap_or_else(|| {
+        // 两次修复不能回到同一份空记录，否则更早的确认可能再次生效。
+        let mut repaired = RedemptionJournal::default();
+        repaired.settled.push(new_request_id());
+        repaired
+    });
+    if let Some(pending) = journal.pending.take() {
+        remember(&mut journal.settled, &pending);
+    }
+    save_journal(&path, &journal)?;
+    forget_reset_start(&path);
+    Ok(())
 }
 
 struct Redemption {
@@ -142,55 +303,25 @@ struct Redemption {
     path: PathBuf,
     journal: RedemptionJournal,
     request_id: String,
-    caller_id: String,
-    completed: bool,
+    fresh: bool,
 }
 
 impl Redemption {
-    fn open(root: &Path, account_id: &str, caller_id: &str) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            !account_id.trim().is_empty(),
-            "缺少官方账号标识，未发送重置请求"
-        );
-        anyhow::ensure!(valid_request_id(caller_id), "重置请求标识无效");
-        fs::create_dir_all(root)?;
-        let name = format!("{:x}", Sha256::digest(account_id.as_bytes()));
-        let path = root.join(format!("{name}.json"));
-        // 锁稳定的独立文件；不等待另一个联网请求，避免阻塞异步运行时。
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join(format!("{name}.lock")))?;
-        FileExt::try_lock_exclusive(&file).context("该账号已有重置操作正在处理，请稍后重试")?;
-        let journal: RedemptionJournal = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("重置操作记录损坏，未发送请求")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                RedemptionJournal::default()
-            }
-            Err(error) => return Err(error.into()),
-        };
-        anyhow::ensure!(
-            journal.pending.as_deref().is_none_or(valid_request_id)
-                && journal.completed.len() <= 64
-                && journal.completed.iter().all(|id| valid_request_id(id)),
-            "重置操作记录无效，未发送请求"
-        );
-        let completed = journal.completed.iter().any(|id| id == caller_id);
-        let request_id = journal
-            .pending
-            .clone()
-            .unwrap_or_else(|| caller_id.to_string());
+    fn open(root: &Path, account_id: &str, confirmation: &str) -> anyhow::Result<Self> {
+        let (file, path, bytes) = lock_journal(root, account_id)?;
+        let (preview, journal) = read_operation(account_id, bytes)?;
+        require_confirmation(&preview, confirmation)?;
+        let journal = journal.context("重置操作记录损坏，未发送请求")?;
+        let fresh = journal.pending.is_none();
+        let request_id = journal.pending.clone().unwrap_or_else(new_request_id);
         let mut operation = Self {
             _lock: file,
             path,
             journal,
             request_id,
-            caller_id: caller_id.to_string(),
-            completed,
+            fresh,
         };
-        if !completed {
+        if fresh {
             operation.journal.pending = Some(operation.request_id.clone());
             operation.save()?; // 持久成功后才允许 POST；重启/切页后复用未确认操作。
         }
@@ -198,27 +329,81 @@ impl Redemption {
     }
 
     fn save(&self) -> anyhow::Result<()> {
-        crate::settings::atomic_write(&self.path, &serde_json::to_vec(&self.journal)?)
-            .context("无法保存重置操作记录，未确认本次结果")
+        save_journal(&self.path, &self.journal)
     }
 
+    /// 记下确定结果并结束未确认操作；`Unknown` 保留同一标识等下次重试。
     fn finish(&mut self, outcome: ConsumeOutcome) -> anyhow::Result<()> {
-        if outcome == ConsumeOutcome::Unknown {
+        if !outcome.settled() {
             return Ok(());
         }
-        for id in [&self.request_id, &self.caller_id] {
-            if !self.journal.completed.contains(id) {
-                self.journal.completed.push(id.clone());
-            }
-        }
-        if self.journal.completed.len() > 64 {
-            self.journal
-                .completed
-                .drain(..self.journal.completed.len() - 64);
+        if outcome.redeemed() {
+            remember(&mut self.journal.completed, &self.request_id);
+        } else {
+            remember(&mut self.journal.settled, &self.request_id);
         }
         self.journal.pending = None;
         self.save()
     }
+}
+
+struct ResetStart {
+    request_id: String,
+    relay_id: String,
+    started_at: Instant,
+}
+
+// 额度冷却也只存在于进程内，重启后不猜测旧操作对应哪个冷却。
+static RESET_STARTS: LazyLock<Mutex<HashMap<PathBuf, ResetStart>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn forget_reset_start(path: &Path) -> Option<ResetStart> {
+    RESET_STARTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
+}
+
+fn record_reset_start(operation: &Redemption, relay_id: &str, started_at: Instant) {
+    if !operation.fresh {
+        return;
+    }
+    let mut starts = RESET_STARTS.lock().unwrap_or_else(|e| e.into_inner());
+    if starts.len() >= 256
+        && let Some(oldest) = starts
+            .iter()
+            .min_by_key(|(_, value)| value.started_at)
+            .map(|(path, _)| path.clone())
+    {
+        starts.remove(&oldest);
+    }
+    starts.insert(
+        operation.path.clone(),
+        ResetStart {
+            request_id: operation.request_id.clone(),
+            relay_id: relay_id.to_owned(),
+            started_at,
+        },
+    );
+}
+
+fn finish_reset(operation: &mut Redemption, outcome: ConsumeOutcome) -> anyhow::Result<()> {
+    if !operation.fresh
+        && let ConsumeOutcome::Rejected(status) = outcome
+    {
+        anyhow::bail!("核实请求被拒绝（HTTP {status}），上次重置结果仍未知；请稍后重试");
+    }
+    if !outcome.settled() {
+        return Ok(());
+    }
+    operation.finish(outcome)?;
+    if let Some(start) = forget_reset_start(&operation.path)
+        && start.request_id == operation.request_id
+        && outcome.redeemed()
+    {
+        super::key_pool::clear_official_quota_cooldown(&start.relay_id, start.started_at);
+    }
+    Ok(())
 }
 
 pub fn record(relay_id: &str, view: ResetCreditsView) {
@@ -365,37 +550,26 @@ pub fn valid_request_id(value: &str) -> bool {
         && !trimmed.chars().any(|ch| ch.is_control())
 }
 
+fn operations_dir() -> PathBuf {
+    crate::paths::default_app_state_dir().join("reset-credit-operations")
+}
+
 /// 用掉一张重置卡。
 ///
-/// `request_id` 由调用方生成并保存：网络中断时用同一个标识重试，
-/// 服务端据此判断是否已经处理过（返回 `already_redeemed`），不会再扣一张。
-pub async fn consume(relay: &RelayProfile, request_id: &str) -> anyhow::Result<ConsumeOutcome> {
-    if !valid_request_id(request_id) {
-        anyhow::bail!("重置请求标识无效");
-    }
+/// 确认绑定到已预览的账号记录。网络中断后，只能重试已保存的同一标识。
+pub async fn consume(relay: &RelayProfile, confirmation: &str) -> anyhow::Result<ConsumeOutcome> {
     if !supported(relay) {
         anyhow::bail!("只有 ChatGPT 订阅账号能使用重置卡");
     }
     let credential = crate::official_login::resolve_official_credential_for_quota(relay).await?;
-    let mut operation = Redemption::open(
-        &crate::paths::default_app_state_dir().join("reset-credit-operations"),
-        &credential.account_id,
-        request_id,
-    )?;
-    if operation.completed {
-        return Ok(ConsumeOutcome::AlreadyRedeemed);
-    }
+    let client = client_for(relay)?;
+    let mut operation = Redemption::open(&operations_dir(), &credential.account_id, confirmation)?;
     let url = format!("{CHATGPT_RESET_CREDITS_URL}{CHATGPT_RESET_CONSUME_SUFFIX}");
-    let outcome = send_redemption(
-        &client_for(relay)?,
-        &url,
-        &credential,
-        &operation.request_id,
-    )
-    .await?;
-    // 结果不确定也清缓存：下次读到的才是服务端的真实状态。
+    record_reset_start(&operation, &relay.id, Instant::now());
+    let outcome = send_redemption(&client, &url, &credential, &operation.request_id).await?;
+    // 收到服务端响应后清缓存：下次读到的才是服务端的真实状态。
     forget(&relay.id);
-    operation.finish(outcome)?;
+    finish_reset(&mut operation, outcome)?;
     Ok(outcome)
 }
 
@@ -413,21 +587,59 @@ async fn send_redemption(
     if !credential.account_id.is_empty() {
         request = request.header("chatgpt-account-id", credential.account_id.as_str());
     }
-    let response = request.send().await?;
-    let status = response.status();
-    if status.as_u16() == 401 || status.as_u16() == 403 {
+    // 超时、连接断开：请求可能已到服务端，结果未知，保留同一标识重试。
+    let response = request.send().await.map_err(|error| {
+        let reason = if error.is_timeout() {
+            "请求超时"
+        } else if error.is_connect() {
+            "连接失败"
+        } else {
+            "网络中断"
+        };
+        anyhow::anyhow!("{reason}，重置结果未知，请稍后用同一操作重试：{error}")
+    })?;
+    let status = response.status().as_u16();
+    if status == 401 || status == 403 {
         anyhow::bail!("登录凭据无效，请恢复登录后重试同一操作");
     }
-    if !status.is_success() {
-        anyhow::bail!("使用重置卡失败：HTTP {}", status.as_u16());
+    if !(200..300).contains(&status) {
+        // 其余 4xx 是服务端明确拒绝、没有处理这次请求；409 可能是同一标识正在处理，
+        // 和 5xx、其它异常状态一样按结果未知保留。
+        if (400..500).contains(&status) && status != 409 {
+            return Ok(ConsumeOutcome::Rejected(status));
+        }
+        anyhow::bail!("服务端返回 HTTP {status}，重置结果未知，请稍后用同一操作重试");
     }
     let body: Value = response.json().await.unwrap_or(Value::Null);
-    let outcome = match body.get("code").and_then(Value::as_str) {
+    Ok(outcome_of_code(body.get("code").and_then(Value::as_str)))
+}
+
+/// 官方 `ConsumeRateLimitResetCreditCode` 的四种 code；认不出的按结果未知处理。
+fn outcome_of_code(code: Option<&str>) -> ConsumeOutcome {
+    match code {
         Some("reset") => ConsumeOutcome::Reset,
         Some("already_redeemed") => ConsumeOutcome::AlreadyRedeemed,
+        Some("no_credit") => ConsumeOutcome::NoCredit,
+        Some("nothing_to_reset") => ConsumeOutcome::NothingToReset,
         _ => ConsumeOutcome::Unknown,
-    };
-    Ok(outcome)
+    }
+}
+
+pub async fn preview_operation(relay: &RelayProfile) -> anyhow::Result<OperationPreview> {
+    if !supported(relay) {
+        anyhow::bail!("只有 ChatGPT 订阅账号能使用重置卡");
+    }
+    let credential = crate::official_login::resolve_official_credential_for_quota(relay).await?;
+    preview_in(&operations_dir(), &credential.account_id)
+}
+
+/// 仅放弃已确认的那笔操作，或修复已确认的那份损坏记录。
+pub async fn abandon_pending(relay: &RelayProfile, confirmation: &str) -> anyhow::Result<()> {
+    if !supported(relay) {
+        anyhow::bail!("只有 ChatGPT 订阅账号能使用重置卡");
+    }
+    let credential = crate::official_login::resolve_official_credential_for_quota(relay).await?;
+    abandon_in(&operations_dir(), &credential.account_id, confirmation)
 }
 
 /// 生成一个可以重放的请求标识（UUID v4）。
@@ -515,57 +727,76 @@ mod tests {
         assert_eq!(view.usable_count_at(2000), Some(0));
     }
 
+    fn current(root: &Path, account_id: &str) -> OperationPreview {
+        preview_in(root, account_id).unwrap()
+    }
+
+    fn open_current(root: &Path, account_id: &str) -> Redemption {
+        Redemption::open(root, account_id, &current(root, account_id).confirmation).unwrap()
+    }
+
     #[test]
-    fn pending_redemption_survives_restart_and_a_new_caller_id() {
+    fn ready_confirmation_cannot_retry_and_pending_confirmation_cannot_start() {
         let root = tempfile::tempdir().unwrap();
-        let first = Redemption::open(root.path(), "account-a", "first-request").unwrap();
-        assert_eq!(first.request_id, "first-request");
+        let root = root.path();
+        let ready = current(root, "account-a");
+        assert_eq!(ready.status, OperationStatus::Ready);
+        let first = Redemption::open(root, "account-a", &ready.confirmation).unwrap();
+        let first_id = first.request_id.clone();
         drop(first);
-        let mut retry = Redemption::open(root.path(), "account-a", "new-page-request").unwrap();
-        assert_eq!(retry.request_id, "first-request");
-        retry.finish(ConsumeOutcome::Unknown).unwrap();
+        assert!(Redemption::open(root, "account-a", &ready.confirmation).is_err());
+        let pending = current(root, "account-a");
+        assert_eq!(pending.status, OperationStatus::Pending);
+        let mut retry = Redemption::open(root, "account-a", &pending.confirmation).unwrap();
+        assert!(!retry.fresh);
+        assert_eq!(retry.request_id, first_id);
+        retry.finish(ConsumeOutcome::Reset).unwrap();
         drop(retry);
-        let mut confirmed = Redemption::open(root.path(), "account-a", "after-restart").unwrap();
-        assert_eq!(confirmed.request_id, "first-request");
-        confirmed.finish(ConsumeOutcome::Reset).unwrap();
-        drop(confirmed);
-        let replay = Redemption::open(root.path(), "account-a", "after-restart").unwrap();
-        assert!(replay.completed);
-        drop(replay);
-        let next = Redemption::open(root.path(), "account-a", "next-operation").unwrap();
-        assert!(!next.completed);
-        assert_eq!(next.request_id, "next-operation");
+        assert!(Redemption::open(root, "account-a", &pending.confirmation).is_err());
+        assert!(Redemption::open(root, "account-a", &ready.confirmation).is_err());
+        let next = open_current(root, "account-a");
+        assert!(next.fresh);
+        assert_ne!(next.request_id, first_id);
     }
 
     #[test]
     fn redemptions_serialize_per_account_and_isolate_accounts() {
         let root = tempfile::tempdir().unwrap();
-        let first = Redemption::open(root.path(), "account-a", "one").unwrap();
-        assert!(Redemption::open(root.path(), "account-a", "two").is_err());
-        let other = Redemption::open(root.path(), "account-b", "two").unwrap();
-        assert_eq!(other.request_id, "two");
+        let root = root.path();
+        let a = current(root, "account-a").confirmation;
+        let b = current(root, "account-b").confirmation;
+        assert_ne!(a, b);
+        assert!(Redemption::open(root, "account-a", &b).is_err());
+        let first = Redemption::open(root, "account-a", &a).unwrap();
+        assert!(preview_in(root, "account-a").is_err());
+        assert!(Redemption::open(root, "account-a", &a).is_err());
+        let other = Redemption::open(root, "account-b", &b).unwrap();
+        assert_ne!(first.request_id, other.request_id);
         drop(first);
     }
 
     #[test]
     fn corrupt_redemption_journal_does_not_silently_start_a_new_operation() {
         let root = tempfile::tempdir().unwrap();
-        let first = Redemption::open(root.path(), "account-a", "one").unwrap();
+        let first = open_current(root.path(), "account-a");
         let path = first.path.clone();
         drop(first);
         fs::write(path, b"broken").unwrap();
-        assert!(Redemption::open(root.path(), "account-a", "two").is_err());
-        assert!(Redemption::open(root.path(), "", "two").is_err());
+        let preview = current(root.path(), "account-a");
+        assert_eq!(preview.status, OperationStatus::Damaged);
+        assert!(Redemption::open(root.path(), "account-a", &preview.confirmation).is_err());
+        assert!(preview_in(root.path(), "").is_err());
     }
 
-    #[tokio::test]
-    async fn unknown_http_outcome_reuses_the_saved_id_on_retry() {
+    /// 测试用的一次性服务端：每个连接读完一个请求，记下 `redeem_request_id`，按顺序回应。
+    /// `None` 表示读完请求后直接断开连接，不给响应。
+    fn serve(replies: Vec<Option<(u16, Value)>>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/consume", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut ids = Vec::new();
-            for code in ["unrecognized_outcome", "already_redeemed"] {
+            for reply in replies {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -593,46 +824,289 @@ mod tests {
                         }
                     }
                 }
-                let body = serde_json::json!({ "code": code }).to_string();
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                let Some((status, body)) = reply else {
+                    drop(stream);
+                    continue;
+                };
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             }
             ids
         });
-        let root = tempfile::tempdir().unwrap();
-        let client = reqwest::Client::builder()
+        (url, server)
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()
-            .unwrap();
-        let credential = crate::official_login::OfficialCredential {
+            .unwrap()
+    }
+
+    fn test_credential() -> crate::official_login::OfficialCredential {
+        crate::official_login::OfficialCredential {
             account_scope: None,
             access_token: "test-only".into(),
             account_id: "test-account".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_http_outcome_reuses_the_saved_id_on_retry() {
+        use super::super::key_pool::{self, FailureClass, KeyRef, OFFICIAL_KEY_ID};
+
+        let (url, server) = serve(vec![
+            None,
+            Some((429, json!({ "error": "slow down" }))),
+            Some((200, json!({ "code": "already_redeemed" }))),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let client = test_client();
+        let credential = test_credential();
+        let official = |relay_id: &str| KeyRef {
+            relay_id: relay_id.into(),
+            key_id: OFFICIAL_KEY_ID.into(),
+            fingerprint: 0,
         };
-        let mut first =
-            Redemption::open(root.path(), &credential.account_id, "original-request").unwrap();
-        let outcome = send_redemption(&client, &url, &credential, &first.request_id)
+        let original = official("reset-operation-original");
+        let alias = official("reset-operation-alias");
+        let now = Instant::now();
+        let exhausted = FailureClass::QuotaExhausted { reset_after: None };
+        key_pool::record_failure(&original, &exhausted, now);
+        key_pool::record_failure(&alias, &exhausted, now);
+        let first = open_current(root.path(), &credential.account_id);
+        let request_id = first.request_id.clone();
+        record_reset_start(&first, &original.relay_id, now);
+        assert!(
+            send_redemption(&client, &url, &credential, &request_id)
+                .await
+                .is_err()
+        );
+        drop(first);
+        assert!(key_pool::cooling_remaining(&original, now).is_some());
+        let pending = current(root.path(), &credential.account_id);
+        let mut limited =
+            Redemption::open(root.path(), &credential.account_id, &pending.confirmation).unwrap();
+        let outcome = send_redemption(&client, &url, &credential, &limited.request_id)
             .await
             .unwrap();
-        assert_eq!(outcome, ConsumeOutcome::Unknown);
-        first.finish(outcome).unwrap();
-        drop(first);
+        assert_eq!(outcome, ConsumeOutcome::Rejected(429));
+        assert!(finish_reset(&mut limited, outcome).is_err());
+        drop(limited);
+        assert!(key_pool::cooling_remaining(&original, now).is_some());
         let mut retry =
-            Redemption::open(root.path(), &credential.account_id, "new-page-request").unwrap();
+            Redemption::open(root.path(), &credential.account_id, &pending.confirmation).unwrap();
+        record_reset_start(&retry, &alias.relay_id, now + Duration::from_secs(1));
         let outcome = send_redemption(&client, &url, &credential, &retry.request_id)
             .await
             .unwrap();
         assert_eq!(outcome, ConsumeOutcome::AlreadyRedeemed);
-        retry.finish(outcome).unwrap();
+        finish_reset(&mut retry, outcome).unwrap();
         drop(retry);
+        assert!(key_pool::cooling_remaining(&original, now).is_none());
+        assert!(key_pool::cooling_remaining(&alias, now).is_some());
         assert!(
-            Redemption::open(root.path(), &credential.account_id, "new-page-request")
-                .unwrap()
-                .completed
+            Redemption::open(root.path(), &credential.account_id, &pending.confirmation).is_err()
         );
+        assert_eq!(server.join().unwrap(), vec![request_id; 3]);
+        key_pool::reset(&alias.relay_id);
+    }
+
+    #[test]
+    fn retry_cannot_clear_a_newer_cooldown_or_one_without_an_original_start() {
+        use super::super::key_pool::{self, FailureClass, KeyRef, OFFICIAL_KEY_ID};
+
+        let root = tempfile::tempdir().unwrap();
+        for has_start in [true, false] {
+            let account = if has_start { "present" } else { "missing" };
+            let key = KeyRef {
+                relay_id: format!("reset-operation-start-{account}"),
+                key_id: OFFICIAL_KEY_ID.into(),
+                fingerprint: 0,
+            };
+            let started_at = Instant::now();
+            let first = open_current(root.path(), account);
+            if has_start {
+                record_reset_start(&first, &key.relay_id, started_at);
+            }
+            drop(first);
+            let later = started_at + Duration::from_secs(1);
+            key_pool::record_failure(
+                &key,
+                &FailureClass::QuotaExhausted { reset_after: None },
+                later,
+            );
+            let mut retry = open_current(root.path(), account);
+            record_reset_start(&retry, &key.relay_id, later);
+            finish_reset(&mut retry, ConsumeOutcome::AlreadyRedeemed).unwrap();
+            assert!(key_pool::cooling_remaining(&key, later).is_some());
+            key_pool::reset(&key.relay_id);
+        }
+    }
+
+    #[test]
+    fn official_consume_codes_are_all_recognized() {
+        assert_eq!(outcome_of_code(Some("reset")), ConsumeOutcome::Reset);
         assert_eq!(
-            server.join().unwrap(),
-            ["original-request", "original-request"]
+            outcome_of_code(Some("already_redeemed")),
+            ConsumeOutcome::AlreadyRedeemed
         );
+        assert_eq!(outcome_of_code(Some("no_credit")), ConsumeOutcome::NoCredit);
+        assert_eq!(
+            outcome_of_code(Some("nothing_to_reset")),
+            ConsumeOutcome::NothingToReset
+        );
+        assert_eq!(outcome_of_code(Some("other")), ConsumeOutcome::Unknown);
+        assert_eq!(outcome_of_code(None), ConsumeOutcome::Unknown);
+    }
+
+    /// 没扣卡的确定结果（无卡、无需重置、4xx 拒绝）清掉未确认操作，且旧标识不再发出去。
+    #[tokio::test]
+    async fn settled_outcomes_without_redemption_clear_pending() {
+        let (url, server) = serve(vec![
+            Some((200, json!({ "code": "no_credit" }))),
+            Some((200, json!({ "code": "nothing_to_reset" }))),
+            Some((400, json!({ "error": "bad request" }))),
+            Some((429, json!({ "error": "slow down" }))),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let client = test_client();
+        let credential = test_credential();
+        let mut expected = Vec::new();
+        for want in [
+            ConsumeOutcome::NoCredit,
+            ConsumeOutcome::NothingToReset,
+            ConsumeOutcome::Rejected(400),
+            ConsumeOutcome::Rejected(429),
+        ] {
+            let ready = current(root.path(), &credential.account_id);
+            let mut operation =
+                Redemption::open(root.path(), &credential.account_id, &ready.confirmation).unwrap();
+            assert!(operation.fresh);
+            expected.push(operation.request_id.clone());
+            let outcome = send_redemption(&client, &url, &credential, &operation.request_id)
+                .await
+                .unwrap();
+            assert_eq!(outcome, want);
+            assert!(outcome.settled() && !outcome.redeemed());
+            operation.finish(outcome).unwrap();
+            drop(operation);
+            assert!(
+                Redemption::open(root.path(), &credential.account_id, &ready.confirmation).is_err()
+            );
+            assert_eq!(
+                current(root.path(), &credential.account_id).status,
+                OperationStatus::Ready
+            );
+        }
+        assert_eq!(server.join().unwrap(), expected);
+    }
+
+    /// 5xx、409、认证失败、连接断开：结果未知，保留同一标识，下次重试仍用它。
+    #[tokio::test]
+    async fn undetermined_http_failures_keep_the_pending_id() {
+        let (url, server) = serve(vec![
+            Some((503, json!({ "error": "unavailable" }))),
+            Some((500, Value::Null)),
+            Some((409, json!({ "error": "in progress" }))),
+            Some((401, json!({ "error": "unauthorized" }))),
+            None,
+            Some((200, json!({ "code": "reset" }))),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let client = test_client();
+        let credential = test_credential();
+        let first = open_current(root.path(), &credential.account_id);
+        let request_id = first.request_id.clone();
+        drop(first);
+        let pending = current(root.path(), &credential.account_id);
+        for _ in 0..5 {
+            let operation =
+                Redemption::open(root.path(), &credential.account_id, &pending.confirmation)
+                    .unwrap();
+            assert_eq!(operation.request_id, request_id);
+            assert!(
+                send_redemption(&client, &url, &credential, &operation.request_id)
+                    .await
+                    .is_err()
+            );
+        }
+        let mut operation =
+            Redemption::open(root.path(), &credential.account_id, &pending.confirmation).unwrap();
+        assert_eq!(operation.request_id, request_id);
+        let outcome = send_redemption(&client, &url, &credential, &operation.request_id)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConsumeOutcome::Reset);
+        operation.finish(outcome).unwrap();
+        drop(operation);
+        assert!(
+            Redemption::open(root.path(), &credential.account_id, &pending.confirmation).is_err()
+        );
+        assert_eq!(server.join().unwrap(), vec![request_id; 6]);
+    }
+
+    #[test]
+    fn abandoning_ends_the_pending_operation_and_never_reuses_its_id() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let ready = current(root, "account-a").confirmation;
+        assert!(abandon_in(root, "account-a", &ready).is_err());
+        let first = open_current(root, "account-a");
+        let first_id = first.request_id.clone();
+        drop(first);
+        let prior = current(root, "account-a").confirmation;
+        let busy = Redemption::open(root, "account-a", &prior).unwrap();
+        assert!(abandon_in(root, "account-a", &prior).is_err());
+        drop(busy);
+        abandon_in(root, "account-a", &prior).unwrap();
+        assert!(Redemption::open(root, "account-a", &prior).is_err());
+        let fresh = open_current(root, "account-a");
+        let fresh_id = fresh.request_id.clone();
+        assert_ne!(fresh_id, first_id);
+        drop(fresh);
+        // 另一窗口仍确认旧操作，不能放弃或使用当前记录。
+        assert!(abandon_in(root, "account-a", &prior).is_err());
+        assert!(Redemption::open(root, "account-a", &prior).is_err());
+        let active = current(root, "account-a").confirmation;
+        assert!(abandon_in(root, "account-b", &active).is_err());
+        assert_eq!(open_current(root, "account-a").request_id, fresh_id);
+    }
+
+    #[test]
+    fn abandoning_repairs_a_corrupt_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let first = open_current(root.path(), "account-a");
+        let path = first.path.clone();
+        drop(first);
+        fs::write(&path, b"broken").unwrap();
+        let damaged = current(root.path(), "account-a").confirmation;
+        fs::write(&path, b"changed damage").unwrap();
+        assert!(abandon_in(root.path(), "account-a", &damaged).is_err());
+        let updated = current(root.path(), "account-a").confirmation;
+        assert!(Redemption::open(root.path(), "account-a", &updated).is_err());
+        abandon_in(root.path(), "account-a", &updated).unwrap();
+        let prior_ready = current(root.path(), "account-a").confirmation;
+        let repair_test = open_current(root.path(), "account-a");
+        assert!(repair_test.fresh);
+        drop(repair_test);
+        fs::write(&path, b"changed damage").unwrap();
+        let next_damage = current(root.path(), "account-a").confirmation;
+        abandon_in(root.path(), "account-a", &next_damage).unwrap();
+        assert!(Redemption::open(root.path(), "account-a", &prior_ready).is_err());
+        assert!(open_current(root.path(), "account-a").fresh);
+    }
+
+    #[test]
+    fn journal_without_settled_list_still_loads() {
+        let root = tempfile::tempdir().unwrap();
+        let first = open_current(root.path(), "account-a");
+        let path = first.path.clone();
+        drop(first);
+        fs::write(&path, br#"{"pending":"one","completed":[]}"#).unwrap();
+        let retry = open_current(root.path(), "account-a");
+        assert_eq!(retry.request_id, "one");
+        assert!(!retry.fresh);
     }
 }

@@ -10231,12 +10231,47 @@ pub fn load_relay_proxy(profile_id: String) -> CommandResult<Value> {
     )
 }
 
-/// 实时请求流：托盘「流量」页签和总览拓扑图的光点动画每秒轮询它。
-/// 只读日志末尾和进行中的请求，不补会话标题和费用，保持轻量。
+/// 片段不走公开 bridge，也不附加到请求日志或请求流。
 #[tauri::command]
-pub fn load_request_flow(limit: Option<usize>) -> CommandResult<Value> {
+pub async fn request_context_preview(
+    window: tauri::WebviewWindow,
+    request: codex_plus_core::request_context_preview::PreviewRequest,
+) -> Result<codex_plus_core::request_context_preview::PreviewResponse, String> {
+    if window.label() != "main" {
+        return Err("Request context previews are only available in Manager".into());
+    }
+    codex_plus_core::launcher::request_context_preview(request)
+        .await
+        .map_err(|_| "Local request context preview is unavailable".into())
+}
+
+/// 实时请求流：托盘「流量」页签和总览拓扑图的光点动画每秒轮询它。
+/// 默认只读日志末尾和进行中的请求。路由页可额外读取本地 Codex 会话标题。
+#[tauri::command]
+pub fn load_request_flow(
+    limit: Option<usize>,
+    include_thread_titles: Option<bool>,
+) -> CommandResult<Value> {
     let limit = limit.unwrap_or(30).clamp(1, 200);
     match codex_plus_core::request_log::read_recent_request_logs(limit) {
+        Ok(entries) if include_thread_titles.unwrap_or(false) => {
+            let titles = request_log_thread_titles(&entries);
+            let count = entries.len();
+            let entries: Vec<Value> = entries
+                .iter()
+                .map(|entry| {
+                    let mut value = serde_json::to_value(entry).unwrap_or_else(|_| json!({}));
+                    if let Some(title) = entry.thread_id.as_ref().and_then(|id| titles.get(id)) {
+                        value["threadTitle"] = json!(title);
+                    }
+                    value
+                })
+                .collect();
+            ok(
+                &format!("已读取 {count} 条请求。"),
+                json!({ "entries": entries }),
+            )
+        }
         Ok(entries) => ok(
             &format!("已读取 {} 条请求。", entries.len()),
             json!({ "entries": entries }),
@@ -10248,10 +10283,29 @@ pub fn load_request_flow(limit: Option<usize>) -> CommandResult<Value> {
     }
 }
 
+fn request_log_thread_titles(
+    entries: &[codex_plus_core::request_log::RequestLogEntry],
+) -> std::collections::HashMap<String, String> {
+    let thread_ids: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.agent.as_deref().is_none_or(|agent| agent == "codex"))
+        .filter_map(|entry| entry.thread_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if thread_ids.is_empty() {
+        return Default::default();
+    }
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
+    codex_plus_data::local_session_titles(&db_paths, &thread_ids)
+}
+
 #[tauri::command]
 pub fn load_request_logs(
     limit: Option<usize>,
     since_ms: Option<u64>,
+    completed_date: Option<String>,
     agent: Option<String>,
     relay_id: Option<String>,
     relay_unknown: Option<bool>,
@@ -10261,6 +10315,7 @@ pub fn load_request_logs(
     let present = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
     let filter = codex_plus_core::request_log::RequestLogFilter {
         since_ms,
+        completed_date: present(completed_date),
         agent: present(agent),
         relay_id: present(relay_id),
         relay_unknown: relay_unknown.unwrap_or(false),
@@ -10269,27 +10324,30 @@ pub fn load_request_logs(
     match codex_plus_core::request_log::read_request_log_page(limit, &filter) {
         Ok(page) => {
             let entries = page.entries;
-            // 费用按供应商里现在填的价格估算，和用量统计一致。
+            // 分开上游实扣与当前配置费率，不把积分当作货币。
             let gateway = codex_plus_core::gateway::store::GatewayStore::default()
                 .load()
                 .unwrap_or_default();
             // 会话标题来自 Codex 本地会话库，只用于展示；查不到时前端退回短 id。
-            let thread_ids: Vec<String> = entries
-                .iter()
-                .filter_map(|entry| entry.thread_id.clone())
-                .collect();
-            let titles = if thread_ids.is_empty() {
-                std::collections::HashMap::new()
-            } else {
-                let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
-                let db_paths =
-                    codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
-                codex_plus_data::local_session_titles(&db_paths, &thread_ids)
-            };
+            let titles = request_log_thread_titles(&entries);
             let entries: Vec<Value> = entries
                 .iter()
                 .map(|entry| {
                     let mut value = serde_json::to_value(entry).unwrap_or_else(|_| json!({}));
+                    let pricing = codex_plus_core::gateway::usage::entry_pricing(entry, &gateway);
+                    if entry.state.as_deref() != Some("running") {
+                        value["pricing"] = json!(pricing);
+                    }
+                    if let Some(usage) = entry.usage.as_ref()
+                        && let Some(object) = value.get_mut("usage").and_then(Value::as_object_mut)
+                    {
+                        let verified = entry.final_response_evidence.as_deref()
+                            == Some(codex_plus_core::request_log::FINAL_RESPONSE_EVIDENCE_V1);
+                        object.insert(
+                            "cachedTokensKnown".to_string(),
+                            json!(usage.reported_cached_tokens(verified).is_some()),
+                        );
+                    }
                     if let Some(title) = entry
                         .thread_id
                         .as_ref()

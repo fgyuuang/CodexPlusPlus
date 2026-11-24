@@ -43,7 +43,7 @@ function runtime(sharedWindow: any = {}, initialSettings?: any) {
     codexRemoteSessionActiveProfile: () => settings.relayProfilesEnabled
       ? settings.relayProfiles.find((entry: any) => entry.id === settings.activeRelayId) : null,
     codexServiceTierModelFromValue: (value: any) => value,
-    renderCodexPlusMenu: () => {}, scheduleCodexModelWhitelistRefresh: () => {},
+    renderCodexPlusMenu: () => {}, scheduleCodexModelWhitelistRefresh: () => {}, scheduleDeferredScan: () => {},
     sendCodexPlusDiagnostic: (event: string, detail: any) => diagnostics.push({ event, detail }),
     uniqueValues: (values: any[]) => [...new Set(values.filter(value => typeof value === "string" && value.trim()))],
     readCodexAppServerPreparation: () => new Promise((resolve, reject) => pending.push({ resolve, reject })),

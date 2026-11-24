@@ -3168,6 +3168,9 @@ body.gw-sorting * {
   fill: hsl(var(--muted-foreground) / 0.25);
 }
 
+.shell .gw-bar[data-future] .gw-bar-empty { opacity: .32; }
+.shell .gw-chart-coverage { margin: 8px 0 0; font-size: 11px; color: hsl(var(--muted-foreground)); }
+
 .shell .gw-bar :is(.gw-bar-input, .gw-bar-cache, .gw-bar-output, .gw-bar-empty) {
   pointer-events: none;
   transition: opacity 0.12s ease;

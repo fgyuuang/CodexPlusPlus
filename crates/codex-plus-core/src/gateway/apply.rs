@@ -25,8 +25,8 @@ use crate::gateway::restore::{self as stash, ChangedKey, FileStash, KeyPath};
 use crate::gateway::route::{self, binding_default_model};
 use crate::gateway::store::{
     AgentBinding, AutoGroupSettings, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider,
-    GatewaySettings, GatewayStore, GroupMember, GroupMode, GroupSticky, ProviderPrice,
-    new_client_token,
+    GatewaySettings, GatewayStore, GroupMember, GroupMode, GroupSticky,
+    NATIVE_CODEX_ACCOUNT_FALLBACK_NAME, ProviderPrice, new_client_token,
 };
 use crate::settings::{
     BackendSettings, RelayApiKey, RelayMode, RelayProfile, RelayProtocol, SettingsStore,
@@ -821,6 +821,9 @@ fn codex_model_metadata(
         fields.insert("description".into(), json!(format!("{upstream} · {group}")));
         fields.insert("codex_plus_group".into(), json!(group));
         fields.insert("codex_plus_group_id".into(), json!(relay.id));
+        if route::native_model(binding, &model) {
+            fields.insert("codex_plus_native_account".into(), json!(true));
+        }
         if codex_favorite(gateway, &relays, &model) {
             fields.insert("codex_plus_favorite".into(), json!(true));
         }
@@ -2575,19 +2578,25 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
                 let Some(entries) = metadata.as_object() else {
                     return binding.native_official.is_none();
                 };
-                let native_entries: Vec<_> = entries
-                    .iter()
-                    .filter(|(_, entry)| entry["codex_plus_group"] == "当前登录账号")
-                    .collect();
+                // 旧目录没有身份标记，仍需识别旧标题以便在升级或退出登录后重建。
+                let native_count = entries
+                    .values()
+                    .filter(|entry| {
+                        entry["codex_plus_native_account"] == true
+                            || entry["codex_plus_group"] == NATIVE_CODEX_ACCOUNT_FALLBACK_NAME
+                    })
+                    .count();
                 match &binding.native_official {
-                    None => native_entries.is_empty(),
+                    None => native_count == 0,
                     Some(native) => {
                         let models = route::relay_models(native);
-                        native_entries.len() == models.len()
+                        let name = crate::gateway::accounts::mask_account_name(native.name.trim());
+                        native_count == models.len()
                             && models.iter().all(|model| {
                                 entries.get(model).is_some_and(|entry| {
                                     entry["codex_plus_group_id"] == native.id
-                                        && entry["codex_plus_group"] == "当前登录账号"
+                                        && entry["codex_plus_group"] == name
+                                        && entry["codex_plus_native_account"] == true
                                 }) && !entries.contains_key(&format!("{}/{model}", native.id))
                             })
                     }

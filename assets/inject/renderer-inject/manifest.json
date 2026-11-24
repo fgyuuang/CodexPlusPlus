@@ -13,7 +13,7 @@
     {
       "name": "10-style.js",
       "description": "样式注入、默认设置、后端设置映射、梦皮主题变量与持久化",
-      "lines": 4340
+      "lines": 4357
     },
     {
       "name": "20-menu.js",
@@ -23,7 +23,7 @@
     {
       "name": "30-service-tier.js",
       "description": "供应商会话适配、请求桥接与原生状态模块定位",
-      "lines": 2304
+      "lines": 2346
     },
     {
       "name": "31-config-read-deadline.js",
@@ -68,7 +68,7 @@
     {
       "name": "42-provider-editing.generated.js",
       "description": "生成文件：与管理器共用的供应商编辑纯函数（relay-profile-editing.ts，scripts/assemble-provider-editing.mjs 打包）",
-      "lines": 3537
+      "lines": 3561
     },
     {
       "name": "43-provider-page.js",
@@ -78,7 +78,7 @@
     {
       "name": "44-provider-gateway.js",
       "description": "「供应商」页的网关页签：在 Codex 里管理网关供应商池、接入 / 断开网关（经 /providers/gateway 走管理器的网关命令）",
-      "lines": 533
+      "lines": 534
     },
     {
       "name": "45-remote-control-page.js",
@@ -98,7 +98,7 @@
     {
       "name": "47-task-board-page.js",
       "description": "左侧图标栏「任务面板」页：记下要做什么、拖卡片改状态、详情编辑（经 /task-board 读写 core task_board 的任务文件）",
-      "lines": 874
+      "lines": 891
     },
     {
       "name": "50-navigation.js",
@@ -123,12 +123,17 @@
     {
       "name": "70-model-catalog.js",
       "description": "全局状态、模型目录、模型白名单与解锁",
-      "lines": 2907
+      "lines": 2917
     },
     {
       "name": "71-model-picker-groups.js",
       "description": "原生模型选择器供应商图标与折叠列表双视图、有效默认身份展示",
       "lines": 2341
+    },
+    {
+      "name": "72-work-gateway.js",
+      "description": "Work 本地项目的网关模型选择与本机对话入口",
+      "lines": 197
     },
     {
       "name": "80-session-share.js",
@@ -218,7 +223,7 @@
     {
       "name": "95-conversation-view.js",
       "description": "会话视图运行时、官方用量策略重写、扫描主循环",
-      "lines": 1761
+      "lines": 1762
     },
     {
       "name": "96-feature-lab.js",
@@ -263,7 +268,7 @@
     {
       "name": "98-scan-schedule.js",
       "description": "扫描相关性判定与调度，启动重试",
-      "lines": 191
+      "lines": 192
     },
     {
       "name": "98-avatar-overlay-layout.js",

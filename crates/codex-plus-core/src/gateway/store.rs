@@ -18,6 +18,7 @@ use crate::settings::RelayProfile;
 use crate::tools::ToolId;
 
 const STORE_FILE: &str = "gateway.json";
+pub(crate) const NATIVE_CODEX_ACCOUNT_FALLBACK_NAME: &str = "当前登录账号";
 /// 3：`auto_models` 默认改为开启；4：`restore_on_exit` 默认改为关闭（见 [`read_store`] 里的迁移）。
 const STORE_VERSION: u32 = 4;
 /// 客户端 token 前缀；日志里看到它就知道是网关签发的本地凭据，不是上游 Key。
@@ -943,17 +944,27 @@ impl GatewaySettings {
             return self;
         }
         // 不借用供应商凭据；每次请求仍由账号库检查状态并刷新认证。
-        let id = self
-            .providers
-            .iter()
-            .find(|provider| {
-                super::official_accounts::account_ref(&provider.relay).as_deref() == Some(account)
-            })
+        let provider = self.providers.iter().find(|provider| {
+            super::official_accounts::account_ref(&provider.relay).as_deref() == Some(account)
+        });
+        let id = provider
             .map(|provider| provider.relay.id.clone())
             .unwrap_or_else(|| format!("local-official-{account}"));
+        let name = provider
+            .map(|provider| provider.relay.name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                crate::official_accounts::OfficialAccountStore::default()
+                    .get(account)
+                    .ok()
+                    .map(|account| account.name.trim().to_owned())
+                    .filter(|name| !name.is_empty())
+            })
+            .unwrap_or_else(|| NATIVE_CODEX_ACCOUNT_FALLBACK_NAME.into());
         self.bindings.entry(crate::tools::ToolId::Codex.as_str().to_string()).or_default().native_official = Some(RelayProfile {
             id,
-            name: "当前登录账号".into(),
+            name,
             relay_mode: crate::settings::RelayMode::Official,
             protocol: crate::settings::RelayProtocol::Responses,
             model: models[0].clone(),

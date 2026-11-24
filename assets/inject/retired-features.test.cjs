@@ -4,25 +4,22 @@ const { test } = require("node:test");
 const vm = require("node:vm");
 const source = readFileSync(`${__dirname}/renderer-inject.js`, "utf8");
 
-test("retired project enhancements have no UI, dispatch or scanner entry", () => {
-  assert.doesNotMatch(source, /data-codex-plus-setting="(?:zedRemoteOpen|upstreamWorktreeCreate)"/);
-  assert.doesNotMatch(source, /data-codex-upstream-worktree-open/);
-  assert.doesNotMatch(source, /(?:postJson|bridgeCall)\("\/(?:zed-remote|upstream-worktree)\//);
-  assert.doesNotMatch(source, /function (?:installUpstream\w+|openUpstreamWorktreeDialog|refreshZedRemote\w+|scheduleZedRemote\w+)\(/);
-  assert.doesNotMatch(source, /upstreamBranchDefaultsCache|codexUpstreamBranchSelection|codexUpstreamProjectContext/);
-
-  // 已发布的类名只保留兼容声明，没有入口或事件处理。
+// The fork retains the documented Zed/worktree adapters. Session sharing stays retired.
+test("fork project adapters preserve their local bridge entry points and class names", () => {
+  assert.match(source, /postJson\("\/zed-remote\/open"/);
+  assert.match(source, /postJson\("\/upstream-worktree\/create"/);
   assert.match(source, /zedRemoteButtonClass = "codex-zed-remote-button"/);
   assert.match(source, /upstreamWorktreeDialogClass = "codex-upstream-worktree-dialog"/);
   assert.match(source, /function installCodexRemoteSessionRecoveryListener\(/);
-  assert.match(source, /sessionShareButtonClass = "codex-session-share-button"/);
-  // 会话分享（按钮、导入监听、开关）已整体下线。
-  assert.doesNotMatch(source, /function (?:installSessionShareButton|createSessionShare|installSessionShareImportListener)\(/);
-  // 会话行「…」菜单里的原地复制 / 自动重命名已整体下线，函数与入口都不该回来。
-  assert.doesNotMatch(source, /function (?:activateSessionCopyMenuItem|activateSessionAutoRenameMenuItem)\(/);
 });
 
-test("old backend switches cannot enable retired features", () => {
+test("session sharing stays retired independently of local project adapters", () => {
+  assert.match(source, /sessionShareButtonClass = "codex-session-share-button"/);
+  assert.doesNotMatch(source, /function (?:installSessionShareButton|createSessionShare|installSessionShareImportListener)\(/);
+  assert.doesNotMatch(source, /(?:postJson|bridgeCall)\("\/(?:share\/create|session\/export)"/);
+});
+
+test("project switches follow backend settings without reviving retired settings", () => {
   const style = readFileSync(`${__dirname}/renderer-inject/10-style.js`, "utf8");
   const begin = style.indexOf("  function defaultCodexPlusSettings()");
   const end = style.indexOf("  // Dream skin runtime", begin);
@@ -37,12 +34,21 @@ test("old backend switches cannot enable retired features", () => {
       codexAppNativeMenuPlacement: false, codexAppStepwiseEnabled: true,
     },
   });
-  vm.runInContext(`${style.slice(begin, end)}\nglobalThis.result = codexPlusSettings();`, context);
-  for (const key of ["zedRemoteOpen", "upstreamWorktreeCreate", "nativeMenuTranslation", "sessionShare"]) {
-    assert.equal(Object.hasOwn(context.result, key), false, key);
-  }
-  assert.equal(context.result.nativeMenuPlacement, false, "menu placement keeps its independent mapping");
-  assert.equal(context.result.stepwise, true, "Stepwise remains available");
+  vm.runInContext(`${style.slice(begin, end)}\nglobalThis.readSettings = codexPlusSettings;`, context);
+  const active = context.readSettings();
+  assert.equal(active.zedRemoteOpen, true);
+  assert.equal(active.upstreamWorktreeCreate, true);
+  assert.equal(active.nativeMenuPlacement, false);
+  assert.equal(active.stepwise, true);
+  context.codexPlusBackendSettings.codexAppSessionShare = false;
+  context.codexPlusBackendSettings.codexAppNativeMenuTranslation = false;
+  assert.deepEqual(context.readSettings(), active, "retired backend flags do not change active settings");
+  context.codexPlusBackendSettings.codexAppZedRemoteOpen = false;
+  assert.equal(context.readSettings().zedRemoteOpen, false);
+  assert.equal(context.readSettings().upstreamWorktreeCreate, true);
+  context.codexPlusBackendSettings.enhancementsEnabled = false;
+  assert.equal(context.readSettings().zedRemoteOpen, false);
+  assert.equal(context.readSettings().upstreamWorktreeCreate, false);
 });
 
 function installForceChinese(fixture) {
@@ -78,8 +84,37 @@ test("renderer startup forces zh-CN through the native locale setting", async ()
     ["get-setting", "localeOverride", undefined],
     ["set-setting", "localeOverride", "zh-CN"],
   ]);
-  // 菜单汉化仍未恢复，这两个入口都不该回来。
-  assert.doesNotMatch(source, /codexMenuLocalizationMap|function localizeCodexMenus\(/);
+});
+
+test("fork menu localization stays scoped away from conversation and extension UI", () => {
+  const menus = readFileSync(`${__dirname}/renderer-inject/80-session-share.js`, "utf8");
+  const begin = menus.indexOf("  function localizeCodexMenuAttributes(");
+  const end = menus.indexOf("  async function loadUpstreamBranchDefaults(", begin);
+  assert.ok(begin >= 0 && end > begin);
+  const translated = new Map([["Rename", "translated"]]);
+  function item(scope, excluded = false, extension = false) {
+    const attrs = new Map([["aria-label", "Rename"]]);
+    return {
+      extension,
+      attrs,
+      closest: (selector) => selector === "native-menu" ? scope : excluded,
+      getAttribute: (name) => attrs.get(name),
+      setAttribute: (name, value) => attrs.set(name, value),
+    };
+  }
+  const native = item(true);
+  const chat = item(true, true);
+  const extension = item(true, false, true);
+  const outside = item(false);
+  const context = vm.createContext({
+    codexMenuLocalizationMap: translated,
+    codexMenuLocalizationScopeSelector: () => "native-menu",
+    isExtensionUiNode: (node) => node.extension,
+  });
+  vm.runInContext(`${menus.slice(begin, end)}\nglobalThis.localize = localizeCodexMenuAttributes;`, context);
+  assert.equal(context.localize({ querySelectorAll: () => [native, chat, extension, outside] }), true);
+  assert.equal(native.attrs.get("aria-label"), "translated");
+  for (const skipped of [chat, extension, outside]) assert.equal(skipped.attrs.get("aria-label"), "Rename");
 });
 
 test("force Chinese locale installs once per configuration", async () => {
@@ -153,36 +188,52 @@ test("switching force Chinese off restores the previous locale through host serv
   assert.deepEqual(fixture.reloads, ["reload"]);
 });
 
-test("retired fast startup flags cannot change native fetch or Statsig initialization", () => {
+test("fork fast startup requires explicit opt-in and does not time out ordinary fetches", async () => {
   const prelude = readFileSync(`${__dirname}/renderer-inject/00-prelude.js`, "utf8");
-  const end = prelude.indexOf("  const helperBase =");
-  assert.ok(end > 0);
-  const fetch = async () => "native response";
+  const begin = prelude.indexOf("  function installCodexPlusFastStartup() {");
+  const end = prelude.indexOf("\n  }", begin) + "\n  }".length;
+  assert.ok(begin >= 0 && end > begin);
+  const calls = [];
+  const timers = [];
+  const fetch = async (...args) => { calls.push(args); return "native response"; };
   const initializeAsync = async () => "native initialization";
-  const unexpectedCalls = [];
   const client = {
     initializeAsync,
     loadingStatus: "Loading",
-    $emt: (...args) => unexpectedCalls.push(args),
   };
   const window = {
-    __CODEX_PLUS_FAST_STARTUP__: { enabled: true, statsigTimeoutMs: 100 },
+    __CODEX_PLUS_FAST_STARTUP__: { enabled: false, statsigTimeoutMs: 100 },
     __STATSIG__: { firstInstance: client },
+    location: { href: "app://-/" },
     fetch,
-    setTimeout: (...args) => unexpectedCalls.push(args),
-    setInterval: (...args) => unexpectedCalls.push(args),
+    setTimeout: (_, ms) => { timers.push(ms); return timers.length; },
+    clearTimeout: () => {},
+    setInterval: () => {},
   };
-  vm.runInNewContext(`${prelude.slice(0, end)}\n})();`, {
-    window,
-    navigator: { userAgent: "test" },
-    process: { versions: { node: "fixture" } },
-  });
+  const context = vm.createContext({ window, URL, AbortController });
+  vm.runInContext(`${prelude.slice(begin, end)}\nglobalThis.install = installCodexPlusFastStartup;`, context);
+  context.install();
   assert.equal(window.fetch, fetch);
   assert.equal(client.initializeAsync, initializeAsync);
   assert.equal(client.loadingStatus, "Loading");
-  assert.deepEqual(unexpectedCalls, []);
-  assert.doesNotMatch(source, /installCodexPlusFastStartup|__CODEX_PLUS_FAST_STARTUP__|__codexPlusFastStartup|statsigTimeoutMs/);
-  // 模型白名单仍依赖原生 Statsig 动态配置，与已撤下的启动超时无关。
+  assert.deepEqual(timers, []);
+
+  window.__CODEX_PLUS_FAST_STARTUP__.enabled = true;
+  context.install();
+  assert.notEqual(window.fetch, fetch);
+  assert.equal(client.loadingStatus, "Ready");
+  const patchedFetch = window.fetch;
+  context.install();
+  assert.equal(window.fetch, patchedFetch, "reinstall does not wrap fetch again");
+  const init = { method: "POST" };
+  assert.equal(await window.fetch("https://example.test", init), "native response");
+  assert.equal(calls[0][1], init);
+  assert.deepEqual(timers, []);
+  await window.fetch("https://api.statsigcdn.com/v1/initialize", init);
+  assert.equal(calls[1][1].signal instanceof AbortSignal, true);
+  assert.deepEqual(timers, [100]);
+
+  assert.match(source, /installCodexPlusFastStartup\(\);/);
   assert.match(source, /function patchStatsigModelDynamicConfig\(/);
   assert.match(source, /function patchStatsigModelWhitelist\(/);
   assert.match(source, /patchStatsigModelWhitelist\(\);/);

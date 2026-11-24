@@ -673,9 +673,10 @@ impl CodexAppServer {
                     turn_completed = true;
                 }
                 Some("error") => {
-                    let error = deep_string(message.get("params"), &["message", "error"])
+                    let params = message.get("params");
+                    let error = deep_string(params, &["message", "error"])
                         .unwrap_or_else(|| "Codex app-server 返回未知错误".to_string());
-                    if is_reconnect_notice(&error) {
+                    if is_retrying_turn_error(params, &error) {
                         reconnect_until.get_or_insert_with(|| {
                             tokio::time::Instant::now() + RECONNECT_WAIT_TIMEOUT
                         });
@@ -1247,9 +1248,24 @@ fn thread_status_is_idle(message: &Value) -> bool {
         == Some("idle")
 }
 
-fn is_reconnect_notice(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("reconnecting") && message.contains("network")
+fn is_retrying_turn_error(params: Option<&Value>, message: &str) -> bool {
+    if let Some(will_retry) = params
+        .and_then(|params| params.get("willRetry"))
+        .and_then(Value::as_bool)
+    {
+        return will_retry;
+    }
+    let message = message.trim().to_ascii_lowercase();
+    let Some(progress) = message.strip_prefix("reconnecting... ") else {
+        return false;
+    };
+    progress == "waiting for network"
+        || progress.split_once('/').is_some_and(|(attempt, total)| {
+            let (Ok(attempt), Ok(total)) = (attempt.parse::<u32>(), total.parse::<u32>()) else {
+                return false;
+            };
+            attempt > 0 && attempt <= total
+        })
 }
 
 fn turn_failure_message(message: &Value) -> Option<String> {
@@ -1667,6 +1683,12 @@ mod tests {
                         );
                     }
                     emit(json!({"id":id,"result":{"turn":{"id":turn}}}));
+                    if mode == "release-current" {
+                        emit(json!({"method":"error","params":{
+                            "threadId":"original","turnId":turn,
+                            "error":{"message":"Reconnecting... 1/5"}
+                        }}));
+                    }
                     if mode.starts_with("release-") {
                         let root = std::env::var_os("CODEX_PLUS_SESSION_FIXTURE_ROOT").unwrap();
                         std::fs::write(Path::new(&root).join("active"), "active").unwrap();
@@ -2407,8 +2429,21 @@ mod tests {
 
     #[test]
     fn reconnect_notice_is_transient_and_failed_turn_is_not_success() {
-        assert!(is_reconnect_notice("Reconnecting... waiting for network"));
-        assert!(!is_reconnect_notice("invalid model"));
+        assert!(is_retrying_turn_error(
+            None,
+            "Reconnecting... waiting for network"
+        ));
+        assert!(is_retrying_turn_error(None, "Reconnecting... 1/5"));
+        assert!(!is_retrying_turn_error(None, "Reconnecting... 6/5"));
+        assert!(!is_retrying_turn_error(None, "invalid model"));
+        assert!(is_retrying_turn_error(
+            Some(&json!({"willRetry": true})),
+            "temporarily unavailable"
+        ));
+        assert!(!is_retrying_turn_error(
+            Some(&json!({"willRetry": false})),
+            "Reconnecting... 1/5"
+        ));
         let failed = json!({
             "method": "turn/completed",
             "params": {"turn": {"status": "failed", "error": {"message": "unknown model"}}}

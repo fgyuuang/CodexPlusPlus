@@ -29,6 +29,7 @@ function runtime(mode: "aggregate" | "pureApi", source: string, status: "idle" |
     hasTurns: true,
     generation: "one",
     generationDuringResume: "",
+    rejectManagedResume: "",
     activateOnRead: 0,
     pendingClient: null as Promise<any> | null,
     pendingCache: null as Promise<any> | null,
@@ -68,6 +69,9 @@ function runtime(mode: "aggregate" | "pureApi", source: string, status: "idle" |
         return {};
       }
       if (method === "thread/resume") {
+        if (state.rejectManagedResume && params.modelProvider === "codex_plus_managed") {
+          throw new Error(state.rejectManagedResume);
+        }
         if (state.status === "notLoaded") {
           state.connectedProvider = params.modelProvider ?? state.indexedProvider;
           state.status = "idle";
@@ -191,6 +195,39 @@ describe("provider and gateway recovery on the same turn", () => {
 });
 
 describe("aggregate transitions through the installed request wrapper", () => {
+  const strictMismatch = "Cannot change this thread's model provider from `openai` to `codex_plus_managed` on resume.";
+
+  it("reopens a cold official chat under its original provider after the native refusal", async () => {
+    const env = runtime("aggregate", "openai", "notLoaded");
+    env.state.rejectManagedResume = strictMismatch;
+    const result = await env.client.sendRequest("thread/resume", {
+      threadId: "thread", cwd: "C:/fixture", config: { model_reasoning_effort: "high" },
+    });
+
+    assert.equal(result.modelProvider, "openai");
+    const resumes = env.calls.filter(call => call.method === "thread/resume");
+    assert.deepEqual(resumes.map(call => call.params.modelProvider), ["codex_plus_managed", "openai"]);
+    assert.deepEqual(Object.entries(resumes[1].params.config), [["model_reasoning_effort", "high"]]);
+    assert.equal(resumes[1].params.cwd, "C:/fixture");
+    assert.deepEqual(env.preparations, []);
+  });
+
+  it("restores an official chat without submitting its turn to a different provider", async () => {
+    const env = runtime("aggregate", "openai", "idle");
+    env.state.rejectManagedResume = strictMismatch;
+    await assert.rejects(env.client.sendRequest("turn/start", { threadId: "thread", input: [] }), /按官方来源恢复/);
+    assert.equal(env.state.connectedProvider, "openai");
+    assert.equal(env.calls.some(call => call.method === "turn/start"), false);
+    assert.deepEqual(env.preparations, []);
+  });
+
+  it("does not retry a resume whose outcome is unknown", async () => {
+    const env = runtime("aggregate", "openai", "notLoaded");
+    env.state.rejectManagedResume = "Timed out waiting for thread/resume";
+    await assert.rejects(env.client.sendRequest("thread/resume", { threadId: "thread" }), /Timed out/);
+    assert.equal(env.calls.filter(call => call.method === "thread/resume").length, 1);
+  });
+
   for (const source of ["custom", "openai"]) {
     it(`does not prepare the ordinary index when entering aggregate from ${source}`, async () => {
       const env = runtime("aggregate", source, "notLoaded");

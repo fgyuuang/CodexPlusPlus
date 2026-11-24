@@ -8,11 +8,12 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Context;
+use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 
 use crate::gateway::balance::has_workbuddy_usage;
 use crate::gateway::store::{GatewaySettings, ProviderPrice};
-use crate::request_log::RequestLogEntry;
+use crate::request_log::{FINAL_RESPONSE_EVIDENCE_V1, RequestLogEntry};
 
 const USAGE_FILE: &str = "gateway-usage.json";
 
@@ -45,6 +46,9 @@ pub struct UsageCounts {
     /// 只加总 WorkBuddy 实际报告的积分；旧数据不填 0。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workbuddy_credits: Option<f64>,
+    /// Number of calls with a usage receipt. Older rows cannot establish coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_metered_calls: Option<u64>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -65,6 +69,9 @@ impl UsageCounts {
         if let Some(credits) = other.workbuddy_credits {
             self.workbuddy_credits = Some(self.workbuddy_credits.unwrap_or(0.0) + credits);
         }
+        if let Some(metered) = other.token_metered_calls {
+            self.token_metered_calls = Some(self.token_metered_calls.unwrap_or(0) + metered);
+        }
     }
 }
 
@@ -78,6 +85,9 @@ pub struct UsageRow {
     pub model: String,
     #[serde(flatten)]
     pub counts: UsageCounts,
+    /// Portion whose account realm was recognizable from the recorded upstream model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_workbuddy_credits: Option<f64>,
     /// 不认识的字段（更新版本加的统计项）原样保留：回滚后这一版继续累加时不把它们丢掉。
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -91,6 +101,9 @@ struct UsageFile {
     /// `YYYY-MM-DD`（本地日期）→ 当天各组合的累计。
     #[serde(default)]
     days: BTreeMap<String, Vec<UsageRow>>,
+    /// 最近的本地日期及其小时汇总，不保存单条请求。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hourly: BTreeMap<String, BTreeMap<u8, UsageCounts>>,
     /// 不认识的顶层字段原样保留。
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
@@ -134,10 +147,25 @@ impl UsageStore {
 
     /// 记一个请求。`day` 是本地日期 `YYYY-MM-DD`。
     pub fn record(&self, day: &str, row: UsageRow) -> anyhow::Result<()> {
+        self.record_at(day, None, row)
+    }
+
+    fn record_at(&self, day: &str, hour: Option<u8>, row: UsageRow) -> anyhow::Result<()> {
         let _guard = write_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut file = self.load()?;
+        if let Some(hour) = hour {
+            file.hourly
+                .entry(day.to_string())
+                .or_default()
+                .entry(hour)
+                .or_default()
+                .add(&row.counts);
+            while file.hourly.len() > 2 {
+                file.hourly.pop_first();
+            }
+        }
         let rows = file.days.entry(day.to_string()).or_default();
         match rows.iter_mut().find(|known| {
             known.agent == row.agent
@@ -146,6 +174,10 @@ impl UsageStore {
         }) {
             Some(known) => {
                 known.counts.add(&row.counts);
+                if let Some(credits) = row.scoped_workbuddy_credits {
+                    known.scoped_workbuddy_credits =
+                        Some(known.scoped_workbuddy_credits.unwrap_or(0.0) + credits);
+                }
                 known.provider = row.provider;
             }
             None => rows.push(row),
@@ -179,6 +211,16 @@ impl UsageStore {
                 .unwrap_or_else(|| today.to_string()),
         };
         let mut summary = UsageSummary::default();
+        if days == Some(1) {
+            summary.hours = Some(
+                file.hourly
+                    .get(today)
+                    .into_iter()
+                    .flatten()
+                    .map(|(&hour, &counts)| UsageHour { hour, counts })
+                    .collect(),
+            );
+        }
         let mut day = first.clone();
         // 逐天补齐，没有请求的日子也画一根空柱子。
         let mut guard = 0;
@@ -219,6 +261,18 @@ impl UsageStore {
                 if let Some(price) = price {
                     add_cost(&mut summary.costs, price, &row.counts);
                 }
+                summary.daily_routes.push(UsageRouteDay {
+                    date: day.clone(),
+                    agent: row.agent.clone(),
+                    provider_id: row.provider_id.clone(),
+                    provider: row.provider.clone(),
+                    model: row.model.clone(),
+                    counts: row.counts,
+                    credit_meter_id: row
+                        .scoped_workbuddy_credits
+                        .and_then(|_| workbuddy_meter_id(&row.model)),
+                    scoped_workbuddy_credits: row.scoped_workbuddy_credits,
+                });
             }
             summary.days.push(UsageDay {
                 date: day.clone(),
@@ -226,6 +280,14 @@ impl UsageStore {
             });
             day = shift_day(&day, 1);
             guard += 1;
+        }
+        if let (Some(first), Some(last)) =
+            (summary.daily_routes.first(), summary.daily_routes.last())
+        {
+            summary.observed_date_range = Some(UsageDateRange {
+                first: first.date.clone(),
+                last: last.date.clone(),
+            });
         }
         for groups in [
             &mut summary.by_agent,
@@ -284,20 +346,105 @@ pub fn entry_cost(entry: &RequestLogEntry, gateway: &GatewaySettings) -> Option<
     if usage.input_tokens == 0 && usage.output_tokens == 0 {
         return None;
     }
-    let provider = gateway.provider(&entry.relay_id)?;
-    if has_workbuddy_usage(&provider.source) {
+    if gateway
+        .provider(&entry.relay_id)
+        .is_some_and(|provider| has_workbuddy_usage(&provider.source))
+    {
         return None;
     }
-    let price = provider.price_for(entry.usage_model())?;
-    let counts = UsageCounts {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cached_tokens: usage.cached_tokens,
-        ..UsageCounts::default()
+    entry_pricing(entry, gateway).estimate
+}
+
+fn workbuddy_meter_id(model: &str) -> Option<&'static str> {
+    let (realm, name) = model.split_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+    match realm {
+        "cn" => Some("workbuddy:cn"),
+        "global" => Some("workbuddy:global"),
+        _ => None,
+    }
+}
+
+pub fn entry_pricing(entry: &RequestLogEntry, gateway: &GatewaySettings) -> RequestUsagePricing {
+    let mut pricing = RequestUsagePricing::default();
+    let usage = entry.usage.as_ref();
+    if let Some(amount) = usage
+        .and_then(|usage| usage.workbuddy_credits)
+        .filter(|amount| amount.is_finite() && *amount >= 0.0)
+    {
+        pricing.actual_meters.push(ActualUsageMeter {
+            meter_id: workbuddy_meter_id(&entry.upstream_model).unwrap_or("workbuddy:unclassified"),
+            unit: "credits",
+            amount,
+            source: "upstream-terminal-report",
+        });
+    }
+
+    let model = entry.upstream_model.trim();
+    let provider = gateway.provider(&entry.relay_id);
+    let price = provider
+        .filter(|_| !model.is_empty())
+        .and_then(|provider| provider.price_for(model));
+    if let Some(price) = price.filter(|price| {
+        !price.currency.trim().is_empty()
+            && [price.input, price.cached_input, price.output]
+                .iter()
+                .all(|rate| rate.is_finite() && *rate >= 0.0)
+    }) {
+        pricing.rate = Some(RequestUsageRate {
+            model: model.to_string(),
+            currency: price.currency.trim().to_ascii_uppercase(),
+            input_per_million: price.input,
+            cached_input_per_million: price.cached_input,
+            output_per_million: price.output,
+            basis: "current-config",
+        });
+    }
+
+    if entry.state.as_deref() == Some("running") || entry.is_image() || !entry.success {
+        pricing.estimate_status = EstimateStatus::NotApplicable;
+        return pricing;
+    }
+    let Some(usage) = usage else {
+        return pricing;
     };
-    let mut costs = Vec::new();
-    add_cost(&mut costs, price, &counts);
-    costs.pop()
+    let Some(rate) = &pricing.rate else {
+        pricing.estimate_status = EstimateStatus::MissingRate;
+        return pricing;
+    };
+    if provider
+        .is_some_and(|provider| crate::official_login::is_official_login_profile(&provider.relay))
+    {
+        pricing.estimate_status = EstimateStatus::UnknownTier;
+        return pricing;
+    }
+    let Some(cached) = usage
+        .reported_cached_tokens(
+            entry.final_response_evidence.as_deref() == Some(FINAL_RESPONSE_EVIDENCE_V1),
+        )
+        .or_else(|| {
+            (usage.input_tokens == 0 || rate.input_per_million == rate.cached_input_per_million)
+                .then_some(0)
+        })
+    else {
+        pricing.estimate_status = EstimateStatus::UnknownCache;
+        return pricing;
+    };
+    let amount = (usage.input_tokens - cached) as f64 / 1_000_000.0 * rate.input_per_million
+        + cached as f64 / 1_000_000.0 * rate.cached_input_per_million
+        + usage.output_tokens as f64 / 1_000_000.0 * rate.output_per_million;
+    if amount.is_finite() {
+        pricing.estimate = Some(UsageCost {
+            currency: rate.currency.clone(),
+            amount,
+        });
+        pricing.estimate_status = EstimateStatus::Available;
+    } else {
+        pricing.estimate_status = EstimateStatus::MissingRate;
+    }
+    pricing
 }
 
 /// 按每百万 token 的价格估算费用：未命中缓存的输入、命中缓存的输入、输出分别计价。
@@ -347,27 +494,105 @@ pub struct UsageCost {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RequestUsagePricing {
+    pub actual_meters: Vec<ActualUsageMeter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<RequestUsageRate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<UsageCost>,
+    pub estimate_status: EstimateStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActualUsageMeter {
+    pub meter_id: &'static str,
+    pub unit: &'static str,
+    pub amount: f64,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestUsageRate {
+    pub model: String,
+    pub currency: String,
+    pub input_per_million: f64,
+    pub cached_input_per_million: f64,
+    pub output_per_million: f64,
+    pub basis: &'static str,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EstimateStatus {
+    Available,
+    MissingRate,
+    UnknownCache,
+    UnknownTier,
+    #[default]
+    NoUsage,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRouteDay {
+    pub date: String,
+    pub agent: String,
+    pub provider_id: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_meter_id: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoped_workbuddy_credits: Option<f64>,
+    #[serde(flatten)]
+    pub counts: UsageCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageDateRange {
+    pub first: String,
+    pub last: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageHour {
+    pub hour: u8,
+    #[serde(flatten)]
+    pub counts: UsageCounts,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageSummary {
     pub totals: UsageCounts,
     pub days: Vec<UsageDay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hours: Option<Vec<UsageHour>>,
     pub by_agent: Vec<UsageGroup>,
     pub by_provider: Vec<UsageGroup>,
     pub by_model: Vec<UsageGroup>,
     /// 只统计填了价格的网关供应商。
     pub costs: Vec<UsageCost>,
+    pub daily_routes: Vec<UsageRouteDay>,
+    /// Bounds of observed rows, not a claim of uninterrupted capture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_date_range: Option<UsageDateRange>,
 }
 
 /// 本地日期（`YYYY-MM-DD`）。
 pub fn local_day(timestamp_ms: u64) -> String {
-    rusqlite::Connection::open_in_memory()
-        .and_then(|connection| {
-            connection.query_row(
-                "SELECT date(?1 / 1000, 'unixepoch', 'localtime')",
-                [timestamp_ms as i64],
-                |row| row.get::<_, String>(0),
-            )
+    i64::try_from(timestamp_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|date| {
+            date.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
         })
-        .unwrap_or_else(|_| "1970-01-01".to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
 }
 
 /// 日期加减天数。
@@ -417,7 +642,10 @@ pub fn record_entry_in(store: &UsageStore, entry: &RequestLogEntry) -> anyhow::R
             timed_calls: u64::from(entry.duration_ms > 0),
             images: u64::from(entry.success && entry.is_image()),
             workbuddy_credits: usage.workbuddy_credits,
+            token_metered_calls: Some(u64::from(entry.usage.is_some())),
         },
+        scoped_workbuddy_credits: workbuddy_meter_id(&entry.upstream_model)
+            .and(usage.workbuddy_credits),
         extra: Default::default(),
     };
     let timestamp = if entry.timestamp_ms > 0 {
@@ -425,7 +653,17 @@ pub fn record_entry_in(store: &UsageStore, entry: &RequestLogEntry) -> anyhow::R
     } else {
         entry.started_at_ms
     };
-    store.record(&local_day(timestamp), row)
+    if let Some(date) = i64::try_from(timestamp)
+        .ok()
+        .filter(|timestamp| *timestamp > 0)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+    {
+        let local = date.with_timezone(&chrono::Local);
+        let day = local.format("%Y-%m-%d").to_string();
+        store.record_at(&day, Some(local.hour() as u8), row)
+    } else {
+        store.record(&local_day(timestamp), row)
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +672,62 @@ mod tests {
     use crate::gateway::store::GatewayProvider;
     use crate::request_log::RequestUsage;
     use crate::settings::RelayProfile;
+
+    #[test]
+    fn today_returns_observed_hours_without_allocating_legacy_daily_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UsageStore::at(dir.path().join(USAGE_FILE));
+        let mut request = entry(Some("codex"), "relay", 30, 15, 10);
+        let local_day = local_day(request.timestamp_ms);
+        let local_hour = chrono::DateTime::from_timestamp_millis(request.timestamp_ms as i64)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .hour() as u8;
+        let gateway = GatewaySettings::default();
+
+        store
+            .record(
+                &local_day,
+                UsageRow {
+                    counts: UsageCounts {
+                        calls: 1,
+                        input_tokens: 20,
+                        ..UsageCounts::default()
+                    },
+                    ..UsageRow::default()
+                },
+            )
+            .unwrap();
+        request.state = Some("running".into());
+        record_entry_in(&store, &request).unwrap();
+        request.state = None;
+        record_entry_in(&store, &request).unwrap();
+        record_entry_in(&store, &request).unwrap();
+
+        let summary = store.summary(&local_day, Some(1), &gateway).unwrap();
+        assert_eq!(summary.totals.calls, 3);
+        let hours = summary.hours.unwrap();
+        assert_eq!(hours.len(), 1);
+        assert_eq!(hours[0].hour, local_hour);
+        assert_eq!(hours[0].counts.calls, 2);
+        assert_eq!(hours[0].counts.input_tokens, 60);
+        assert!(
+            store
+                .summary(&local_day, Some(7), &gateway)
+                .unwrap()
+                .hours
+                .is_none()
+        );
+        store.clear().unwrap();
+        assert!(
+            store
+                .summary(&local_day, Some(1), &gateway)
+                .unwrap()
+                .hours
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     fn entry(
         agent: Option<&str>,
@@ -474,10 +768,13 @@ mod tests {
                 cached_tokens: cached,
                 reasoning_tokens: 1,
                 workbuddy_credits: None,
+                cached_tokens_known: Some(true),
             }),
             cache_hit_ratio: None,
+            context_summary: None,
             final_response_evidence: None,
             final_response_id: None,
+            route: None,
             agent: agent.map(str::to_string),
         }
     }
@@ -539,6 +836,24 @@ mod tests {
         assert_eq!(summary.by_model[0].counts.workbuddy_credits, Some(0.375));
         assert_eq!(summary.by_agent[0].counts.workbuddy_credits, Some(0.375));
         assert!(summary.costs.is_empty());
+
+        let mut legacy_scoped_name = free.clone();
+        legacy_scoped_name.model = "global:deepseek-v4-pro".to_string();
+        legacy_scoped_name.upstream_model.clear();
+        legacy_scoped_name.usage.as_mut().unwrap().workbuddy_credits = Some(8.0);
+        record_entry_in(&store, &legacy_scoped_name).unwrap();
+        let mut proven_scope = metered.clone();
+        proven_scope.upstream_model = "global:deepseek-v4-pro".to_string();
+        record_entry_in(&store, &proven_scope).unwrap();
+        let with_scope = store.summary(&day, None, &gateway).unwrap();
+        let scoped_lane = with_scope
+            .daily_routes
+            .iter()
+            .find(|route| route.model == "global:deepseek-v4-pro")
+            .unwrap();
+        assert_eq!(scoped_lane.credit_meter_id, Some("workbuddy:global"));
+        assert_eq!(scoped_lane.scoped_workbuddy_credits, Some(0.375));
+        assert_eq!(scoped_lane.counts.workbuddy_credits, Some(8.375));
     }
 
     #[test]
@@ -587,6 +902,7 @@ mod tests {
             auto_compact: Default::default(),
             relay: RelayProfile {
                 id: "ds".to_string(),
+                relay_mode: crate::settings::RelayMode::PureApi,
                 ..RelayProfile::default()
             },
             extra: Default::default(),
@@ -626,18 +942,111 @@ mod tests {
         );
         assert_eq!(summary.totals.timed_calls, 5);
         assert_eq!(summary.totals.duration_ms, 5 * 1200);
+        assert_eq!(summary.totals.token_metered_calls, Some(3));
+        assert_eq!(summary.daily_routes.len(), 4);
+        assert!(summary.daily_routes.iter().all(|route| route.date == day));
+        let joint = summary
+            .daily_routes
+            .iter()
+            .find(|route| route.agent == "claude")
+            .unwrap();
+        assert_eq!(
+            (joint.provider_id.as_str(), joint.model.as_str()),
+            ("ds", "deepseek-v4-pro")
+        );
+        assert_eq!(joint.counts.calls, 2);
+        assert_eq!(joint.counts.token_metered_calls, Some(2));
+        assert_eq!(
+            summary.observed_date_range,
+            Some(UsageDateRange {
+                first: day.clone(),
+                last: day.clone()
+            })
+        );
 
         // 每条请求的费用按同样的价格算：1M 输入（无缓存）× 2 = 2 元。
         let cost = entry_cost(&entry(Some("claude"), "ds", 1_000_000, 0, 0), &gateway).unwrap();
         assert_eq!(cost.currency, "CNY");
         assert!((cost.amount - 2.0).abs() < 1e-9);
+        let mut subscription_gateway = gateway.clone();
+        subscription_gateway.providers[0].relay.relay_mode = crate::settings::RelayMode::Official;
+        let subscription = entry_pricing(
+            &entry(Some("claude"), "ds", 1_000_000, 0, 0),
+            &subscription_gateway,
+        );
+        assert!(subscription.rate.is_some());
+        assert!(subscription.estimate.is_none());
+        assert_eq!(subscription.estimate_status, EstimateStatus::UnknownTier);
         assert!(
             entry_cost(&entry(None, "codex-relay", 10, 5, 0), &gateway).is_none(),
             "没填价格不算"
         );
 
+        let mut unreported_cache = entry(Some("claude"), "ds", 12, 0, 0);
+        unreported_cache.usage.as_mut().unwrap().cached_tokens_known = Some(false);
+        let unknown = entry_pricing(&unreported_cache, &gateway);
+        assert!(
+            unknown.rate.is_some(),
+            "tariff is independent of cache telemetry"
+        );
+        assert!(unknown.estimate.is_none());
+        assert_eq!(unknown.estimate_status, EstimateStatus::UnknownCache);
+        assert!(entry_cost(&unreported_cache, &gateway).is_none());
+
+        let mut actual = entry(Some("claude"), "ds", 0, 0, 0);
+        actual.upstream_model = "global:deepseek-v4-pro".to_string();
+        actual.usage.as_mut().unwrap().workbuddy_credits = Some(0.0);
+        let priced = entry_pricing(&actual, &gateway);
+        assert_eq!(priced.actual_meters[0].meter_id, "workbuddy:global");
+        assert_eq!(priced.actual_meters[0].amount, 0.0);
+        assert_eq!(priced.estimate_status, EstimateStatus::Available);
+        assert_eq!(
+            priced.estimate,
+            Some(UsageCost {
+                currency: "CNY".into(),
+                amount: 0.0
+            })
+        );
+
+        actual.model = "global:deepseek-v4-pro".to_string();
+        actual.upstream_model.clear();
+        actual.usage.as_mut().unwrap().workbuddy_credits = Some(2.0);
+        let unclassified = entry_pricing(&actual, &gateway);
+        assert_eq!(
+            unclassified.actual_meters[0].meter_id,
+            "workbuddy:unclassified"
+        );
+        assert_eq!(unclassified.estimate_status, EstimateStatus::MissingRate);
+
+        let earlier = shift_day(&day, -2);
+        store
+            .record(
+                &earlier,
+                UsageRow {
+                    agent: "claude".into(),
+                    provider_id: "ds".into(),
+                    provider: "DS".into(),
+                    model: "old".into(),
+                    counts: UsageCounts {
+                        calls: 3,
+                        input_tokens: 20,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let with_history = store.summary(&day, Some(7), &gateway).unwrap();
+        assert_eq!(
+            with_history.daily_routes[0].counts.token_metered_calls,
+            None
+        );
+        assert_eq!(with_history.totals.token_metered_calls, Some(3));
+        assert_eq!(with_history.totals.calls, 8);
+        assert_eq!(with_history.observed_date_range.unwrap().first, earlier);
+
         let all = store.summary(&day, None, &gateway).unwrap();
-        assert_eq!(all.days.len(), 1);
+        assert_eq!(all.days.len(), 3);
         store.clear().unwrap();
         assert_eq!(store.summary(&day, None, &gateway).unwrap().totals.calls, 0);
     }

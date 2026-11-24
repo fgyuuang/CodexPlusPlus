@@ -265,7 +265,7 @@ function AgentRow({
     }
   };
   const save = async (next: BindingDraft, updateDraft = true, item?: PickerItem) => {
-    const error = validateDraft(next, payload, connected ? binding?.model : undefined, connected && !item ? binding?.defaultModelSelection : null);
+    const error = validateDraft(next, payload, connected ? binding?.model : undefined, connected && !item ? binding?.defaultModelSelection : null, agent.nativeModels);
     if (error) {
       void notify(t("还不能接入"), t(error), "warning");
       return false;
@@ -295,7 +295,7 @@ function AgentRow({
       void disconnect();
       return;
     }
-    const error = validateDraft(draft, payload);
+    const error = validateDraft(draft, payload, undefined, null, agent.nativeModels);
     if (error) {
       setPickerOpen(true);
       void notify(t("还不能接入"), t(error), "warning");
@@ -630,6 +630,7 @@ function AgentDetail({
               exclude={draft.poolExclude}
               inactiveBlocksRequest
               label=""
+              native={agent.nativeModels}
               onPick={(model) => onSave({ ...draft, titleModel: model })}
               payload={payload}
               value={draft.titleModel}
@@ -1245,7 +1246,7 @@ function ModelPicker({
     : modelDisplay(payload, effectiveModel, draft.poolExclude, effectiveSelection);
   const nativeModel = agent.nativeModels?.models.some((model) => model.toLowerCase() === effectiveModel.toLowerCase());
   const display = nativeModel
-    ? { ...baseDisplay, title: prettyModelName(effectiveModel), sub: "当前登录账号", auto: false }
+    ? { ...baseDisplay, title: prettyModelName(effectiveModel), sub: agent.nativeModels?.accountName || "当前登录账号", auto: false }
     : connected && agent.defaultSelectionStatus === "invalid"
     ? { ...baseDisplay, issue: "invalid" as const }
     : connected && agent.defaultSelectionStatus === "available"
@@ -1323,6 +1324,7 @@ function TierPicker({
   value,
   payload,
   exclude,
+  native,
   onPick,
   emptyLabel,
   inactiveBlocksRequest = false,
@@ -1331,6 +1333,7 @@ function TierPicker({
   value: string;
   payload: GatewayPayload | null;
   exclude: string[];
+  native?: GatewayAgentView["nativeModels"];
   onPick: (model: string) => void;
   /** 没选时显示的文字；默认「同默认模型」。 */
   emptyLabel?: string;
@@ -1339,8 +1342,14 @@ function TierPicker({
   const empty = emptyLabel ?? t("同默认模型");
   const [open, setOpen] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
-  const display = value ? modelDisplay(payload, value, exclude) : null;
-  const inactive = disabledGroup(payload, value);
+  const slug = modelSlugFromRowName(value);
+  const nativeName = native?.models.some((model) => model.toLowerCase() === slug.toLowerCase())
+    ? native.accountName?.trim() || t("当前登录账号")
+    : undefined;
+  const display = nativeName
+    ? { title: prettyModelName(slug), sub: nativeName, group: false }
+    : value ? modelDisplay(payload, value, exclude) : null;
+  const inactive = nativeName ? undefined : disabledGroup(payload, value);
   const head = (
     <button className="gw-mp-action" data-active={!value} onClick={() => { setOpen(false); onPick(""); }} title={t("跟随这一行选的模型")} type="button">
       <span className="gw-tier-default">=</span>
@@ -1350,7 +1359,7 @@ function TierPicker({
   );
   return (
     <>
-      <button aria-expanded={open} className="gw-tier-button" onClick={() => setOpen(!open)} ref={buttonRef} title={inactive ? tf(inactiveBlocksRequest ? "模型组「{0}」已停用，请选择其他模型" : "模型组「{0}」已停用，当前使用默认模型", [inactive.name]) : undefined} type="button">
+      <button aria-expanded={open} className="gw-tier-button" onClick={() => setOpen(!open)} ref={buttonRef} title={inactive ? tf(inactiveBlocksRequest ? "模型组「{0}」已停用，请选择其他模型" : "模型组「{0}」已停用，当前使用默认模型", [inactive.name]) : nativeName} type="button">
         {label ? <em>{label}</em> : null}
         {display ? <ModelViewGlyph view={display} /> : null}
         <span>{display ? display.title : empty}{inactive ? ` · ${t("已停用")}` : ""}</span>
@@ -1361,6 +1370,7 @@ function TierPicker({
         <ModelList
           exclude={exclude}
           head={head}
+          native={native}
           onPick={(item) => {
             setOpen(false);
             onPick(item.model);

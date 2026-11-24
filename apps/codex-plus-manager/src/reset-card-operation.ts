@@ -1,24 +1,23 @@
-/** 持久保存未确认的操作标识；后端另按官方账号落盘，不能靠重建页面开启另一次消费。 */
-type Storage = Pick<globalThis.Storage, "getItem" | "setItem" | "removeItem">;
-const key = (providerId: string) => `codexpp:reset-card-operation:${encodeURIComponent(providerId)}`;
+export type ResetCardOperation = {
+  status: "ready" | "pending" | "damaged";
+  confirmation: string;
+};
 
-export function pendingResetCardOperation(storage: Storage, providerId: string): string | null {
-  const id = storage.getItem(key(providerId));
-  if (id !== null && (!id.trim() || id !== id.trim() || id.length > 128 || /[\x00-\x1f\x7f]/.test(id))) {
-    throw new Error("重置操作记录无效，请先核实上次结果");
-  }
-  return id;
+export function parseResetCardOperation(value: unknown): ResetCardOperation | null {
+  if (value === null || typeof value !== "object") return null;
+  const { status, confirmation } = value as Record<string, unknown>;
+  if (status !== "ready" && status !== "pending" && status !== "damaged") return null;
+  if (typeof confirmation !== "string" || confirmation.length !== 64 || /[^0-9a-f]/.test(confirmation)) return null;
+  return { status, confirmation };
 }
 
-export function beginResetCardOperation(storage: Storage, providerId: string, createId: () => string): string {
-  const pending = pendingResetCardOperation(storage, providerId);
-  if (pending) return pending;
-  const id = createId();
-  storage.setItem(key(providerId), id);
-  if (pendingResetCardOperation(storage, providerId) !== id) throw new Error("无法保存重置操作，请稍后重试");
-  return id;
-}
-
-export function finishResetCardOperation(storage: Storage, providerId: string, id: string): void {
-  if (pendingResetCardOperation(storage, providerId) === id) storage.removeItem(key(providerId));
+export function resetCardAction(
+  shown: ResetCardOperation | null,
+  current: ResetCardOperation,
+  action: "consume" | "abandon",
+): "start" | "retry" | "abandon" | null {
+  if (shown?.confirmation !== current.confirmation || shown.status !== current.status) return null;
+  if (action === "abandon") return current.status === "ready" ? null : "abandon";
+  if (current.status === "pending") return "retry";
+  return current.status === "ready" ? "start" : null;
 }

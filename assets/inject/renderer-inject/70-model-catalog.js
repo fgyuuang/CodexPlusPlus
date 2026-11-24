@@ -282,7 +282,10 @@
         codexModelCatalogLoadedAt = codexModelCatalogRuntime.loadedAt = Date.now();
         codexModelCatalogRuntime.retryAt = 0;
         codexModelCatalogRuntime.failure = null;
-        if (changed) refreshCodexNativeModelQueries();
+        if (changed) {
+          refreshCodexNativeModelQueries();
+          scheduleDeferredScan();
+        }
         renderCodexPlusMenu();
         syncCodexPlusGroupModelQueries();
         scheduleCodexModelWhitelistRefresh();
@@ -1483,7 +1486,8 @@
       }
       let result;
       try {
-        result = await sendAppServerRequestThroughExchange(client, method, nextParams, () => originalSendRequest(method, nextParams, options));
+        result = await sendAppServerRequestThroughExchange(client, method, nextParams,
+          (next) => originalSendRequest(method, next, options));
         noteCodexGatewayThreadStart(String(method || ""), nextParams, result, client.hostId, gatewayGeneration);
         verifyCodexPureApiResumeResult(String(method || ""), nextParams, result, client.hostId);
         noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
@@ -1537,13 +1541,18 @@
    * 内核分片还没初始化（页面早期、只抽前面分片的测试）时读中间件表会落进暂时性死区，按没有中间件处理。
    */
   async function sendAppServerRequestThroughExchange(client, method, params, send) {
+    const managedResume = method === "thread/resume" ? params
+      : method === "send-cli-request-for-host" && params?.method === "thread/resume" ? params.params : null;
+    const dispatch = () => managedResume?.modelProvider === "codex_plus_managed"
+      ? sendCodexManagedResumeWithFallback(method, params, client.hostId, send)
+      : send(params);
     let wanted = false;
     try {
       wanted = codexPlusExtensionInterceptors.has("codex/exchange");
     } catch {}
-    if (!wanted) return send();
-    const exchange = await codexPlusRunWaterfall("codex/exchange", { method, params, hostId: client.hostId, send });
-    return typeof exchange?.send === "function" ? exchange.send() : send();
+    if (!wanted) return dispatch();
+    const exchange = await codexPlusRunWaterfall("codex/exchange", { method, params, hostId: client.hostId, send: dispatch });
+    return typeof exchange?.send === "function" ? exchange.send() : dispatch();
   }
 
   // 账号额度用尽后，上游会把输入框和发送按钮一起锁死（coreRateLimitBlocked /
@@ -2620,7 +2629,8 @@
       }
       let result;
       try {
-        result = await sendAppServerRequestThroughExchange(client, method, nextParams, () => originalSendRequest.call(client, method, nextParams, options));
+        result = await sendAppServerRequestThroughExchange(client, method, nextParams,
+          (next) => originalSendRequest.call(client, method, next, options));
         noteCodexGatewayThreadStart(String(method || ""), nextParams, result, client.hostId, gatewayGeneration);
         verifyCodexPureApiResumeResult(String(method || ""), nextParams, result, client.hostId);
         noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
