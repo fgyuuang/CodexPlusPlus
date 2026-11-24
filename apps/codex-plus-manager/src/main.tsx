@@ -75,9 +75,12 @@ const app = document.getElementById("app");
 if (app instanceof HTMLElement) {
   if (import.meta.env.DEV && !("__TAURI_INTERNALS__" in window)
     && new URLSearchParams(location.search).has("previewRoute")) {
-    void import("../preview/quota-usage").then(({ installUsagePreviewMocks }) => {
-      installUsagePreviewMocks();
-      mountApp(app);
-    });
+    const preview = import.meta.glob<{ installUsagePreviewMocks: () => void }>("../preview/quota-usage.tsx");
+    const loadPreview = preview["../preview/quota-usage.tsx"];
+    if (loadPreview) {
+      void loadPreview().then(({ installUsagePreviewMocks }) => installUsagePreviewMocks())
+        .catch((error: unknown) => console.error("Usage preview could not load:", error))
+        .then(() => mountApp(app));
+    } else mountApp(app);
   } else mountApp(app);
 }
