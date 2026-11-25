@@ -39,6 +39,15 @@ const KEEP_LOG_BYTES: u64 = 1024 * 1024;
 static ENTRY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LOG_PATH_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
     std::sync::OnceLock::new();
+static REQUEST_LOG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 同进程读取器只在复制日志字节时持锁，解析应在释放锁后进行。
+#[doc(hidden)]
+pub fn lock_request_log() -> std::io::Result<std::sync::MutexGuard<'static, ()>> {
+    REQUEST_LOG_WRITE_LOCK
+        .lock()
+        .map_err(|_| std::io::Error::other("request log lock poisoned"))
+}
 
 /// 一次上游请求的 token 用量。
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -274,12 +283,20 @@ pub fn finish_request(entry: &RequestLogEntry) {
     if let Ok(mut live) = live_requests().lock() {
         live.remove(&entry.id);
     }
-    if let Some(route) = crate::gateway::activity::take_request_route(&entry.id) {
+    let entry_with_route = crate::gateway::activity::take_request_route(&entry.id).map(|route| {
         let mut entry = entry.clone();
         entry.route = Some(route);
-        let _ = append_request_log(&entry);
-    } else {
-        let _ = append_request_log(entry);
+        entry
+    });
+    if let Err(error) = append_request_log(entry_with_route.as_ref().unwrap_or(entry))
+        && let Err(diagnostic_error) = crate::diagnostic_log::append_diagnostic_log(
+            "request_log.write_or_trim_failed",
+            serde_json::json!({ "error": error.to_string() }),
+        )
+    {
+        eprintln!(
+            "request log write or trim failed: {error}; diagnostic log failed: {diagnostic_error}"
+        );
     }
     // 单元测试里默认路径指向真实用户状态目录，同样不写。
     if !(cfg!(test) && log_path_override().is_none()) {
@@ -418,36 +435,54 @@ pub fn append_request_log(entry: &RequestLogEntry) -> std::io::Result<()> {
 }
 
 pub fn append_request_log_at(path: &Path, entry: &RequestLogEntry) -> std::io::Result<()> {
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut line = serde_json::to_vec(entry)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    line.push(b'\n');
+    let _guard = lock_request_log()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let line = serde_json::to_string(entry)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)?;
-    writeln!(file, "{line}")?;
+    // 上次写入若在换行前中断，不让残行吞掉这次完整的请求。
+    if file.metadata()?.len() != 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last != [b'\n'] {
+            file.write_all(b"\n")?;
+        }
+    }
+    file.write_all(&line)?;
+    let needs_trim = file.metadata()?.len() > MAX_LOG_BYTES;
     drop(file);
-    if std::fs::metadata(path)
-        .map(|meta| meta.len() > MAX_LOG_BYTES)
-        .unwrap_or(false)
-    {
+    if needs_trim {
         trim_request_log_to_tail(path, KEEP_LOG_BYTES)?;
     }
     Ok(())
 }
 
 fn trim_request_log_to_tail(path: &Path, keep_bytes: u64) -> std::io::Result<()> {
-    let contents = std::fs::read(path)?;
-    let keep_from = contents.len().saturating_sub(keep_bytes as usize);
-    let start = contents[keep_from..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map(|offset| keep_from + offset + 1)
-        .unwrap_or(keep_from);
-    std::fs::write(path, &contents[start..])
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let offset = file.metadata()?.len().saturating_sub(keep_bytes);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut tail = Vec::new();
+    file.take(keep_bytes).read_to_end(&mut tail)?;
+    let start = if offset > 0 {
+        tail.iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(tail.len(), |position| position + 1)
+    } else {
+        0
+    };
+    std::fs::write(path, &tail[start..])
 }
 
 /// 读取最近 `limit` 条请求日志（含正在进行的请求），按开始时间倒序返回。
@@ -516,6 +551,26 @@ pub struct RequestLogPage {
     pub more: bool,
     /// 日志文件里最早一条的开始时间：日志按大小滚动，更早的请求只留在用量统计里。
     pub oldest_ms: Option<u64>,
+    /// 文件里最后一条记录的位置，下一轮拿它增量读；空文件时没有。
+    pub cursor: Option<RequestLogCursor>,
+}
+
+/// 增量读请求日志的游标：文件里最后读到的那一行的起始字节和它的请求 id。
+/// 下次从这一行读起，先核对还是不是同一条记录——日志被清空或按大小裁剪后对不上，就整页重读。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestLogCursor {
+    pub offset: u64,
+    pub id: String,
+}
+
+/// 游标之后新写入的请求日志（已按条件筛过）。
+#[derive(Clone, Debug, Default)]
+pub struct RequestLogDelta {
+    /// 新完成的请求 + 现在仍在进行的请求，按开始时间倒序。
+    pub entries: Vec<RequestLogEntry>,
+    /// 新的游标；没有新记录时和传入的相同。
+    pub cursor: RequestLogCursor,
 }
 
 /// 读取符合条件的最近 `limit` 条请求日志（含正在进行的请求）。
@@ -543,7 +598,10 @@ pub fn read_request_log_page_at(
     limit: usize,
     filter: &RequestLogFilter,
 ) -> std::io::Result<RequestLogPage> {
-    let contents = match std::fs::read_to_string(path) {
+    let contents = match {
+        let _guard = lock_request_log()?;
+        std::fs::read(path)
+    } {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(RequestLogPage::default());
@@ -552,17 +610,24 @@ pub fn read_request_log_page_at(
     };
     let mut page = RequestLogPage::default();
     let mut entries = VecDeque::with_capacity(limit.min(1024));
-    for line in contents.lines() {
-        let line = line.trim();
+    let mut offset = 0u64;
+    for raw in contents.split_inclusive(|byte| *byte == b'\n') {
+        let start = offset;
+        offset += raw.len() as u64;
+        let line = raw.trim_ascii();
         if line.is_empty() {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<RequestLogEntry>(line) else {
+        let Ok(entry) = serde_json::from_slice::<RequestLogEntry>(line) else {
             continue;
         };
         if page.oldest_ms.is_none() {
             page.oldest_ms = Some(entry.started_at_ms.max(1));
         }
+        page.cursor = Some(RequestLogCursor {
+            offset: start,
+            id: entry.id.clone(),
+        });
         if !filter.matches(&entry) {
             continue;
         }
@@ -576,19 +641,96 @@ pub fn read_request_log_page_at(
     Ok(page)
 }
 
+/// 只读游标之后新写入的请求日志（含正在进行的请求），给请求日志页的自动刷新用：
+/// 不再每轮把整个日志读一遍、解析一遍。游标对不上时返回 `None`，调用方改为整页重读。
+pub fn read_request_logs_after(
+    filter: &RequestLogFilter,
+    cursor: &RequestLogCursor,
+) -> std::io::Result<Option<RequestLogDelta>> {
+    let Some(mut delta) = read_request_logs_after_at(&request_log_path(), filter, cursor)? else {
+        return Ok(None);
+    };
+    delta.entries.extend(
+        running_requests()
+            .into_iter()
+            .filter(|entry| filter.matches(entry)),
+    );
+    delta
+        .entries
+        .sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
+    Ok(Some(delta))
+}
+
+pub fn read_request_logs_after_at(
+    path: &Path,
+    filter: &RequestLogFilter,
+    cursor: &RequestLogCursor,
+) -> std::io::Result<Option<RequestLogDelta>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let guard = lock_request_log()?;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() <= cursor.offset {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(cursor.offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    drop(guard);
+    let mut chunks = bytes.split_inclusive(|byte| *byte == b'\n');
+    // 游标那一行必须还是同一条记录，否则日志被清空或裁剪过，偏移已经不作数。
+    let first = chunks.next().unwrap_or_default();
+    let first_offset = first.len() as u64;
+    match serde_json::from_slice::<RequestLogEntry>(first.trim_ascii()) {
+        Ok(entry) if entry.id == cursor.id => {}
+        _ => return Ok(None),
+    }
+    let mut delta = RequestLogDelta {
+        entries: Vec::new(),
+        cursor: cursor.clone(),
+    };
+    let mut offset = cursor.offset + first_offset;
+    for chunk in chunks {
+        let start = offset;
+        offset += chunk.len() as u64;
+        // 写入方整行加锁追加，这里仍只认带换行的完整行，半行留到下一轮。
+        if !chunk.ends_with(b"\n") {
+            break;
+        }
+        let line = chunk.trim_ascii();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<RequestLogEntry>(line) else {
+            continue;
+        };
+        delta.cursor = RequestLogCursor {
+            offset: start,
+            id: entry.id.clone(),
+        };
+        if filter.matches(&entry) {
+            delta.entries.push(entry);
+        }
+    }
+    delta.entries.reverse();
+    Ok(Some(delta))
+}
+
 pub fn read_request_logs_at(path: &Path, limit: usize) -> std::io::Result<Vec<RequestLogEntry>> {
-    let contents = match std::fs::read_to_string(path) {
+    let contents = match {
+        let _guard = lock_request_log()?;
+        std::fs::read(path)
+    } {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
     let mut entries = VecDeque::with_capacity(limit.min(1024));
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<RequestLogEntry>(line) {
+    for line in contents.split(|byte| *byte == b'\n') {
+        if let Ok(entry) = serde_json::from_slice::<RequestLogEntry>(line.trim_ascii()) {
             entries.push_back(entry);
             if entries.len() > limit {
                 entries.pop_front();
@@ -617,6 +759,7 @@ pub fn read_recent_request_logs_at(
     limit: usize,
 ) -> std::io::Result<Vec<RequestLogEntry>> {
     use std::io::{Read, Seek, SeekFrom};
+    let guard = lock_request_log()?;
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -626,19 +769,15 @@ pub fn read_recent_request_logs_at(
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines = text.lines();
+    drop(guard);
+    let mut lines = bytes.split(|byte| *byte == b'\n');
     // 从文件中间开始读时，第一行多半被截断，丢掉。
     if start > 0 {
         lines.next();
     }
     let mut entries = VecDeque::with_capacity(limit.min(1024));
     for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<RequestLogEntry>(line) {
+        if let Ok(entry) = serde_json::from_slice::<RequestLogEntry>(line.trim_ascii()) {
             entries.push_back(entry);
             if entries.len() > limit {
                 entries.pop_front();
@@ -656,6 +795,7 @@ pub fn clear_request_logs() -> std::io::Result<()> {
 }
 
 pub fn clear_request_logs_at(path: &Path) -> std::io::Result<()> {
+    let _guard = lock_request_log()?;
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -964,6 +1104,38 @@ mod tests {
     }
 
     #[test]
+    fn request_usage_distinguishes_missing_and_explicit_zero_cache() {
+        for (usage, known) in [
+            (json!({"input_tokens": 10, "output_tokens": 2}), false),
+            (
+                json!({"input_tokens": 10, "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 0}}),
+                true,
+            ),
+            (json!({"prompt_tokens": 10, "completion_tokens": 2}), false),
+            (
+                json!({"prompt_tokens": 10, "completion_tokens": 2,
+                "prompt_tokens_details": {"cached_tokens": 0}}),
+                true,
+            ),
+        ] {
+            let parsed = usage_from_usage_value(&usage).unwrap();
+            assert_eq!(parsed.cached_tokens, 0);
+            assert_eq!(parsed.cached_tokens_known, Some(known));
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap()["cachedTokensKnown"],
+                known
+            );
+            assert_eq!(parsed.cache_hit_ratio(), known.then_some(0.0));
+        }
+        let legacy: RequestUsage = serde_json::from_value(json!({
+            "inputTokens": 10, "outputTokens": 2, "cachedTokens": 0
+        }))
+        .unwrap();
+        assert_eq!(legacy.cached_tokens_known, None);
+    }
+
+    #[test]
     fn upstream_model_binding_uses_mutated_body_and_is_not_deserialized() {
         let mut trace = RequestTrace::default();
         let mut body = json!({"model":"before-middleware"});
@@ -1051,6 +1223,78 @@ mod tests {
         assert_eq!(ids(&limited), vec!["e3", "e2"]);
         assert!(limited.more, "符合条件的不止这些");
         assert_eq!(limited.oldest_ms, Some(1_000), "最早一条按整个文件算");
+    }
+
+    #[test]
+    fn delta_reads_only_lines_after_cursor_and_resets_when_log_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("request-log.jsonl");
+        let ids = |entries: &[RequestLogEntry]| {
+            entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let row = |id: &str, started: u64, relay: &str| {
+            let mut row = entry(id);
+            row.started_at_ms = started;
+            row.relay_id = relay.to_string();
+            row
+        };
+        append_request_log_at(&path, &row("e0", 1_000, "relay-a")).unwrap();
+        append_request_log_at(&path, &row("e1", 2_000, "relay-b")).unwrap();
+        let page = read_request_log_page_at(&path, 10, &RequestLogFilter::default()).unwrap();
+        let cursor = page.cursor.clone().expect("非空日志要给游标");
+        assert_eq!(cursor.id, "e1", "游标指向文件里最后一条");
+
+        // 没有新记录：空结果、游标不变。
+        let idle = read_request_logs_after_at(&path, &RequestLogFilter::default(), &cursor)
+            .unwrap()
+            .unwrap();
+        assert!(idle.entries.is_empty());
+        assert_eq!(idle.cursor, cursor);
+
+        // 新写入的按条件筛；长请求开始得早、写得晚，也照样读到；游标跟到最后一行（不论是否符合条件）。
+        append_request_log_at(&path, &row("e2", 3_000, "relay-a")).unwrap();
+        append_request_log_at(&path, &row("e3", 500, "relay-a")).unwrap();
+        append_request_log_at(&path, &row("e4", 4_000, "relay-b")).unwrap();
+        let relay_a = RequestLogFilter {
+            relay_id: Some("relay-a".to_string()),
+            ..Default::default()
+        };
+        let delta = read_request_logs_after_at(&path, &relay_a, &cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ids(&delta.entries),
+            vec!["e3", "e2"],
+            "新写入的倒序返回，供应商条件照常生效"
+        );
+        assert_eq!(delta.cursor.id, "e4");
+        let full = read_request_log_page_at(&path, 10, &RequestLogFilter::default()).unwrap();
+        assert_eq!(
+            full.cursor.as_ref(),
+            Some(&delta.cursor),
+            "增量游标和整页读的一致"
+        );
+
+        // 日志被清空或改写过：游标对不上，要求整页重读。
+        clear_request_logs_at(&path).unwrap();
+        assert!(
+            read_request_logs_after_at(&path, &RequestLogFilter::default(), &delta.cursor)
+                .unwrap()
+                .is_none()
+        );
+        for index in 0..6 {
+            append_request_log_at(&path, &row(&format!("n{index}"), 10_000 + index, "relay-a"))
+                .unwrap();
+        }
+        assert!(
+            read_request_logs_after_at(&path, &RequestLogFilter::default(), &delta.cursor)
+                .unwrap()
+                .is_none(),
+            "同一偏移上换成了别的记录"
+        );
     }
 
     #[test]
@@ -1262,6 +1506,44 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_utf8_row_does_not_hide_or_consume_completed_requests() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.jsonl");
+        append_request_log_at(&path, &entry("before")).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"relayName\":\"\xe6\xb5").unwrap();
+        drop(file);
+
+        let first = read_request_log_page_at(&path, 10, &Default::default()).unwrap();
+        assert_eq!(first.entries.len(), 1);
+        let cursor = first.cursor.unwrap();
+        assert_eq!(cursor.id, "before");
+        append_request_log_at(&path, &entry("after")).unwrap();
+        for rows in [
+            read_request_logs_at(&path, 10).unwrap(),
+            read_recent_request_logs_at(&path, 10).unwrap(),
+            read_request_log_page_at(&path, 10, &Default::default())
+                .unwrap()
+                .entries,
+        ] {
+            assert_eq!(
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                ["after", "before"]
+            );
+        }
+        let delta = read_request_logs_after_at(&path, &Default::default(), &cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delta.entries.len(), 1);
+        assert_eq!(delta.entries[0].id, "after");
+    }
+
+    #[test]
     fn recent_logs_read_only_the_tail_and_match_full_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(REQUEST_LOG_FILE);
@@ -1326,6 +1608,265 @@ mod tests {
         assert!(!logs.is_empty());
         assert_eq!(logs[0].id, "entry-39");
         assert!(logs.len() < 40, "裁剪后不应保留全部记录: {}", logs.len());
+    }
+
+    #[test]
+    fn concurrent_appends_survive_log_trimming() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REQUEST_LOG_FILE);
+        let filler = format!("{}\n", serde_json::to_string(&entry("filler")).unwrap());
+        let count = (MAX_LOG_BYTES as usize - 16 * 1024) / filler.len();
+        std::fs::write(&path, filler.repeat(count)).unwrap();
+
+        let workers = 12;
+        let per_worker = 96;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let threads: Vec<_> = (0..workers)
+            .map(|worker| {
+                let path = path.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    for number in 0..per_worker {
+                        append_request_log_at(&path, &entry(&format!("marker-{worker}-{number}")))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut markers = std::collections::HashSet::new();
+        for line in contents.lines() {
+            let entry: RequestLogEntry = serde_json::from_str(line).unwrap();
+            if entry.id.starts_with("marker-") {
+                assert!(markers.insert(entry.id));
+            }
+        }
+        assert_eq!(markers.len(), workers * per_worker);
+    }
+
+    #[test]
+    fn readers_wait_for_in_process_trimming() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REQUEST_LOG_FILE);
+        std::fs::write(&path, "").unwrap();
+        let guard = lock_request_log().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let read_path = path.clone();
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx.send(read_request_logs_at(&read_path, 1)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&entry("retained")).unwrap()),
+        )
+        .unwrap();
+        drop(guard);
+        let rows = result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rows[0].id, "retained");
+        thread.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trimming_preserves_custom_windows_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REQUEST_LOG_FILE);
+        let filler = format!("{}\n", serde_json::to_string(&entry("filler")).unwrap());
+        std::fs::write(
+            &path,
+            filler.repeat(MAX_LOG_BYTES as usize / filler.len() + 1),
+        )
+        .unwrap();
+        let configured = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/inheritance:r", "/grant:r", "*S-1-5-11:(F)"])
+            .output()
+            .unwrap();
+        assert!(configured.status.success(), "failed to configure test ACL");
+        let before = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(before.status.success());
+
+        append_request_log_at(&path, &entry("trigger")).unwrap();
+
+        let after = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(after.status.success());
+        assert!(
+            after.stdout == before.stdout,
+            "trimming changed the custom ACL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trimming_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REQUEST_LOG_FILE);
+        let filler = format!("{}\n", serde_json::to_string(&entry("filler")).unwrap());
+        std::fs::write(
+            &path,
+            filler.repeat(MAX_LOG_BYTES as usize / filler.len() + 1),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        append_request_log_at(&path, &entry("trigger")).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn concurrent_appends_and_clears_leave_complete_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REQUEST_LOG_FILE);
+        let workers = 8;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(workers + 1));
+        let clear_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let threads: Vec<_> = (0..workers)
+            .map(|worker| {
+                let path = path.clone();
+                let start = start.clone();
+                let clear_finished = clear_finished.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    for number in 0..96 {
+                        append_request_log_at(&path, &entry(&format!("marker-{worker}-{number}")))
+                            .unwrap();
+                    }
+                    while !clear_finished.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    append_request_log_at(&path, &entry(&format!("after-clear-{worker}"))).unwrap();
+                })
+            })
+            .collect();
+        start.wait();
+        for _ in 0..64 {
+            clear_request_logs_at(&path).unwrap();
+            std::thread::yield_now();
+        }
+        clear_finished.store(true, Ordering::Release);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let entries: Vec<RequestLogEntry> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for worker in 0..workers {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.id == format!("after-clear-{worker}"))
+            );
+        }
+    }
+
+    #[test]
+    fn append_failure_is_reported_without_stopping_usage() {
+        const CHILD_DIR: &str = "CODEX_PLUS_REQUEST_LOG_FAILURE_TEST_DIR";
+        const POISON_LOCK: &str = "CODEX_PLUS_REQUEST_LOG_POISON_LOCK";
+        if let Some(root) = std::env::var_os(CHILD_DIR) {
+            let root = PathBuf::from(root);
+            let request_path = root.join("request-log-directory");
+            let diagnostic_path = root.join("diagnostic.jsonl");
+            if std::env::var_os(POISON_LOCK).is_some() {
+                let poisoned = std::thread::spawn(|| {
+                    let _guard = lock_request_log().unwrap();
+                    panic!("poison test lock");
+                });
+                assert!(poisoned.join().is_err());
+            } else {
+                std::fs::create_dir(&request_path).unwrap();
+            }
+            set_request_log_path_for_tests(Some(request_path));
+            crate::diagnostic_log::set_diagnostic_log_path_for_tests(Some(diagnostic_path.clone()));
+
+            finish_request(&entry("failed-append"));
+
+            let diagnostics = std::fs::read_to_string(diagnostic_path).unwrap();
+            assert!(diagnostics.contains("\"event\":\"request_log.write_or_trim_failed\""));
+            let usage_path = root.join("gateway-usage.json");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let usage = loop {
+                if let Ok(contents) = std::fs::read(&usage_path) {
+                    break serde_json::from_slice::<Value>(&contents).unwrap();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "usage was not recorded"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let rows = usage["days"]
+                .as_object()
+                .unwrap()
+                .values()
+                .flat_map(|day| day.as_array().unwrap().iter());
+            assert!(rows.into_iter().any(|row| {
+                row["providerId"] == "relay-a" && row["calls"] == 1 && row["inputTokens"] == 1000
+            }));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for mode in ["unwritable", "poisoned"] {
+            let root = dir.path().join(mode);
+            std::fs::create_dir(&root).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "request_log::tests::append_failure_is_reported_without_stopping_usage",
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, &root)
+                .env("CODEX_PLUS_STATE_DIR", root.join("state"))
+                .env("CODEX_HOME", &root)
+                .env("APPDATA", &root)
+                .env("LOCALAPPDATA", &root)
+                .env("TEMP", &root)
+                .env("TMP", &root)
+                .env_remove("CODEX_SQLITE_HOME")
+                .env_remove(POISON_LOCK);
+            if mode == "poisoned" {
+                command.env(POISON_LOCK, "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod markdown;
 pub mod provider_sync;
 pub mod session_index_repair;
 mod session_index_scan;
+pub mod session_relocate;
 pub mod storage;
 mod sync_journal;
 pub mod usage_archive;
@@ -32,7 +33,12 @@ pub use provider_sync::{
     run_remote_control_session_finalization_for_thread_with_target,
     try_acquire_provider_sync_lifecycle_guard, validate_provider_sync_target,
 };
+pub use session_relocate::{
+    SessionRelocationItem, SessionRelocationPlan, SessionRelocationReport,
+    SessionRelocationRequest, SessionRelocationRoot, apply_session_relocation,
+    plan_session_relocation,
+};
 pub use storage::{
-    LocalSession, LocalSessionPage, LocalSessionPager, SQLiteStorageAdapter,
-    delete_local_from_paths, local_session_titles,
+    LocalSession, LocalSessionFilter, LocalSessionPage, LocalSessionPager, SQLiteStorageAdapter,
+    delete_local_from_paths, local_session_titles, normalized_project_path,
 };

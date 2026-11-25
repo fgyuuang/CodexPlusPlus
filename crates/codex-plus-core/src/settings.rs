@@ -89,6 +89,8 @@ pub struct RelayProfile {
     pub relay_mode: RelayMode,
     #[serde(rename = "officialMixApiKey", default)]
     pub official_mix_api_key: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_mixed_api: Option<InactiveMixedApi>,
     /// 供应商引用的网关/账号凭证；留空时沿用供应商自己的 auth 快照。
     #[serde(
         rename = "officialAccountRef",
@@ -218,6 +220,11 @@ pub struct RelayProfile {
     /// OpenAI 扩展字段，只会返回泛化的 invalid_request（#2870）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub strip_responses_image_detail: bool,
+    /// 转发前移除 Responses 顶层 `include` 里的 `output.encrypted_content`。
+    /// 部分严格上游只接受 `reasoning.encrypted_content`，带上该项会整单 400。
+    /// 默认关闭；Kimi 等已知上游仍由自动识别处理。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strip_responses_output_encrypted_content: bool,
     /// 不向该上游发送 `tool_search` 托管工具：部分第三方 Responses 上游不认识
     /// 它，供应商测试能过但实际聊天整单 400（#2868 / #2871）。Kimi 官方自动处理。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -558,6 +565,15 @@ pub struct AggregateRelayProfile {
     pub auto_review_relay_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InactiveMixedApi {
+    pub config_contents: String,
+    pub upstream_base_url: String,
+    #[serde(default)]
+    pub model_routes: Vec<RelayModelRoute>,
+}
+
 impl Default for RelayProfile {
     fn default() -> Self {
         Self {
@@ -573,6 +589,7 @@ impl Default for RelayProfile {
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            inactive_mixed_api: None,
             official_account_ref: String::new(),
             no_auth: false,
             hide_official_usage_alert: false,
@@ -605,6 +622,7 @@ impl Default for RelayProfile {
             strict_responses_reasoning: false,
             strip_image_generation_tool: false,
             strip_responses_image_detail: false,
+            strip_responses_output_encrypted_content: false,
             disable_tool_search: false,
             pure_api_image_generation: false,
             auto_review_model: String::new(),
@@ -676,6 +694,15 @@ impl RelayProfile {
     /// 第三方 Responses 上游生效。
     pub fn strips_responses_image_detail(&self) -> bool {
         self.strip_responses_image_detail
+            && self.protocol == RelayProtocol::Responses
+            && self.relay_mode != RelayMode::Aggregate
+            && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+    }
+
+    /// 是否在转发前移除 Responses 顶层 `include` 里的
+    /// `output.encrypted_content`；只对经本地代理转发的第三方 Responses 上游生效。
+    pub fn strips_responses_output_encrypted_content(&self) -> bool {
+        self.strip_responses_output_encrypted_content
             && self.protocol == RelayProtocol::Responses
             && self.relay_mode != RelayMode::Aggregate
             && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
@@ -1417,6 +1444,10 @@ pub struct BackendSettings {
     /// 原版 Claude 的本地兼容服务，与增强副本的开关独立，默认不接管启动。
     #[serde(rename = "claudeDesktopLocal", default)]
     pub claude_desktop_local: ClaudeLocalSettings,
+    /// Claude Desktop 自动接管（默认关闭）：启动模式是完整功能模式时，用户自己打开的官方 Claude
+    /// 会被退出、再经本地服务重开。3p 模式和补丁副本不接管，见 `claude_auto_takeover`。
+    #[serde(rename = "claudeAppAutoTakeover", default)]
+    pub claude_app_auto_takeover: bool,
     // 默认开启：只在受管副本的页面里加一个语音入口，识别走 Codex++ 自己的听写服务，
     // 不改官方应用、不动输入框已有内容；关掉只是没有入口，已运行的副本需重启才生效。
     #[serde(rename = "claudeAppVoiceInput", default = "default_true")]
@@ -1434,6 +1465,14 @@ pub struct BackendSettings {
     pub claude_app_computer_use: bool,
     #[serde(rename = "claudeAppBashTimeout", default)]
     pub claude_app_bash_timeout: ClaudeBashTimeoutSettings,
+    /// Claude 增强的生效方式：`full`（完整功能模式，本地服务注入）或 `copy`（补丁副本，启动时注入）。
+    /// 没写过时按现状推断，见 `claude_localization::enhance_delivery`。
+    #[serde(
+        rename = "claudeEnhanceDelivery",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub claude_enhance_delivery: Option<String>,
     /// Codex++ Computer Use 的审批策略。
     ///
     /// - `auto`（默认）：代理就地放行，只留痕。适合信任调用方、只想少弹窗的场景。
@@ -1528,8 +1567,9 @@ pub struct BackendSettings {
     /// Codex App 与 CLI 的本地代理响应信任上报用量，不改 usage；旧会话首次响应前仍可能使用原估算。默认关。
     #[serde(rename = "codexAppReportedUsageCompaction", default)]
     pub codex_app_reported_usage_compaction: bool,
-    /// 管理器的使用模式（"codex" / "enhance" / "all"，空 = 没选过）。页面本地存储会丢（例如管理员身份启动时
-    /// WebView 数据目录不同），这里再存一份，启动时用它补回，问卷不再每次都弹（#2902）。
+    /// 管理器的启动引导出现过没有（空 = 没出现过）。页面本地存储会丢（例如管理员身份启动时 WebView 数据目录不同），
+    /// 这里再留一个记号，启动时两处都看，向导不会每次都弹（#2902）。
+    /// 字段原来记的是使用模式（"codex" / "enhance" / "all"，已取消），旧值照样算出现过；现在只写 "all"。
     #[serde(rename = "managerAgentFocus", default)]
     pub manager_agent_focus: String,
     #[serde(rename = "codexAppPetRealMouseLook", default)]
@@ -1647,6 +1687,16 @@ pub struct BackendSettings {
     pub codex_app_dream_skin_theme_config: DreamSkinThemeConfig,
     #[serde(rename = "codexAppDreamSkinImagePath", default)]
     pub codex_app_dream_skin_image_path: String,
+    /// 皮肤面板透出壁纸的百分比（0–100，#3233）。是用户偏好，不写进主题包：
+    /// 注入时作为 `userTransparency` 并进交给上游渲染器的主题配置。
+    /// None 表示跟随主题（主题配色自带透明度就用它，否则上游默认透出 30%）。
+    #[serde(
+        rename = "codexAppDreamSkinUserTransparency",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_dream_skin_user_transparency"
+    )]
+    pub codex_app_dream_skin_user_transparency: Option<u8>,
     #[serde(rename = "codexGoalsEnabled", default)]
     pub codex_goals_enabled: bool,
     #[serde(rename = "weixinConnectEnabled", default)]
@@ -1846,11 +1896,13 @@ impl Default for BackendSettings {
             usage_history_enabled: false,
             codex_app_proxy_request_status: true,
             claude_desktop_local: ClaudeLocalSettings::default(),
+            claude_app_auto_takeover: false,
             claude_app_voice_input: true,
             claude_app_localization: true,
             claude_app_extensions: false,
             claude_app_computer_use: false,
             claude_app_bash_timeout: ClaudeBashTimeoutSettings::default(),
+            claude_enhance_delivery: None,
             computer_use_approval: default_computer_use_approval(),
             computer_use_mode: default_computer_use_mode(),
             computer_use_pip: true,
@@ -1910,6 +1962,7 @@ impl Default for BackendSettings {
             codex_app_dream_skin_theme: default_dream_skin_theme(),
             codex_app_dream_skin_theme_config: DreamSkinThemeConfig::default(),
             codex_app_dream_skin_image_path: String::new(),
+            codex_app_dream_skin_user_transparency: None,
             codex_goals_enabled: false,
             weixin_connect_enabled: false,
             weixin_connect_base_url: default_weixin_connect_base_url(),
@@ -1993,6 +2046,7 @@ impl BackendSettings {
                 protocol: RelayProtocol::Responses,
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
+                inactive_mixed_api: None,
                 official_account_ref: String::new(),
                 no_auth: false,
                 hide_official_usage_alert: false,
@@ -2025,6 +2079,7 @@ impl BackendSettings {
                 strict_responses_reasoning: false,
                 strip_image_generation_tool: false,
                 strip_responses_image_detail: false,
+                strip_responses_output_encrypted_content: false,
                 disable_tool_search: false,
                 pure_api_image_generation: false,
                 auto_review_model: String::new(),
@@ -2075,6 +2130,7 @@ impl BackendSettings {
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            inactive_mixed_api: None,
             official_account_ref: String::new(),
             no_auth: false,
             hide_official_usage_alert: false,
@@ -2107,6 +2163,7 @@ impl BackendSettings {
             strict_responses_reasoning: false,
             strip_image_generation_tool: false,
             strip_responses_image_detail: false,
+            strip_responses_output_encrypted_content: false,
             disable_tool_search: false,
             pure_api_image_generation: false,
             auto_review_model: String::new(),
@@ -2230,6 +2287,9 @@ impl BackendSettings {
                 .active_relay_profile()
                 .enables_pure_api_image_generation()
             || self.active_relay_profile().strips_responses_image_detail()
+            || self
+                .active_relay_profile()
+                .strips_responses_output_encrypted_content()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -2694,6 +2754,22 @@ where
         .unwrap_or_else(default_dream_skin_theme))
 }
 
+/// 皮肤「壁纸透出」偏好：数字取整并限制在 0–100；null 或不是数字都算跟随主题（None）。
+pub fn normalize_dream_skin_user_transparency(value: &Value) -> Option<u8> {
+    let number = value.as_f64().filter(|number| number.is_finite())?;
+    Some(number.round().clamp(0.0, 100.0) as u8)
+}
+
+/// 手改坏的值不能让整份设置读不出来：读不懂就当跟随主题。
+fn deserialize_dream_skin_user_transparency<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(normalize_dream_skin_user_transparency(&Value::deserialize(
+        deserializer,
+    )?))
+}
+
 fn deserialize_stepwise_max_items<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2739,16 +2815,9 @@ where
         .unwrap_or_else(default_capacity_retry_max_attempts))
 }
 
-fn deserialize_profile_api_key<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-/// `modelWindows` / `modelAutoCompact` / `modelMetadata` / `modelVlm` 落盘是一段 JSON 文本。
-/// 外部脚本或更早的版本可能把 map 直接写进这几个字段：两种写法都认，统一还原成文本，
-/// 免得一个字段的类型不对就让整份配置读不出来（网关那边会连绑定一起丢掉）。
+// 兼容直接写入 JSON 对象的配置；保存时仍使用原有文本形态。
+// 对象里直接写数字的（`{"model-a": 500000}`）转成文本形态里的字符串：窗口、压缩百分比这两张表
+// 应用时只认字符串值，原样留着数字会在切换供应商时报「值必须是字符串」。
 fn deserialize_json_text<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2756,8 +2825,23 @@ where
     Ok(match Option::<Value>::deserialize(deserializer)? {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(text)) => text,
+        Some(Value::Object(mut map)) => {
+            for value in map.values_mut() {
+                if let Value::Number(number) = value {
+                    *value = Value::String(number.to_string());
+                }
+            }
+            Value::Object(map).to_string()
+        }
         Some(other) => other.to_string(),
     })
+}
+
+fn deserialize_profile_api_key<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 pub fn normalize_codex_extra_args(args: &[String]) -> Vec<String> {
@@ -3293,6 +3377,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert("dictation".to_string(), Value::Object(dictation));
     }
     merge_bool_setting(target, source, "claudeAppExtensions");
+    merge_bool_setting(target, source, "claudeAppAutoTakeover");
     merge_bool_setting(target, source, "relayPreserveNonproviderSettings");
     target.remove("codexAppPluginAutoExpand");
     target.remove("computerUseGuardEnabled");
@@ -3719,6 +3804,21 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
             Value::String(value.trim().to_string()),
         );
     }
+    // null 清回「跟随主题」；数字按 0–100 归一；其它值不动原设置。
+    match source.get("codexAppDreamSkinUserTransparency") {
+        Some(Value::Null) => {
+            target.remove("codexAppDreamSkinUserTransparency");
+        }
+        Some(value) => {
+            if let Some(percent) = normalize_dream_skin_user_transparency(value) {
+                target.insert(
+                    "codexAppDreamSkinUserTransparency".to_string(),
+                    Value::from(percent),
+                );
+            }
+        }
+        None => {}
+    }
     if let Some(value) = source.get("codexGoalsEnabled").and_then(Value::as_bool) {
         target.insert("codexGoalsEnabled".to_string(), Value::Bool(value));
     }
@@ -4062,6 +4162,7 @@ pub(crate) const RELAY_PROFILE_KNOWN_FIELDS: &[&str] = &[
     "protocol",
     "relayMode",
     "officialMixApiKey",
+    "inactiveMixedApi",
     "officialAccountRef",
     "noAuth",
     "hideOfficialUsageAlert",
@@ -4092,6 +4193,7 @@ pub(crate) const RELAY_PROFILE_KNOWN_FIELDS: &[&str] = &[
     "strictResponsesReasoning",
     "stripImageGenerationTool",
     "stripResponsesImageDetail",
+    "stripResponsesOutputEncryptedContent",
     "disableToolSearch",
     "pureApiImageGeneration",
     "autoReviewModel",
@@ -4725,7 +4827,7 @@ mod tests {
     /// 外部脚本会把 `modelWindows` 写成 map；读的时候要认，并且转成文本形态，
     /// 否则整份 gateway.json 解析失败，网关连绑定都读不到。
     #[test]
-    fn relay_profile_accepts_json_text_fields_written_as_maps() {
+    fn relay_profile_accepts_legacy_maps_for_all_json_text_fields() {
         let profile: RelayProfile = serde_json::from_value(json!({
             "id": "chat-ecnu",
             "name": "Chat ECNU",
@@ -4736,8 +4838,8 @@ mod tests {
         }))
         .expect("map 形态的 JSON 文本字段也要能读");
 
-        assert_eq!(profile.model_windows, r#"{"ecnu-reasoner":524288}"#);
-        assert_eq!(profile.model_auto_compact, r#"{"ecnu-reasoner":80}"#);
+        assert_eq!(profile.model_windows, r#"{"ecnu-reasoner":"524288"}"#);
+        assert_eq!(profile.model_auto_compact, r#"{"ecnu-reasoner":"80"}"#);
         assert_eq!(
             profile.model_metadata,
             r#"{"ecnu-reasoner":{"displayName":"Reasoner"}}"#
@@ -4745,7 +4847,10 @@ mod tests {
         assert_eq!(profile.model_vlm, r#"{"ecnu-reasoner":"strip"}"#);
         // 写回去还是字符串，不会把 map 再写进磁盘。
         let saved = serde_json::to_value(&profile).unwrap();
-        assert_eq!(saved["modelWindows"], json!(r#"{"ecnu-reasoner":524288}"#));
+        assert_eq!(
+            saved["modelWindows"],
+            json!(r#"{"ecnu-reasoner":"524288"}"#)
+        );
     }
 
     /// 正常的文本形态还要照旧读，null / 缺字段都当空串。
@@ -5216,6 +5321,29 @@ mod tests {
         };
 
         assert!(settings.active_relay_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn relay_profile_accepts_json_text_fields_written_as_maps() {
+        let profile: RelayProfile = serde_json::from_value(serde_json::json!({
+            "id": "relay",
+            "name": "Relay",
+            "modelWindows": { "model-a": 500000 },
+            "modelAutoCompact": { "model-a": 80 },
+            "modelMetadata": { "model-a": { "supports_search_tool": true } },
+            "modelVlm": { "model-a": "strip" }
+        }))
+        .unwrap();
+
+        let saved = serde_json::to_value(&profile).unwrap();
+        // 数字值转成字符串：应用供应商时这两张表只认字符串值。
+        assert_eq!(saved["modelWindows"], r#"{"model-a":"500000"}"#);
+        assert_eq!(saved["modelAutoCompact"], r#"{"model-a":"80"}"#);
+        assert_eq!(
+            saved["modelMetadata"],
+            r#"{"model-a":{"supports_search_tool":true}}"#
+        );
+        assert_eq!(saved["modelVlm"], r#"{"model-a":"strip"}"#);
     }
 
     #[test]
@@ -6167,7 +6295,7 @@ experimental_bearer_token = "sk-existing""#
 
     #[test]
     fn settings_store_update_persists_manager_agent_focus() {
-        // #2902：使用模式存进设置文件，只认已知的三个值。
+        // #2902：记号存进设置文件，只认已知的三个值（沿用旧的使用模式取值）。
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
         store.save(&BackendSettings::default()).unwrap();
@@ -7096,6 +7224,58 @@ experimental_bearer_token = "sk-existing""#
         assert!(!off.active_relay_transport_uses_protocol_proxy());
     }
 
+    /// 「不发送 output.encrypted_content」也只在代理里执行：开启后必须改走本地代理，
+    /// 关闭后立即恢复直连，并确认配置按 camelCase 往返。
+    #[test]
+    fn strip_responses_output_encrypted_content_routes_through_protocol_proxy() {
+        let enabled = RelayProfile {
+            id: "on".to_string(),
+            relay_mode: RelayMode::PureApi,
+            protocol: RelayProtocol::Responses,
+            base_url: "https://responses.example.test/v1".to_string(),
+            strip_responses_output_encrypted_content: true,
+            ..RelayProfile::default()
+        };
+        assert!(enabled.strips_responses_output_encrypted_content());
+        let value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["stripResponsesOutputEncryptedContent"], true);
+        let restored: RelayProfile = serde_json::from_value(value).unwrap();
+        assert!(restored.strips_responses_output_encrypted_content());
+
+        let settings = BackendSettings {
+            active_relay_id: "on".to_string(),
+            relay_profiles: vec![enabled.clone()],
+            ..BackendSettings::default()
+        };
+        assert!(settings.active_relay_transport_uses_protocol_proxy());
+        let off = BackendSettings {
+            active_relay_id: "on".to_string(),
+            relay_profiles: vec![RelayProfile {
+                strip_responses_output_encrypted_content: false,
+                ..enabled
+            }],
+            ..BackendSettings::default()
+        };
+        assert!(!off.active_relay_transport_uses_protocol_proxy());
+
+        let default = serde_json::to_value(RelayProfile::default()).unwrap();
+        assert!(
+            default
+                .get("stripResponsesOutputEncryptedContent")
+                .is_none()
+        );
+
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let mut persisted = settings.clone();
+        store.save(&persisted).unwrap();
+        persisted = store.load().unwrap();
+        assert!(persisted.relay_profiles[0].strip_responses_output_encrypted_content);
+        persisted.relay_profiles[0].strip_responses_output_encrypted_content = false;
+        store.save(&persisted).unwrap();
+        assert!(!store.load().unwrap().relay_profiles[0].strip_responses_output_encrypted_content);
+    }
+
     #[test]
     fn strip_image_generation_tool_is_default_off_and_only_for_api_responses() {
         let legacy = serde_json::to_value(RelayProfile::default()).unwrap();
@@ -7170,6 +7350,29 @@ experimental_bearer_token = "sk-existing""#
         let reloaded = store.load().unwrap();
         assert!(reloaded.codex_app_auto_takeover);
         assert_eq!(reloaded.codex_app_auto_takeover_when_active, "immediate");
+    }
+
+    // Claude 的自动接管开关：默认关闭，老配置缺键按关闭，经 update 能写进同一份 settings.json。
+    #[test]
+    fn claude_auto_takeover_setting_is_off_by_default_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        assert!(!BackendSettings::default().claude_app_auto_takeover);
+        store.save(&BackendSettings::default()).unwrap();
+        let mut raw: Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("settings.json")).unwrap())
+                .unwrap();
+        raw.as_object_mut().unwrap().remove("claudeAppAutoTakeover");
+        let legacy: BackendSettings = serde_json::from_value(raw).unwrap();
+        assert!(!legacy.claude_app_auto_takeover, "缺键时必须按关闭处理");
+
+        let updated = store
+            .update(json!({ "claudeAppAutoTakeover": true }))
+            .unwrap();
+        assert!(updated.claude_app_auto_takeover);
+        assert!(store.load().unwrap().claude_app_auto_takeover);
+        // 不影响 Codex 的开关。
+        assert!(!store.load().unwrap().codex_app_auto_takeover);
     }
 
     #[test]

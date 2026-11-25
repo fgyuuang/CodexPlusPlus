@@ -3,12 +3,13 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 // #511：Skills 页「从本地目录导入」走系统目录选择 → 后端 import_local_skills → 用返回的列表刷新。
-const extra = readFileSync(new URL("./ManagementExtra.tsx", import.meta.url), "utf8");
+// 页面在 SkillsPage.tsx，来源标签等工具函数在 SkillDrawers.tsx。
+const extra = readFileSync(new URL("./SkillsPage.tsx", import.meta.url), "utf8") + readFileSync(new URL("./SkillDrawers.tsx", import.meta.url), "utf8");
 const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 const commands = readFileSync(new URL("../src-tauri/src/commands.rs", import.meta.url), "utf8");
 
 test("skills page imports a picked local folder through the registered backend command", () => {
-  assert.match(extra, /import \{ open as openDialog \} from "@tauri-apps\/plugin-dialog";/);
+  assert.match(extra, /import \{ open as openDialog, save as saveDialog \} from "@tauri-apps\/plugin-dialog";/);
   assert.match(extra, /openDialog\(\{ directory: true, multiple: false,/);
   // run() 会用返回的 payload 刷新列表，并把失败原文（例如缺少 SKILL.md）提示出来。
   assert.match(extra, /if \(await run\("import_local_skills", \{ path \}\)\) setTab\("installed"\);/);

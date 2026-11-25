@@ -420,7 +420,6 @@
   const codexPlusRailTasksId = "codex-plus-rail-tasks";
   const codexPlusRailPluginMarketId = "codex-plus-rail-plugin-market";
   const codexPlusSidebarPluginMarketId = "codex-plus-sidebar-plugin-market";
-  const codexPlusPluginMarketTab = "plugin-market";
   const codexPlusRailSelector = "nav[data-app-navigation-rail]";
   const codexPlusRailDestinationSelector = "[data-sidebar-destination]";
   const codexPlusExtensionsTab = "extensions";
@@ -912,7 +911,11 @@
    * 脚本本身抛错在用户看来是同一件事，不需要第二套排查入口。
    */
   function codexPlusMarkExtensionFailure(scriptKey, message) {
-    if (!scriptKey) return;
+    if (!scriptKey) {
+      // 没有归属脚本的失败（RPC 拦截层、请求中间件这些内核环节）没有脚本状态可写，记进诊断日志。
+      codexPlusLogKernelFailure(message);
+      return;
+    }
     const record = window.__codexPlusUserScripts?.scripts?.[scriptKey];
     if (record) {
       record.error = message;
@@ -923,6 +926,52 @@
     window.__codexPlusExtensionFailures.push({ script_key: scriptKey, message, at: Date.now() });
     if (window.__codexPlusExtensionFailures.length > 100) window.__codexPlusExtensionFailures.shift();
   }
+
+  /** 内核失败日志的限流窗口：同一条 message 一个窗口内只记一次，一个窗口最多记这么多条。 */
+  const codexPlusKernelFailureWindowMs = 60_000;
+  const codexPlusKernelFailureWindowLimit = 20;
+  const codexPlusKernelFailureWindow = { startedAt: 0, seen: new Set(), suppressed: 0 };
+
+  /**
+   * 把没有归属脚本的失败写进诊断日志（事件 `extension.kernel_failure`）。
+   *
+   * 调用点在 RPC 帧拦截这类热路径上，每一帧都可能触发，所以必须限流；被限流掉的条数
+   * 记在下一条写出去的日志里（suppressed）。先登记再发送：发送途中即使又绕回这里，
+   * 同一条 message 也已经在窗口里，不会递归。本函数不抛错，也不回调 codexPlusMarkExtensionFailure。
+   */
+  function codexPlusLogKernelFailure(message) {
+    try {
+      const text = String(message ?? "").slice(0, 2000);
+      const state = codexPlusKernelFailureWindow;
+      const now = Date.now();
+      if (now - state.startedAt >= codexPlusKernelFailureWindowMs || now < state.startedAt) {
+        state.startedAt = now;
+        state.seen.clear();
+      }
+      if (state.seen.has(text) || state.seen.size >= codexPlusKernelFailureWindowLimit) {
+        state.suppressed += 1;
+        return;
+      }
+      state.seen.add(text);
+      const detail = { message: text, suppressed: state.suppressed };
+      state.suppressed = 0;
+      // 完整产物里走统一的诊断上报（桥没连上时它会退到本地服务）；单独执行本分片时直接走桥。
+      if (typeof sendCodexPlusDiagnostic === "function") {
+        Promise.resolve(sendCodexPlusDiagnostic("extension.kernel_failure", detail)).catch(() => {});
+        return;
+      }
+      window.__codexSessionDeleteBridge?.("/diagnostics/log", {
+        event: "extension.kernel_failure",
+        detail,
+      })?.catch?.(() => {});
+    } catch {}
+  }
+  /**
+   * 原生悬浮侧栏开合用的弹簧（motion 的 spring，bounce 0.1）按同一条曲线采样成 linear()；
+   * 原生打开 0.3s、收起 0.2s，卡片淡入淡出，同时横移 1.5 个 --spacing。
+   */
+  const codexPlusSidebarPeekEase = "linear(0, 0.07, 0.218, 0.383, 0.537, 0.666, 0.768, 0.844, 0.899, 0.937, 0.962, 0.979, 0.989, 0.995, 0.999, 1 75%, 1)";
+
   /**
    * 装上 / 换掉样式表。版本 = 手写版本号前缀 + 样式全文的哈希：改了任何 CSS，重新注入（不刷新页面）时
    * 都会换成新样式表。以前只比手写版本号，改样式忘了 +1 时新 JS 配旧样式，新界面全没样式。
@@ -1302,30 +1351,12 @@
         background: var(--codex-plus-bg-selected);
         color: var(--codex-plus-text);
       }
-      .codex-plus-plugin-sidebar { position: relative; flex: 0 0 auto; }
-      .codex-plus-plugin-sidebar .codex-plus-sidebar-nav-icon { width: 20px; height: 20px; flex: 0 0 20px; display: inline-flex; align-items: center; justify-content: center; }
-      .codex-plus-plugin-sidebar .codex-plus-sidebar-nav-icon svg { width: 19px; height: 19px; }
-      .codex-plus-plugin-sidebar-label { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; min-width: 0; }
-      .codex-plus-plugin-sidebar button[data-active="true"] { background: var(--codex-plus-bg-selected); color: var(--codex-plus-text); }
-      .codex-plus-plugin-market-panel { max-width: 1140px; width: 100%; margin: 0 auto; box-sizing: border-box; }
-      .codex-plus-plugin-intro { margin: 0 0 18px; color: var(--codex-plus-text-secondary); font-size: 13px; line-height: 1.6; }
-      .codex-plus-plugin-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 14px; }
-      .codex-plus-plugin-sources { display: flex; gap: 4px; flex: 1 1 auto; }
-      .codex-plus-plugin-sources button { border: 1px solid var(--codex-plus-border); border-radius: 7px; padding: 7px 12px; color: var(--codex-plus-text-secondary); background: transparent; cursor: pointer; }
-      .codex-plus-plugin-sources button[data-active="true"] { background: var(--codex-plus-bg-selected); color: var(--codex-plus-text); }
-      .codex-plus-plugin-search { flex: 1 1 240px; min-width: 120px; border: 1px solid var(--codex-plus-border); border-radius: 8px; background: var(--codex-plus-bg-secondary); color: var(--codex-plus-text); padding: 9px 12px; font-size: 14px; }
-      .codex-plus-plugin-filter { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--codex-plus-text-secondary); }
-      .codex-plus-plugin-status { font-size: 12px; color: var(--codex-plus-text-secondary); white-space: pre-wrap; margin-bottom: 14px; }
-      .codex-plus-plugin-results { display: flex; flex-direction: column; gap: 10px; }
-      .codex-plus-plugin-card { display: flex; align-items: flex-start; gap: 18px; padding: 16px; border: 1px solid var(--codex-plus-border); border-radius: 10px; background: var(--codex-plus-bg-secondary); }
-      .codex-plus-plugin-card-info { flex: 1 1 auto; min-width: 0; }
-      .codex-plus-plugin-name { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
-      .codex-plus-plugin-id, .codex-plus-plugin-meta { color: var(--codex-plus-text-tertiary); font-size: 11px; margin-top: 4px; overflow-wrap: anywhere; }
-      .codex-plus-plugin-description { color: var(--codex-plus-text-secondary); font-size: 13px; line-height: 1.55; margin: 7px 0; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
-      .codex-plus-plugin-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
-      .codex-plus-plugin-tags span { border-radius: 5px; padding: 2px 6px; background: var(--codex-plus-bg-selected); color: var(--codex-plus-text-secondary); font-size: 10px; overflow-wrap: anywhere; }
-      .codex-plus-plugin-install { flex: 0 0 auto; white-space: nowrap; }
-      .codex-plus-plugin-market-page button:disabled { opacity: .55; cursor: default; }
+      /* 插件页「公开」页签的本机分类标题：点了看这一类的全部（选择器与 62-plugin-market-adapter 的 codexPlusPluginCategoryTitle 一致）。 */
+      html[data-codex-plus-plugin-categories] section[id^="plugins-"]:not([id^="plugins-marketplace-"], #plugins-created-by-you, #plugins-shared-with-you) > [data-slot="section-header"] > h2:not(:has(*)) { cursor: pointer; }
+      html[data-codex-plus-plugin-categories] section[id^="plugins-"]:not([id^="plugins-marketplace-"], #plugins-created-by-you, #plugins-shared-with-you) > [data-slot="section-header"] > h2:not(:has(*))::after {
+        content: "›"; color: var(--color-token-text-tertiary, currentColor); font-weight: 400; transition: transform 0.15s ease-out;
+      }
+      html[data-codex-plus-plugin-categories] section[id^="plugins-"]:not([id^="plugins-marketplace-"], #plugins-created-by-you, #plugins-shared-with-you) > [data-slot="section-header"] > h2:not(:has(*)):hover::after { transform: translateX(2px); }
       /* 「供应商」页（43-provider-page.js）：左侧列表 + 右侧详情，13px 紧凑，沿用 --codex-plus-* 变量。 */
       .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="provider"] { background: var(--codex-plus-settings-page-bg, var(--codex-plus-bg-primary)) !important; }
       .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="provider"] .codex-plus-modal-body { box-sizing: border-box; padding: 0; height: 100%; overflow: hidden; }
@@ -1483,6 +1514,15 @@
       .codex-plus-provider-menu-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
       .codex-plus-provider-menu-popover { top: calc(100% + 4px); right: 0; max-height: 320px; overflow-y: auto; }
       .codex-plus-provider-model-row .codex-plus-provider-menu { justify-self: end; }
+      /* 聚合供应商：成员行（名称 + 标签 | 权重 / 模型数 + 开关），路由行（匹配 | 目标 | 优先级 | 移除）。 */
+      .codex-plus-provider-agg-member .codex-plus-provider-line-title { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+      .codex-plus-provider-agg-member[data-selected="false"] .codex-plus-provider-line-title { color: var(--codex-plus-text-secondary); }
+      .codex-plus-provider-card .codex-plus-provider-agg-number { width: 64px; text-align: right; }
+      .codex-plus-provider-card .codex-plus-provider-agg-number:disabled { opacity: .45; }
+      .codex-plus-provider-agg-label { color: var(--codex-plus-text-secondary); font-size: 12px; white-space: nowrap; }
+      .codex-plus-provider-agg-route { display: grid; grid-template-columns: minmax(0, 1fr) auto auto 64px auto; align-items: center; gap: 8px; padding: 12px 0; }
+      .codex-plus-provider-agg-route-error { grid-column: 1 / -1; color: var(--codex-plus-danger, #dc2626); font-size: 12px; }
+      .codex-plus-provider-agg-route-add { padding: 12px 0; }
       /* 「配置文件」折叠标题：小节标题是 flex，原生三角会消失，自己画一个会转的箭头。 */
       details.codex-plus-provider-group > summary { cursor: pointer; list-style: none; gap: 6px; user-select: none; }
       details.codex-plus-provider-group > summary::-webkit-details-marker { display: none; }
@@ -1494,12 +1534,6 @@
       .codex-plus-provider-detail > .codex-plus-provider-mode-bar, .codex-plus-provider-detail > .codex-plus-provider-note { box-sizing: border-box; margin-bottom: 12px; padding: 8px 12px; border: 1px solid var(--codex-plus-settings-card-border); border-radius: var(--codex-plus-control-radius); }
       .codex-plus-provider-sidebar-header { padding: 4px 8px 10px; color: var(--codex-plus-text-secondary); font-weight: 500; letter-spacing: 0; }
       .codex-plus-provider-sidebar-header .codex-plus-action-button { min-height: 24px; padding: 0 8px; font-size: 12px; }
-      .codex-plus-plugin-job-message { font-size: 12px; color: var(--codex-plus-text-secondary); margin-top: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
-      .codex-plus-plugin-job-message[data-status="failed"] { color: var(--codex-plus-danger); }
-      .codex-plus-plugin-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 20px; font-size: 12px; color: var(--codex-plus-text-secondary); }
-      .codex-plus-plugin-pagination > span { margin-right: auto; }
-      .codex-plus-plugin-empty { padding: 40px 16px; text-align: center; color: var(--codex-plus-text-secondary); }
-      @media (max-width: 600px) { .codex-plus-plugin-card { flex-direction: column; gap: 10px; } .codex-plus-plugin-install { align-self: flex-end; } }
       /*
        * 新版导航图标栏里的 Codex++ / 拓展 / 推荐内容入口：原生按钮只放图标，
        * 这里对齐它的尺寸。
@@ -1589,7 +1623,7 @@
         left: var(--codex-plus-page-left, 0px);
         width: calc(100vw / var(--codex-plus-zoom, 1) - var(--codex-plus-page-left, 0px) - var(--codex-plus-page-right, 0px));
         height: calc(100vh / var(--codex-plus-zoom, 1) - var(--codex-plus-page-top, 0px) - var(--codex-plus-page-bottom, 0px));
-        border-radius: var(--codex-plus-page-radius, 0px);
+        border-radius: var(--codex-plus-page-radius, 0px) var(--codex-plus-page-radius-end, var(--codex-plus-page-radius, 0px)) var(--codex-plus-page-radius-end, var(--codex-plus-page-radius, 0px)) var(--codex-plus-page-radius, 0px);
         overflow: hidden;
         /*
          * 功能页是覆盖在 Codex 内容区上的基础层，不能压过原生侧栏/顶部栏
@@ -1628,6 +1662,28 @@
       html[data-codex-plus-page-open] .app-header-tint {
         z-index: 2147483645 !important;
       }
+      /*
+       * 新外壳下页面从窗口顶边铺起（positionCodexPlusPage 量到标题栏叠在原生面板上时打 inset 标记）：
+       * 原生标题栏本身透明、只有按钮接收点击，抬到页面之上就和原生面板上一样浮着；
+       * 只比页面高一级，仍在我们的弹窗、提示之下。
+       * 页面内容让出标题栏的高度；让出的那条不能再声明 no-drag，否则会盖掉标题栏的拖动区，
+       * 页面开着时就拖不动窗口了，所以 no-drag 只给内容区里的元素。
+       * 清掉要写 initial：Chromium 把写出来的 none 也算成 no-drag，只有 initial / unset 才真是「不声明」。
+       */
+      html[data-codex-plus-page-open] [data-app-shell-titlebar] {
+        z-index: 2147482001 !important;
+      }
+      .${codexPlusPageClass}[data-codex-plus-titlebar="inset"],
+      .${codexPlusPageClass}[data-codex-plus-titlebar="inset"] > .codex-plus-modal-content {
+        -webkit-app-region: initial;
+      }
+      .${codexPlusPageClass}[data-codex-plus-titlebar="inset"] > .codex-plus-modal-content {
+        box-sizing: border-box;
+        padding-top: var(--codex-plus-page-inset-top, 0px);
+      }
+      .${codexPlusPageClass}[data-codex-plus-titlebar="inset"] > .codex-plus-modal-content > * {
+        -webkit-app-region: no-drag;
+      }
       .${codexPlusPageClass} .codex-plus-modal-content {
         width: auto;
         height: 100%;
@@ -1654,7 +1710,7 @@
         min-height: 0;
         width: 100%;
       }
-      .${codexPlusPageClass} .codex-plus-page-nav {
+      :is(.${codexPlusPageClass}, .codex-plus-rail-peek) .codex-plus-page-nav {
         width: 260px;
         flex: 0 0 260px;
         display: flex;
@@ -1662,16 +1718,16 @@
         min-height: 0;
         border-right: 1px solid var(--codex-plus-border-subtle);
       }
-      .${codexPlusPageClass} .codex-plus-page-nav-header {
+      :is(.${codexPlusPageClass}, .codex-plus-rail-peek) .codex-plus-page-nav-header {
         flex: 0 0 auto;
         padding: 4px 16px 10px;
       }
-      .${codexPlusPageClass} .codex-plus-page-nav-title {
+      :is(.${codexPlusPageClass}, .codex-plus-rail-peek) .codex-plus-page-nav-title {
         font-size: 15px;
         font-weight: 600;
         color: var(--codex-plus-text);
       }
-      .${codexPlusPageClass} .codex-plus-page-nav-body {
+      :is(.${codexPlusPageClass}, .codex-plus-rail-peek) .codex-plus-page-nav-body {
         flex: 1 1 auto;
         min-height: 0;
         overflow-y: auto;
@@ -2108,6 +2164,7 @@
         padding: 0 8px;
       }
       .codex-plus-width-input:disabled { opacity: .55; cursor: not-allowed; }
+      .codex-plus-settings input.codex-plus-daily-project-path { width: min(20em, 32%); min-width: 5em; text-align: start; }
       .codex-plus-about { color: #a1a1aa; line-height: 1.5; }
       .codex-plus-panel[hidden] { display: none; }
       .codex-plus-official-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 8px 0 14px; }
@@ -2398,6 +2455,120 @@
       }
       .${codexPlusPageClass} .codex-plus-modal-content { border-color: transparent; }
       /*
+       * 新外壳下原生页面只有面板一个底色：positionCodexPlusPage 量到面板颜色时打 surface 标记，
+       * 页面底、内容区、左栏、顶部页签栏和底部状态栏统一用它（内联的主题变量要用 !important 才压得住）。
+       * 梦皮壁纸模式的规则选择器更具体，仍由它把这些变量改成透明。
+       */
+      .${codexPlusPageClass}[data-codex-plus-surface="native"] {
+        --codex-plus-bg-primary: var(--codex-plus-shell-surface) !important;
+        --codex-plus-settings-page-bg: var(--codex-plus-shell-surface) !important;
+        --codex-plus-nav-bg: var(--codex-plus-shell-surface) !important;
+      }
+      .${codexPlusPageClass}[data-codex-plus-surface="native"] :is(.codex-plus-page-nav, .codex-plus-provider-sidebar, .codex-plus-task-sidebar) {
+        border-right-color: transparent !important;
+      }
+      /*
+       * 侧栏展开时照原生页面画：原生是「侧栏一层灰，面板从侧栏右边起、带圆角」。
+       * 有左栏的页面整块透明，左栏宽度对齐原生侧栏，于是左栏底下透出的就是原生侧栏的灰，
+       * 内容区底下透出的就是原生面板，拐角是原生面板自己的圆角，颜色、半透明都和原生同源。
+       * 被透出来的原生会话列表和原生页面内容在页面开着时藏起来（只是 visibility，不动布局）。
+       * 没有左栏的页面仍是不透明的整块面板，不受影响。
+       */
+      .${codexPlusPageClass}[data-codex-plus-surface="native"][data-codex-plus-sidebar="open"]:has(:is(.codex-plus-page-nav, .codex-plus-provider-sidebar, .codex-plus-task-sidebar)) {
+        border-radius: 0 !important;
+        background: transparent !important;
+      }
+      .${codexPlusPageClass}[data-codex-plus-surface="native"][data-codex-plus-sidebar="open"]:has(:is(.codex-plus-page-nav, .codex-plus-provider-sidebar, .codex-plus-task-sidebar)) :is(.codex-plus-modal-content, .codex-plus-task-list-pane, .codex-plus-task-detail, .codex-plus-provider-tabs, .codex-plus-provider-footer, .codex-plus-task-status) {
+        background: transparent !important;
+        border-top-color: transparent !important;
+        border-bottom-color: transparent !important;
+      }
+      .${codexPlusPageClass}[data-codex-plus-surface="native"][data-codex-plus-sidebar="open"] :is(.codex-plus-page-nav, .codex-plus-provider-sidebar, .codex-plus-task-sidebar) {
+        box-sizing: border-box;
+        width: var(--codex-plus-native-sidebar-width) !important;
+        flex-basis: var(--codex-plus-native-sidebar-width) !important;
+        background: transparent !important;
+      }
+      html:has(.${codexPlusPageClass}[data-codex-plus-surface="native"][data-codex-plus-sidebar="open"]) :is([data-sidebar-navigation-root], [data-app-shell-active-page]) {
+        visibility: hidden !important;
+      }
+      /* 标题栏（侧栏开关、前进后退）挂在原生页面里面，单独放出来。 */
+      html:has(.${codexPlusPageClass}[data-codex-plus-surface="native"][data-codex-plus-sidebar="open"]) [data-app-shell-titlebar] {
+        visibility: visible !important;
+      }
+      /*
+       * 侧栏收起时原生侧栏是悬浮的：内容铺满，鼠标停在图标栏入口（或窗口左边缘）上才浮出一张圆角卡片，移开就收起。
+       * 设置、拓展、远程控制、微信连接、推荐内容的左栏照着浮（开合由 installCodexPlusNavPeek 打 data-codex-plus-nav-peek）。
+       * 卡片的位置和样式照原生悬浮侧栏：上下左各留 4px（my-1 ms-1），圆角、底色、描边、阴影取原生的令牌。
+       * modal-content 是 inline-size 容器，自带布局包含，就是卡片的定位参照。
+       */
+      .${codexPlusPageClass}[data-codex-plus-sidebar="floating"] .codex-plus-modal-content > .codex-plus-page-layout > .codex-plus-page-nav {
+        position: absolute;
+        z-index: 3;
+        top: calc(var(--codex-plus-page-inset-top, 0px) + 4px);
+        bottom: 4px;
+        left: 4px;
+        box-sizing: border-box;
+        width: var(--codex-plus-native-peek-width, 284px) !important;
+        flex-basis: auto !important;
+        overflow: hidden;
+        border-right: 0 !important;
+        border-radius: var(--app-shell-sidebar-popover-radius, 12px);
+        background: var(--app-shell-sidebar-popover-background, var(--codex-plus-nav-bg)) !important;
+        box-shadow: inset 0 0 0 var(--hairline, .5px) var(--app-shell-sidebar-popover-border, var(--codex-plus-border)), var(--shadow-card, 0 8px 24px rgba(0, 0, 0, .24));
+        opacity: 0;
+        transform: translateX(calc(var(--spacing, 4px) * -1.5));
+        visibility: hidden;
+        pointer-events: none;
+        transition: opacity .2s ${codexPlusSidebarPeekEase}, transform .2s ${codexPlusSidebarPeekEase}, visibility 0s linear .2s;
+      }
+      .${codexPlusPageClass}[data-codex-plus-sidebar="floating"][data-codex-plus-nav-peek="true"] .codex-plus-modal-content > .codex-plus-page-layout > .codex-plus-page-nav {
+        opacity: 1;
+        transform: none;
+        visibility: visible;
+        pointer-events: auto;
+        transition: opacity .3s ${codexPlusSidebarPeekEase}, transform .3s ${codexPlusSidebarPeekEase};
+      }
+      /*
+       * 别的入口（没打开的页面，或者正在看原生页面时）浮出的独立卡片（showCodexPlusRailPeek）：
+       * 外框照原生悬浮侧栏，位置由脚本量好写在 left / top / bottom / width；里面的左栏和页面里的同一套样式。
+       */
+      .codex-plus-rail-peek {
+        position: fixed;
+        z-index: 2147482003;
+        box-sizing: border-box;
+        display: flex;
+        overflow: hidden;
+        border-radius: var(--app-shell-sidebar-popover-radius, 12px);
+        background: var(--app-shell-sidebar-popover-background, var(--codex-plus-nav-bg));
+        box-shadow: inset 0 0 0 var(--hairline, .5px) var(--app-shell-sidebar-popover-border, var(--codex-plus-border)), var(--shadow-card, 0 8px 24px rgba(0, 0, 0, .24));
+        color: var(--codex-plus-text);
+        opacity: 0;
+        transform: translateX(calc(var(--spacing, 4px) * -1.5));
+        visibility: hidden;
+        pointer-events: none;
+        transition: opacity .2s ${codexPlusSidebarPeekEase}, transform .2s ${codexPlusSidebarPeekEase}, visibility 0s linear .2s;
+        -webkit-app-region: no-drag;
+      }
+      .codex-plus-rail-peek[data-open="true"] {
+        opacity: 1;
+        transform: none;
+        visibility: visible;
+        pointer-events: auto;
+        transition: opacity .3s ${codexPlusSidebarPeekEase}, transform .3s ${codexPlusSidebarPeekEase};
+      }
+      .codex-plus-rail-peek-content { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; }
+      .codex-plus-rail-peek .codex-plus-page-nav {
+        width: 100% !important;
+        flex: 1 1 auto !important;
+        border-right: 0 !important;
+        background: transparent !important;
+      }
+      /* 页面开着时鼠标停在原生入口上，原生悬浮侧栏（带 popover 底色的那张卡）要浮在页面之上，和在原生页面上一样。 */
+      html[data-codex-plus-page-open]:has([data-sidebar-navigation-root][class*="sidebar-popover-background"]) aside.app-shell-left-panel {
+        z-index: 2147482002 !important;
+      }
+      /*
        * 梦皮（Dream Skin）壁纸模式（#3152）：原生设置页在梦皮下是一层半透明遮罩叠在壁纸上，
        * 我们的页面却是实色底，整块盖住壁纸。页面是盖在内容区上的独立 fixed 层，底下不是同一页，
        * 不能直接透明；这里照梦皮给原生设置页的画法，在页面根节点自己画「遮罩 + 壁纸」，
@@ -2492,18 +2663,20 @@
       /*
        * 设置页左栏：尺寸、字号、选中态照原生设置页的侧栏（288 宽、30 高的行、14px、10px 圆角乘缩放），
        * 版本号与后端状态点在顶上，位置对应原生的「设置」标题。
+       * 远程控制、微信连接、推荐内容的左栏（data-codex-plus-section-nav，见 installCodexPlusSectionNav）用同一套。
        */
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav {
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav {
         box-sizing: border-box;
         width: 288px;
         flex-basis: 288px;
         background: var(--codex-plus-nav-bg);
       }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-header { padding: 14px 16px 10px; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-header { padding: 14px 16px 10px; }
       .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-header > .codex-plus-modal-header { padding: 0; }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-header .codex-plus-modal-title { font-family: var(--font-openai-sans, inherit); font-synthesis: weight style small-caps; font-size: 18px; font-weight: 600; line-height: 24px; }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-body { display: flex; flex-direction: column; gap: 1px; padding: 4px 8px 8px; }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-item {
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-header .codex-plus-modal-title,
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content)[data-codex-plus-section-nav] .codex-plus-page-nav-title { font-family: var(--font-openai-sans, inherit); font-synthesis: weight style small-caps; font-size: 18px; font-weight: 600; line-height: 24px; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-body { display: flex; flex-direction: column; gap: 1px; padding: 4px 8px 8px; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-item {
         box-sizing: border-box;
         height: 30px;
         min-height: 30px;
@@ -2514,13 +2687,13 @@
         font-weight: 400;
         line-height: 21px;
       }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-item:hover { background: var(--codex-plus-nav-hover-bg); }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-item[data-active="true"] { background: var(--codex-plus-nav-selected-bg); }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-item-icon { width: 16px; height: 16px; border-radius: 0; background: none; color: inherit; }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-item-icon svg { width: 16px; height: 16px; }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-item-name { flex: 1 1 auto; min-width: 0; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-item:hover { background: var(--codex-plus-nav-hover-bg); }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-item[data-active="true"] { background: var(--codex-plus-nav-selected-bg); }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-item-icon { width: 16px; height: 16px; border-radius: 0; background: none; color: inherit; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-item-icon svg { width: 16px; height: 16px; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-item-name { flex: 1 1 auto; min-width: 0; }
       /* 分区小标题照原生：14px/500、次要灰、30 高；分区之间空 16px，标题和第一项之间空 4px（nav-body 自带 1px 间距）。 */
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-section-title {
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-section-title {
         display: flex;
         align-items: center;
         box-sizing: border-box;
@@ -2532,7 +2705,17 @@
         font-weight: 500;
         line-height: 21px;
       }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-page-nav-section-title:first-child { margin-top: 0; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content):is([data-codex-plus-active-tab="home"], [data-codex-plus-section-nav]) .codex-plus-page-nav-section-title:first-child { margin-top: 0; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content)[data-codex-plus-section-nav] .codex-plus-page-nav-title .codex-plus-feature-tag { margin-left: 6px; vertical-align: 3px; }
+      /* 分页后横幅（出错、提示）在大标题上面，不再往上贴页面标题。 */
+      .codex-plus-settings[data-codex-plus-settings-paged="true"] > .codex-plus-remote-banner { margin: 0 0 16px; }
+      /* 窗口窄时左栏让出宽度，同设置页。三个页面的 modal-content 各自是 inline-size 容器。 */
+      @container (max-width: 800px) {
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-section-nav] .codex-plus-page-nav { width: 220px; flex-basis: 220px; }
+      }
+      @container (max-width: 480px) {
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-section-nav] .codex-plus-page-nav { width: 168px; flex-basis: 168px; }
+      }
       .codex-plus-settings {
         width: 100%;
         max-width: 728px;
@@ -2644,7 +2827,7 @@
       /* 行高与原生 text-sm 一致：13px × 1.25/0.875。 */
       .codex-plus-settings .codex-plus-row-title { font-size: 13px; font-weight: 500; line-height: calc(1.25 / .875); }
       /* 设置项标题旁的小标签：实验 / 需重启，与管理器增强页一致。 */
-      .codex-plus-settings .codex-plus-feature-tag {
+      :is(.codex-plus-settings, .codex-plus-page-nav-title) .codex-plus-feature-tag {
         display: inline-flex;
         align-items: center;
         margin-left: 6px;
@@ -2658,7 +2841,7 @@
         line-height: 16px;
         vertical-align: 1px;
       }
-      .codex-plus-settings .codex-plus-feature-tag[data-tone="experimental"] {
+      :is(.codex-plus-settings, .codex-plus-page-nav-title) .codex-plus-feature-tag[data-tone="experimental"] {
         border-color: color-mix(in srgb, var(--codex-plus-warning) 40%, transparent);
         color: var(--codex-plus-warning);
       }
@@ -2670,7 +2853,8 @@
         line-height: 16px;
         overflow-wrap: anywhere;
       }
-      .codex-plus-settings .codex-plus-toggle {
+      .codex-plus-settings .codex-plus-toggle,
+      .codex-plus-provider-page .codex-plus-toggle {
         flex: 0 0 32px;
         width: 32px;
         height: 20px;
@@ -2680,15 +2864,16 @@
         background: var(--codex-plus-switch-off);
         cursor: pointer;
       }
-      .codex-plus-settings .codex-plus-toggle span {
+      .codex-plus-settings .codex-plus-toggle span,
+      .codex-plus-provider-page .codex-plus-toggle span {
         width: 16px;
         height: 16px;
         background: var(--codex-plus-switch-thumb);
         box-shadow: var(--switch-thumb-shadow, 0 1px 2px rgba(0,0,0,.2));
       }
-      .codex-plus-settings .codex-plus-toggle[data-enabled="true"] { background: var(--codex-plus-switch-on); }
-      .codex-plus-settings .codex-plus-toggle[data-enabled="true"] span { background: var(--switch-thumb-color-checked, var(--codex-plus-switch-thumb)); }
-      .codex-plus-settings .codex-plus-toggle[data-enabled="true"] span { transform: translateX(12px); }
+      .codex-plus-settings .codex-plus-toggle[data-enabled="true"], .codex-plus-provider-page .codex-plus-toggle[data-enabled="true"] { background: var(--codex-plus-switch-on); }
+      .codex-plus-settings .codex-plus-toggle[data-enabled="true"] span, .codex-plus-provider-page .codex-plus-toggle[data-enabled="true"] span { background: var(--switch-thumb-color-checked, var(--codex-plus-switch-thumb)); }
+      .codex-plus-settings .codex-plus-toggle[data-enabled="true"] span, .codex-plus-provider-page .codex-plus-toggle[data-enabled="true"] span { transform: translateX(12px); }
       .codex-plus-settings .codex-plus-toggle[data-pending="true"],
       .codex-plus-settings .codex-plus-toggle:disabled { cursor: not-allowed; opacity: .55; }
       .codex-plus-settings .codex-plus-width-control {
@@ -2754,14 +2939,14 @@
         background: var(--codex-plus-settings-page-bg, var(--codex-plus-bg-primary)) !important;
         container: codex-plus-remote-page / inline-size;
       }
+      /* 有了目录左栏，内容区留白同设置主页，标题落在同一高度。 */
       .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="remote-control"] .codex-plus-modal-body {
         box-sizing: border-box;
-        padding: 72px 32px 64px;
+        padding: 16px 20px 64px;
       }
       @container codex-plus-remote-page (max-width: 800px) {
-        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="remote-control"] .codex-plus-modal-body { padding: 48px 24px; }
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="remote-control"] .codex-plus-modal-body { padding: 24px 16px 48px; }
       }
-      .codex-plus-remote-page .codex-plus-feature-tag { font-size: 11px; vertical-align: 6px; }
       .codex-plus-remote-page .codex-plus-row > :not(:first-child) { max-width: 60%; }
       .codex-plus-remote-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
       .codex-plus-remote-controls .codex-plus-action-button { padding: 0 12px; white-space: nowrap; }
@@ -2769,14 +2954,68 @@
         background: var(--codex-plus-bg-elevated, var(--codex-plus-bg-hover)); color: var(--codex-plus-text-secondary); }
       .codex-plus-remote-banner[data-tone="warn"] { color: var(--codex-plus-warning); }
       .codex-plus-remote-banner[data-tone="ok"] { color: var(--codex-plus-success); }
+      .codex-plus-remote-banner.codex-plus-remote-robot-error { margin: 0 0 12px; }
+      .codex-plus-remote-robot-input { width: 280px; max-width: 100%; min-width: 0; }
+      .codex-plus-remote-page .codex-plus-action-button[data-primary="true"]:not(:disabled) { background: var(--codex-plus-text); color: var(--codex-plus-bg-primary); }
       .codex-plus-remote-url, .codex-plus-remote-fingerprint, .codex-plus-remote-address code { font-family: var(--codex-plus-font-mono, ui-monospace, Menlo, monospace); font-size: 12px; overflow-wrap: anywhere; }
       .codex-plus-remote-address { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
-      .codex-plus-remote-segmented { display: inline-flex; border: 1px solid var(--codex-plus-border); border-radius: 8px; overflow: hidden; }
-      .codex-plus-remote-segmented button { min-height: 30px; padding: 0 10px; border: 0; border-left: 1px solid var(--codex-plus-border);
+      .codex-plus-remote-segmented, .codex-plus-provider-segmented { display: inline-flex; border: 1px solid var(--codex-plus-border); border-radius: 8px; overflow: hidden; }
+      .codex-plus-remote-segmented button, .codex-plus-provider-segmented button { min-height: 30px; padding: 0 10px; border: 0; border-left: 1px solid var(--codex-plus-border);
         background: transparent; color: var(--codex-plus-text-secondary); font: inherit; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
-      .codex-plus-remote-segmented button:first-child { border-left: 0; }
-      .codex-plus-remote-segmented button[aria-checked="true"] { background: var(--codex-plus-bg-hover); color: var(--codex-plus-text); font-weight: 550; }
-      .codex-plus-remote-segmented button:disabled { cursor: default; opacity: .6; }
+      .codex-plus-remote-segmented button:first-child, .codex-plus-provider-segmented button:first-child { border-left: 0; }
+      .codex-plus-remote-segmented button[aria-checked="true"], .codex-plus-provider-segmented button[aria-checked="true"] { background: var(--codex-plus-bg-hover); color: var(--codex-plus-text); font-weight: 550; }
+      .codex-plus-remote-segmented button:disabled, .codex-plus-provider-segmented button:disabled { cursor: default; opacity: .6; }
+      /* Codex++ 设置页的「皮肤」分区（96-dream-skin-page.js）：状态卡 + 主题来源页签 + 主题卡片网格 + 编辑区。 */
+      .codex-plus-skin { display: flex; flex-direction: column; gap: 16px; }
+      .codex-plus-skin-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 12px; border: 1px solid var(--codex-plus-settings-card-border);
+        border-radius: var(--codex-plus-control-radius); background: var(--codex-plus-settings-card-bg); color: var(--codex-plus-text-secondary); font-size: 12px; line-height: 17px; overflow-wrap: anywhere; }
+      .codex-plus-skin-banner[data-tone="ok"] { color: var(--codex-plus-success, #10a37f); border-color: color-mix(in srgb, var(--codex-plus-success, #10a37f) 35%, transparent); }
+      .codex-plus-skin-banner[data-tone="warn"] { color: var(--codex-plus-warning, #d97706); border-color: color-mix(in srgb, var(--codex-plus-warning, #d97706) 40%, transparent); }
+      .codex-plus-skin-banner[data-tone="error"] { color: var(--codex-plus-danger, #dc2626); border-color: color-mix(in srgb, var(--codex-plus-danger, #dc2626) 40%, transparent); }
+      .codex-plus-skin-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+      .codex-plus-skin-toolbar-actions, .codex-plus-skin-editor-actions, .codex-plus-skin-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+      .codex-plus-skin .codex-plus-action-button { display: inline-flex; align-items: center; justify-content: center; white-space: nowrap; }
+      .codex-plus-skin .codex-plus-action-button[data-primary="true"]:not(:disabled) { background: var(--codex-plus-text); color: var(--codex-plus-bg-primary); border-color: transparent; }
+      .codex-plus-skin .codex-plus-action-button[data-danger="true"]:not(:disabled) { color: var(--codex-plus-danger, #dc2626); }
+      .codex-plus-skin .codex-plus-action-button:disabled { opacity: .5; cursor: default; }
+      .codex-plus-skin-file { cursor: pointer; }
+      .codex-plus-skin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+      .codex-plus-skin-card { display: flex; flex-direction: column; min-width: 0; overflow: hidden; border: 1px solid var(--codex-plus-settings-card-border); border-radius: var(--codex-plus-card-radius); background: var(--codex-plus-settings-card-bg); }
+      .codex-plus-skin-card[data-active="true"] { border-color: color-mix(in srgb, var(--codex-plus-success, #10a37f) 55%, transparent); }
+      .codex-plus-skin-thumb { display: flex; align-items: center; justify-content: center; aspect-ratio: 16 / 9; background: color-mix(in srgb, var(--codex-plus-text) 6%, transparent) center / cover no-repeat;
+        color: var(--codex-plus-text-secondary); font-size: 22px; font-weight: 600; }
+      .codex-plus-skin-thumb[data-loaded="true"] span { display: none; }
+      .codex-plus-skin-card-body { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px 12px; min-width: 0; }
+      .codex-plus-skin-card-title { overflow: hidden; color: var(--codex-plus-text); font-size: 13px; font-weight: 500; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; }
+      .codex-plus-skin-card-meta { overflow: hidden; color: var(--codex-plus-text-secondary); font-size: 12px; line-height: 16px; text-overflow: ellipsis; white-space: nowrap; }
+      .codex-plus-skin-card-badges { display: flex; flex-wrap: wrap; gap: 4px; min-height: 16px; }
+      .codex-plus-skin-card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 2px; }
+      .codex-plus-skin-card-actions .codex-plus-action-button { min-height: 26px; padding: 0 10px; font-size: 12px; }
+      .codex-plus-skin-badge { display: inline-block; padding: 0 6px; border-radius: 4px; background: color-mix(in srgb, var(--codex-plus-text) 8%, transparent); color: var(--codex-plus-text-secondary); font-size: 11px; line-height: 16px; }
+      .codex-plus-skin-badge[data-tone="active"] { color: var(--codex-plus-success, #10a37f); }
+      .codex-plus-skin-badge[data-tone="warn"] { color: var(--codex-plus-warning, #d97706); }
+      .codex-plus-skin-empty, .codex-plus-skin-note { padding: 12px 0; color: var(--codex-plus-text-secondary); font-size: 12px; }
+      .codex-plus-skin-section-head { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: var(--codex-plus-text); font-size: 14px; font-weight: 500; }
+      .codex-plus-skin-editor { display: flex; flex-direction: column; gap: 10px; }
+      .codex-plus-skin-input { box-sizing: border-box; width: 240px; max-width: 100%; min-height: 28px; padding: 4px 10px; border: 1px solid var(--codex-plus-control-border); border-radius: var(--codex-plus-control-radius);
+        background: var(--codex-plus-control-bg); color: var(--codex-plus-text); font: inherit; font-size: 13px; }
+      .codex-plus-skin-input:focus { outline: none; border-color: var(--codex-plus-focus, #2563eb); }
+      .codex-plus-skin-number { width: 64px; text-align: right; }
+      /* 「壁纸透出」滑块：跟随主题时淡显，拖动即改成自定义值。 */
+      .codex-plus-skin-range { width: 160px; max-width: 100%; accent-color: var(--codex-plus-text); cursor: pointer; }
+      .codex-plus-skin-range[data-follow="true"] { opacity: .45; }
+      .codex-plus-skin-range:disabled { opacity: .35; cursor: default; }
+      .codex-plus-skin-range-value { min-width: 56px; color: var(--codex-plus-text-secondary); font-size: 12px; font-variant-numeric: tabular-nums; }
+      .codex-plus-skin-color { display: inline-flex; align-items: center; gap: 8px; }
+      .codex-plus-skin-color .codex-plus-skin-input { width: 140px; font-family: var(--codex-plus-font-mono, ui-monospace, Menlo, monospace); font-size: 12px; }
+      .codex-plus-skin-swatch { width: 20px; height: 20px; border: 1px solid var(--codex-plus-control-border); border-radius: 5px; }
+      .codex-plus-skin-companion { width: 32px; height: 32px; border-radius: 6px; object-fit: cover; }
+      .codex-plus-skin-error { color: var(--codex-plus-danger, #dc2626); }
+      .codex-plus-skin-check { display: block; }
+      .codex-plus-skin-check strong { margin-right: 6px; font-weight: 500; }
+      .codex-plus-skin-check[data-level="pass"] strong { color: var(--codex-plus-success, #10a37f); }
+      .codex-plus-skin-check[data-level="warning"] strong { color: var(--codex-plus-warning, #d97706); }
+      .codex-plus-skin-check[data-level="fail"] strong { color: var(--codex-plus-danger, #dc2626); }
       .codex-plus-remote-pairing { display: grid; gap: 12px; padding: 14px 0 16px; border-top: 1px solid var(--codex-plus-border-subtle, var(--codex-plus-border)); }
       .codex-plus-remote-pairing-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; }
       .codex-plus-remote-code { font-family: var(--codex-plus-font-mono, ui-monospace, Menlo, monospace); font-size: 16px; letter-spacing: 2px; }
@@ -2791,10 +3030,10 @@
       }
       .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="weixin-connect"] .codex-plus-modal-body {
         box-sizing: border-box;
-        padding: 72px 32px 64px;
+        padding: 16px 20px 64px;
       }
       @container codex-plus-weixin-page (max-width: 800px) {
-        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="weixin-connect"] .codex-plus-modal-body { padding: 48px 24px; }
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="weixin-connect"] .codex-plus-modal-body { padding: 24px 16px 48px; }
       }
       .codex-plus-weixin-page .codex-plus-row > :not(:first-child) { max-width: 60%; min-width: 0; }
       .codex-plus-weixin-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
@@ -2988,16 +3227,16 @@
         box-sizing: border-box;
         padding: 32px 32px 56px;
       }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav {
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content)[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav {
         box-sizing: border-box;
         width: 312px;
         flex-basis: 312px;
         background: var(--codex-plus-nav-bg, var(--codex-plus-bg-secondary));
       }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-item[data-active="true"] { background: var(--codex-plus-nav-selected-bg, var(--codex-plus-bg-selected)); }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-header { padding: 16px; }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-title { font-size: 18px; line-height: 24px; }
-      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-body { padding: 0 12px 20px; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content)[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-item[data-active="true"] { background: var(--codex-plus-nav-selected-bg, var(--codex-plus-bg-selected)); }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content)[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-header { padding: 16px; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content)[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-title { font-size: 18px; line-height: 24px; }
+      :is(.${codexPlusPageClass} .codex-plus-modal-content, .codex-plus-rail-peek-content)[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-body { padding: 0 12px 20px; }
       .codex-plus-extensions-nav-entry {
         min-height: 36px;
         gap: 10px;
@@ -3166,23 +3405,6 @@
         -webkit-backdrop-filter: blur(8px);
       }
       .codex-plus-extensions-sort-menu { top: calc(100% + 4px); right: 0; }
-      .codex-plus-work-gateway-search {
-        min-width: 0;
-        margin: 4px 5px;
-        padding: 6px 9px;
-        border: 1px solid var(--codex-plus-border);
-        border-radius: 8px;
-        background: transparent;
-        color: inherit;
-        font-size: 13px;
-      }
-      .codex-plus-work-gateway-list { min-height: 0; overflow-y: auto; }
-      .codex-plus-work-gateway-heading {
-        padding: 5px 8px 2px;
-        color: var(--color-text-tertiary, var(--codex-plus-muted));
-        font-size: 11px;
-        overflow-wrap: anywhere;
-      }
       .codex-plus-menu-item {
         display: flex;
         align-items: center;
@@ -5831,6 +6053,15 @@
         errors.push(`${assetPrefix}: ${error?.message || String(error)}`);
       }
     }
+    for (const { src } of document.querySelectorAll('script[type="module"][src]')) {
+      if (!/^app:\/\/-\/assets\/\d+\.[a-f\d]+\.js$/.test(src)) continue;
+      const { __webpack_require__: runtime } = await import(src);
+      for (const { exports } of Object.values(runtime?.c || {})) {
+        if (!exports || !Object.hasOwn(exports, "appServices") || !Object.hasOwn(exports, "setAppServices")) continue;
+        const services = exports.appServices;
+        if (typeof services?.settings?.readAll === "function" && typeof services.settings.write === "function") return services;
+      }
+    }
     throw new Error(`Codex 宿主服务不可用 (${errors.join("; ")})`);
   }
 
@@ -6675,7 +6906,7 @@
       }
       if (!codexPlusBackendSettings.providerSyncEnabled && sourceProvider !== targetProvider
           && sourceProvider !== "codex_plus_managed" && targetProvider !== "codex_plus_managed") {
-        throw new Error("会话供应商与当前网关不一致，请开启供应商同步后重试");
+        throw new Error("会话供应商与当前本地服务不一致，请开启供应商同步后重试");
       }
       if (needsIndex) {
         const result = await postJson("/thread-provider/prepare", {
@@ -6762,7 +6993,7 @@
           const currentGateway = await readCodexGatewayGenerationForRecovery();
           signal?.throwIfAborted();
           if (currentGateway && (!currentGateway.active || currentGateway.generation !== gateway.generation)) {
-            throw new Error("网关连接已变化，请重新发送");
+            throw new Error("本地服务连接已变化，请重新发送");
           }
           if (currentGateway) {
             const connection = codexGatewayPreparations.get(threadId) || { tail: null };
@@ -6811,7 +7042,7 @@
       codexBridgePreparationReadTimeoutMs);
     if (connection?.status !== "ok" || typeof connection.active !== "boolean"
         || typeof connection.generation !== "string") {
-      throw new Error(connection?.message || "读取网关连接状态失败，请稍后重试");
+      throw new Error(connection?.message || "读取本地服务连接状态失败，请稍后重试");
     }
     return connection;
   }
@@ -6909,7 +7140,7 @@
             || cached?.threadRuntimeStatus?.type === "active") {
           sendCodexPlusDiagnostic("gateway_recovery_active", {});
           if (typeof showToast === "function") {
-            showToast("网关连接已变化；活动回复会继续，此时发送可能仍使用旧连接。", { type: "warn" });
+            showToast("本地服务连接已变化；活动回复会继续，此时发送可能仍使用旧连接。", { type: "warn" });
           }
           return;
         }
@@ -6925,7 +7156,7 @@
         if (read.thread.modelProvider !== provider) {
           sendCodexPlusDiagnostic("gateway_recovery_provider_mismatch", {});
           if (typeof showToast === "function") {
-            showToast("当前会话供应商与网关不一致，消息将交由原生会话处理，可能仍使用旧连接。", { type: "warn" });
+            showToast("当前会话供应商与本地服务不一致，消息将交由原生会话处理，可能仍使用旧连接。", { type: "warn" });
           }
           return;
         }
@@ -6998,7 +7229,7 @@
             if (!unloaded) await new Promise((resolve) => setTimeout(resolve, 500));
             signal.throwIfAborted();
           }
-          if (!unloaded) throw new Error("会话仍被占用，无法重新连接网关，请稍后重新发送");
+          if (!unloaded) throw new Error("会话仍被占用，无法重新连接本地服务，请稍后重新发送");
           if (!resumed) {
             mayContinueNatively = false;
             state.resuming = --codexGatewayResumeSequence;
@@ -7024,7 +7255,7 @@
           signal.throwIfAborted();
           if (!currentGateway) return;
           if (!currentGateway.active || currentGateway.generation !== gateway.generation) {
-            throw new Error("网关连接已变化，请重新发送");
+            throw new Error("本地服务连接已变化，请重新发送");
           }
           state.generation = gateway.generation;
         } finally {
@@ -7039,7 +7270,7 @@
             || window.__codexPlusConnectionRecoveryPending?.has(threadId)) throw error;
         sendCodexPlusDiagnostic("gateway_recovery_preflight_failed", { errorMessage: String(error?.message || error) });
         if (typeof showToast === "function") {
-          showToast("网关连接检查未完成，本次消息将交由原生会话处理，可能仍使用旧连接。", { type: "warn" });
+          showToast("本地服务连接检查未完成，本次消息将交由原生会话处理，可能仍使用旧连接。", { type: "warn" });
         }
       } finally {
         release();
@@ -7052,7 +7283,7 @@
     try {
       await Promise.race([work, new Promise((_, reject) => {
         timer = setTimeout(() => {
-          const error = new Error("网关连接准备超时，请重新发送");
+          const error = new Error("本地服务连接准备超时，请重新发送");
           controller.abort(error);
           reject(error);
         }, codexGatewayPreparationTimeoutMs);
@@ -9393,6 +9624,8 @@
   let codexPlusBackendFailureCount = 0;
   /** 上次心跳成功读取的设置版本。 */
   let codexPlusBackendSettingsRevision = "";
+  let codexPlusWeixinSyncRevision = null;
+  let codexPlusWeixinSyncHeartbeat = null;
   const CODEX_PLUS_BACKEND_FAILURE_THRESHOLD = 3;
   // 桥接通道（binding）与后端可用性分开统计：HTTP 回落成功会让后端状态保持绿色，
   // 但桥接持续失败时必须把降级呈现出来，否则启动器侧的重注入修复循环对用户完全不可见（issue #2169）。
@@ -9483,15 +9716,20 @@
         // 渲染进程主线程切碎。后端在 status 里带上快照版本，这里只比对字符串。
         // 老后端不带版本（空串）时退回原来的每次全量拉取，行为不变。
         const revision = typeof nextStatus.settingsRevision === "string" ? nextStatus.settingsRevision : "";
+        const weixinRevision = nextStatus.weixinDesktopSyncRevision ?? null;
         const settingsStale = !revision
           || !codexPlusBackendSettingsLoaded
-          || revision !== codexPlusBackendSettingsRevision;
+          || revision !== codexPlusBackendSettingsRevision
+          || weixinRevision !== codexPlusWeixinSyncRevision;
         if (settingsStale) {
           void syncBackendSettingsFromHeartbeat().then((loaded) => {
             if (loaded && codexPlusBackendGeneration === window.__codexPlusBackendGeneration) {
               codexPlusBackendSettingsRevision = revision;
+              codexPlusWeixinSyncRevision = weixinRevision;
             }
           }).catch(() => {});
+        } else {
+          codexPlusWeixinSyncHeartbeat?.();
         }
       } else {
         codexPlusBackendFailureCount += 1;
@@ -9879,14 +10117,16 @@
     if (!panel) return;
     const local = (codexPlusUserScripts.scripts || []).find((script) => script.key === key);
     const config = local?.package?.config || window.__codexPlusUserScripts?.scripts?.[key]?.manifest?.config || {};
-    const saveConfig = (values) => saveCodexPlusExtensionConfig(key, values);
+    // 拓展自己调的 saveConfig 只覆盖给出的项：它常常只传改动的那一项，整份替换会把别的项打回默认值。
+    const saveConfig = (values) => saveCodexPlusExtensionConfig(key, values, true);
     const result = runCodexPlusExtensionCallback(key, "settingsPanel.render", () => panel.render({ container: slot, config: { ...config }, saveConfig }));
     codexPlusMountedSettingsPanel = { key, node: slot, panel, cleanup: result.ok ? result.value : null };
   }
 
   /** 拓展设置面板保存配置：后台只收清单里声明过的项；拓展用 onConfigUpdate 接住时原地生效，否则整体热重载。 */
-  async function saveCodexPlusExtensionConfig(key, values) {
-    const result = await postJson("/user-scripts/set-config", { key, values: values && typeof values === "object" ? values : {} });
+  /** merge 为 true：只覆盖给出的项，其余已存的值保留；默认整份替换（通用表单逐项保存时传的是整份）。 */
+  async function saveCodexPlusExtensionConfig(key, values, merge = false) {
+    const result = await postJson("/user-scripts/set-config", { key, values: values && typeof values === "object" ? values : {}, merge });
     if (!result || result.status !== "ok") throw new Error(result?.message || "拓展配置没有保存");
     const config = result.config && typeof result.config === "object" ? result.config : {};
     const local = (codexPlusUserScripts.scripts || []).find((script) => script.key === key);
@@ -9957,7 +10197,7 @@
     const main = document.createElement("div");
     main.className = "codex-plus-page-main";
     // 「拓展」的左面板是脚本列表；设置页的左面板是分组导航（和 Codex 自己的设置页一样，右边一次只看一组）。
-    // 推荐内容是单栏内容页，没有左面板。
+    // 推荐内容的左栏是合作伙伴目录，见下方 installCodexPlusSectionNav。
     if (tab === codexPlusExtensionsTab) {
       const nav = document.createElement("div");
       nav.className = "codex-plus-page-nav";
@@ -9984,6 +10224,88 @@
     layout.appendChild(main);
     main.appendChild(body);
     if (tab === "home") syncCodexPlusSettingsGroups(overlay);
+    // 推荐内容只有一组「合作伙伴」，左栏照原生插件页的「自定义」栏，只为和其它页面同一副样子。
+    if (tab === codexPlusSponsorTab) installCodexPlusSectionNav(overlay, codexPlusSponsorSectionNav);
+  }
+
+  const codexPlusSponsorSectionNav = { title: "推荐内容", groups: [{ id: "partners", label: "合作伙伴", icon: "plugins" }] };
+
+  /** 左栏目录的按钮：页面里的左栏和图标栏悬浮卡片（showCodexPlusRailPeek）共用。 */
+  function codexPlusSectionNavItemsHtml(groups, active = "") {
+    return groups.map((group) => {
+      const current = group.id === active;
+      return `<button type="button" class="codex-plus-page-nav-item" data-codex-plus-section-nav="${escapeHtml(group.id)}" data-active="${String(current)}"${current ? ' aria-current="page"' : ""}><span class="codex-plus-page-nav-item-icon" aria-hidden="true">${codexPlusSettingsGroupIcon(group.icon)}</span><span class="codex-plus-page-nav-item-name">${escapeHtml(group.label)}</span></button>`;
+    }).join("");
+  }
+
+  /** 记住的组（localStorage），不在了就是第一组。 */
+  function codexPlusSectionNavActive({ title, groups }) {
+    let active = "";
+    try { active = window.localStorage.getItem(`codex-plus-section-nav:${title}`) || ""; } catch {}
+    return groups.some((group) => group.id === active) ? active : groups[0]?.id || "";
+  }
+
+  /**
+   * 远程控制、微信连接、推荐内容的左栏，照原生设置页（和 Codex++ 设置页同一套样式）：
+   * 左栏选一组，右边只显示这一组。页面把内容包成 .codex-plus-settings-group[data-codex-plus-section-group]，
+   * 放在 .codex-plus-settings[data-codex-plus-settings-paged] 里，组里第一节的标题就是页面大标题。
+   * 侧栏展开时左栏和其它页面的左栏一样对齐原生侧栏。
+   *
+   * 页面内容会被整块重画（轮询、操作之后）：MutationObserver 在重画后、绘制前把当前组的 data-active 补回去。
+   * 选中的组记在 localStorage，下次打开还在那一组。
+   * 左栏不用 data-codex-plus-page-nav-body：refreshCodexPlusPageNav 认那个挂载点，会把设置分组画进来。
+   */
+  function installCodexPlusSectionNav(overlay, { title, titleHtml = "", groups }) {
+    const content = overlay?.querySelector(".codex-plus-modal-content");
+    const body = content?.querySelector(".codex-plus-modal-body");
+    if (!content || !body || !groups.length) return;
+    let main = body.parentElement?.classList.contains("codex-plus-page-main") ? body.parentElement : null;
+    if (!main) {
+      const layout = document.createElement("div");
+      layout.className = "codex-plus-page-layout";
+      main = document.createElement("div");
+      main.className = "codex-plus-page-main";
+      content.appendChild(layout);
+      layout.appendChild(main);
+      main.appendChild(body);
+    }
+    const storageKey = `codex-plus-section-nav:${title}`;
+    let active = codexPlusSectionNavActive({ title, groups });
+    const nav = document.createElement("nav");
+    nav.className = "codex-plus-page-nav";
+    nav.setAttribute("aria-label", `${title}分组`);
+    nav.innerHTML = `<div class="codex-plus-page-nav-header"><div class="codex-plus-page-nav-title">${titleHtml || escapeHtml(title)}</div></div>
+      <div class="codex-plus-page-nav-body" data-codex-plus-section-nav-body="true">${codexPlusSectionNavItemsHtml(groups, active)}</div>`;
+    main.before(nav);
+    content.dataset.codexPlusSectionNav = "true";
+    const sync = () => {
+      body.querySelectorAll("[data-codex-plus-section-group]").forEach((node) => {
+        const value = String(node.getAttribute("data-codex-plus-section-group") === active);
+        if (node.dataset.active !== value) node.dataset.active = value;
+      });
+      nav.querySelectorAll("[data-codex-plus-section-nav]").forEach((button) => {
+        const current = button.getAttribute("data-codex-plus-section-nav") === active;
+        button.dataset.active = String(current);
+        if (current) button.setAttribute("aria-current", "page");
+        else button.removeAttribute("aria-current");
+      });
+    };
+    nav.addEventListener("click", (event) => {
+      const button = event.target instanceof Element ? event.target.closest("[data-codex-plus-section-nav]") : null;
+      if (!button) return;
+      active = button.getAttribute("data-codex-plus-section-nav");
+      try { window.localStorage.setItem(storageKey, active); } catch {}
+      sync();
+      // 换一组从顶上看起。
+      body.scrollTop = 0;
+    });
+    new MutationObserver(sync).observe(body, { childList: true, subtree: true });
+    sync();
+  }
+
+  /** 页面里一组的外壳：远程控制、微信连接的渲染函数用它把各节分进左栏的组里。 */
+  function codexPlusSectionGroupHtml(id, html) {
+    return `<div class="codex-plus-settings-group" data-codex-plus-section-group="${escapeHtml(id)}">${html}</div>`;
   }
 
   /** 页面标题：每个 rail 入口一个名字，和图标栏上的标签保持一致。 */
@@ -10091,17 +10413,43 @@
     if (codexPlusActiveEntry() === "extensions") refreshCodexPlusExtensionsView();
   }
 
-  /** 安装确认框里的能力清单，按风险从高到低（与管理器 permissionLines 同一套文案）。 */
+  /** 安装确认框里的能力清单，按风险从高到低（与管理器 permissionLines 同一套文案，改一边要同步改另一边）。 */
   function codexPlusPackagePermissionLines(permissions = {}) {
     const lines = [];
-    if (permissions.backend) lines.push(`常驻后台进程 ${permissions.backend}：可读写本机文件、访问网络`);
+    const list = (items) => (Array.isArray(items) ? items : []).join("、");
+    if (permissions.backend) {
+      lines.push(`常驻后台进程 ${permissions.backend}：可读写本机文件、访问网络`);
+      if (permissions.backendHttp) lines.push("后台处理本机 HTTP 请求：本机其它程序可以调用它");
+      if (permissions.schedules) lines.push(`定时任务 ${permissions.schedules} 条：按时调用它的后台`);
+    }
+    if (permissions.launchBefore) lines.push(`启动前脚本 ${permissions.launchBefore}：每次启动 Codex 前在本机运行，可读写本机文件、访问网络`);
+    if (permissions.launchAfter) lines.push(`退出后脚本 ${permissions.launchAfter}：每次 Codex 退出后在本机运行，可读写本机文件、访问网络`);
+    if (permissions.mcpServers?.length) lines.push(`MCP 服务器 ${list(permissions.mcpServers)}：写进 Codex 配置，由 Codex 在本机启动它指定的命令`);
+    if (permissions.dsh) lines.push(`dsh 插件 ${permissions.dsh}：插件代码在本机常驻进程里运行`);
     for (const hook of permissions.hooks || []) {
       lines.push(hook.matcher ? `Codex 钩子 ${hook.event}（匹配 ${hook.matcher}）：可拦截或改写工具调用` : `Codex 钩子 ${hook.event}：可拦截或改写工具调用`);
     }
+    if (permissions.toolPipeline) lines.push(`工具调用管线 ${permissions.toolPipeline} 个：可改参数、拦截、代为执行工具调用或改写结果`);
     if (permissions.gatewayRequest) lines.push(`网关请求中间件 ${permissions.gatewayRequest} 个：可读取并改写发往模型的完整请求`);
     if (permissions.gatewayResponse) lines.push(`网关响应中间件 ${permissions.gatewayResponse} 个：可读取并改写模型回复`);
+    if (permissions.gatewayError) lines.push(`网关失败重试 ${permissions.gatewayError} 个：请求失败后可改写并重发`);
+    if (permissions.gatewayReplaces?.length) {
+      lines.push(permissions.gatewayReplaces.includes("builtin:auth-headers")
+        ? `关掉内置网关环节 ${list(permissions.gatewayReplaces)}：由它接管，其中鉴权头会把供应商 Key 交给它`
+        : `关掉内置网关环节 ${list(permissions.gatewayReplaces)}：由它接管`);
+    }
+    if (permissions.providers?.length) lines.push(`模型供应商 ${list(permissions.providers)}：并入供应商池，选用时请求发往它指定的地址`);
     if (permissions.tools?.length) lines.push(`模型工具：${permissions.tools.join("、")}`);
+    if (permissions.launchArgs?.length) lines.push(`Codex 启动参数：${permissions.launchArgs.join(" ")}`);
+    if (permissions.instructions) lines.push("全局指令：追加到 Codex 的系统指令");
+    if (permissions.skills?.length) lines.push(`Skills：${list(permissions.skills)}（同步进 Codex 的技能目录）`);
+    if (permissions.agents?.length) lines.push(`子 Agent：${list(permissions.agents)}`);
+    if (permissions.prompts?.length) lines.push(`提示词：${list(permissions.prompts)}`);
+    if (permissions.replaces?.length) lines.push(`顶替内置拓展 ${list(permissions.replaces)}：对应的内置功能停用，由它接管`);
+    if (permissions.managerReplaces?.length) lines.push(`顶替管理器页面：${list(permissions.managerReplaces)}`);
+    if (permissions.managerData?.length) lines.push(`读取管理器数据：${list(permissions.managerData)}`);
     for (const route of permissions.routes || []) lines.push(`本地路由 ${route}`);
+    if (permissions.preload?.length) lines.push(`页面最早期脚本 ${list(permissions.preload)}：在 Codex 自己的脚本之前运行`);
     if (permissions.renderer?.length) lines.push(`在 Codex 页面里运行脚本：${permissions.renderer.join("、")}`);
     return lines;
   }
@@ -10653,7 +11001,6 @@
     const tab = overlay.querySelector(".codex-plus-modal-content")?.dataset?.codexPlusActiveTab;
     if (tab === codexPlusExtensionsTab) return "extensions";
     if (tab === codexPlusSponsorTab) return "sponsor";
-    if (tab === codexPlusPluginMarketTab) return "plugin-market";
     if (tab === codexPlusProviderTab) return "provider";
     if (tab === codexPlusRemoteControlTab) return "remote";
     if (tab === codexPlusWeixinConnectTab) return "weixin";
@@ -10735,15 +11082,38 @@
     const layoutLeft = zoom === 1 ? left : left / zoom;
     overlay.style.setProperty("--codex-plus-page-left", `${layoutLeft}px`);
     overlay.style.left = `${layoutLeft}px`;
-    // 官方顶部有一条 header（返回/前进/隐藏侧边栏），图标栏与侧边栏都从它的下沿开始。
+    const pageSurface = document.querySelector('[class*="_PageSurface_"], [class^="PageSurface-"], [class*=" PageSurface-"]');
+    // 26.1117 起的外壳没有 _PageSurface_：原生内容面板 [data-app-shell-surface-backing] 从窗口顶边铺起，
+    // 顶部那条标题栏（侧栏开关、前进后退，可拖动窗口）是透明地叠在面板与侧栏上的。
+    // overlay 若仍从标题栏下沿开始，上面就露出一条「侧栏那段发灰、面板那段发黑、拐角落在侧栏右边」的
+    // 原生底色——用户截图圈出的「顶上多出来一块黑的」就是它。这种外壳下改成和原生面板一样从标题栏
+    // 顶边铺起，由 CSS 把标题栏抬到 overlay 之上，内容整体下移标题栏的高度，按钮和拖动都照旧。
+    // 外壳里常同时挂着两个标题栏，前一个是 0×0 的空壳，要取真正有尺寸的那个。
+    const titlebar = pageSurface
+      ? null
+      : Array.from(document.querySelectorAll("[data-app-shell-titlebar]"))
+        .find((node) => node.getBoundingClientRect().height > 0);
+    const titlebarRect = titlebar?.getBoundingClientRect?.();
+    const backing = titlebarRect && titlebarRect.height > 0
+      ? document.querySelector("[data-app-shell-surface-backing]")
+      : null;
+    const backingRect = backing?.getBoundingClientRect?.();
+    const underTitlebar = Boolean(backingRect && backingRect.height > 0 && backingRect.top <= titlebarRect.top);
+    // 旧外壳：官方顶部有一条 header（返回/前进/隐藏侧边栏），图标栏与侧边栏都从它的下沿开始。
     // 我们的 overlay 若从 y=0 铺满就会把整条 header 盖住——用户反馈「比官方少了一条顶部栏」
     // 就是这个原因。这里同样量图标栏的顶边（而非硬编码高度），让 overlay 从 header 下沿开始。
-    const top = railRect && railRect.height > 0
-      ? Math.max(0, railRect.top)
-      : (rect && rect.height > 0 ? Math.max(0, rect.top) : 0);
+    const top = underTitlebar
+      ? Math.max(0, titlebarRect.top)
+      : railRect && railRect.height > 0
+        ? Math.max(0, railRect.top)
+        : (rect && rect.height > 0 ? Math.max(0, rect.top) : 0);
     const layoutTop = zoom === 1 ? top : top / zoom;
     overlay.style.setProperty("--codex-plus-page-top", `${layoutTop}px`);
     overlay.style.top = `${layoutTop}px`;
+    const insetTop = underTitlebar ? Math.max(0, titlebarRect.bottom - top) : 0;
+    overlay.style.setProperty("--codex-plus-page-inset-top", `${zoom === 1 ? insetTop : insetTop / zoom}px`);
+    if (underTitlebar) overlay.dataset.codexPlusTitlebar = "inset";
+    else delete overlay.dataset.codexPlusTitlebar;
     // 右侧与下方官方各留了一圈槽：整行的 [data-app-shell-workspace-row] 比视口小
     // （真机 1715x984 / 视口 1719x988，即右、下各 4px），官方内容面板正好收在行的右下角。
     // 我们原先 right/bottom 都贴 0，于是比官方多占这 4px。这里量取而不是硬编码 4。
@@ -10767,27 +11137,64 @@
     // 类名是 CSS Modules 的哈希名，但 PageSurface 这个名字稳定，且不会命中 PageSurfaceLayout
     //（新旧两种哈希格式 `_PageSurface_xx` / `PageSurface-xx` 都认，#2893）。量到的是视觉值，同样折算成布局坐标。
     // 读不到就保持 0，不做猜测。
-    const pageSurface = document.querySelector('[class*="_PageSurface_"], [class^="PageSurface-"], [class*=" PageSurface-"]');
+    // 新外壳没有 _PageSurface_，量原生面板 backing：它只圆起始一侧（右、下贴着窗口边）。
+    // 侧栏开着时 backing 起点在侧栏右边、比我们靠右，我们这块就像面板提前从图标栏边上开始，左侧照它圆；
+    // 侧栏收起时 backing 一直铺到图标栏底下，我们与它连成一片，左侧不圆，免得多出一道拐角。
     const pageSurfaceStyle = pageSurface ? getComputedStyle(pageSurface) : null;
     const mainSurfaceStyle = (() => {
       const main = document.querySelector("main[data-app-shell-main-surface]");
       return main ? getComputedStyle(main) : null;
     })();
-    const radius =
-      parseFloat(pageSurfaceStyle?.borderTopLeftRadius || "") ||
-      parseFloat(mainSurfaceStyle?.getPropertyValue("--app-shell-main-surface-clip-end-radius") || "") ||
-      0;
+    const radius = underTitlebar
+      ? (backingRect.left > left + 1 ? parseFloat(getComputedStyle(backing).borderTopLeftRadius || "") || 0 : 0)
+      : parseFloat(pageSurfaceStyle?.borderTopLeftRadius || "") ||
+        parseFloat(mainSurfaceStyle?.getPropertyValue("--app-shell-main-surface-clip-end-radius") || "") ||
+        0;
     const layoutRadius = zoom === 1 ? radius : radius / zoom;
     overlay.style.setProperty("--codex-plus-page-radius", `${layoutRadius}px`);
+    if (underTitlebar) overlay.style.setProperty("--codex-plus-page-radius-end", "0px");
+    else overlay.style.removeProperty("--codex-plus-page-radius-end");
+    // 新外壳的原生页面整块就是面板一个底色（侧栏收起时连图标栏底下都是它）。
+    // 我们的页面底、左栏、顶栏统一取面板的实际颜色，不再用比它深的正文令牌和比它浅的侧栏令牌。
+    // 面板被皮肤画成透明时不取，免得页面透出底下的原生内容。
+    const surface = underTitlebar ? getComputedStyle(backing).backgroundColor : "";
+    if (surface && !/^transparent$|,\s*0\)$|\/\s*0\)$/.test(surface)) {
+      overlay.style.setProperty("--codex-plus-shell-surface", surface);
+      overlay.dataset.codexPlusSurface = "native";
+    } else {
+      overlay.style.removeProperty("--codex-plus-shell-surface");
+      delete overlay.dataset.codexPlusSurface;
+    }
+    // 侧栏展开时原生面板从侧栏右边起：记下侧栏宽度，CSS 让有左栏的页面照原生「左灰右黑带圆角」画。
+    if (underTitlebar && backingRect.left > left + 1) {
+      overlay.dataset.codexPlusSidebar = "open";
+      const sidebarWidth = backingRect.left - left;
+      overlay.style.setProperty("--codex-plus-native-sidebar-width", `${zoom === 1 ? sidebarWidth : sidebarWidth / zoom}px`);
+    } else if (underTitlebar) {
+      // 侧栏收起时原生侧栏是悬浮的：鼠标移到图标栏入口上才浮出一张卡片，宽 = 侧栏宽 − 左边 4px 的缝。
+      // 收起后原生侧栏仍按原宽排着（只是被裁掉），量它；左栏照着浮（installCodexPlusNavPeek）。
+      overlay.dataset.codexPlusSidebar = "floating";
+      overlay.style.removeProperty("--codex-plus-native-sidebar-width");
+      const navWidth = document.querySelector("[data-sidebar-navigation-root]")?.getBoundingClientRect().width || 0;
+      if (navWidth > 4) overlay.style.setProperty("--codex-plus-native-peek-width", `${(zoom === 1 ? navWidth : navWidth / zoom) - 4}px`);
+      else overlay.style.removeProperty("--codex-plus-native-peek-width");
+    } else {
+      delete overlay.dataset.codexPlusSidebar;
+      overlay.style.removeProperty("--codex-plus-native-sidebar-width");
+      overlay.style.removeProperty("--codex-plus-native-peek-width");
+    }
+    // 侧栏开合时 aside 本身的尺寸不一定变，原生面板 backing 的宽度一定变，所以也盯着它。
+    const surfaceBacking = document.querySelector("[data-app-shell-surface-backing]");
     if (window.__codexPlusPageLayoutObserver &&
         (window.__codexPlusPageLayoutTargets?.main !== main ||
          window.__codexPlusPageLayoutTargets?.sidebar !== sidebar ||
-         window.__codexPlusPageLayoutTargets?.rail !== rail)) {
+         window.__codexPlusPageLayoutTargets?.rail !== rail ||
+         window.__codexPlusPageLayoutTargets?.backing !== surfaceBacking)) {
       window.__codexPlusPageLayoutObserver.disconnect();
-      for (const target of new Set([main, sidebar, rail])) {
+      for (const target of new Set([main, sidebar, rail, surfaceBacking])) {
         if (target) window.__codexPlusPageLayoutObserver.observe(target);
       }
-      window.__codexPlusPageLayoutTargets = { main, sidebar, rail };
+      window.__codexPlusPageLayoutTargets = { main, sidebar, rail, backing: surfaceBacking };
     }
   }
 
@@ -10803,6 +11210,237 @@
     window.addEventListener("resize", reposition);
     positionCodexPlusPage(overlay);
     syncCodexPlusPageBackButton();
+    installCodexPlusNavPeek();
+  }
+
+  /**
+   * 侧栏收起时照原生悬浮：鼠标停在图标栏的哪个入口上，就浮出那个入口自己的侧栏卡片，换一个入口卡片跟着换，
+   * 移开一会儿收起。当前页面的入口（以及窗口左边缘 4px）浮出页面自己的左栏（CSS 见 data-codex-plus-sidebar="floating"，
+   * 这里打 data-codex-plus-nav-peek）；别的入口——没打开的、或者正在看原生页面时——浮出独立卡片（showCodexPlusRailPeek）。
+   * 侧栏展开时不浮，和原生一样。
+   * 只认 pointermove / 离开窗口，监听挂在 document 上；同一代注入只装一次，重复注入时换成新一代的处理函数。
+   */
+  function installCodexPlusNavPeek() {
+    if (window.__codexPlusNavPeekHandler && window.__codexPlusNavPeekGeneration === codexPlusBackendGeneration) return;
+    document.removeEventListener("pointermove", window.__codexPlusNavPeekHandler, true);
+    document.removeEventListener("pointerout", window.__codexPlusNavPeekHandler, true);
+    window.__codexPlusNavPeekGeneration = codexPlusBackendGeneration;
+    // shown / pending：null 是收起，"page" 是页面自己的左栏，其余是图标栏入口的 id（独立卡片）。
+    let shown = null;
+    let pending = null;
+    let timer = null;
+    const pageCard = () => {
+      const overlay = document.querySelector(`.${codexPlusPageClass}[data-codex-plus-sidebar="floating"]`);
+      const card = overlay?.querySelector(".codex-plus-modal-content > .codex-plus-page-layout > .codex-plus-page-nav");
+      return card ? { overlay, card } : null;
+    };
+    // 原生悬浮卡片开着（收起动画没走完也算）：卡片上带着 popover 底色。
+    const nativePeekOpen = () => Boolean(document.querySelector('[data-sidebar-navigation-root][class*="sidebar-popover-background"]'));
+    // 原生在入口之间换卡片只换内容、不重播开合动画：卡片已经浮着（我们的或原生的）时换成我们的另一张就直接换（snap）。
+    // 只有从无到有、从有到无才淡入淡出。
+    const apply = (next, snap) => {
+      timer = null;
+      const page = pageCard();
+      if (next === "page" && !page) next = null;
+      if (next !== null && next !== "page" && !showCodexPlusRailPeek(next, true, snap)) next = null;
+      if (next === null || next === "page") hideCodexPlusRailPeek(snap);
+      if (page) {
+        if (snap) page.card.style.transition = "none";
+        if (next === "page") page.overlay.dataset.codexPlusNavPeek = "true";
+        else delete page.overlay.dataset.codexPlusNavPeek;
+        if (snap) {
+          void page.card.offsetWidth;
+          page.card.style.removeProperty("transition");
+        }
+      }
+      shown = next;
+    };
+    window.__codexPlusNavPeekHandler = (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const leavingWindow = event.type === "pointerout" && !event.relatedTarget;
+      const page = pageCard();
+      const peek = document.getElementById(codexPlusRailPeekId);
+      let next = null;
+      if (!leavingWindow) {
+        const railButton = target?.closest("[data-codex-plus-rail] > button");
+        if (railButton) {
+          if (codexPlusSidebarFloating()) next = page && railButton.getAttribute("aria-current") === "page" ? "page" : railButton.parentElement.id;
+        } else if (page?.card.contains(target)) next = "page";
+        else if (peek?.dataset.open === "true" && peek.contains(target)) next = shown;
+        else if (page && event.clientX <= 4) next = "page";
+      }
+      if (next === shown) {
+        clearTimeout(timer);
+        timer = null;
+        return;
+      }
+      if (timer && next === pending) return;
+      clearTimeout(timer);
+      pending = next;
+      // 卡片浮着时换入口是立刻的。移到原生入口上时我们的马上收；原生卡片要等一下才出来（从无到有，带动画），我们的照常淡出，不留空档。
+      const swapping = next !== null && (shown !== null || nativePeekOpen());
+      const delay = next === null
+        ? (target?.closest(codexPlusRailDestinationSelector) ? 0 : 250)
+        : (swapping || page?.card.contains(target) ? 0 : 120);
+      timer = setTimeout(() => apply(next, swapping), delay);
+    };
+    document.addEventListener("pointermove", window.__codexPlusNavPeekHandler, true);
+    document.addEventListener("pointerout", window.__codexPlusNavPeekHandler, true);
+  }
+
+  /** 侧栏收起：原生面板一直铺到图标栏右边（展开时它从侧栏右边起）。旧外壳没有这块面板，不算。 */
+  function codexPlusSidebarFloating() {
+    const rail = document.querySelector(codexPlusRailSelector)?.getBoundingClientRect();
+    const backing = document.querySelector("[data-app-shell-surface-backing]")?.getBoundingClientRect();
+    return Boolean(rail?.width > 0 && backing?.width > 0 && backing.left <= rail.right + 1);
+  }
+
+  const codexPlusRailPeekId = "codex-plus-rail-peek";
+
+  /**
+   * 图标栏入口的悬浮卡片内容：标题、左栏条目和点一项要做的事（打开那一页并停在那一组）。
+   * 条目和页面里的左栏同一套标记，样式也共用（10-style.js 里 .codex-plus-rail-peek-content）。
+   * 供应商、任务面板的左栏还不浮，没有卡片。
+   */
+  function codexPlusRailPeekSpec(railId, load = true) {
+    // 条目要等后台读完（设置项清单、用户拓展）：读完时卡片还开着就照新数据重画（重画不再触发读取）。
+    const refreshAfter = (loader) => {
+      if (!load) return;
+      Promise.resolve(loader()).then(() => {
+        const peek = document.getElementById(codexPlusRailPeekId);
+        if (peek?.dataset.open === "true" && peek.dataset.railId === railId) showCodexPlusRailPeek(railId, false);
+      }, () => {});
+    };
+    const section = (nav, open) => ({
+      label: nav.title,
+      titleHtml: nav.titleHtml || escapeHtml(nav.title),
+      attrs: ' data-codex-plus-section-nav="true"',
+      items: codexPlusSectionNavItemsHtml(nav.groups, codexPlusSectionNavActive(nav)),
+      pick(button) {
+        const id = button.getAttribute("data-codex-plus-section-nav");
+        if (!id) return;
+        try { window.localStorage.setItem(`codex-plus-section-nav:${nav.title}`, id); } catch {}
+        open();
+      },
+    });
+    if (railId === codexPlusRailRemoteId) return section(codexPlusRemoteSectionNav, openCodexPlusRemoteControlPage);
+    if (railId === codexPlusRailWeixinId) return section(codexPlusWeixinSectionNav, openCodexPlusWeixinConnectPage);
+    if (railId === codexPlusRailSponsorId) return section(codexPlusSponsorSectionNav, openCodexPlusSponsor);
+    if (railId === codexPlusRailNavId) {
+      if (!codexPlusSettingsCatalog) refreshAfter(loadCodexPlusSettingsCatalog);
+      return {
+        label: "Codex++ 设置分组",
+        titleHtml: `Codex++ ${escapeHtml(codexPlusVersion)}`,
+        attrs: ' data-codex-plus-active-tab="home" data-codex-plus-section-nav="true"',
+        items: codexPlusSettingsPeekNavItems(),
+        pick(button) {
+          const id = button.getAttribute("data-codex-plus-settings-nav");
+          if (!id) return;
+          openCodexPlusPage();
+          selectCodexPlusSettingsGroup(id);
+        },
+      };
+    }
+    if (railId === codexPlusRailExtensionsId) {
+      if (!codexPlusUserScriptsLoaded) refreshAfter(loadUserScripts);
+      return {
+        label: "拓展",
+        titleHtml: escapeHtml(codexPlusPageTitle(codexPlusExtensionsTab)),
+        attrs: ` data-codex-plus-active-tab="${codexPlusExtensionsTab}"`,
+        items: renderCodexPlusExtensionsNav(),
+        pick(button) {
+          const select = button.getAttribute("data-codex-extensions-select");
+          if (!select && !button.hasAttribute("data-codex-extensions-browse")) return;
+          if (!select) codexPlusExtensionsFilter = "market";
+          openCodexPlusExtensions();
+          if (!select) return;
+          const [kind, ...rest] = select.split(":");
+          codexPlusExtensionsSelected = { kind, key: rest.join(":") };
+          if (typeof resetCodexPlusExtensionsDetailTab === "function") resetCodexPlusExtensionsDetailTab();
+          refreshCodexPlusExtensionsView();
+        },
+      };
+    }
+    return null;
+  }
+
+  /**
+   * 设置页没打开时的分组导航：分组外壳照设置页的顺序拼一份（不画里面的设置项），
+   * 交给 renderCodexPlusSettingsNavItems，小标题、图标、选中态和页面里的左栏一样。
+   */
+  function codexPlusSettingsPeekNavItems() {
+    const catalog = codexPlusSettingsCatalog;
+    const groups = catalog
+      ? catalog.groups.map((group) => renderCodexPlusSettingsGroup(group.id, group.title, "")).join("")
+      : renderCodexPlusSettingsGroup("core", "常规", "");
+    const menu = codexPlusExtensionItems(codexPlusRegistry.menuItems).length ? '<div data-codex-plus-ext-menu="true"></div>' : "";
+    const root = document.createElement("div");
+    root.innerHTML = `<div data-codex-plus-panel="home">${groups}${renderCodexPlusSettingsSectionGroups()}${renderCodexPlusSettingsGroup("ext-menu", "拓展设置", menu)}${renderCodexPlusSettingsGroup("tools", "工具与关于", "")}</div>`;
+    return renderCodexPlusSettingsNavItems(root);
+  }
+
+  /**
+   * 浮出入口的独立卡片，位置照原生悬浮侧栏：图标栏右边起，上下左各留 4px，宽 = 原生侧栏宽 − 4。
+   * snap：从另一张浮着的卡片换过来，直接出现，不淡入。
+   */
+  function showCodexPlusRailPeek(railId, load = true, snap = false) {
+    const spec = codexPlusRailPeekSpec(railId, load);
+    const rail = document.querySelector(codexPlusRailSelector)?.getBoundingClientRect();
+    if (!spec || !rail || rail.width <= 0) return false;
+    let peek = document.getElementById(codexPlusRailPeekId);
+    // 上一代注入留下的卡片绑着旧闭包，换掉。
+    if (peek && peek.__codexPlusGeneration !== codexPlusBackendGeneration) {
+      peek.remove();
+      peek = null;
+    }
+    if (!peek) {
+      peek = document.createElement("div");
+      peek.id = codexPlusRailPeekId;
+      peek.__codexPlusGeneration = codexPlusBackendGeneration;
+      peek.className = "codex-plus-rail-peek";
+      markCodexPlusExtensionNode(peek, "builtin-rail-peek");
+      peek.addEventListener("click", (event) => {
+        const button = event.target instanceof Element ? event.target.closest("button") : null;
+        const pick = peek.__codexPlusPick;
+        if (!button || !pick) return;
+        hideCodexPlusRailPeek(true);
+        pick(button);
+        // 新开的页面左栏接着浮在鼠标底下，和在原生卡片里点一项一样。
+        const overlay = document.querySelector(`.${codexPlusPageClass}[data-codex-plus-sidebar="floating"]`);
+        if (overlay) overlay.dataset.codexPlusNavPeek = "true";
+      });
+      document.body.appendChild(peek);
+    }
+    applyCodexPlusTheme(peek);
+    const zoom = applyCodexPlusZoom(peek);
+    const navWidth = document.querySelector("[data-sidebar-navigation-root]")?.getBoundingClientRect().width || 288;
+    peek.style.left = `${(rail.right + 4) / zoom}px`;
+    peek.style.top = `${(rail.top + 4) / zoom}px`;
+    peek.style.bottom = `${(window.innerHeight - rail.bottom + 4) / zoom}px`;
+    peek.style.width = `${(navWidth - 4) / zoom}px`;
+    peek.innerHTML = `<div class="codex-plus-rail-peek-content"${spec.attrs}><nav class="codex-plus-page-nav" aria-label="${escapeHtml(spec.label)}">
+      <div class="codex-plus-page-nav-header"><div class="codex-plus-page-nav-title">${spec.titleHtml}</div></div>
+      <div class="codex-plus-page-nav-body">${spec.items}</div></nav></div>`;
+    peek.__codexPlusPick = spec.pick;
+    peek.dataset.railId = railId;
+    if (peek.dataset.open !== "true") {
+      // 先按收起的样子排一次，打开才有淡入。
+      void peek.offsetWidth;
+      if (snap) peek.style.transition = "none";
+      peek.dataset.open = "true";
+      if (snap) {
+        void peek.offsetWidth;
+        peek.style.removeProperty("transition");
+      }
+    }
+    return true;
+  }
+
+  function hideCodexPlusRailPeek(instant = false) {
+    const peek = document.getElementById(codexPlusRailPeekId);
+    if (!peek) return;
+    if (instant) peek.remove();
+    else peek.dataset.open = "false";
   }
 
   function codexPlusHostUsesLightTheme() {
@@ -11081,6 +11719,14 @@
     root.querySelectorAll('[data-codex-plus-panel="home"] > [data-codex-plus-settings-group]').forEach((node) => {
       const value = String(node.getAttribute("data-codex-plus-settings-group") === active);
       if (node.dataset.active !== value) node.dataset.active = value;
+      if (node.getAttribute("data-codex-plus-settings-group") === "ext-permissions") {
+        const details = node.querySelector("[data-codex-plus-usage-storage]");
+        const visible = value === "true" || !node.closest('[data-codex-plus-settings-paged="true"]');
+        if (details && details.dataset.active !== String(visible)) {
+          details.dataset.active = String(visible);
+          if (visible && !details.dataset.loading) void loadCodexPlusUsageStorage(details);
+        }
+      }
     });
     root.querySelectorAll("[data-codex-plus-settings-nav]").forEach((button) => {
       const current = button.getAttribute("data-codex-plus-settings-nav") === active;
@@ -11345,6 +11991,27 @@
     return escapeHtml(experimental ? item.title.replace(codexPlusExperimentalTitle, "") : item.title) + tags;
   }
 
+  async function loadCodexPlusUsageStorage(details) {
+    const size = details.querySelector("[data-usage-storage-bytes]");
+    const path = details.querySelector("[data-usage-storage-directory]");
+    details.dataset.loading = "true";
+    try {
+      const result = await postJson("/settings/usage-history-storage", {});
+      if (result.status !== "ok" || !Number.isSafeInteger(result.bytes) || result.bytes < 0 || typeof result.directory !== "string") {
+        throw new Error(result.message || "未取得用量库存储信息");
+      }
+      size.textContent = result.bytes < 1024 ** 2
+        ? `${result.bytes.toLocaleString()} B`
+        : `${(result.bytes / 1024 ** 2).toLocaleString(undefined, { maximumFractionDigits: 2 })} MiB`;
+      path.textContent = result.directory;
+    } catch (error) {
+      size.textContent = "读取失败";
+      path.textContent = error.message;
+    } finally {
+      delete details.dataset.loading;
+    }
+  }
+
   function renderCodexPlusSettingsCatalogRow(item, options = {}) {
     const title = escapeHtml(item.title);
     let control = "";
@@ -11363,11 +12030,18 @@
     const descriptionData = item.descriptionWhenEnhancementsOn ? ` data-codex-plus-setting-description="${escapeHtml(item.key)}"` : "";
     const builtin = item.builtin ? ` data-codex-plus-builtin="${escapeHtml(item.builtin)}"` : "";
     const param = options.param ? " data-codex-plus-builtin-param=\"true\"" : "";
+    const storage = item.key === "usageHistoryEnabled" ? `
+                <div class="codex-plus-row" data-codex-plus-usage-storage>
+                  <div role="status">
+                    <div class="codex-plus-row-title">用量库占用 <span data-usage-storage-bytes>正在读取</span></div>
+                    <div class="codex-plus-row-description">保存目录 <span data-usage-storage-directory></span></div>
+                  </div>
+                </div>` : "";
     return `
                 <div class="codex-plus-row" data-codex-plus-setting-row="${escapeHtml(item.key)}"${builtin}${param}>
                   <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div>${item.key === "codexAppNativeFastUnlock" ? '<div class="codex-plus-row-description" data-codex-plus-native-fast-status="true" role="status" hidden></div>' : ""}</div>
                   ${control}
-                </div>`;
+                </div>${storage}`;
   }
 
   /**
@@ -11541,7 +12215,7 @@
               <h2 class="codex-plus-settings-section-title">工具与关于</h2>
               <div class="codex-plus-settings-card">
                 <div class="codex-plus-row">
-                  <div><div class="codex-plus-row-title">管理工具</div><div class="codex-plus-row-description">增强总开关、供应商、网关与会话维护在管理工具里设置。</div></div>
+                  <div><div class="codex-plus-row-title">管理工具</div><div class="codex-plus-row-description">增强总开关、供应商、本地服务与会话维护在管理工具里设置。</div></div>
                   <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
                 </div>
                 <div class="codex-plus-row">
@@ -12016,7 +12690,9 @@
         closeCodexPlusPage();
         return;
       }
-      if (!target?.closest(selectors.sidebarThread)) return;
+      // 侧栏收起时原生侧栏能悬浮在页面之上（10-style.js），点里面的入口同样是去原生页面。
+      const nativeSidebarItem = target?.closest("[data-sidebar-navigation-root] :is(button, a)");
+      if (!target?.closest(selectors.sidebarThread) && !(nativeSidebarItem && !nativeSidebarItem.closest(`#${codexPlusSidebarNavId}`))) return;
       // Let Codex's own click handler update its route before removing our page.
       closeCodexPlusPageAfterNativeNavigation();
     };
@@ -12065,6 +12741,7 @@
       if (!button.className) button.className = "h-token-nav-row w-full flex items-center gap-2 px-3 py-2 text-sm";
       button.type = "button";
       button.removeAttribute("data-state");
+      button.removeAttribute("data-sidebar-destination");
       button.removeAttribute("aria-current");
       button.removeAttribute("disabled");
       button.removeAttribute("aria-disabled");
@@ -12154,6 +12831,10 @@
     button.type = "button";
     // 留着 data-sidebar-destination 会被 Codex 的自定义/排序逻辑当成真的 destination。
     button.removeAttribute("data-sidebar-destination");
+    // 留着悬浮区标记，侧栏收起时鼠标停在我们的入口上会浮出模板那一项（如「定时任务」）的原生侧栏。
+    button.removeAttribute("data-slate-sidebar-peek-area");
+    button.removeAttribute("data-slate-sidebar-peek-product-mode");
+    button.removeAttribute("aria-expanded");
     button.removeAttribute("data-state");
     button.removeAttribute("disabled");
     button.removeAttribute("aria-disabled");
@@ -12393,6 +13074,8 @@
 
     const status = document.getElementById(codexPlusRailNavId)?.querySelector(".codex-plus-sidebar-nav-status");
     if (status) status.dataset.status = codexPlusBackendStatus.status || "checking";
+    // 侧栏收起时入口浮出各自的侧栏卡片，原生页面上也要有，所以随入口一起装。
+    installCodexPlusNavPeek();
     return true;
   }
 
@@ -13264,9 +13947,11 @@
   /** 按风险列出的徽标（与管理器 riskBadges 一致）。 */
   function codexPlusRiskBadges(permissions = {}) {
     const badges = [];
-    if (permissions.backend) badges.push("后台进程");
-    if (permissions.hooks?.length) badges.push("钩子");
-    if (permissions.gatewayRequest || permissions.gatewayResponse) badges.push("网关");
+    if (permissions.backend || permissions.dsh) badges.push("后台进程");
+    if (permissions.launchBefore || permissions.launchAfter) badges.push("启动脚本");
+    if (permissions.mcpServers?.length) badges.push("MCP");
+    if (permissions.hooks?.length || permissions.toolPipeline) badges.push("钩子");
+    if (permissions.gatewayRequest || permissions.gatewayResponse || permissions.gatewayError || permissions.gatewayReplaces?.length || permissions.providers?.length) badges.push("网关");
     if (permissions.tools?.length) badges.push("模型工具");
     return badges;
   }
@@ -13911,6 +14596,7 @@ var codexPlusProviderEditing = (() => {
     buildOfficialRelayAuthJson: () => buildOfficialRelayAuthJson,
     buildRelayAuthJson: () => buildRelayAuthJson,
     buildRelayConfigToml: () => buildRelayConfigToml,
+    clampAggregateRoutePriority: () => clampAggregateRoutePriority,
     clampAggregateWeight: () => clampAggregateWeight,
     cliproxyGeneralModelAliases: () => cliproxyGeneralModelAliases,
     cliproxyOfficialModelAliases: () => cliproxyOfficialModelAliases,
@@ -13941,6 +14627,7 @@ var codexPlusProviderEditing = (() => {
     isCliproxyOfficialModel: () => isCliproxyOfficialModel,
     isCliproxyOfficialProfile: () => isCliproxyOfficialProfile,
     isNewapiManagedProfile: () => isNewapiManagedProfile,
+    isOfficialLoginMemberProfile: () => isOfficialLoginMemberProfile,
     isOfficialLoginProfile: () => isOfficialLoginProfile,
     joinTomlSections: () => joinTomlSections,
     nextAggregateMappingKey: () => nextAggregateMappingKey,
@@ -13969,6 +14656,7 @@ var codexPlusProviderEditing = (() => {
     relaySessionProviderFromConfig: () => relaySessionProviderFromConfig,
     relaySessionProviderValidation: () => relaySessionProviderValidation,
     relaySettingsValidation: () => relaySettingsValidation,
+    relaySettingsValidationForSave: () => relaySettingsValidationForSave,
     relaySettingsWithDraft: () => relaySettingsWithDraft,
     removeCodexExperimentalBearerToken: () => removeCodexExperimentalBearerToken,
     removeRelayProfile: () => removeRelayProfile,
@@ -14159,6 +14847,31 @@ var codexPlusProviderEditing = (() => {
   function isAggregateProfile(profile) {
     return profile.relayMode === "aggregate" || !!profile.aggregate;
   }
+  function isApiMemberProfile(profile) {
+    return Boolean((profile.baseUrl ?? "").trim() && (profile.apiKey ?? "").trim());
+  }
+  function authContentsHaveChatgptTokens(contents) {
+    const trimmed = (contents ?? "").trim();
+    if (!trimmed) return false;
+    try {
+      const value = JSON.parse(trimmed);
+      const tokens = value && typeof value === "object" ? value.tokens : void 0;
+      if (!tokens || typeof tokens !== "object") return false;
+      return [tokens.access_token, tokens.refresh_token].some(
+        (token) => typeof token === "string" && token.trim().length > 0
+      );
+    } catch {
+      return /"tokens"\s*:/.test(trimmed) && /"(access_token|refresh_token)"\s*:/.test(trimmed);
+    }
+  }
+  function isOfficialLoginMemberProfile(profile) {
+    return profile.relayMode === "official" && !profile.officialMixApiKey && (profile.protocol ?? "responses") === "responses" && authContentsHaveChatgptTokens(profile.authContents);
+  }
+  function aggregateMemberCandidates(profiles, aggregateId) {
+    return profiles.filter(
+      (profile) => profile.id !== aggregateId && !isAggregateProfile(profile) && (isApiMemberProfile(profile) || isOfficialLoginMemberProfile(profile))
+    );
+  }
   function normalizeAggregateDefaultRelayId(value, memberIds) {
     const id = (value ?? "").trim();
     return id && memberIds.has(id) ? id : "";
@@ -14289,6 +15002,9 @@ var codexPlusProviderEditing = (() => {
   }
   function stripResponsesImageDetailEnabled(profile) {
     return profile.stripResponsesImageDetail === true && profile.protocol === "responses" && profile.relayMode !== "aggregate" && (profile.relayMode !== "official" || profile.officialMixApiKey);
+  }
+  function stripResponsesOutputEncryptedContentEnabled(profile) {
+    return profile.stripResponsesOutputEncryptedContent === true && profile.protocol === "responses" && profile.relayMode !== "aggregate" && (profile.relayMode !== "official" || profile.officialMixApiKey);
   }
   function pureApiImageGenerationEnabled(profile) {
     return profile.pureApiImageGeneration === true && profile.relayMode === "pureApi";
@@ -14423,7 +15139,7 @@ var codexPlusProviderEditing = (() => {
   function buildRelayConfigToml(profile, options) {
     const searchHistoryCompat = profile.webSearchHistoryCompat === true && profile.protocol === "responses" && profile.relayMode !== "aggregate" && (profile.relayMode !== "official" || profile.officialMixApiKey);
     const localCompaction = profile.localCompactionPromptAtEnd === true && (profile.protocol === "responses" || profile.protocol === "chatCompletions") && profile.relayMode !== "aggregate" && (profile.relayMode !== "official" || profile.officialMixApiKey);
-    const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile) || stripImageGenerationToolEnabled(profile) || stripResponsesImageDetailEnabled(profile) || pureApiImageGenerationEnabled(profile) ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
+    const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile) || stripImageGenerationToolEnabled(profile) || stripResponsesImageDetailEnabled(profile) || stripResponsesOutputEncryptedContentEnabled(profile) || pureApiImageGenerationEnabled(profile) ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
     const apiKey = profile.apiKey.trim();
     const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
     const rootLines = [
@@ -14511,6 +15227,15 @@ var codexPlusProviderEditing = (() => {
     const compatibleSession = sessionProviderForProtocol(sessionProvider, protocol);
     const normalizedPatch = compatibleSession === sessionProvider ? patch : { ...patch, sessionProvider: compatibleSession };
     let next = { ...profile, ...normalizedPatch };
+    if (profile.relayMode === "official" && profile.officialMixApiKey && next.relayMode === "official" && !next.officialMixApiKey) {
+      next.inactiveMixedApi = {
+        configContents: profile.configContents || withGeneratedRelayFiles(profile).configContents,
+        upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl,
+        modelRoutes: profile.modelRoutes
+      };
+    } else if (profile.relayMode === "official" && !profile.officialMixApiKey && next.officialMixApiKey && profile.inactiveMixedApi) {
+      next = { ...next, ...profile.inactiveMixedApi, inactiveMixedApi: void 0 };
+    }
     if (isAggregateRelayProfile(next)) {
       return normalizeAggregateRelayProfile(next, null);
     }
@@ -14544,10 +15269,10 @@ var codexPlusProviderEditing = (() => {
     if ("upstreamBaseUrl" in patch) {
       next.baseUrl = patch.upstreamBaseUrl || "";
     }
-    if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "stripImageGenerationTool" in patch || "stripResponsesImageDetail" in patch || "pureApiImageGeneration" in patch || "modelMetadata" in patch) {
+    if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "stripImageGenerationTool" in patch || "stripResponsesImageDetail" in patch || "stripResponsesOutputEncryptedContent" in patch || "pureApiImageGeneration" in patch || "modelMetadata" in patch) {
       const searchHistoryCompat = next.webSearchHistoryCompat === true && next.protocol === "responses" && next.relayMode !== "aggregate" && (next.relayMode !== "official" || next.officialMixApiKey);
       const localCompaction = next.localCompactionPromptAtEnd === true && (next.protocol === "responses" || next.protocol === "chatCompletions") && next.relayMode !== "aggregate" && (next.relayMode !== "official" || next.officialMixApiKey);
-      const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next) || stripImageGenerationToolEnabled(next) || stripResponsesImageDetailEnabled(next) || pureApiImageGenerationEnabled(next) ? PROTOCOL_PROXY_BASE_URL : next.upstreamBaseUrl || next.baseUrl;
+      const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next) || stripImageGenerationToolEnabled(next) || stripResponsesImageDetailEnabled(next) || stripResponsesOutputEncryptedContentEnabled(next) || pureApiImageGenerationEnabled(next) ? PROTOCOL_PROXY_BASE_URL : next.upstreamBaseUrl || next.baseUrl;
       next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {
         requiresOpenAiAuth: next.relayMode !== "pureApi"
       });
@@ -14993,6 +15718,20 @@ ${key} = ${value}`]);
     }
     return relayModelRoutesSettingsValidation(settings);
   }
+  function relaySettingsValidationForSave(settings, editingId) {
+    const named = (profileId, message) => {
+      if (profileId === editingId) return message;
+      const other = settings.relayProfiles.find((profile) => profile.id === profileId);
+      return tf("供应商「{0}」配置有误：{1}", [other?.name || t("未命名供应商"), message]);
+    };
+    for (const profile of settings.relayProfiles) {
+      const sessionProviderError = relaySessionProviderValidation(profile);
+      if (sessionProviderError) return named(profile.id, sessionProviderError);
+    }
+    const routeIssue = findRelayModelRouteIssue(settings.relayProfiles, settings.relayProfiles);
+    const routeMessage = relayModelRouteIssueMessage(routeIssue);
+    return routeIssue && routeMessage ? named(routeIssue.sourceRelayId, routeMessage) : null;
+  }
   function relaySessionProviderValidation(profile) {
     if (relaySessionProvider(profile) === "openai" && profile.protocol !== "responses") {
       return t("OpenAI 会话身份仅支持 Responses API；Chat Completions 不支持 ChatGPT Remote 的远程压缩。请切换协议或改回 Custom。");
@@ -15154,7 +15893,7 @@ ${key} = ${value}`]);
   function createAggregateRelayProfile(settings) {
     const id = `aggregate-${Date.now().toString(36)}`;
     const contextSelection = relayProfileEditingHost.contextSelectionForAllEntries(settings);
-    const candidates = aggregateMemberCandidates(settings, id, true);
+    const candidates = aggregateMemberCandidates2(settings, id, true);
     return normalizeAggregateRelayProfile({
       id,
       name: tf("聚合供应商 {0}", [settings.relayProfiles.filter(isAggregateRelayProfile).length + 1]),
@@ -15343,7 +16082,7 @@ ${key} = ${value}`]);
     return profile.protocol !== "responses" || normalizeRelayModelRoutes(profile.modelRoutes).length ? "routing" : "direct";
   }
   function normalizeAggregateRelayProfile(profile, settings) {
-    const candidates = settings ? aggregateMemberCandidates(settings, profile.id) : [];
+    const candidates = settings ? aggregateMemberCandidates2(settings, profile.id) : [];
     const aggregate = normalizeAggregateConfig(profile.aggregate, candidates, settings ? new Set(settings.relayProfiles.map((item) => item.id)) : null);
     const officialModelList = settings ? officialLoginModelList(settings) : [];
     const modelList = inferAggregateModelList({ ...profile, aggregate }, settings);
@@ -15723,7 +16462,7 @@ ${key} = ${value}`]);
   }
   function inferAggregateModelList(profile, settings) {
     if (!settings) return profile.modelList.trim();
-    const candidates = aggregateMemberCandidates(settings, profile.id);
+    const candidates = aggregateMemberCandidates2(settings, profile.id);
     const aggregate = normalizeAggregateConfig(profile.aggregate, candidates, new Set(settings.relayProfiles.map((item) => item.id)));
     const memberProfiles = aggregateSelectedMemberProfiles(aggregate, candidates);
     const officialCliproxyModels = settings.officialLoginMixedMode ? cliproxyOfficialModelAliases(settings) : [];
@@ -15759,7 +16498,7 @@ ${key} = ${value}`]);
       return true;
     });
   }
-  function aggregateMemberCandidates(settingsOrProfiles, aggregateId, requireCredentials = false) {
+  function aggregateMemberCandidates2(settingsOrProfiles, aggregateId, requireCredentials = false) {
     const profiles = Array.isArray(settingsOrProfiles) ? settingsOrProfiles : settingsOrProfiles.relayProfiles;
     return profiles.filter((profile) => profile.id !== aggregateId && !isAggregateRelayProfile(profile) && !isCliproxyManagedProfile(profile) && !isNewapiManagedProfile(profile) && !isOfficialLoginProfile(profile) && (!requireCredentials || isApiRelayProfile(profile)));
   }
@@ -15778,18 +16517,19 @@ ${key} = ${value}`]);
     GATEWAY_AGENT_NAMES: () => GATEWAY_AGENT_NAMES,
     GATEWAY_CLAUDE_PROVIDER_ID: () => GATEWAY_CLAUDE_PROVIDER_ID,
     GROUP_MODEL_PREFIX: () => GROUP_MODEL_PREFIX,
+    MAGPIE_UPSTREAM_ID: () => MAGPIE_UPSTREAM_ID,
     MAX_GATEWAY_PORT: () => MAX_GATEWAY_PORT,
     MIN_GATEWAY_PORT: () => MIN_GATEWAY_PORT,
     QUEUE_REASON_PREFIX: () => QUEUE_REASON_PREFIX,
     RECENT_USE_MS: () => RECENT_USE_MS,
-    SPONSORS: () => SPONSORS,
     activeAutoGroup: () => activeAutoGroup,
-    activeSponsorIds: () => activeSponsorIds,
     agentModels: () => agentModels,
     agentName: () => agentName,
     agentPoolProviders: () => agentPoolProviders,
+    appendGroupMembers: () => appendGroupMembers,
     averageDuration: () => averageDuration,
     axisLabelIndexes: () => axisLabelIndexes,
+    batchMemberRows: () => batchMemberRows,
     bindingFromDraft: () => bindingFromDraft,
     blankBinding: () => blankBinding,
     cacheHitRate: () => cacheHitRate,
@@ -15844,6 +16584,7 @@ ${key} = ${value}`]);
     parseWeight: () => parseWeight,
     patternMatches: () => patternMatches,
     pendingImportCount: () => pendingImportCount,
+    pendingImports: () => pendingImports,
     pickerSections: () => pickerSections,
     poolExcludeToggle: () => poolExcludeToggle,
     presetAdded: () => presetAdded,
@@ -15872,6 +16613,7 @@ ${key} = ${value}`]);
     servingProviders: () => servingProviders,
     shortDate: () => shortDate,
     shortPath: () => shortPath,
+    shortProviderName: () => shortProviderName,
     skippedAgents: () => skippedAgents,
     slugify: () => slugify,
     soonestResetCardExpiry: () => soonestResetCardExpiry,
@@ -16031,28 +16773,7 @@ ${key} = ${value}`]);
       modelList: ["LongCat-Flash-Chat"],
       websiteUrl: "https://longcat.chat/platform"
     },
-    // ── 聚合/中转 ──
-    {
-      id: "jojocode-max",
-      name: "JOJO Code",
-      websiteUrl: "https://max2.jojocode.com/",
-      apiKeyUrl: "https://max2.jojocode.com/",
-      category: "aggregator",
-      baseUrl: "https://max2.jojocode.com/v1",
-      protocol: "responses",
-      // 模型留空：添加时「从上游获取」或手填。
-      model: ""
-    },
-    {
-      id: "runapi",
-      name: "RunAPI",
-      websiteUrl: "https://runapi.host",
-      apiKeyUrl: "https://runapi.host",
-      category: "aggregator",
-      baseUrl: "https://runapi.host/v1",
-      protocol: "responses",
-      model: "gpt-5.5"
-    },
+    // ── 聚合/中转（赞助商不在这里，见 sponsorPresets）──
     {
       id: "siliconflow",
       name: "SiliconFlow",
@@ -16082,38 +16803,6 @@ ${key} = ${value}`]);
       protocol: "responses",
       model: "gpt-5.5",
       websiteUrl: "https://aihubmix.com"
-    },
-    {
-      id: "apikeyfun",
-      name: "APIKEY.FUN",
-      category: "aggregator",
-      baseUrl: "https://api.apikey.fun/v1",
-      protocol: "responses",
-      model: "gpt-5.5",
-      modelList: ["gpt-5.5"],
-      websiteUrl: "https://apikey.fun"
-    },
-    {
-      id: "cccccc-api",
-      name: "ccccccAPI",
-      websiteUrl: "https://dzhsmartai.com",
-      apiKeyUrl: "https://dzhsmartai.com/register?promo=CODEXPLUSPLUS",
-      category: "aggregator",
-      baseUrl: "https://dzhsmartai.com/v1",
-      protocol: "responses",
-      // 模型留空：添加时「从上游获取」或手填。
-      model: ""
-    },
-    {
-      id: "tokenmy",
-      name: "TokenMy",
-      websiteUrl: "https://agent.tokenmy.ai",
-      apiKeyUrl: "https://agent.tokenmy.ai",
-      category: "aggregator",
-      baseUrl: "https://agent.tokenmy.ai/v1",
-      protocol: "responses",
-      // 模型留空：添加时「从上游获取」或手填。
-      model: ""
     },
     {
       id: "novita",
@@ -16428,12 +17117,12 @@ ${key} = ${value}`]);
   }
   function validateDraft(draft, payload, retainedModel, retainedSelection, native) {
     if (payload) {
-      if (!agentPoolProviders(payload, draft.poolExclude).length) return "供应商池是空的，先到「供应商」里添加";
+      if (!agentPoolProviders(payload, draft.poolExclude).length) return "共享供应商是空的，先在「共享供应商」里添加供应商";
       const model = draft.model.trim();
       const retainedDisabledModel = draft.model === retainedModel && disabledGroup(payload, model);
       const retainedProvider = retainedSelection && payload.pool.find((entry) => entry.id === retainedSelection.providerId);
       const retainedUnavailableModel = draft.model === retainedModel && retainedSelection && modelSlugFromRowName(model).toLowerCase() === `${retainedSelection.providerId}/${modelSlugFromRowName(retainedSelection.upstreamModel)}`.toLowerCase() && (retainedSelection.providerRemoved || !retainedProvider || !providerEnabled(retainedProvider) || draft.poolExclude.includes(retainedProvider.id));
-      if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude, native)) return "供应商池里没有这个模型";
+      if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude, native)) return "共享供应商里没有这个模型";
     }
     const window = parseContextWindow(draft.contextWindow);
     if (window !== null && (!Number.isFinite(window) || window < 1e3)) return "上下文窗口格式不对，例如 200000、200k 或 1M";
@@ -16980,38 +17669,29 @@ ${key} = ${value}`]);
       defaultKey: "lm-studio"
     }
   ];
-  var SPONSORS = [
-    { id: "jojocode-max", expiresAt: "2029-06-15" },
-    { id: "runapi", expiresAt: "2026-12-07" },
-    { id: "apikeyfun", expiresAt: "2026-11-22" },
-    { id: "cccccc-api", expiresAt: "2026-12-01" },
-    { id: "tokenmy", expiresAt: "2026-11-20" }
-  ];
-  function localDay(now) {
-    const pad = (value) => String(value).padStart(2, "0");
-    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-  }
-  function activeSponsorIds(now = /* @__PURE__ */ new Date()) {
-    const today = localDay(now);
-    return SPONSORS.filter((sponsor) => sponsor.expiresAt >= today).map((sponsor) => sponsor.id);
-  }
-  function gatewayPresets(now = /* @__PURE__ */ new Date()) {
-    const sponsorIds = activeSponsorIds(now);
-    const expired = new Set(SPONSORS.map((sponsor) => sponsor.id).filter((id) => !sponsorIds.includes(id)));
-    const shared = PRESETS.filter((preset) => !expired.has(preset.id)).map((preset) => ({
+  function toGatewayPreset(preset, section) {
+    return {
       key: preset.id,
       name: preset.name,
       baseUrl: preset.baseUrl,
       protocol: preset.protocol,
       model: preset.model,
       modelList: preset.modelList ?? (preset.model ? [preset.model] : []),
-      section: sponsorIds.includes(preset.id) ? "sponsor" : preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay",
+      section,
       apiKeyUrl: preset.apiKeyUrl
-    }));
+    };
+  }
+  function gatewayPresets(sponsors = []) {
+    const sponsorIds = new Set(sponsors.map((preset) => preset.id));
+    const shared = PRESETS.filter((preset) => !sponsorIds.has(preset.id)).map((preset) => toGatewayPreset(preset, preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay"));
     const vendors = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "vendor"), ...shared.filter((preset) => preset.section === "vendor")];
     const relays = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "relay"), ...shared.filter((preset) => preset.section === "relay")];
-    const sponsors = sponsorIds.flatMap((id) => shared.filter((preset) => preset.key === id));
-    return [...sponsors, ...vendors, ...relays, ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")];
+    return [
+      ...sponsors.map((preset) => toGatewayPreset(preset, "sponsor")),
+      ...vendors,
+      ...relays,
+      ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")
+    ];
   }
   function normalizeUrl(url) {
     return url.trim().replace(/\/+$/, "").toLowerCase();
@@ -17028,7 +17708,7 @@ ${key} = ${value}`]);
     const target = normalizeUrl(preset.baseUrl);
     return Boolean(payload?.pool.some((entry) => entry.source === `preset:${preset.key}` || normalizeUrl(entry.baseUrl) === target));
   }
-  var NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false, stripResponsesImageDetail: false, disableToolSearch: false };
+  var NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false, stripResponsesImageDetail: false, stripResponsesOutputEncryptedContent: false, disableToolSearch: false };
   function providerDraftFromPreset(preset) {
     if (!preset) return { name: "", baseUrl: "", keys: "", protocol: "chatCompletions", model: "", modelList: "", ...NO_PRICE };
     return {
@@ -17057,6 +17737,7 @@ ${key} = ${value}`]);
       stripImageGenerationTool: entry.stripImageGenerationTool === true,
       subscriptionPolicy: entry.subscriptionPolicy == null ? entry.subscriptionPolicy : normalizeSubscriptionPolicy(entry.subscriptionPolicy),
       stripResponsesImageDetail: entry.stripResponsesImageDetail === true,
+      stripResponsesOutputEncryptedContent: entry.stripResponsesOutputEncryptedContent === true,
       disableToolSearch: entry.disableToolSearch === true,
       customHeaders: providerHeaderRows(entry.customHeaders)
     };
@@ -17075,6 +17756,7 @@ ${key} = ${value}`]);
       stripImageGenerationTool: draft.stripImageGenerationTool === true,
       ...draft.subscriptionPolicy !== void 0 ? { subscriptionPolicy: draft.subscriptionPolicy } : {},
       stripResponsesImageDetail: draft.stripResponsesImageDetail === true,
+      stripResponsesOutputEncryptedContent: draft.stripResponsesOutputEncryptedContent === true,
       disableToolSearch: draft.disableToolSearch === true,
       ...draft.customHeaders !== void 0 ? { customHeaders: providerHeaderInputs(draft.customHeaders) } : {}
     };
@@ -17229,6 +17911,9 @@ ${key} = ${value}`]);
   function maskEmailsIn(text) {
     return text.replace(EMAIL_PATTERN, (_match, lead, email) => lead + maskEmail(email));
   }
+  function shortProviderName(name) {
+    return name.split("·")[0].trim() || name;
+  }
   function maskAccountName(name) {
     const masked = maskEmailsIn(name);
     const match = /^((?:ChatGPT|Copilot|SuperGrok|GitHub Copilot)[^·]*·\s*)(.+)$/.exec(masked);
@@ -17254,12 +17939,28 @@ ${key} = ${value}`]);
       ...plain("codex", payload?.codexProviders),
       ...(payload?.codexAggregates ?? []).map((item) => ({ source: "aggregate", id: item.id, name: item.name, imported: item.imported })),
       ...plain("claude", payload?.claudeProviders),
+      ...plain("ccswitch", payload?.ccSwitchClaude),
+      ...plain("claudemom", payload?.claudeMomProfiles),
+      ...plain("magpie", payload?.magpieProviders),
       ...plain("grok", payload?.grokProfiles),
       ...plain("opencode", payload?.opencodeKeys)
     ];
   }
+  var MAGPIE_UPSTREAM_ID = "@gateway";
+  function pendingImports(payload) {
+    const candidates = importCandidates(payload);
+    const magpie = candidates.filter((item) => item.source === "magpie");
+    const magpieDone = magpie.some((item) => item.imported);
+    const upstream = magpie.find((item) => item.id === MAGPIE_UPSTREAM_ID);
+    return candidates.filter((item) => {
+      if (item.imported) return false;
+      if (item.source !== "magpie") return true;
+      if (magpieDone) return false;
+      return upstream ? item === upstream : true;
+    });
+  }
   function pendingImportCount(payload) {
-    return importCandidates(payload).filter((item) => !item.imported).length;
+    return pendingImports(payload).length;
   }
   function pinnedBare(payload, model) {
     const slash = model.indexOf("/");
@@ -17316,6 +18017,37 @@ ${key} = ${value}`]);
     const serving = servingProviders(payload, model);
     return serving.length === 1 ? { entry: serving[0], model: model.trim() } : null;
   }
+  function batchMemberRows(payload, members) {
+    const taken = /* @__PURE__ */ new Set();
+    for (const member of members) {
+      const target = memberTarget(payload, member.model);
+      if (target) taken.add(`${target.entry.id}/${target.model}`.toLowerCase());
+    }
+    return modelDispatch(payload).map((row) => {
+      const pinned = row.providers.length > 1 || Boolean(disabledGroup(payload, row.model));
+      return {
+        model: row.model,
+        candidates: row.providers.map((provider) => ({
+          providerId: provider.id,
+          name: provider.name,
+          baseUrl: provider.baseUrl,
+          member: pinned ? `${provider.id}/${row.model}` : row.model,
+          added: taken.has(`${provider.id}/${row.model}`.toLowerCase())
+        }))
+      };
+    });
+  }
+  function appendGroupMembers(members, models) {
+    const seen = new Set(members.map((member) => member.model.toLowerCase()));
+    const next = [...members];
+    for (const model of models) {
+      const key = model.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      next.push({ model, weight: 1 });
+    }
+    return next;
+  }
 
   // apps/codex-plus-manager/src/gateway-agent-safety.ts
   var gateway_agent_safety_exports = {};
@@ -17363,13 +18095,13 @@ ${key} = ${value}`]);
   }
   function diagnosticEvidenceLabel(code) {
     const labels = {
-      matches: "与网关配置一致",
-      matched: "与网关配置一致",
+      matches: "与本地服务配置一致",
+      matched: "与本地服务配置一致",
       missing: "配置项缺失",
       missingFile: "文件不存在",
       missing_file: "文件不存在",
       changed: "配置项已改变",
-      mismatch: "与网关配置不符",
+      mismatch: "与本地服务配置不符",
       endpointChanged: "地址已改变",
       endpoint_changed: "地址已改变",
       unreadable: "无法读取",
@@ -17379,21 +18111,21 @@ ${key} = ${value}`]);
       credential_changed: "本地凭据已改变",
       credentialMissing: "本地凭据缺失",
       credential_missing: "本地凭据缺失",
-      endpointMatched: "与网关配置一致",
-      endpointPortMismatch: "端口与网关配置不符",
-      endpointHostMismatch: "主机与网关配置不符",
-      endpointPathMismatch: "路径与网关配置不符",
+      endpointMatched: "与本地服务配置一致",
+      endpointPortMismatch: "端口与本地服务配置不符",
+      endpointHostMismatch: "主机与本地服务配置不符",
+      endpointPathMismatch: "路径与本地服务配置不符",
       endpointMissing: "地址缺失",
       selectionChanged: "当前供应商或模型已改变",
       fileMissing: "文件不存在",
       fileUnreadable: "无法读取",
       invalidConfig: "配置格式无效",
       unsupportedConfig: "此配置暂无法验证",
-      endpoint_match: "与网关配置一致",
-      credential_match: "与网关配置一致",
+      endpoint_match: "与本地服务配置一致",
+      credential_match: "与本地服务配置一致",
       credential_sealed: "凭据已由系统安全存储加密保存",
-      selection_match: "与网关配置一致",
-      managed_config_match: "与网关配置一致",
+      selection_match: "与本地服务配置一致",
+      managed_config_match: "与本地服务配置一致",
       config_missing: "配置缺失",
       config_unreadable: "无法读取",
       config_invalid: "配置格式无效",
@@ -17401,9 +18133,9 @@ ${key} = ${value}`]);
       unsupported_agent: "此 Agent 暂无法验证",
       endpoint_missing: "地址缺失",
       endpoint_invalid: "地址格式无效",
-      endpoint_host_mismatch: "主机与网关配置不符",
-      endpoint_port_mismatch: "端口与网关配置不符",
-      endpoint_path_mismatch: "路径与网关配置不符",
+      endpoint_host_mismatch: "主机与本地服务配置不符",
+      endpoint_port_mismatch: "端口与本地服务配置不符",
+      endpoint_path_mismatch: "路径与本地服务配置不符",
       selection_changed: "当前供应商或模型已改变",
       managed_config_changed: "托管配置已改变"
     };
@@ -17438,12 +18170,13 @@ ${key} = ${value}`]);
    *     （codexPlusProviderEditing，来源 apps/codex-plus-manager/src/relay-profile-editing.ts），
    *     行为与管理器的「连接与供应商」页一致；
    *   - 保存 / 切换经 bridge 路由 /providers/*（core provider_page），最终跑的是管理器自己的
-   *     save_settings / switch_relay_profile：归一化、切换锁、live 文件、网关绑定都只有一份。
+   *     save_settings / switch_relay_profile：归一化、切换锁、live 文件、本地服务绑定都只有一份。
    *   - 命名 Key 只下发打码预览，提交时由服务端按 id 还原；选中别的已存 Key 不改文件，
    *     由服务端归一化时按选中的那把重写，所以页面里永远拿不到备用 Key 的明文。
    *
-   * 本页只编辑直连供应商（官方 / 官方+API / 纯 API）；聚合与网关条目可以「使用」，
-   * 编辑请到管理器（「在 Codex++ 中打开」）。
+   * 本页编辑直连供应商（官方 / 官方+API / 纯 API）与聚合供应商（故障转移 / 模型聚合：成员、权重、
+   * 策略、路由、默认成员、审批成员，同样用共用函数归一化与校验）；本地服务接管条目只能「使用」。
+   * 直连供应商的模型路由、请求头、兼容选项仍在管理器里编辑（「在 Codex++ 中打开」）。
    *
    * 页面 DOM 每次打开重建，状态只放在 codexPlusProviderPageState 里（见 01-registry 的生命周期约定）。
    */
@@ -17482,8 +18215,14 @@ ${key} = ${value}`]);
     return codexPlusProviderEditingApi.isAggregateRelayProfile(profile || {});
   }
 
+  /** 直连供应商：字段与 config.toml / auth.json 联动的那一套编辑。 */
   function codexPlusProviderEditable(profile) {
     return !!profile && !profile.gatewayManaged && !codexPlusProviderIsAggregate(profile);
+  }
+
+  /** 能在本页保存的条目：直连与聚合都行，本地服务接管条目不行。 */
+  function codexPlusProviderCanEdit(profile) {
+    return !!profile && !profile.gatewayManaged;
   }
 
   function codexPlusProviderModeKey(profile) {
@@ -17494,7 +18233,7 @@ ${key} = ${value}`]);
   }
 
   function codexPlusProviderModeLabel(profile) {
-    if (profile?.gatewayManaged) return "网关";
+    if (profile?.gatewayManaged) return "本地服务";
     const mode = codexPlusProviderModeKey(profile);
     if (mode === "aggregate") return profile.aggregate?.modelAggregationEnabled === true ? "模型聚合" : "故障转移";
     return { pureApi: "纯 API", mixedApi: "官方 + API", official: "官方登录" }[mode];
@@ -17582,7 +18321,8 @@ ${key} = ${value}`]);
     codexPlusProviderApplyList(result, { keepSelection });
     if (!state.tab) state.tab = result.gatewayMode === true ? "gateway" : "direct";
     renderCodexPlusProviderPage();
-    if (state.tab === "gateway" && !codexPlusGatewayPageState.payload && !codexPlusGatewayPageState.busy) void codexPlusGatewayLoad();
+    // 共享供应商和直连供应商在同一个列表里：打开页面就读一次。
+    if (!codexPlusGatewayPageState.payload && !codexPlusGatewayPageState.busy) void codexPlusGatewayLoad();
     return true;
   }
 
@@ -17645,7 +18385,7 @@ ${key} = ${value}`]);
   /**
    * 没改过的供应商原样提交服务端下发的版本：页面读取时做过与管理器相同的归一化，
    * 原样回传归一化结果可能和库里有细微差别，服务端会误判「当前供应商变了」而去重写 live 文件
-   * （网关接管时那次切换还会被拒，连带改别的供应商也保存不了）。
+   * （本地服务接管时那次切换还会被拒，连带改别的供应商也保存不了）。
    */
   function codexPlusProviderProfilesForCommit(profiles) {
     const state = codexPlusProviderPageState;
@@ -17671,7 +18411,26 @@ ${key} = ${value}`]);
   function codexPlusProviderSettingsWithDraft() {
     const state = codexPlusProviderPageState;
     const draft = state.draft;
-    if (!draft || !codexPlusProviderEditable(draft)) return codexPlusProviderClone(state.settings);
+    if (!draft || !codexPlusProviderCanEdit(draft)) return codexPlusProviderClone(state.settings);
+    if (codexPlusProviderIsAggregate(draft)) {
+      // 与管理器保存聚合草稿一致：先按会话身份 / 成员 / 默认成员 / 路由校验，再归一化后放回列表
+      // （syncLegacyRelayFields 会重新生成 aggregateRelayProfiles，服务端按它保存）。
+      const aggregateIssue = !String(draft.name || "").trim()
+        ? "请填写供应商名称。"
+        : codexPlusProviderEditingApi.relaySessionProviderValidation(draft)
+          || codexPlusProviderEditingApi.aggregateRelayProfileValidation(draft);
+      if (aggregateIssue) {
+        codexPlusProviderSetStatus(aggregateIssue, "error");
+        return null;
+      }
+      const next = codexPlusProviderEditingApi.relaySettingsWithDraft(state.settings, draft.id, draft, state.isNew);
+      const settingsIssue = codexPlusProviderEditingApi.relaySettingsValidation(next);
+      if (settingsIssue) {
+        codexPlusProviderSetStatus(settingsIssue, "error");
+        return null;
+      }
+      return next;
+    }
     const issue = codexPlusProviderEditingApi.relaySessionProviderValidation(draft);
     if (issue) {
       codexPlusProviderSetStatus(issue, "error");
@@ -17702,7 +18461,7 @@ ${key} = ${value}`]);
   async function codexPlusProviderUse(id) {
     const state = codexPlusProviderPageState;
     if (state.data?.gatewayMode === true) {
-      // 管理器在网关接管时会拒绝直接切换：先给出还原预览，确认断开后再切到这个供应商。
+      // 管理器在本地服务接管时会拒绝直接切换：先给出还原预览，确认断开后再切到这个供应商。
       await codexPlusGatewayOpenDisconnect(() => codexPlusProviderUse(id));
       return;
     }
@@ -17761,16 +18520,76 @@ ${key} = ${value}`]);
     await codexPlusProviderCommit(codexPlusProviderEditingApi.reorderRelayProfiles(state.settings, id, target), { busy: "reorder", successMessage: "顺序已更新。" });
   }
 
-  function codexPlusProviderStartNew() {
+  /** 新建：kind 为 "direct"（纯 API 直连）、"failover"（故障转移）或 "model"（模型聚合），与管理器的新建入口一致。 */
+  function codexPlusProviderStartNew(kind = "direct") {
     const state = codexPlusProviderPageState;
-    const draft = codexPlusProviderEditingApi.createRelayProfile(state.settings);
-    state.draft = codexPlusProviderEditingApi.applyRelayProfilePatchToFiles(draft, { name: "自定义供应商", relayMode: "pureApi", officialMixApiKey: false }, { allowGenerateFiles: true });
+    const api = codexPlusProviderEditingApi;
+    if (kind === "failover" || kind === "model") {
+      const memberSettings = codexPlusProviderMemberSettings();
+      state.draft = api.aggregateProfileForMode(api.createAggregateRelayProfile(memberSettings), memberSettings, kind === "model" ? "model" : "provider");
+    } else {
+      const draft = api.createRelayProfile(state.settings);
+      state.draft = api.applyRelayProfilePatchToFiles(draft, { name: "自定义供应商", relayMode: "pureApi", officialMixApiKey: false }, { allowGenerateFiles: true });
+    }
     state.selectedId = state.draft.id;
     state.isNew = true;
     state.dirty = true;
     state.fetchedModels = [];
     codexPlusProviderSetStatus("");
     renderCodexPlusProviderPage();
+    // 重绘会沿用上一个供应商的滚动位置；新建从头看起。
+    const detail = document.querySelector("[data-codex-provider-panel] .codex-plus-provider-detail");
+    if (detail) detail.scrollTop = 0;
+  }
+
+  /**
+   * 判定聚合成员用的设置视图：页面里已存的命名 Key 只有打码预览，派生出的 apiKey 是空的，
+   * 共用的成员判定（URL + Key 都填才算 API 成员）会把它们全当成不可用。这里给「当前 Key 已存」的
+   * 供应商填一个占位 Key，只用来判定成员与新建聚合的初始成员，从不提交。
+   */
+  function codexPlusProviderMemberSettings() {
+    const settings = codexPlusProviderPageState.settings;
+    const relayProfiles = (settings?.relayProfiles || []).map((profile) => {
+      if (String(profile.apiKey || "").trim()) return profile;
+      const stored = (profile.apiKeys || []).some((entry) => entry.id === profile.activeApiKeyId && entry.stored === true);
+      return stored ? { ...profile, apiKey: "stored" } : profile;
+    });
+    return { ...settings, relayProfiles };
+  }
+
+  /** 可勾选的聚合成员：API 供应商或已完成官方登录的账号（与管理器同一判定）。 */
+  function codexPlusProviderAggregateCandidates(draft) {
+    return codexPlusProviderEditingApi.aggregateMemberCandidates(codexPlusProviderMemberSettings().relayProfiles, draft.id);
+  }
+
+  function codexPlusProviderAggregateConfig(draft) {
+    return codexPlusProviderEditingApi.normalizeAggregateConfig(draft.aggregate, codexPlusProviderAggregateCandidates(draft));
+  }
+
+  /** 改聚合配置：与管理器 AggregateRelayProfileEditor 的 updateAggregate 一样，改完按当前列表归一化。 */
+  function codexPlusProviderUpdateAggregate(patch, profilePatch = {}) {
+    const state = codexPlusProviderPageState;
+    if (!state.draft) return;
+    const aggregate = codexPlusProviderAggregateConfig(state.draft);
+    state.draft = codexPlusProviderEditingApi.normalizeAggregateRelayProfile(
+      { ...state.draft, ...profilePatch, aggregate: { ...aggregate, ...patch } },
+      state.settings,
+    );
+    state.dirty = true;
+    codexPlusProviderSyncFileFields();
+  }
+
+  function codexPlusProviderToggleMember(profileId) {
+    const aggregate = codexPlusProviderAggregateConfig(codexPlusProviderPageState.draft);
+    const members = aggregate.members.some((member) => member.profileId === profileId)
+      ? aggregate.members.filter((member) => member.profileId !== profileId)
+      : [...aggregate.members, { profileId, weight: 1 }];
+    codexPlusProviderUpdateAggregate({ members });
+  }
+
+  function codexPlusProviderUpdateRoute(index, patch) {
+    const routes = codexPlusProviderAggregateConfig(codexPlusProviderPageState.draft).routes || [];
+    codexPlusProviderUpdateAggregate({ routes: routes.map((route, routeIndex) => (routeIndex === index ? { ...route, ...patch } : route)) });
   }
 
   /** 与管理器 updateDraft 一致：字段改动按需同步进 config.toml / auth.json。 */
@@ -17790,6 +18609,9 @@ ${key} = ${value}`]);
     if (auth && document.activeElement !== auth) auth.value = draft?.authContents || "";
     const dirty = document.querySelector("[data-codex-provider-dirty]");
     if (dirty) dirty.hidden = !codexPlusProviderPageState.dirty;
+    // 输入不重绘整页：「保存」按钮的可用状态在这里跟着改。
+    const save = document.querySelector('[data-codex-provider-panel] [data-codex-provider-action="save"]');
+    if (save) save.disabled = Boolean(codexPlusProviderPageState.busy) || !codexPlusProviderPageState.dirty;
   }
 
   /** 模型列表：一行一个，`slug[1M]` 后缀写窗口（与管理器的 model_list 语法相同）。 */
@@ -17881,10 +18703,11 @@ ${key} = ${value}`]);
 
   function renderCodexPlusProviderList() {
     const state = codexPlusProviderPageState;
-    const profiles = state.settings?.relayProfiles || [];
+    // 托管的「Codex++ 本地服务」条目不单列：经本地服务时，下面「共享供应商」里标着用的是哪一家。
+    const profiles = (state.settings?.relayProfiles || []).filter((profile) => !profile.gatewayManaged);
     const rows = profiles.map((profile, index) => {
       const active = profile.id === state.settings.activeRelayId;
-      const selected = profile.id === state.selectedId && !state.isNew;
+      const selected = profile.id === state.selectedId && !state.isNew && state.tab !== "gateway";
       return `<div class="codex-plus-provider-item" role="listitem" data-selected="${selected}" data-codex-provider-select="${escapeHtml(profile.id)}">
         <div class="codex-plus-provider-item-main">
           <div class="codex-plus-provider-item-name">${active ? '<span class="codex-plus-provider-item-dot" aria-hidden="true"></span>' : ""}${escapeHtml(profile.name || profile.id)}</div>
@@ -17935,6 +18758,11 @@ ${key} = ${value}`]);
   function codexPlusProviderMenu(kind, value, options, label, attrs = "") {
     const current = options.find(([id]) => id === value) || options[0] || ["", ""];
     return `<div class="codex-plus-provider-menu"><button type="button" class="codex-plus-menu-trigger" data-codex-provider-menu-toggle="${escapeHtml(kind)}" data-value="${escapeHtml(current[0])}" data-options="${escapeHtml(JSON.stringify(options))}" data-menu-label="${escapeHtml(label)}" aria-haspopup="menu" aria-expanded="false" aria-label="${escapeHtml(label)}：${escapeHtml(current[1])}" ${attrs}><span class="codex-plus-provider-menu-label">${escapeHtml(current[1])}</span>${codexPlusMenuIcons.chevron}</button></div>`;
+  }
+
+  /** 动作菜单（如「+ 新建」）：按钮文字固定，不显示当前值，菜单里也没有勾选项。 */
+  function codexPlusProviderActionMenu(kind, text, options, attrs = "") {
+    return `<div class="codex-plus-provider-menu"><button type="button" class="codex-plus-menu-trigger" data-codex-provider-menu-toggle="${escapeHtml(kind)}" data-fixed-label="true" data-value="" data-options="${escapeHtml(JSON.stringify(options))}" data-menu-label="${escapeHtml(text)}" aria-haspopup="menu" aria-expanded="false" aria-label="${escapeHtml(text)}" ${attrs}><span class="codex-plus-provider-menu-label">${escapeHtml(text)}</span>${codexPlusMenuIcons.chevron}</button></div>`;
   }
 
   function codexPlusProviderOpenMenu(trigger) {
@@ -18010,10 +18838,12 @@ ${key} = ${value}`]);
     if (!trigger) return;
     const value = item.dataset.codexProviderMenuValue || "";
     const text = item.textContent.trim();
-    trigger.dataset.value = value;
-    const label = trigger.querySelector(".codex-plus-provider-menu-label");
-    if (label) label.textContent = text;
-    trigger.setAttribute("aria-label", `${trigger.dataset.menuLabel || ""}：${text}`);
+    if (trigger.dataset.fixedLabel !== "true") {
+      trigger.dataset.value = value;
+      const label = trigger.querySelector(".codex-plus-provider-menu-label");
+      if (label) label.textContent = text;
+      trigger.setAttribute("aria-label", `${trigger.dataset.menuLabel || ""}：${text}`);
+    }
     codexPlusProviderCloseMenu(true);
     codexPlusProviderMenuChanged(trigger.dataset.codexProviderMenuToggle, value, trigger);
   }
@@ -18034,7 +18864,28 @@ ${key} = ${value}`]);
       if (list) codexPlusProviderApplyModelLines(codexPlusProviderModelRowsText(list));
       return;
     }
-    // 网关页签：协议写进草稿（与输入框一样不重绘）；测试用模型只在点「测试」时读按钮上的值。
+    if (kind === "new") {
+      if (value === "shared") {
+        void codexPlusProviderConfirmDiscard().then(async (ok) => {
+          if (!ok || !(await codexPlusGatewayConfirmDiscard())) return;
+          codexPlusProviderPageState.tab = "gateway";
+          codexPlusGatewayStartNew();
+        });
+        return;
+      }
+      void codexPlusProviderConfirmDiscard().then((ok) => {
+        if (!ok) return;
+        codexPlusProviderPageState.tab = "direct";
+        codexPlusProviderStartNew(value);
+      });
+      return;
+    }
+    if (kind === "agg-strategy") codexPlusProviderUpdateAggregate({ strategy: value });
+    else if (kind === "agg-session") codexPlusProviderUpdateAggregate({}, { sessionProvider: value });
+    else if (kind === "agg-review") codexPlusProviderUpdateAggregate({ autoReviewRelayId: value });
+    else if (kind === "agg-route-target") codexPlusProviderUpdateRoute(Number(trigger.dataset.aggRouteIndex), { profileId: value });
+    if (kind.startsWith("agg-")) return renderCodexPlusProviderPage();
+    // 本地服务页签：协议写进草稿（与输入框一样不重绘）；测试用模型只在点「测试」时读按钮上的值。
     if (kind === "gw-protocol") codexPlusGatewayHandleInput({ target: { dataset: { codexGatewayField: "protocol" }, value } });
   }
 
@@ -18083,23 +18934,29 @@ ${key} = ${value}`]);
     const isActive = !state.isNew && draft.id === state.settings.activeRelayId;
     const busy = Boolean(state.busy);
     const editable = codexPlusProviderEditable(draft);
+    const canEdit = codexPlusProviderCanEdit(draft);
     const header = `<div class="codex-plus-provider-detail-header">
       <div><div class="codex-plus-provider-title">${escapeHtml(draft.name || "新供应商")}</div>
         <div class="codex-plus-provider-subtitle">${escapeHtml(codexPlusProviderModeLabel(draft))}${isActive ? " · 使用中" : ""}<span data-codex-provider-dirty ${state.dirty ? "" : "hidden"}> · 有未保存的修改</span></div></div>
       <div class="codex-plus-provider-actions">
         ${isActive || state.isNew ? "" : `<button type="button" class="codex-plus-action-button" data-codex-provider-action="use" ${busy ? "disabled" : ""}>${state.busy === "switch" ? "切换中…" : "使用"}</button>`}
-        ${editable ? `<button type="button" class="codex-plus-action-button" data-codex-provider-action="save" data-primary="true" ${busy || !state.dirty ? "disabled" : ""}>${state.busy === "save" ? "保存中…" : isActive ? "保存并应用" : "保存"}</button>` : ""}
+        ${canEdit ? `<button type="button" class="codex-plus-action-button" data-codex-provider-action="save" data-primary="true" ${busy || !state.dirty ? "disabled" : ""}>${state.busy === "save" ? "保存中…" : isActive ? "保存并应用" : "保存"}</button>` : ""}
         ${editable ? `<button type="button" class="codex-plus-action-button" data-codex-provider-action="test" ${busy ? "disabled" : ""}>${state.busy === "test" ? "测试中…" : "测试"}</button>` : ""}
         ${state.isNew ? `<button type="button" class="codex-plus-action-button" data-codex-provider-action="cancel-new">取消</button>` : `
-          ${editable ? `<button type="button" class="codex-plus-action-button" data-codex-provider-action="duplicate" ${busy ? "disabled" : ""}>复制</button>` : ""}`}
+          ${canEdit ? `<button type="button" class="codex-plus-action-button" data-codex-provider-action="duplicate" ${busy ? "disabled" : ""}>复制</button>` : ""}`}
       </div></div>`;
-    if (!editable) {
-      return `${header}${codexPlusProviderCard("编辑", codexPlusProviderActionLine(draft.gatewayManaged ? "由网关维护" : "成员、路由和策略",
-        draft.gatewayManaged
-          ? "这是 Codex++ 网关接管 Codex 时生成的条目，由网关维护，这里只能切换。"
-          : "聚合供应商的成员、路由和策略请在 Codex++ 管理器里编辑；这里可以直接切换使用。",
+    const statusBanner = state.status
+      ? `<div class="codex-plus-provider-banner" data-tone="${escapeHtml(state.statusTone || "info")}" role="${state.statusTone === "error" ? "alert" : "status"}">${escapeHtml(state.status)}</div>`
+      : "";
+    const dangerCard = draft.gatewayManaged || state.isNew ? "" : codexPlusProviderCard("危险操作", codexPlusProviderActionLine("删除这个供应商",
+      isActive ? "当前使用的供应商不能删除，先切换到别的供应商。" : "它的 Key 和配置快照会一起删掉。",
+      `<button type="button" class="codex-plus-action-button" data-codex-provider-action="delete" data-danger="true" ${busy || isActive ? "disabled" : ""}>删除</button>`));
+    if (!canEdit) {
+      return `${header}${statusBanner}${codexPlusProviderCard("编辑", codexPlusProviderActionLine("由本地服务维护",
+        "这是 Codex++ 本地服务接管 Codex 时生成的条目，由本地服务维护，这里只能切换。",
         '<button type="button" class="codex-plus-action-button" data-codex-provider-action="open-manager">在 Codex++ 中打开</button>'))}`;
     }
+    if (!editable) return `${header}${statusBanner}${renderCodexPlusProviderAggregateDetail(draft)}${dangerCard}`;
     const mode = codexPlusProviderModeKey(draft);
     const showApi = mode !== "official";
     const keys = Array.isArray(draft.apiKeys) ? draft.apiKeys : [];
@@ -18115,9 +18972,6 @@ ${key} = ${value}`]);
     // 获取结果直接作为「从上游获取模型」那一行的说明文字（行内 span，不再套一层带内边距的 help 块）。
     const fetched = state.fetchedModels.length
       ? `上游有 ${state.fetchedModels.length} 个模型：${escapeHtml(state.fetchedModels.slice(0, 12).join("、"))}${state.fetchedModels.length > 12 ? "…" : ""} <button type="button" class="codex-plus-provider-link" data-codex-provider-action="fill-models">全部填入</button>`
-      : "";
-    const statusBanner = state.status
-      ? `<div class="codex-plus-provider-banner" data-tone="${escapeHtml(state.statusTone || "info")}" role="${state.statusTone === "error" ? "alert" : "status"}">${escapeHtml(state.status)}</div>`
       : "";
     return `${header}
       ${statusBanner}
@@ -18150,9 +19004,138 @@ ${key} = ${value}`]);
       </details>
       ${codexPlusProviderCard("更多设置", codexPlusProviderActionLine("模型路由、请求头、兼容选项", "这些高级项在 Codex++ 管理器里编辑。",
         '<button type="button" class="codex-plus-action-button" data-codex-provider-action="open-manager">在 Codex++ 中打开</button>'))}
-      ${draft.gatewayManaged || state.isNew ? "" : codexPlusProviderCard("危险操作", codexPlusProviderActionLine("删除这个供应商",
-        isActive ? "当前使用的供应商不能删除，先切换到别的供应商。" : "它的 Key 和配置快照会一起删掉。",
-        `<button type="button" class="codex-plus-action-button" data-codex-provider-action="delete" data-danger="true" ${busy || isActive ? "disabled" : ""}>删除</button>`))}`;
+      ${dangerCard}`;
+  }
+
+  function codexPlusProviderToggleHtml(on, label, attrs) {
+    return `<button type="button" class="codex-plus-toggle" role="switch" aria-label="${escapeHtml(label)}" aria-checked="${String(on)}" data-enabled="${String(on)}" ${attrs}><span></span></button>`;
+  }
+
+  /** 成员的模型名：模型列表 + 默认模型去重（与管理器的成员卡片同一口径）。 */
+  function codexPlusProviderMemberModels(profile) {
+    const names = String(profile.modelList || "").split(/[\r\n,]+/).map((line) => line.trim()).filter(Boolean);
+    const model = String(profile.model || "").trim();
+    return [...new Set(model ? [...names, model] : names)];
+  }
+
+  function codexPlusProviderMemberBrief(profile) {
+    if (codexPlusProviderEditingApi.isOfficialLoginMemberProfile(profile)) return "使用已登录的 ChatGPT 账号凭据";
+    const host = String(profile.baseUrl || "").replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+    return [profile.model, host].filter(Boolean).join(" · ") || "未填写地址";
+  }
+
+  /**
+   * 聚合供应商的编辑区：照管理器 AggregateRelayProfileEditor 的字段与文案，排成本页的分组卡片。
+   * 类型（故障转移 / 模型聚合）创建时选定，之后不能改，与管理器一致。
+   */
+  function renderCodexPlusProviderAggregateDetail(draft) {
+    const state = codexPlusProviderPageState;
+    const api = codexPlusProviderEditingApi;
+    const candidates = codexPlusProviderAggregateCandidates(draft);
+    const aggregate = codexPlusProviderAggregateConfig(draft);
+    const modelMode = aggregate.modelAggregationEnabled === true;
+    const memberIds = new Set(aggregate.members.map((member) => member.profileId));
+    const nameOf = (id) => (state.settings.relayProfiles.find((profile) => profile.id === id)?.name || "未命名供应商");
+    const memberOptions = aggregate.members.map((member) => [member.profileId, nameOf(member.profileId)]);
+    const sessionProvider = api.normalizeRelaySessionProvider(draft.sessionProvider);
+    const typeControl = state.isNew
+      ? `<div class="codex-plus-provider-segmented" role="radiogroup" aria-label="类型">${[["provider", "故障转移"], ["model", "模型聚合"]]
+        .map(([value, text]) => `<button type="button" role="radio" aria-checked="${String((value === "model") === modelMode)}" data-codex-provider-agg-mode="${value}">${text}</button>`).join("")}</div>`
+      : `<span class="codex-plus-provider-badge">${modelMode ? "模型聚合" : "故障转移"}</span>`;
+    const basic = codexPlusProviderCard("基本", [
+      codexPlusProviderLine("名称", codexPlusProviderInput("name", draft.name, 'placeholder="例如 主力聚合池"')),
+      codexPlusProviderActionLine("类型", modelMode
+        ? "把成员模型合并到 Codex 列表，选择模型后固定发送到对应供应商。"
+        : "多个供应商组成请求池，支持失败切换、会话轮转、请求轮转和权重。", typeControl),
+      modelMode ? "" : codexPlusProviderActionLine("聚合策略", api.aggregateStrategyHelp(aggregate.strategy),
+        codexPlusProviderMenu("agg-strategy", aggregate.strategy, api.aggregateStrategyOptions.map((option) => [option.value, option.label]), "聚合策略")),
+      codexPlusProviderActionLine("Codex 会话身份", modelMode
+        ? "模型聚合请求仍由本地 Responses 代理转发；OpenAI 身份用于让 ChatGPT Remote 识别会话。"
+        : "聚合请求仍由本地 Responses 代理轮转成员；OpenAI 身份用于让 ChatGPT Remote 识别会话。",
+        codexPlusProviderMenu("agg-session", sessionProvider, [["custom", "Custom（默认）"], ["openai", "OpenAI（兼容 ChatGPT Remote）"]], "Codex 会话身份")),
+    ].join(""));
+
+    const selected = candidates.filter((candidate) => memberIds.has(candidate.id));
+    const defaultCandidate = selected.find((candidate) => candidate.id === aggregate.defaultRelayId);
+    const bareCount = defaultCandidate ? codexPlusProviderMemberModels(defaultCandidate).length : 0;
+    const prefixedCount = selected.filter((candidate) => candidate.id !== defaultCandidate?.id)
+      .reduce((sum, candidate) => sum + codexPlusProviderMemberModels(candidate).length, 0);
+    const summary = !modelMode || !selected.length ? ""
+      : defaultCandidate && bareCount === 0 && api.isOfficialLoginMemberProfile(defaultCandidate)
+        ? `Codex 将看到 ${defaultCandidate.name || "未命名供应商"} 的官方模型目录（裸名）+ ${prefixedCount} 个 cpx- 前缀模型。`
+        : defaultCandidate
+          ? `Codex 将看到 ${bareCount} 个裸名模型（来自 ${defaultCandidate.name || "未命名供应商"}）+ ${prefixedCount} 个 cpx- 前缀模型。`
+          : `Codex 将看到 ${prefixedCount} 个 cpx- 前缀模型；还没指定默认成员，不带前缀的请求会报错。`;
+    const memberRows = candidates.map((candidate) => {
+      const checked = memberIds.has(candidate.id);
+      const member = aggregate.members.find((item) => item.profileId === candidate.id);
+      const name = candidate.name || "未命名供应商";
+      let side;
+      if (modelMode) {
+        const models = codexPlusProviderMemberModels(candidate);
+        const count = models.length ? `${models.length} 个模型`
+          : api.isOfficialLoginMemberProfile(candidate) ? "未填写：用 Codex 的官方模型目录" : "未填写模型";
+        const isDefault = checked && candidate.id === aggregate.defaultRelayId;
+        side = `<span class="codex-plus-provider-agg-label" title="${escapeHtml(models.join("\n"))}">${escapeHtml(count)}</span>${!checked ? ""
+          : isDefault ? '<span class="codex-plus-provider-badge" data-tone="active">默认</span>'
+            : `<button type="button" class="codex-plus-provider-link" data-codex-provider-agg-default="${escapeHtml(candidate.id)}" title="不带 cpx- 前缀的请求（旧会话、自动压缩带的模型名）会原样交给它">设为默认</button>`}`;
+      } else {
+        side = `<span class="codex-plus-provider-agg-label">权重</span><input type="text" inputmode="numeric" class="codex-plus-provider-input codex-plus-provider-agg-number" data-codex-provider-agg-weight="${escapeHtml(candidate.id)}" value="${escapeHtml(String(member?.weight ?? 1))}" aria-label="「${escapeHtml(name)}」的权重" ${checked ? "" : "disabled"}>`;
+      }
+      const protocol = candidate.protocol && candidate.protocol !== "responses"
+        ? `<span class="codex-plus-provider-badge">${escapeHtml((codexPlusProviderProtocolOptions.find(([id]) => id === candidate.protocol) || [, candidate.protocol])[1])}</span>` : "";
+      return `<div class="codex-plus-provider-line codex-plus-provider-agg-member" data-kind="action" data-selected="${checked}">
+        <span class="codex-plus-provider-line-copy"><span class="codex-plus-provider-line-title">${escapeHtml(name)}<span class="codex-plus-provider-badge">${escapeHtml(codexPlusProviderModeLabel(candidate))}</span>${protocol}</span>
+          <span class="codex-plus-provider-line-help">${escapeHtml(codexPlusProviderMemberBrief(candidate))}</span></span>
+        <span class="codex-plus-provider-line-control">${side}${codexPlusProviderToggleHtml(checked, `把「${name}」设为成员`, `data-codex-provider-agg-member="${escapeHtml(candidate.id)}"`)}</span>
+      </div>`;
+    }).join("");
+    const members = codexPlusProviderCard(`成员供应商（${aggregate.members.length} / ${candidates.length}）`,
+      memberRows || '<div class="codex-plus-provider-help">先添加至少 1 个可用的 API 供应商或官方登录账号，再把它加为成员。</div>',
+      [modelMode
+        ? "默认成员的模型以裸名发布，其他成员带 cpx- 前缀。本模式不使用轮转策略或通配符路由。"
+        : "可选 API 供应商或已完成 ChatGPT 登录的官方账号；聚合供应商不会作为成员。", summary].filter(Boolean).join(" "));
+
+    let defaults = "";
+    if (modelMode) {
+      const defaultIsOfficialLogin = !!defaultCandidate && defaultCandidate.relayMode === "official" && !defaultCandidate.officialMixApiKey;
+      defaults = codexPlusProviderCard("默认供应商", [
+        codexPlusProviderActionLine(defaultCandidate ? `默认：${defaultCandidate.name || defaultCandidate.id}` : "还没指定默认供应商",
+          defaultCandidate
+            ? "不带 cpx- 前缀的请求（旧会话、自动压缩带的模型名等）会原样交给它；带 cpx- 前缀但解析不出来的 ID 一律报错，不回落。"
+            : "在上方成员行点「设为默认」。不带 cpx- 前缀的请求会原样交给它，没设就报错。", ""),
+        defaultIsOfficialLogin
+          ? codexPlusProviderActionLine("把默认成员的官方登录同步到 Codex",
+            "开启后切换到本聚合时，会把默认成员的 ChatGPT 凭据一并写进 Codex（代理 Key 保留），账号在 Codex 里就是登录态。",
+            codexPlusProviderToggleHtml(aggregate.syncDefaultMemberLogin === true, "把默认成员的官方登录同步到 Codex", "data-codex-provider-agg-sync"))
+          : codexPlusProviderActionLine("同步官方登录", "当前默认成员不是官方登录账号，无法把登录同步到 Codex；只有「官方登录」类型的成员才有 ChatGPT 凭据。", ""),
+      ].join(""));
+    }
+
+    const review = memberOptions.length ? codexPlusProviderCard("审批", codexPlusProviderActionLine("审批成员",
+      "Codex「替我审批」的请求（codex-auto-review）只发给这个成员，模型取它的「自动审批模型」，没填用它的默认模型。默认成员是官方登录时，指定一个 API 成员可避免审批消耗官方额度。",
+      codexPlusProviderMenu("agg-review", aggregate.autoReviewRelayId || "", [["", "不单独指定"], ...memberOptions], "审批成员"))) : "";
+
+    let routes = "";
+    if (!modelMode) {
+      const routeRows = (aggregate.routes || []).map((route, index) => {
+        const isMember = memberIds.has(route.profileId);
+        const options = isMember ? memberOptions : [[route.profileId, `${nameOf(route.profileId)}（不是成员）`], ...memberOptions];
+        return `<div class="codex-plus-provider-agg-route">
+          <input type="text" class="codex-plus-provider-input" data-codex-provider-agg-route-pattern="${index}" value="${escapeHtml(route.pattern)}" placeholder="例如 deepseek-*" spellcheck="false" aria-label="模型匹配">
+          ${codexPlusProviderMenu("agg-route-target", route.profileId, options, "目标成员", `data-agg-route-index="${index}"`)}
+          <span class="codex-plus-provider-agg-label">优先级</span>
+          <input type="text" inputmode="numeric" class="codex-plus-provider-input codex-plus-provider-agg-number" data-codex-provider-agg-route-priority="${index}" value="${escapeHtml(String(route.priority))}" aria-label="优先级">
+          <button type="button" class="codex-plus-provider-model-remove" data-codex-provider-agg-route-remove="${index}" aria-label="删除规则">移除</button>
+          ${isMember ? "" : '<span class="codex-plus-provider-agg-route-error">路由目标必须是已勾选的聚合成员，请先在成员供应商中勾选。</span>'}
+        </div>`;
+      }).join("");
+      routes = codexPlusProviderCard(`路由规则（${(aggregate.routes || []).length}）`,
+        `${routeRows || '<div class="codex-plus-provider-help">暂无路由规则，未匹配的模型会按聚合策略选择成员。</div>'}
+        <div class="codex-plus-provider-agg-route-add"><button type="button" class="codex-plus-action-button" data-codex-provider-action="agg-route-add" ${aggregate.members.length ? "" : "disabled"}>+ 添加规则</button></div>`,
+        "按模型名自动路由到指定成员；仅支持 * 通配符，数字越大越优先，chat/completions 协议不走路由。");
+    }
+    return `${basic}${members}${defaults}${review}${routes}`;
   }
 
   function codexPlusProviderPreviewKey(key) {
@@ -18180,31 +19163,27 @@ ${key} = ${value}`]);
       return;
     }
     const scroll = panel.querySelector(".codex-plus-provider-detail")?.scrollTop || 0;
+    // 直连和共享供应商一份列表（和管理器「连接与供应商」一样）：上面直连，下面「共享供应商」（经本地服务）；
+    // 选中哪一类，右侧就是哪一类的详情（state.tab 记的是当前看的是哪一类）。用哪家看哪一行「使用中」。
     const gatewayMode = state.data?.gatewayMode === true;
-    const tabs = `<div class="codex-plus-provider-tabs" role="tablist" aria-label="供应商类型">
-      <div class="codex-plus-provider-tab-group">
-        <button type="button" role="tab" data-codex-provider-tab="gateway" aria-selected="${state.tab === "gateway"}">网关供应商池${gatewayMode ? '<span class="codex-plus-provider-badge" data-tone="active">使用中</span>' : ""}</button>
-        <button type="button" role="tab" data-codex-provider-tab="direct" aria-selected="${state.tab !== "gateway"}">直连供应商${gatewayMode ? "" : '<span class="codex-plus-provider-badge" data-tone="active">使用中</span>'}</button>
-      </div>
-    </div>`;
     const footer = `<div class="codex-plus-provider-footer" data-codex-provider-footer></div>`;
-    if (state.tab === "gateway") {
-      panel.innerHTML = `<div class="codex-plus-provider-shell">${tabs}${renderCodexPlusGatewayPane()}${footer}</div>${renderCodexPlusGatewayDisconnectDialog()}`;
-      const gatewayDetail = panel.querySelector(".codex-plus-provider-detail");
-      if (gatewayDetail) gatewayDetail.scrollTop = scroll;
-      codexPlusProviderSyncFooter();
-      return;
-    }
-    panel.innerHTML = `<div class="codex-plus-provider-shell">${tabs}<div class="codex-plus-provider-layout">
+    const sharedList = codexPlusGatewayPageState.payload
+      ? renderCodexPlusGatewayList()
+      : `<div class="codex-plus-provider-help">${codexPlusGatewayPageState.busy === "load" ? "正在读取共享供应商…" : escapeHtml(codexPlusGatewayPageState.status || "还没有读取共享供应商")} <button type="button" class="codex-plus-provider-link" data-codex-gateway-action="reload">重试</button></div>`;
+    const detailBody = state.tab === "gateway"
+      ? `${renderCodexPlusGatewayModeBar()}${renderCodexPlusGatewayDetail()}`
+      : `${gatewayMode ? '<div class="codex-plus-provider-note">Codex 现在经本地服务（下面「共享供应商」里标着用的是哪一家）；在这里点「使用」会先断开本地服务并还原。</div>' : ""}${renderCodexPlusProviderDetail()}`;
+    panel.innerHTML = `<div class="codex-plus-provider-shell"><div class="codex-plus-provider-layout">
       <aside class="codex-plus-provider-sidebar">
         <div class="codex-plus-provider-sidebar-header"><span>供应商</span>
-          <button type="button" class="codex-plus-action-button" data-codex-provider-action="new" ${state.busy ? "disabled" : ""}>+ 新建</button></div>
+          ${codexPlusProviderActionMenu("new", "+ 新建", [["direct", "直连供应商"], ["failover", "故障转移（聚合）"], ["model", "模型聚合"], ["shared", "共享供应商（经本地服务）"]], state.busy || codexPlusGatewayPageState.busy ? "disabled" : "")}</div>
         ${state.settings.relayProfilesEnabled ? "" : '<div class="codex-plus-provider-note">供应商配置总开关已关闭：可以编辑，但不会写入 Codex。</div>'}
         ${renderCodexPlusProviderList()}
+        <div class="codex-plus-provider-sidebar-header" data-codex-provider-subheader="shared" title="多 Key 轮换、出错换下一家、协议自动转换；Claude 等其它 Agent 也能用"><span>共享供应商</span></div>
+        ${sharedList}
       </aside>
       <section class="codex-plus-provider-detail">
-        ${gatewayMode ? '<div class="codex-plus-provider-note">Codex 正经网关接入，直连供应商暂时不起作用；在这里点「使用」会先断开网关并还原。</div>' : ""}
-        ${renderCodexPlusProviderDetail()}
+        ${detailBody}
       </section></div>${footer}</div>${renderCodexPlusGatewayDisconnectDialog()}`;
     const detail = panel.querySelector(".codex-plus-provider-detail");
     if (detail) detail.scrollTop = scroll;
@@ -18290,12 +19269,57 @@ ${key} = ${value}`]);
     return false;
   }
 
+  /** 聚合编辑区的点击（成员开关、设为默认、同步登录、类型、删除路由）；是它的事件就处理并返回 true。 */
+  function codexPlusProviderHandleAggregateClick(target) {
+    const state = codexPlusProviderPageState;
+    if (!state.draft || !codexPlusProviderIsAggregate(state.draft)) return false;
+    const member = target.closest("[data-codex-provider-agg-member]");
+    const makeDefault = target.closest("[data-codex-provider-agg-default]");
+    const mode = target.closest("[data-codex-provider-agg-mode]");
+    const removeRoute = target.closest("[data-codex-provider-agg-route-remove]");
+    if (member) codexPlusProviderToggleMember(member.dataset.codexProviderAggMember);
+    else if (makeDefault) codexPlusProviderUpdateAggregate({ defaultRelayId: makeDefault.dataset.codexProviderAggDefault });
+    else if (target.closest("[data-codex-provider-agg-sync]")) {
+      codexPlusProviderUpdateAggregate({ syncDefaultMemberLogin: codexPlusProviderAggregateConfig(state.draft).syncDefaultMemberLogin !== true });
+    } else if (mode) {
+      const next = mode.dataset.codexProviderAggMode === "model" ? "model" : "provider";
+      state.draft = codexPlusProviderEditingApi.aggregateProfileForMode(state.draft, state.settings, next);
+      state.dirty = true;
+    } else if (removeRoute) {
+      const index = Number(removeRoute.dataset.codexProviderAggRouteRemove);
+      const routes = codexPlusProviderAggregateConfig(state.draft).routes || [];
+      codexPlusProviderUpdateAggregate({ routes: routes.filter((_, routeIndex) => routeIndex !== index) });
+    } else {
+      return false;
+    }
+    renderCodexPlusProviderPage();
+    return true;
+  }
+
   function codexPlusProviderHandleInput(event) {
     if (codexPlusGatewayHandleInput(event)) return;
     if (codexPlusProviderHandleModelEditor(event)) return;
     const target = event.target;
     const state = codexPlusProviderPageState;
     if (!state.draft || !(target instanceof HTMLElement)) return;
+    // 聚合的权重 / 路由：就地写回草稿不重绘（重绘会丢焦点）；清空时先不写，等填了数字再写。
+    const weightFor = target.dataset.codexProviderAggWeight;
+    const routeIndex = target.dataset.codexProviderAggRoutePattern ?? target.dataset.codexProviderAggRoutePriority;
+    if (weightFor !== undefined || routeIndex !== undefined) {
+      const number = Number.parseInt(target.value, 10);
+      if (target.dataset.codexProviderAggRoutePattern !== undefined) {
+        codexPlusProviderUpdateRoute(Number(routeIndex), { pattern: target.value });
+      } else if (Number.isFinite(number) && weightFor !== undefined) {
+        const aggregate = codexPlusProviderAggregateConfig(state.draft);
+        codexPlusProviderUpdateAggregate({
+          members: aggregate.members.map((member) => (member.profileId === weightFor
+            ? { ...member, weight: codexPlusProviderEditingApi.clampAggregateWeight(number) } : member)),
+        });
+      } else if (Number.isFinite(number)) {
+        codexPlusProviderUpdateRoute(Number(routeIndex), { priority: codexPlusProviderEditingApi.clampAggregateRoutePriority(number) });
+      }
+      return;
+    }
     const field = target.dataset.codexProviderField;
     if (field && field !== "protocol") {
       if (field === "name") {
@@ -18329,14 +19353,15 @@ ${key} = ${value}`]);
     const state = codexPlusProviderPageState;
     if (!target) return;
     if (codexPlusProviderHandleMenuClick(target)) return;
-    const tab = target.closest("[data-codex-provider-tab]");
-    if (tab) {
-      const next = tab.dataset.codexProviderTab === "gateway" ? "gateway" : "direct";
-      if (next === state.tab) return;
-      state.tab = next;
-      renderCodexPlusProviderPage();
-      if (next === "gateway" && !codexPlusGatewayPageState.payload && !codexPlusGatewayPageState.busy) void codexPlusGatewayLoad();
-      return;
+    // 从直连切到看共享供应商：先确认放弃直连这边没保存的修改；同一家再点一次也要切过去。
+    const sharedSelect = target.closest("[data-codex-gateway-select]");
+    if (sharedSelect && state.tab !== "gateway") {
+      if (!(await codexPlusProviderConfirmDiscard())) return;
+      state.tab = "gateway";
+      if (sharedSelect.dataset.codexGatewaySelect === codexPlusGatewayPageState.selectedId && !codexPlusGatewayPageState.isNew) {
+        codexPlusGatewaySetStatus("");
+        return renderCodexPlusProviderPage();
+      }
     }
     if (target.closest("[data-codex-gateway-select], [data-codex-gateway-move], [data-codex-gateway-action], [data-codex-gateway-key-replace], [data-codex-gateway-key-delete]")) {
       await codexPlusGatewayHandleClick(target);
@@ -18351,6 +19376,12 @@ ${key} = ${value}`]);
     const select = target.closest("[data-codex-provider-select]");
     if (select) {
       const id = select.dataset.codexProviderSelect;
+      // 从共享供应商切回看直连：先确认放弃共享那边没保存的修改。
+      if (state.tab === "gateway") {
+        if (!(await codexPlusGatewayConfirmDiscard())) return;
+        state.tab = "direct";
+        if (id === state.selectedId && !state.isNew) return renderCodexPlusProviderPage();
+      }
       if (id === state.selectedId && !state.isNew) return;
       if (!(await codexPlusProviderConfirmDiscard())) return;
       codexPlusProviderSelect(id);
@@ -18358,6 +19389,7 @@ ${key} = ${value}`]);
       return renderCodexPlusProviderPage();
     }
     if (codexPlusProviderHandleModelEditor(event)) return;
+    if (codexPlusProviderHandleAggregateClick(target)) return;
     const removeKey = target.closest("[data-codex-provider-key-remove]");
     if (removeKey) return codexPlusProviderRemoveKey(removeKey.dataset.codexProviderKeyRemove);
     const action = target.closest("[data-codex-provider-action]")?.dataset.codexProviderAction;
@@ -18365,9 +19397,14 @@ ${key} = ${value}`]);
     const id = state.draft?.id;
     switch (action) {
       case "reload": return codexPlusProviderLoad();
-      case "new":
-        if (!(await codexPlusProviderConfirmDiscard())) return;
-        return codexPlusProviderStartNew();
+      case "agg-route-add": {
+        const aggregate = codexPlusProviderAggregateConfig(state.draft);
+        codexPlusProviderUpdateAggregate({ routes: [...(aggregate.routes || []), { pattern: "", profileId: aggregate.members[0]?.profileId ?? "", priority: 0 }] });
+        renderCodexPlusProviderPage();
+        const patterns = document.querySelectorAll("[data-codex-provider-agg-route-pattern]");
+        patterns[patterns.length - 1]?.focus();
+        return;
+      }
       case "cancel-new":
         codexPlusProviderSelect(state.settings.activeRelayId);
         return renderCodexPlusProviderPage();
@@ -18458,11 +19495,11 @@ ${key} = ${value}`]);
     void codexPlusProviderLoad({ keepSelection: Boolean(state.selectedId) });
   }
   /**
-   * 「供应商」页的网关页签：在 Codex 里管理 Codex++ 网关的供应商池，并在网关 / 直连之间切换。
+   * 「供应商」页的本地服务页签：在 Codex 里管理 Codex++ 本地服务的共享供应商，并在本地服务 / 直连之间切换。
    *
-   * - 全部操作经 /providers/gateway 转给管理器自己的网关命令（core provider_page 做白名单与脱敏），
+   * - 全部操作经 /providers/gateway 转给管理器自己的本地服务命令（core provider_page 做白名单与脱敏），
    *   所以生效方式与管理器完全一致：路由每次请求重读 gateway.json，模型变化由 refresh_agents 重写
-   *   Codex 的网关目录、心跳指纹变化后页面自动重载 model/list；已打开的对话下一条请求就用新的池。
+   *   Codex 的本地服务目录、心跳指纹变化后页面自动重载 model/list；已打开的对话下一条请求就用新的池。
    * - 表单逻辑用与管理器共用的 gateway-model.ts（42 分片的 codexPlusProviderEditing.gateway）。
    * - Key 只有打码视图：编辑时 Key 留空表示不改，新增 / 替换 / 删除各走单独命令。
    * - 账号 / 订阅类、Codex 原生登录、拓展提供的条目只读（管理器同样不给编辑），去 Codex++ 里管。
@@ -18505,7 +19542,7 @@ ${key} = ${value}`]);
   function codexPlusGatewaySetStatus(message, tone = "") {
     codexPlusGatewayPageState.status = String(message || "");
     codexPlusGatewayPageState.statusTone = tone;
-    // 同步底部状态栏（如果当前是网关页签）
+    // 同步底部状态栏（如果当前是本地服务页签）
     if (codexPlusProviderPageState.tab === "gateway") {
       const footer = document.querySelector("[data-codex-provider-footer]");
       if (footer) {
@@ -18525,7 +19562,7 @@ ${key} = ${value}`]);
     state.draft = entry && codexPlusGatewayEditable(entry) ? codexPlusGatewayModel.providerDraftFromEntry(entry) : null;
   }
 
-  /** 网关命令的返回（CommandResult 里平铺了 GatewayPayload）。没带 payload 的结果不覆盖现有列表。 */
+  /** 本地服务命令的返回（CommandResult 里平铺了 GatewayPayload）。没带 payload 的结果不覆盖现有列表。 */
   function codexPlusGatewayApplyResult(result, { keepSelection = true } = {}) {
     const state = codexPlusGatewayPageState;
     if (result?.gateway && Array.isArray(result.pool)) {
@@ -18553,7 +19590,7 @@ ${key} = ${value}`]);
     const result = await codexPlusGatewayCall("load_gateway");
     state.busy = "";
     if (result?.status !== "ok" || !result.gateway) {
-      codexPlusGatewaySetStatus(result?.message || "读取网关供应商池失败", "error");
+      codexPlusGatewaySetStatus(result?.message || "读取共享供应商失败", "error");
     } else {
       codexPlusGatewayApplyResult(result);
     }
@@ -18571,8 +19608,8 @@ ${key} = ${value}`]);
     if (ok) {
       state.isNew = false;
       codexPlusGatewayApplyResult(result);
-      codexPlusGatewaySetStatus(`${success || result.message || "已保存。"} 已打开的对话下一条请求就用新的供应商池。`, "ok");
-      showToast(success || "网关供应商池已更新", { type: "success" });
+      codexPlusGatewaySetStatus(`${success || result.message || "已保存。"} 已打开的对话下一条请求就用新的共享供应商。`, "ok");
+      showToast(success || "共享供应商已更新", { type: "success" });
     } else {
       codexPlusGatewaySetStatus(result?.message || "操作失败", "error");
     }
@@ -18617,8 +19654,8 @@ ${key} = ${value}`]);
 
   async function codexPlusGatewayDelete(entry) {
     const answer = await codexPlusAsk({
-      title: "从网关删除供应商",
-      message: `确定从网关供应商池删除「${entry.name}」？它的 Key、模型和用量设置一起删除，模型组和各 Agent 里对它的引用也会清掉。`,
+      title: "从共享供应商删除供应商",
+      message: `确定从共享供应商删除「${entry.name}」？它的 Key、模型和用量设置一起删除，模型组和各 Agent 里对它的引用也会清掉。`,
       options: [{ value: "delete", label: "删除" }],
     });
     if (!answer) return;
@@ -18677,20 +19714,21 @@ ${key} = ${value}`]);
     renderCodexPlusProviderPage();
   }
 
-  /** 让 Codex 经网关接入：与管理器「连接与供应商 → 经网关」同一条命令，沿用上次的接入设置。 */
-  async function codexPlusGatewayConnect() {
+  /** 让 Codex 经共享供应商接入：与管理器「连接与供应商」的「共享」分页同一条命令，沿用上次的接入设置；
+   * 传了 `model`（`<供应商 id>/<模型>`）就把默认模型换成它。 */
+  async function codexPlusGatewayConnect(model = "") {
     const state = codexPlusGatewayPageState;
     const payload = state.payload;
     const previous = payload?.gateway?.bindings?.codex;
-    const draft = codexPlusGatewayModel.draftFromBinding(previous);
+    const draft = { ...codexPlusGatewayModel.draftFromBinding(previous), ...(model ? { model } : {}) };
     const native = payload?.agents?.find((agent) => agent.agent === "codex")?.nativeModels;
     const issue = codexPlusGatewayModel.validateDraft(draft, payload, undefined, null, native);
     if (issue) {
-      codexPlusGatewaySetStatus(`${issue}（请先在供应商池里添加可用的供应商，或在 Codex++「Agent 接入」里调整默认模型）`, "error");
+      codexPlusGatewaySetStatus(`${issue}（请先在共享供应商里添加可用的供应商，或在 Codex++「Agent 接入」里调整默认模型）`, "error");
       return renderCodexPlusProviderPage();
     }
     const binding = { ...codexPlusGatewayModel.bindingFromDraft(draft, previous), enabled: true };
-    const result = await codexPlusGatewayMutate("save_gateway_binding", { agent: "codex", binding, reconnect: true }, { busy: "connect", success: "Codex 已经由网关接入。" });
+    const result = await codexPlusGatewayMutate("save_gateway_binding", { agent: "codex", binding, reconnect: true }, { busy: "connect", success: "Codex 已经经共享供应商接入。" });
     if (result) await codexPlusProviderLoad({ quiet: true });
   }
 
@@ -18719,7 +19757,7 @@ ${key} = ${value}`]);
     state.disconnect = { ...state.disconnect, applying: true };
     renderCodexPlusProviderPage();
     const command = fullSwitch ? "disable_gateway_binding_full_switch" : "disable_gateway_binding";
-    const result = await codexPlusGatewayMutate(command, { agent: "codex", previewToken: preview.previewToken }, { busy: "disconnect", success: "已断开网关，Codex 改回直连。" });
+    const result = await codexPlusGatewayMutate(command, { agent: "codex", previewToken: preview.previewToken }, { busy: "disconnect", success: "已断开本地服务，Codex 改回直连。" });
     state.disconnect = null;
     await codexPlusProviderLoad({ quiet: true });
     if (result && typeof then === "function") await then();
@@ -18736,10 +19774,10 @@ ${key} = ${value}`]);
         <div class="codex-plus-gateway-diff-head"><code>${escapeHtml(file.path)}</code><span>${escapeHtml(codexPlusGatewaySafety.disconnectFileLabel(file.kind))}</span></div>
         <pre>${file.diff ? file.diff.split("\n").map((line) => `<span data-kind="${line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "remove" : "context"}">${escapeHtml(line)}\n</span>`).join("") : "文件内容无需修改"}</pre>
       </section>`).join("");
-    return `<div class="codex-plus-gateway-modal" data-codex-plus-ext="builtin-provider" role="dialog" aria-modal="true" aria-label="断开网关并还原">
+    return `<div class="codex-plus-gateway-modal" data-codex-plus-ext="builtin-provider" role="dialog" aria-modal="true" aria-label="断开本地服务并还原">
       <div class="codex-plus-gateway-modal-box">
-        <div class="codex-plus-provider-title">断开网关并还原为直连</div>
-        <div class="codex-plus-provider-help">Codex 会恢复接入网关之前的设置，下面是要改回的内容。</div>
+        <div class="codex-plus-provider-title">断开本地服务并还原为直连</div>
+        <div class="codex-plus-provider-help">Codex 会恢复接入本地服务之前的设置，下面是要改回的内容。</div>
         ${dialog.loading ? '<div class="codex-plus-provider-note">正在检查文件与还原差异…</div>' : ""}
         ${dialog.error ? `<div class="codex-plus-provider-status" data-tone="error">${escapeHtml(dialog.error)}</div>` : ""}
         ${preview?.warnings?.length ? `<ul class="codex-plus-gateway-warnings">${preview.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
@@ -18757,14 +19795,22 @@ ${key} = ${value}`]);
     const gatewayMode = codexPlusProviderPageState.data?.gatewayMode === true;
     const busy = Boolean(codexPlusGatewayPageState.busy);
     const model = codexPlusGatewayPageState.payload?.gateway?.bindings?.codex?.model || "";
+    // 选中的这一家能不能直接「使用」：有模型、开着、不是正在用的那家。
+    const entry = codexPlusGatewayPageState.isNew ? null : codexPlusGatewaySelected();
+    const entryModel = entry?.models?.[0] || "";
+    const active = gatewayMode && entry && model.toLowerCase().startsWith(`${entry.id}/`.toLowerCase());
+    const useButton = entry && entryModel && entry.enabled !== false && !active
+      ? `<button type="button" class="codex-plus-provider-link" data-codex-gateway-action="use-selected" ${busy ? "disabled" : ""}>${codexPlusGatewayPageState.busy === "connect" ? "正在切换…" : "让 Codex 用这家"}</button>`
+      : "";
     return gatewayMode
       ? `<div class="codex-plus-provider-mode-bar" data-codex-gateway-mode="gateway">
-          <span>Codex 正经 Codex++ 网关接入${model ? `，默认模型 ${escapeHtml(model)}` : ""}。已打开的对话下一条请求就生效。</span>
+          <span>Codex 正经 Codex++ 本地服务接入${model ? `，默认模型 ${escapeHtml(model)}` : ""}。已打开的对话下一条请求就生效。</span>
+          ${useButton}
           <button type="button" class="codex-plus-provider-link" data-codex-gateway-action="disconnect" ${busy ? "disabled" : ""}>断开并还原为直连</button>
         </div>`
       : `<div class="codex-plus-provider-mode-bar" data-codex-gateway-mode="direct">
-          <span>Codex 现在是直连，这里的供应商池暂时不起作用。</span>
-          <button type="button" class="codex-plus-provider-link" data-codex-gateway-action="connect" ${busy ? "disabled" : ""}>${codexPlusGatewayPageState.busy === "connect" ? "正在接入…" : "让 Codex 经网关接入"}</button>
+          <span>Codex 现在是直连。在这里「使用」一家，Codex 就经本地服务、默认用这家的模型。</span>
+          ${useButton}
         </div>`;
   }
 
@@ -18776,7 +19822,7 @@ ${key} = ${value}`]);
     const activeModel = state.payload?.gateway?.bindings?.codex?.model || "";
     const activeProviderId = gatewayMode && activeModel.includes("/") ? activeModel.split("/")[0] : "";
     const rows = entries.map((entry, index) => {
-      const selected = entry.id === state.selectedId && !state.isNew;
+      const selected = entry.id === state.selectedId && !state.isNew && codexPlusProviderPageState.tab === "gateway";
       const enabled = entry.enabled !== false;
       const isActive = gatewayMode && entry.id === activeProviderId;
       const tag = entry.account ? (entry.plan || "账号") : String(entry.source || "").startsWith("extension:") ? "拓展" : String(entry.source || "").startsWith("native:") ? "原生登录" : ({ responses: "Responses", chatCompletions: "Chat", anthropicMessages: "Anthropic" }[entry.protocol] || entry.protocol);
@@ -18794,7 +19840,7 @@ ${key} = ${value}`]);
     const draftRow = state.isNew
       ? `<div class="codex-plus-provider-item" role="listitem" data-selected="true"><div class="codex-plus-provider-item-main"><div class="codex-plus-provider-item-name">${escapeHtml(state.draft?.name || "新供应商")}</div><div class="codex-plus-provider-item-meta"><span class="codex-plus-provider-badge" data-tone="new">未保存</span></div></div></div>`
       : "";
-    return `<div class="codex-plus-provider-list" role="list" aria-label="网关供应商池">${rows}${draftRow}${rows || draftRow ? "" : '<div class="codex-plus-provider-help">供应商池是空的。</div>'}</div>`;
+    return `<div class="codex-plus-provider-list" role="list" aria-label="共享供应商">${rows}${draftRow}${rows || draftRow ? "" : '<div class="codex-plus-provider-help">共享供应商是空的。</div>'}</div>`;
   }
 
   function renderCodexPlusGatewayDetail() {
@@ -18806,7 +19852,7 @@ ${key} = ${value}`]);
     const enabled = entry ? entry.enabled !== false : true;
     const header = `<div class="codex-plus-provider-detail-header">
       <div><div class="codex-plus-provider-title">${escapeHtml(state.isNew ? (state.draft?.name || "新供应商") : entry.name)}</div>
-        <div class="codex-plus-provider-subtitle">网关供应商${entry && !enabled ? " · 已停用" : ""}${state.dirty ? " · 有未保存的修改" : ""}</div></div>
+        <div class="codex-plus-provider-subtitle">共享供应商${entry && !enabled ? " · 已停用" : ""}${state.dirty ? " · 有未保存的修改" : ""}</div></div>
       <div class="codex-plus-provider-actions">
         ${entry ? `<button type="button" class="codex-plus-action-button" data-codex-gateway-action="toggle" ${busy ? "disabled" : ""}>${enabled ? "停用" : "启用"}</button>` : ""}
         ${editable ? `<button type="button" class="codex-plus-action-button" data-primary="true" data-codex-gateway-action="save" ${busy || !state.dirty ? "disabled" : ""}>${state.busy === "save" ? "保存中…" : "保存"}</button>` : ""}
@@ -18814,7 +19860,7 @@ ${key} = ${value}`]);
         ${state.isNew ? '<button type="button" class="codex-plus-action-button" data-codex-gateway-action="cancel-new">取消</button>' : ""}
       </div></div>`;
     // 删除放到页面底部的「危险操作」卡片，与直连页一致。
-    const dangerCard = entry ? codexPlusProviderCard("危险操作", codexPlusProviderActionLine("从供应商池删除", "它的 Key 和模型配置会一起删掉；只想暂时不用可以点右上角「停用」。",
+    const dangerCard = entry ? codexPlusProviderCard("危险操作", codexPlusProviderActionLine("从共享供应商删除", "它的 Key 和模型配置会一起删掉；只想暂时不用可以点右上角「停用」。",
       `<button type="button" class="codex-plus-action-button" data-danger="true" data-codex-gateway-action="delete" ${busy ? "disabled" : ""}>删除</button>`)) : "";
     // 与直连页同一套卡片：小节标题 + 圆角卡片，卡片里一行一项（左标题右控件）。
     const testRow = entry
@@ -18829,7 +19875,7 @@ ${key} = ${value}`]);
           codexPlusProviderActionLine("模型列表", (entry.models || []).join("、") || "（无）", ""),
           testRow,
         ].join(""), entry.account
-          ? "登录得到的账号（订阅额度、Token 刷新都由网关维护），在 Codex 里只能启停、排序和测试。"
+          ? "登录得到的账号（订阅额度、Token 刷新都由本地服务维护），在 Codex 里只能启停、排序和测试。"
           : "这一项由 Codex 原生登录或拓展提供，在 Codex 里只能启停、排序和测试。")}
         ${managerRow("账号与订阅", "登录、额度和刷新在 Codex++ 管理器里管理。")}
         ${dangerCard}`;
@@ -18868,12 +19914,12 @@ ${key} = ${value}`]);
   function renderCodexPlusGatewayPane() {
     const state = codexPlusGatewayPageState;
     if (!state.payload) {
-      return `<div class="codex-plus-provider-empty">${state.busy === "load" ? "正在读取网关供应商池…" : escapeHtml(state.status || "还没有读取网关供应商池")}
+      return `<div class="codex-plus-provider-empty">${state.busy === "load" ? "正在读取共享供应商…" : escapeHtml(state.status || "还没有读取共享供应商")}
         <button type="button" class="codex-plus-provider-link" data-codex-gateway-action="reload">重试</button></div>`;
     }
     return `<div class="codex-plus-provider-layout">
       <aside class="codex-plus-provider-sidebar">
-        <div class="codex-plus-provider-sidebar-header"><span>供应商池</span>
+        <div class="codex-plus-provider-sidebar-header"><span>共享供应商</span>
           <button type="button" class="codex-plus-action-button" data-codex-gateway-action="new" ${state.busy ? "disabled" : ""}>+ 新建</button></div>
         ${renderCodexPlusGatewayList()}
       </aside>
@@ -18885,11 +19931,11 @@ ${key} = ${value}`]);
 
   async function codexPlusGatewayConfirmDiscard() {
     if (!codexPlusGatewayPageState.dirty) return true;
-    const answer = await codexPlusAsk({ title: "放弃修改？", message: "当前网关供应商有未保存的修改。", options: [{ value: "discard", label: "放弃修改" }] });
+    const answer = await codexPlusAsk({ title: "放弃修改？", message: "当前共享供应商有未保存的修改。", options: [{ value: "discard", label: "放弃修改" }] });
     return Boolean(answer);
   }
 
-  /** 网关页签的输入：只改草稿，不重绘（保持焦点）。 */
+  /** 本地服务页签的输入：只改草稿，不重绘（保持焦点）。 */
   function codexPlusGatewayHandleInput(event) {
     const target = event.target;
     const field = target?.dataset?.codexGatewayField;
@@ -18902,7 +19948,7 @@ ${key} = ${value}`]);
     return true;
   }
 
-  /** 网关页签的点击；处理了返回 true。 */
+  /** 本地服务页签的点击；处理了返回 true。 */
   async function codexPlusGatewayHandleClick(target) {
     const state = codexPlusGatewayPageState;
     const move = target.closest("[data-codex-gateway-move]");
@@ -18967,6 +20013,11 @@ ${key} = ${value}`]);
         break;
       }
       case "connect": await codexPlusGatewayConnect(); break;
+      case "use-selected": {
+        const model = entry?.models?.[0] || "";
+        if (entry && model) await codexPlusGatewayConnect(`${entry.id}/${model}`);
+        break;
+      }
       case "disconnect": await codexPlusGatewayOpenDisconnect(); break;
       case "disconnect-cancel":
         state.disconnect = null;
@@ -18997,7 +20048,9 @@ ${key} = ${value}`]);
    * 分工：
    *   - 服务本体在 core `remote_control`，由管理器进程托管；本页经 bridge 路由 `/remote-control`
    *     `{ action, ...args }` 调用与管理器同一份 `remote_control::dispatch`，两边看到的是同一个状态。
-   *   - 路由不在拓展白名单里（能开关服务、发配对码、移除设备）。
+   *   - 「钉钉与飞书通知」经 `/remote-control/robots` `{ action, provider, update }` 调与管理器同一份
+   *     `chat_notifications::dispatch`；Webhook 和签名密钥只能写，读回来只有「有没有」。
+   *   - 两条路由都不在拓展白名单里（能开关服务、发配对码、移除设备、改机器人）。
    *   - 管理器没在跑时路由返回 failed + 提示，本页照实显示。
    *
    * 页面 DOM 每次打开重建，状态只放在 codexPlusRemotePageState 里（见 01-registry 的生命周期约定）。
@@ -19018,12 +20071,71 @@ ${key} = ${value}`]);
     pollTimer: null,
     tickTimer: null,
     deviceCount: null,
+    robots: null,
+    robotError: "",
+    // 正在配置的机器人：{ provider, webhook, secret, clearSecret, network }，同一时间只配一个；关页即丢掉（含密钥草稿）。
+    robotEdit: null,
   };
+  const codexPlusRemoteRobotLabels = { dingtalk: "钉钉", feishu: "飞书" };
+  const codexPlusRemoteRobotNetworks = [["lan", "局域网"], ["tailscale", "Tailscale"], ["none", "仅通知"]];
 
   async function codexPlusRemoteRequest(action, args = {}) {
     const result = await postJson("/remote-control", { action, ...args });
     if (result?.status !== "ok") throw new Error(result?.message || "远程控制操作失败");
     return result;
+  }
+
+  async function codexPlusRemoteRobotRequest(action, provider = null, update = null) {
+    const result = await postJson("/remote-control/robots", { action, provider, update });
+    if (result?.status !== "ok") throw new Error(result?.message || "机器人操作失败");
+    return result;
+  }
+
+  async function codexPlusRemoteLoadRobots() {
+    const state = codexPlusRemotePageState;
+    try {
+      state.robots = await codexPlusRemoteRobotRequest("status");
+      state.robotError = "";
+    } catch (error) {
+      state.robotError = error?.message || String(error);
+    }
+    renderCodexPlusRemotePage();
+  }
+
+  async function codexPlusRemoteRobotRun(action, provider, update = null) {
+    const state = codexPlusRemotePageState;
+    state.busy = "robot";
+    state.robotError = "";
+    renderCodexPlusRemotePage();
+    try {
+      state.robots = await codexPlusRemoteRobotRequest(action, provider, update);
+      return true;
+    } catch (error) {
+      state.robotError = error?.message || String(error);
+      return false;
+    } finally {
+      state.busy = "";
+      renderCodexPlusRemotePage();
+    }
+  }
+
+  /** 保存正在配置的机器人：Webhook、密钥留空表示保留已保存的（同管理器）。 */
+  async function codexPlusRemoteRobotSave() {
+    const state = codexPlusRemotePageState;
+    const edit = state.robotEdit;
+    if (!edit || state.busy) return;
+    const webhook = edit.webhook.trim();
+    const secret = edit.secret.trim();
+    if (!state.robots?.[edit.provider]?.hasWebhook && !webhook) {
+      state.robotError = "请填写机器人 Webhook。";
+      renderCodexPlusRemotePage();
+      return;
+    }
+    const update = { ...(webhook ? { webhook } : {}), ...(secret ? { secret } : {}), clearSecret: edit.clearSecret, linkNetwork: edit.network };
+    if (await codexPlusRemoteRobotRun("save", edit.provider, update)) {
+      state.robotEdit = null;
+      renderCodexPlusRemotePage();
+    }
   }
 
   function codexPlusRemoteApply(data) {
@@ -19112,19 +20224,65 @@ ${key} = ${value}`]);
     </div>`;
   }
 
+  /** 一个机器人：标题行（配置 / 测试 / 开关），配置中时展开 Webhook、签名密钥、会话链接与保存。 */
+  function codexPlusRemoteRobotRows(provider, robot) {
+    const state = codexPlusRemotePageState;
+    const busy = Boolean(state.busy);
+    const name = codexPlusRemoteRobotLabels[provider];
+    const edit = state.robotEdit?.provider === provider ? state.robotEdit : null;
+    const attrs = `data-codex-remote-robot="${provider}"`;
+    const toggleOff = busy || !robot.hasWebhook || Boolean(edit);
+    const head = codexPlusRemoteRow(name, escapeHtml(robot.lastResult || (robot.hasWebhook ? "已保存机器人" : "尚未配置机器人")),
+      `<button type="button" class="codex-plus-action-button" data-codex-remote-action="robotEdit" ${attrs} ${busy ? "disabled" : ""}>${edit ? "取消" : "配置机器人"}</button>${robot.hasWebhook ? `<button type="button" class="codex-plus-action-button" data-codex-remote-action="robotTest" ${attrs} ${busy || edit ? "disabled" : ""}>测试通知</button>` : ""}<button type="button" class="codex-plus-toggle" role="switch" aria-label="${name}通知" aria-checked="${String(Boolean(robot.enabled))}" data-enabled="${String(Boolean(robot.enabled))}" data-pending="${String(busy)}" data-codex-remote-action="robotToggle" ${attrs} ${toggleOff ? "disabled" : ""}><span></span></button>`);
+    if (!edit) return head;
+    const input = (field, label, placeholder, disabled = false) => `<input class="codex-plus-provider-input codex-plus-service-input codex-plus-remote-robot-input" type="password" data-codex-remote-robot-field="${field}" value="${escapeHtml(edit[field])}" placeholder="${escapeHtml(placeholder)}" aria-label="${escapeHtml(label)}" autocomplete="off" spellcheck="false" ${busy || disabled ? "disabled" : ""}>`;
+    const clearSecret = robot.hasSecret
+      ? `<button type="button" class="codex-plus-toggle" role="switch" aria-label="清除签名" aria-checked="${String(edit.clearSecret)}" data-enabled="${String(edit.clearSecret)}" data-codex-remote-action="robotClearSecret" ${busy ? "disabled" : ""}><span></span></button><span class="codex-plus-row-description">清除签名</span>`
+      : "";
+    const networks = `<div class="codex-plus-remote-segmented" role="radiogroup" aria-label="消息中的会话链接">${codexPlusRemoteRobotNetworks
+      .map(([id, label]) => `<button type="button" role="radio" aria-checked="${String(id === edit.network)}" data-codex-remote-robot-network="${id}" ${busy ? "disabled" : ""}>${label}</button>`)
+      .join("")}</div>`;
+    return `${head}
+      ${codexPlusRemoteRow("机器人 Webhook", "在群里添加自定义机器人，复制它的 Webhook 地址。如果启用关键词校验，请添加 Codex++。",
+        input("webhook", `${name} Webhook`, robot.hasWebhook ? "已保存，留空保留" : "https://…"))}
+      ${codexPlusRemoteRow("机器人签名密钥", "使用加签的机器人请填写密钥。更换 Webhook 时同时填写新机器人的密钥。",
+        `${input("secret", `${name} 机器人签名密钥`, robot.hasSecret ? "已保存，留空保留" : "可选", edit.clearSecret)}${clearSecret}`)}
+      ${codexPlusRemoteRow("消息中的会话链接", "手机需能访问所选网络，审批使用已配对设备的完全控制权限。", networks)}
+      ${codexPlusRemoteRow("机器人配置", "",
+        `${robot.hasWebhook ? `<button type="button" class="codex-plus-action-button" data-codex-remote-action="robotClear" ${attrs} ${busy ? "disabled" : ""}>清除</button>` : ""}<button type="button" class="codex-plus-action-button" data-primary="true" data-codex-remote-action="robotSave" ${busy ? "disabled" : ""}>${state.busy === "robot" ? "正在保存…" : "保存"}</button>`)}`;
+  }
+
+  function codexPlusRemoteRobotSection(data) {
+    const state = codexPlusRemotePageState;
+    const robots = state.robots;
+    const note = !data.running ? "打开远程控制后开始监听任务通知。" : !data.lan?.running ? "要在手机上打开会话，请启用局域网访问并配对设备。" : "";
+    const body = robots
+      ? ["dingtalk", "feishu"].map((provider) => codexPlusRemoteRobotRows(provider, robots[provider] || {})).join("")
+      : codexPlusRemoteRow("机器人", state.robotError ? "读取失败。" : "正在读取…",
+        state.robotError ? '<button type="button" class="codex-plus-action-button" data-codex-remote-action="robotReload">重试</button>' : "");
+    return `<section class="codex-plus-settings-section" aria-label="钉钉与飞书通知">
+      <h2 class="codex-plus-settings-section-title">钉钉与飞书通知</h2>
+      ${state.robotError ? `<div class="codex-plus-remote-banner codex-plus-remote-robot-error" data-tone="warn" role="alert">${escapeHtml(state.robotError)}</div>` : ""}
+      <div class="codex-plus-settings-card">
+        ${codexPlusRemoteRow("任务通知", `任务完成、出错或等待审批时，向选定的群发送状态和会话短编号。启用局域网访问后，可从通知打开会话处理审批。${note ? `<br>${note}` : ""}`)}
+        ${body}
+      </div>
+    </section>`;
+  }
+
   function renderCodexPlusRemotePage() {
     const panel = document.querySelector("[data-codex-remote-panel]");
     if (!panel) return;
     const state = codexPlusRemotePageState;
     const data = state.data;
     const busy = Boolean(state.busy);
-    const header = `<div class="codex-plus-modal-header"><div class="codex-plus-modal-title">远程控制<em class="codex-plus-feature-tag" data-tone="experimental">实验</em></div></div>`;
+    // 页面名和「实验」标在左栏顶上（installCodexPlusSectionNav），右边每组第一节的标题就是大标题。
     const banner = [
       state.error || data?.error || data?.lan?.error ? `<div class="codex-plus-remote-banner" data-tone="warn" role="alert">${escapeHtml(state.error || data?.error || data?.lan?.error)}</div>` : "",
       state.notice ? `<div class="codex-plus-remote-banner" data-tone="ok" role="status">${escapeHtml(state.notice)}</div>` : "",
     ].join("");
     if (!data) {
-      panel.innerHTML = `${header}${banner}<div class="codex-plus-provider-empty">${state.busy ? "正在读取…" : ""}
+      panel.innerHTML = `${banner}<div class="codex-plus-provider-empty">${state.busy ? "正在读取…" : ""}
         ${state.busy ? "" : '<button type="button" class="codex-plus-action-button" data-codex-remote-action="reload">重试</button>'}</div>`;
       return;
     }
@@ -19144,9 +20302,11 @@ ${key} = ${value}`]);
       </div>
     </section>`;
     const addresses = Array.isArray(lan.addresses) ? lan.addresses : [];
-    const phones = data.enabled ? `<section class="codex-plus-settings-section" aria-label="手机与其它设备">
+    const phones = `<section class="codex-plus-settings-section" aria-label="手机与其它设备">
       <h2 class="codex-plus-settings-section-title">手机与其它设备</h2>
       <div class="codex-plus-settings-card">
+        ${!data.enabled ? codexPlusRemoteRow("先启用远程控制", "启用后，同一 Wi-Fi 或 Tailscale 网络里的手机才能配对访问。",
+          `<button type="button" class="codex-plus-action-button" data-codex-remote-action="enable" ${busy ? "disabled" : ""}>启用远程控制</button>`) : `
         ${codexPlusRemoteRow("允许局域网访问", "同一 Wi-Fi 或同一 Tailscale 网络里的设备经 HTTPS 访问，只有配对过的设备能用。",
           `${lan.running ? `<span class="codex-plus-provider-badge" data-tone="active">端口 ${Number(lan.port)}</span>` : ""}${codexPlusRemoteToggle(lan.enabled ? "disableLan" : "enableLan", Boolean(lan.enabled), "允许局域网访问")}`)}
         ${lan.running ? `
@@ -19156,9 +20316,9 @@ ${key} = ${value}`]);
           ${lan.fingerprint ? codexPlusRemoteRow("证书指纹", `<code class="codex-plus-remote-fingerprint">${escapeHtml(lan.fingerprint)}</code><br>证书是这台电脑自己签的，手机第一次打开会提示不受信任。可以在浏览器的证书详情里核对这串指纹，一致再继续访问。`) : ""}
           ${codexPlusRemoteRow("添加设备", "选好权限后生成一次性配对码（5 分钟内有效），用手机相机扫码打开，确认后即配对完成。",
             `${codexPlusRemoteRoleSwitch(state.pairRole)}<button type="button" class="codex-plus-action-button" data-codex-remote-action="startPairing" ${busy ? "disabled" : ""}>${data.pairing ? "重新生成" : "生成配对码"}</button>`)}
-          ${renderCodexPlusRemotePairing(data.pairing)}` : ""}
+          ${renderCodexPlusRemotePairing(data.pairing)}` : ""}`}
       </div>
-    </section>` : "";
+    </section>`;
     const deviceList = devices.length ? `<section class="codex-plus-settings-section" aria-label="已配对设备">
       <h2 class="codex-plus-settings-section-title">已配对设备（${devices.length}）</h2>
       <div class="codex-plus-settings-card">
@@ -19176,10 +20336,21 @@ ${key} = ${value}`]);
         ${codexPlusRemoteRow("提醒", "手机页面开着时，需要审批、模型提问或一轮跑完会用标题、振动和系统通知提醒；页面关掉后收不到。")}
       </div>
     </section>`;
+    // 轮询重绘时正在填机器人 Webhook / 密钥：草稿在 robotEdit 里，重绘后把焦点和光标放回去。
+    const active = document.activeElement;
+    const field = active instanceof Element && panel.contains(active) ? active.getAttribute("data-codex-remote-robot-field") : null;
+    const selection = field ? [active.selectionStart, active.selectionEnd] : null;
     const scroll = panel.closest(".codex-plus-modal-body")?.scrollTop || 0;
-    panel.innerHTML = `${header}${banner}${main}${phones}${deviceList}${help}`;
+    panel.innerHTML = `${banner}${codexPlusSectionGroupHtml("remote", main)}${codexPlusSectionGroupHtml("devices", `${phones}${deviceList}`)}${codexPlusSectionGroupHtml("notify", codexPlusRemoteRobotSection(data))}${codexPlusSectionGroupHtml("help", help)}`;
     const body = panel.closest(".codex-plus-modal-body");
     if (body) body.scrollTop = scroll;
+    const next = field ? panel.querySelector(`[data-codex-remote-robot-field="${field}"]`) : null;
+    if (next && !next.disabled) {
+      next.focus({ preventScroll: true });
+      try {
+        next.setSelectionRange(...selection);
+      } catch {}
+    }
   }
 
   async function codexPlusRemoteHandleClick(event) {
@@ -19198,10 +20369,56 @@ ${key} = ${value}`]);
       if (device && device.role !== role) await codexPlusRemoteRun("setDeviceRole", { id: deviceId, role });
       return;
     }
+    const networkButton = target?.closest("[data-codex-remote-robot-network]");
+    if (networkButton && !networkButton.disabled && state.robotEdit) {
+      state.robotEdit.network = networkButton.getAttribute("data-codex-remote-robot-network");
+      renderCodexPlusRemotePage();
+      return;
+    }
     const button = target?.closest("[data-codex-remote-action]");
     if (!button || button.disabled) return;
     const action = button.getAttribute("data-codex-remote-action");
+    const provider = button.getAttribute("data-codex-remote-robot") || "";
+    const robot = state.robots?.[provider] || {};
     switch (action) {
+      case "robotReload":
+        await codexPlusRemoteLoadRobots();
+        return;
+      case "robotEdit":
+        state.robotError = "";
+        state.robotEdit = state.robotEdit?.provider === provider
+          ? null
+          : { provider, webhook: "", secret: "", clearSecret: false, network: robot.linkNetwork || "lan" };
+        renderCodexPlusRemotePage();
+        document.querySelector('[data-codex-remote-robot-field="webhook"]')?.focus({ preventScroll: true });
+        return;
+      case "robotClearSecret":
+        if (!state.robotEdit) return;
+        state.robotEdit.clearSecret = !state.robotEdit.clearSecret;
+        if (state.robotEdit.clearSecret) state.robotEdit.secret = "";
+        renderCodexPlusRemotePage();
+        return;
+      case "robotSave":
+        await codexPlusRemoteRobotSave();
+        return;
+      case "robotTest":
+        await codexPlusRemoteRobotRun("test", provider);
+        return;
+      case "robotToggle":
+        await codexPlusRemoteRobotRun("save", provider, { enabled: !robot.enabled });
+        return;
+      case "robotClear": {
+        const answer = await codexPlusAsk({
+          title: `清除${codexPlusRemoteRobotLabels[provider] || ""}机器人配置？`,
+          message: "清除后将停止向这个机器人推送。",
+          options: [{ value: "clear", label: "清除" }],
+        });
+        if (answer && await codexPlusRemoteRobotRun("clear", provider)) {
+          state.robotEdit = null;
+          renderCodexPlusRemotePage();
+        }
+        return;
+      }
       case "reload":
         await codexPlusRemoteRun("status", {}, "load");
         return;
@@ -19267,6 +20484,43 @@ ${key} = ${value}`]);
     });
   }
 
+  /** 机器人输入框的草稿记进 robotEdit，轮询重绘不丢。 */
+  function codexPlusRemoteHandleInput(event) {
+    const input = event.target instanceof Element ? event.target.closest("[data-codex-remote-robot-field]") : null;
+    const edit = codexPlusRemotePageState.robotEdit;
+    if (input && edit) edit[input.getAttribute("data-codex-remote-robot-field")] = input.value;
+  }
+
+  /**
+   * Codex 在 document 捕获阶段把按键送进它的输入框，所以在 window 捕获阶段先接住机器人输入框里的按键；
+   * 回车保存，Esc 取消配置。
+   */
+  function codexPlusRemoteCaptureKeydown(event) {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target?.matches("[data-codex-remote-robot-field]") || !target.closest(".codex-plus-remote-page")) return;
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void codexPlusRemoteRobotSave();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      codexPlusRemotePageState.robotEdit = null;
+      renderCodexPlusRemotePage();
+    }
+  }
+
+  /** 左栏目录：页面里的左栏和图标栏悬浮卡片共用。 */
+  const codexPlusRemoteSectionNav = {
+    title: "远程控制",
+    titleHtml: '远程控制<em class="codex-plus-feature-tag" data-tone="experimental">实验</em>',
+    groups: [
+      { id: "remote", label: "远程控制", icon: "core" },
+      { id: "devices", label: "手机与其它设备", icon: "standalone" },
+      { id: "notify", label: "钉钉与飞书通知", icon: "chat" },
+      { id: "help", label: "使用说明", icon: "tools" },
+    ],
+  };
+
   function openCodexPlusRemoteControlPage() {
     closeCodexPlusPage();
     document.querySelectorAll('.codex-plus-modal-overlay, [data-codex-plus-dialog="true"]').forEach((node) => node.remove());
@@ -19277,8 +20531,10 @@ ${key} = ${value}`]);
     applyCodexPlusTheme(overlay);
     applyCodexPlusZoom(overlay);
     overlay.innerHTML = `<div class="codex-plus-modal-content" role="region" aria-label="远程控制" data-codex-plus-active-tab="${codexPlusRemoteControlTab}">
-      <div class="codex-plus-modal-body"><div class="codex-plus-panel codex-plus-settings" data-codex-remote-panel="true"></div></div></div>`;
+      <div class="codex-plus-modal-body"><div class="codex-plus-panel codex-plus-settings" data-codex-plus-settings-paged="true" data-codex-remote-panel="true"></div></div></div>`;
     overlay.addEventListener("click", (event) => { void codexPlusRemoteHandleClick(event); });
+    overlay.addEventListener("input", codexPlusRemoteHandleInput);
+    installCodexPlusSectionNav(overlay, codexPlusRemoteSectionNav);
     document.body.appendChild(overlay);
     positionCodexPlusPage(overlay);
     observeCodexPlusPageLayout(overlay);
@@ -19298,16 +20554,21 @@ ${key} = ${value}`]);
     clearInterval(state.tickTimer);
     state.pollTimer = setInterval(codexPlusRemotePoll, 2500);
     state.tickTimer = setInterval(codexPlusRemoteTick, 1000);
+    window.removeEventListener("keydown", codexPlusRemoteCaptureKeydown, true);
+    window.addEventListener("keydown", codexPlusRemoteCaptureKeydown, true);
     // 关页时由 closeCodexPlusPage 调用（92-extension-host.js）。
     window.__codexPlusExtensionPageCleanup = () => {
       clearInterval(state.pollTimer);
       clearInterval(state.tickTimer);
       state.pollTimer = null;
       state.tickTimer = null;
+      state.robotEdit = null;
+      window.removeEventListener("keydown", codexPlusRemoteCaptureKeydown, true);
     };
-    Object.assign(state, { error: "", notice: "", copied: false, deviceCount: null });
+    Object.assign(state, { error: "", notice: "", copied: false, deviceCount: null, robotError: "", robotEdit: null });
     renderCodexPlusRemotePage();
     void codexPlusRemoteRun("status", {}, "load");
+    void codexPlusRemoteLoadRobots();
   }
   /**
    * Codex 左侧图标栏的「微信连接」页：不离开 Codex 就能扫码登录、启停微信连接、改常用设置。
@@ -19317,7 +20578,8 @@ ${key} = ${value}`]);
    *     本页经 bridge 路由 `/weixin-connect` `{ action, ...args }` 调管理器登记的宿主路由，
    *     动作与管理器微信页共用同一组命令函数（`weixin_connect_bridge.rs`），两边看到的是同一个状态。
    *   - 路由不在拓展白名单里（能扫码登录、启停连接、改设置）。管理器没在跑时路由返回 failed + 提示，本页照实显示。
-   *   - 只放每天会碰的设置；新会话项目、重置联系人会话、登录凭据、连接参数到管理器里改（页底有入口）。
+   *   - 登录凭据、连接参数、Codex CLI 路径不在这里改（后端白名单也不收，见 core `connect::page`），
+   *     到管理器里改（页底有入口）。
    *
    * 页面 DOM 每次打开重建，状态只放在 codexPlusWeixinPageState 里（见 01-registry 的生命周期约定）。
    */
@@ -19336,6 +20598,11 @@ ${key} = ${value}`]);
     catalog: null,
     catalogError: "",
     catalogLoading: false,
+    // 项目列表要起一次 Codex app-server，按需读：已选过项目时打开页面读，否则点「刷新」才读。
+    projects: null,
+    projectsError: "",
+    projectsLoading: false,
+    resetPeer: "",
     qr: null,
     qrGeneration: 0,
     busy: "",
@@ -19408,6 +20675,32 @@ ${key} = ${value}`]);
       state.catalogLoading = false;
       renderCodexPlusWeixinPage();
     }
+  }
+
+  async function codexPlusWeixinLoadProjects() {
+    const state = codexPlusWeixinPageState;
+    if (state.projectsLoading) return;
+    state.projectsLoading = true;
+    renderCodexPlusWeixinPage();
+    try {
+      const result = await codexPlusWeixinRequest("projects");
+      if (!Array.isArray(result.projects)) throw new Error("读取项目列表失败。");
+      state.projects = result.projects;
+      state.projectsError = "";
+    } catch (error) {
+      state.projectsError = error?.message || String(error);
+    } finally {
+      state.projectsLoading = false;
+      renderCodexPlusWeixinPage();
+    }
+  }
+
+  /** 选项目时工作目录跟着换成项目的第一个目录（同管理器微信页）。 */
+  function codexPlusWeixinProjectPatch(id) {
+    const state = codexPlusWeixinPageState;
+    const project = (state.projects || []).find((entry) => entry.id === id);
+    const root = project?.roots?.[0]?.path;
+    return root ? { weixinConnectProjectId: id, weixinConnectWorkDir: root } : { weixinConnectProjectId: id };
   }
 
   /** 扫码：生成二维码后一直查状态，直到确认、过期、出错或关页（qrGeneration 变了就停）。 */
@@ -19526,7 +20819,9 @@ ${key} = ${value}`]);
     const value = item.dataset.codexWeixinMenuValue || "";
     const changed = value !== (trigger.dataset.value || "");
     codexPlusWeixinCloseMenu(true);
-    if (changed) void codexPlusWeixinSave({ [trigger.dataset.codexWeixinMenu]: value });
+    if (!changed) return;
+    const field = trigger.dataset.codexWeixinMenu;
+    void codexPlusWeixinSave(field === "weixinConnectProjectId" ? codexPlusWeixinProjectPatch(value) : { [field]: value });
   }
 
   /** 菜单键盘操作：上下移动、Home / End、回车 / 空格选中、Esc / Tab 收起（与供应商页菜单一致）。 */
@@ -19590,6 +20885,11 @@ ${key} = ${value}`]);
     if (!input) return;
     const field = input.getAttribute("data-codex-weixin-field");
     const value = input.value.trim();
+    // 要重置的联系人 ID 不是设置，只记下来给「重置」按钮用。
+    if (field === "resetPeer") {
+      codexPlusWeixinPageState.resetPeer = value;
+      return;
+    }
     const saved = codexPlusWeixinPageState.data?.settings?.[field] ?? "";
     if (value === saved) return;
     void codexPlusWeixinSave({ [field]: value });
@@ -19625,18 +20925,33 @@ ${key} = ${value}`]);
     return { modelOptions, effortOptions, hint };
   }
 
+  function codexPlusWeixinProjectOptions(state, settings) {
+    const projects = Array.isArray(state.projects) ? state.projects : [];
+    const id = settings.weixinConnectProjectId || "";
+    const missing = Boolean(id && !projects.some((project) => project.id === id));
+    const options = [
+      ["", "不归属项目"],
+      ...(missing ? [[id, `${id} (${state.projects && !state.projectsError ? "不可用" : "当前值"})`]] : []),
+      ...projects.map((project) => [project.id, project.name || project.id]),
+    ];
+    const hint = state.projectsError
+      || (state.projects && missing ? "当前项目已不在项目列表中，请重新选择。" : "")
+      || (state.projects ? "新会话归到 Codex 里的哪个项目；选项目会把工作目录换成它的目录。" : "新会话归到 Codex 里的哪个项目；点「刷新」读取项目列表。");
+    return { options, hint };
+  }
+
   /** 整页 HTML（纯函数，便于测试）。 */
   function codexPlusWeixinPageHtml(state) {
     const data = state.data;
     const busy = Boolean(state.busy);
-    const header = `<div class="codex-plus-modal-header"><div class="codex-plus-modal-title">微信连接</div></div>`;
+    // 页面名在左栏顶上（installCodexPlusSectionNav），右边每组第一节的标题就是大标题。
     const bannerText = state.error || (data?.connection?.state === "error" ? data.connection.message : "");
     const banner = [
       bannerText ? `<div class="codex-plus-remote-banner" data-tone="warn" role="alert">${escapeHtml(bannerText)}</div>` : "",
       state.notice ? `<div class="codex-plus-remote-banner" data-tone="ok" role="status">${escapeHtml(state.notice)}</div>` : "",
     ].join("");
     if (!data) {
-      return `${header}${banner}<div class="codex-plus-provider-empty">${busy ? "正在读取…" : '<button type="button" class="codex-plus-action-button" data-codex-weixin-action="reload">重试</button>'}</div>`;
+      return `${banner}<div class="codex-plus-provider-empty">${busy ? "正在读取…" : '<button type="button" class="codex-plus-action-button" data-codex-weixin-action="reload">重试</button>'}</div>`;
     }
     const settings = data.settings || {};
     const connection = data.connection || {};
@@ -19682,6 +20997,7 @@ ${key} = ${value}`]);
       </div>
     </section>` : "";
     const { modelOptions, effortOptions, hint } = codexPlusWeixinModelOptions(state, settings);
+    const project = codexPlusWeixinProjectOptions(state, settings);
     const sessionSection = `<section class="codex-plus-settings-section" aria-label="对话">
       <h2 class="codex-plus-settings-section-title">对话</h2>
       <div class="codex-plus-settings-card">
@@ -19689,8 +21005,12 @@ ${key} = ${value}`]);
           codexPlusWeixinInput("weixinConnectAllowFrom", settings.weixinConnectAllowFrom, "允许的微信用户 ID", "user@im.wechat"))}
         ${codexPlusWeixinRow("工作目录", "新会话在这个目录里工作。",
           codexPlusWeixinInput("weixinConnectWorkDir", settings.weixinConnectWorkDir, "工作目录", "输入工作目录的完整路径"))}
+        ${codexPlusWeixinRow("新会话项目", escapeHtml(project.hint),
+          `${codexPlusWeixinMenu("weixinConnectProjectId", settings.weixinConnectProjectId || "", project.options, "新会话项目")}<button type="button" class="codex-plus-action-button" data-codex-weixin-action="projects" ${state.projectsLoading ? "disabled" : ""}>${state.projectsLoading ? "读取中…" : "刷新"}</button>`)}
         ${codexPlusWeixinRow("模型", escapeHtml(hint),
           `${codexPlusWeixinMenu("weixinConnectModel", settings.weixinConnectModel || "", modelOptions, "模型")}${codexPlusWeixinMenu("weixinConnectReasoningEffort", settings.weixinConnectReasoningEffort || "", effortOptions, "推理强度")}<button type="button" class="codex-plus-action-button" data-codex-weixin-action="catalog" ${state.catalogLoading ? "disabled" : ""}>${state.catalogLoading ? "读取中…" : "刷新"}</button>`)}
+        ${codexPlusWeixinRow("重置联系人会话", "下一条消息开启新会话，原历史保留。",
+          `${codexPlusWeixinInput("resetPeer", state.resetPeer, "需要重置的联系人 ID", connection.lastPeerId || "联系人 ID")}<button type="button" class="codex-plus-action-button" data-codex-weixin-action="resetSession" ${busy || !loggedIn ? "disabled" : ""}>${state.busy === "resetSession" ? "正在重置…" : "重置"}</button>`)}
       </div>
     </section>`;
     const remoteRunning = Boolean(data.remoteControlRunning);
@@ -19720,11 +21040,11 @@ ${key} = ${value}`]);
     const moreSection = `<section class="codex-plus-settings-section" aria-label="更多设置">
       <h2 class="codex-plus-settings-section-title">更多设置</h2>
       <div class="codex-plus-settings-card">
-        ${codexPlusWeixinRow("新会话项目、重置联系人会话、登录凭据、连接参数", "这些不常用的设置在 Codex++ 管理工具的微信连接页里改。",
-          '<button type="button" class="codex-plus-action-button" data-codex-weixin-action="openManager">在 Codex++ 管理工具里打开更多设置</button>')}
+        ${codexPlusWeixinRow("登录凭据、连接参数、Codex CLI 路径", "登录凭据和账号扫码后自动填好，一般不用改；要手动改它们、iLink 地址或 Codex CLI 路径，到 Codex++ 管理工具的微信连接页。",
+          '<button type="button" class="codex-plus-action-button" data-codex-weixin-action="openManager">打开管理工具</button>')}
       </div>
     </section>`;
-    return `${header}${banner}${statusSection}${qrSection}${sessionSection}${jiajiaSection}${permissionSection}${moreSection}`;
+    return `${banner}${codexPlusSectionGroupHtml("connection", `${statusSection}${qrSection}${moreSection}`)}${codexPlusSectionGroupHtml("session", sessionSection)}${codexPlusSectionGroupHtml("jiajia", jiajiaSection)}${codexPlusSectionGroupHtml("permission", permissionSection)}`;
   }
 
   /** 正在编辑输入框或开着菜单时不重绘（会丢输入、收掉菜单），等编辑完再补画。 */
@@ -19822,6 +21142,22 @@ ${key} = ${value}`]);
       case "catalog":
         await codexPlusWeixinLoadCatalog();
         return;
+      case "projects":
+        await codexPlusWeixinLoadProjects();
+        return;
+      case "resetSession": {
+        // 打完字直接点按钮时，输入框失焦的 change 先于 click，resetPeer 已记下。
+        if (!state.resetPeer) {
+          state.error = "请填写需要重置的微信联系人 ID。";
+          renderCodexPlusWeixinPage();
+          return;
+        }
+        if (await codexPlusWeixinRun("resetSession", { peerId: state.resetPeer })) {
+          state.resetPeer = "";
+          renderCodexPlusWeixinPage();
+        }
+        return;
+      }
       case "openRemote":
         openCodexPlusRemoteControlPage();
         return;
@@ -19852,6 +21188,17 @@ ${key} = ${value}`]);
     }).catch(() => {});
   }
 
+  /** 左栏目录：页面里的左栏和图标栏悬浮卡片共用。 */
+  const codexPlusWeixinSectionNav = {
+    title: "微信连接",
+    groups: [
+      { id: "connection", label: "连接", icon: "core" },
+      { id: "session", label: "对话", icon: "chat" },
+      { id: "jiajia", label: "加加", icon: "pet" },
+      { id: "permission", label: "权限", icon: "feature-lab" },
+    ],
+  };
+
   function openCodexPlusWeixinConnectPage() {
     closeCodexPlusPage();
     document.querySelectorAll('.codex-plus-modal-overlay, [data-codex-plus-dialog="true"]').forEach((node) => node.remove());
@@ -19862,7 +21209,7 @@ ${key} = ${value}`]);
     applyCodexPlusTheme(overlay);
     applyCodexPlusZoom(overlay);
     overlay.innerHTML = `<div class="codex-plus-modal-content" role="region" aria-label="微信连接" data-codex-plus-active-tab="${codexPlusWeixinConnectTab}">
-      <div class="codex-plus-modal-body"><div class="codex-plus-panel codex-plus-settings" data-codex-weixin-panel="true"></div></div></div>`;
+      <div class="codex-plus-modal-body"><div class="codex-plus-panel codex-plus-settings" data-codex-plus-settings-paged="true" data-codex-weixin-panel="true"></div></div></div>`;
     overlay.addEventListener("click", (event) => { void codexPlusWeixinHandleClick(event); });
     overlay.addEventListener("change", codexPlusWeixinHandleChange);
     // 输入框失焦后补画轮询期间攒下的变化（没改内容时不会有 change）。
@@ -19870,6 +21217,7 @@ ${key} = ${value}`]);
       const panel = document.querySelector("[data-codex-weixin-panel]");
       if (panel && codexPlusWeixinPageState.renderPending && !codexPlusWeixinEditing(panel)) renderCodexPlusWeixinPage();
     }, 0));
+    installCodexPlusSectionNav(overlay, codexPlusWeixinSectionNav);
     document.body.appendChild(overlay);
     positionCodexPlusPage(overlay);
     observeCodexPlusPageLayout(overlay);
@@ -19901,9 +21249,11 @@ ${key} = ${value}`]);
       const editing = document.activeElement;
       if (editing instanceof Element && editing.matches("[data-codex-weixin-field]")) codexPlusWeixinHandleChange({ target: editing });
     };
-    Object.assign(state, { error: "", notice: "", copied: false, renderPending: false, qr: null });
+    Object.assign(state, { error: "", notice: "", copied: false, renderPending: false, qr: null, projects: null, projectsError: "", resetPeer: "" });
     renderCodexPlusWeixinPage();
-    void codexPlusWeixinRun("state", {}, "load");
+    void codexPlusWeixinRun("state", {}, "load").then(() => {
+      if (state.data?.settings?.weixinConnectProjectId) void codexPlusWeixinLoadProjects();
+    });
     void codexPlusWeixinLoadCatalog();
   }
   /**
@@ -24007,309 +25357,11 @@ ${key} = ${value}`]);
     return wrapper;
   }
   /**
-   * 独立插件市场只加载索引；安装由 launcher 下载所选插件并写入本地安装目录。
-   * 不调用 Codex 的 plugin/install，避免在浏览目录时触发服务连接或 OAuth。
-   * 状态存数据，页面每次打开重建；请求结果通过来源/序号校验后才刷新当前页面。
-   */
-  const codexPlusPluginMarketState = window.__codexPlusPluginMarketState || {
-    source: "public", query: "", installedOnly: false, page: 1,
-    catalogs: {}, jobs: {},
-  };
-  window.__codexPlusPluginMarketState = codexPlusPluginMarketState;
-  Object.values(codexPlusPluginMarketState.jobs).forEach((job) => {
-    clearTimeout(job.timer);
-    job.timer = null;
-  });
-  const codexPlusPluginMarketPageSize = 50;
-
-  function codexPlusPluginMarketCatalog(source = codexPlusPluginMarketState.source) {
-    if (!codexPlusPluginMarketState.catalogs[source]) {
-      codexPlusPluginMarketState.catalogs[source] = {
-        plugins: [], loaded: false, loading: false, message: "", revision: 0, cached: false,
-      };
-    }
-    return codexPlusPluginMarketState.catalogs[source];
-  }
-
-  function codexPlusPluginMarketPanel() {
-    return document.querySelector('[data-codex-plugin-market-panel="true"]');
-  }
-
-  function codexPlusPluginMarketFilteredPlugins() {
-    const state = codexPlusPluginMarketState;
-    const query = state.query.trim().toLocaleLowerCase();
-    return codexPlusPluginMarketCatalog().plugins.filter((plugin) => {
-      if (state.installedOnly && !plugin.installed) return false;
-      if (!query) return true;
-      const text = [plugin.displayName, plugin.name, plugin.description, ...(Array.isArray(plugin.tags) ? plugin.tags : [])].join(" ").toLocaleLowerCase();
-      return text.includes(query);
-    });
-  }
-
-  function codexPlusPluginMarketBytes(bytes) {
-    const value = Number(bytes);
-    if (!Number.isFinite(value) || value <= 0) return "";
-    if (value < 1024 * 1024) return `${Math.ceil(value / 1024)} KB`;
-    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
-  }
-
-  function codexPlusPluginMarketStage(stage) {
-    return ({ queued: "等待下载", downloading: "下载中", extracting: "解压中", installing: "安装中", validating: "校验中", complete: "安装完成" })[stage] || "正在安装";
-  }
-
-  function codexPlusPluginMarketCard(plugin, source) {
-    const job = codexPlusPluginMarketState.jobs[`${source}:${plugin.id}`];
-    const busy = job?.busy === true;
-    const installed = plugin.installed === true;
-    const label = busy ? `${codexPlusPluginMarketStage(job.stage)}…` : plugin.updateAvailable ? "更新" : installed ? "已安装" : "下载安装";
-    const meta = [plugin.version ? `v${plugin.version}` : "", plugin.author || "", codexPlusPluginMarketBytes(plugin.bytes), Number(plugin.skills) > 0 ? `${plugin.skills} 个技能` : ""].filter(Boolean).join(" · ");
-    const tags = (Array.isArray(plugin.tags) ? plugin.tags : []).slice(0, 4);
-    return `<article class="codex-plus-plugin-card" role="listitem">
-      <div class="codex-plus-plugin-card-info">
-        <div class="codex-plus-plugin-name">${escapeHtml(plugin.displayName || plugin.name || plugin.id)}</div>
-        <div class="codex-plus-plugin-id">${escapeHtml(plugin.name || plugin.id)}</div>
-        <div class="codex-plus-plugin-description">${escapeHtml(plugin.description || "暂无介绍")}</div>
-        <div class="codex-plus-plugin-meta">${escapeHtml(meta)}</div>
-        <div class="codex-plus-plugin-tags">${tags.map((tag) => `<span>${escapeHtml(String(tag))}</span>`).join("")}${plugin.requiresAuth ? "<span>需要服务授权</span>" : ""}${plugin.license ? `<span>${escapeHtml(plugin.license)}</span>` : ""}</div>
-        ${job?.message ? `<div class="codex-plus-plugin-job-message" data-status="${job.failed ? "failed" : "ok"}">${escapeHtml(job.message)}</div>` : ""}
-      </div>
-      <button type="button" class="codex-plus-button codex-plus-plugin-install" data-codex-plugin-install="${escapeHtml(plugin.id)}" aria-label="${escapeHtml(`${label} ${plugin.displayName || plugin.name || plugin.id}`)}" ${busy || (installed && !plugin.updateAvailable) ? "disabled" : ""}>${label}</button>
-    </article>`;
-  }
-
-  function renderCodexPlusPluginMarket() {
-    const panel = codexPlusPluginMarketPanel();
-    if (!panel) return;
-    const state = codexPlusPluginMarketState;
-    const catalog = codexPlusPluginMarketCatalog();
-    const filtered = codexPlusPluginMarketFilteredPlugins();
-    const pages = Math.max(1, Math.ceil(filtered.length / codexPlusPluginMarketPageSize));
-    state.page = Math.max(1, Math.min(pages, state.page));
-    panel.querySelectorAll("[data-codex-plugin-source]").forEach((button) => {
-      const active = button.dataset.codexPluginSource === state.source;
-      button.dataset.active = String(active);
-      button.setAttribute("aria-pressed", String(active));
-    });
-    const refresh = panel.querySelector("[data-codex-plugin-refresh]");
-    if (refresh) refresh.disabled = catalog.loading;
-    const sourceNote = panel.querySelector("[data-codex-plugin-source-note]");
-    if (sourceNote) {
-      sourceNote.hidden = state.source !== "full";
-      sourceNote.textContent = "完整市场收录全部插件，索引较大，首次加载可能需要几秒。";
-    }
-    const status = panel.querySelector("[data-codex-plugin-market-status]");
-    if (status) status.textContent = catalog.loading ? "正在加载插件目录…" : catalog.message || `${catalog.plugins.length.toLocaleString()} 个插件${catalog.cached ? " · 使用缓存目录" : ""}`;
-    const results = panel.querySelector("[data-codex-plugin-results]");
-    if (results) results.innerHTML = filtered.length
-      ? filtered.slice((state.page - 1) * codexPlusPluginMarketPageSize, state.page * codexPlusPluginMarketPageSize).map((plugin) => codexPlusPluginMarketCard(plugin, state.source)).join("")
-      : `<div class="codex-plus-plugin-empty">${catalog.loading ? "正在加载…" : !catalog.loaded ? "目录尚未加载，请刷新重试。" : catalog.plugins.length ? "没有找到符合条件的插件。" : "此来源暂无可显示的插件。"}</div>`;
-    const count = panel.querySelector("[data-codex-plugin-result-count]");
-    if (count) count.textContent = `${filtered.length.toLocaleString()} 个结果 · 第 ${state.page} / ${pages} 页`;
-    const previous = panel.querySelector('[data-codex-plugin-page="previous"]');
-    const next = panel.querySelector('[data-codex-plugin-page="next"]');
-    if (previous) previous.disabled = state.page <= 1;
-    if (next) next.disabled = state.page >= pages;
-  }
-
-  async function loadCodexPlusPluginMarket(source, refresh = false) {
-    const catalog = codexPlusPluginMarketCatalog(source);
-    if (catalog.loading || (catalog.loaded && !refresh)) {
-      renderCodexPlusPluginMarket();
-      return;
-    }
-    const revision = ++catalog.revision;
-    catalog.loading = true;
-    catalog.message = "";
-    renderCodexPlusPluginMarket();
-    let result;
-    try {
-      result = await postJson("/plugin-market/list", { source, refresh });
-    } catch (error) {
-      result = { status: "failed", message: error?.message || "插件目录加载失败" };
-    }
-    if (catalog.revision !== revision) return;
-    catalog.loading = false;
-    if (Array.isArray(result?.plugins)) {
-      catalog.plugins = result.plugins.filter((plugin) => plugin && typeof plugin.id === "string");
-      catalog.loaded = true;
-      catalog.cached = result.cached === true;
-      catalog.message = result.message || "";
-    } else {
-      catalog.message = result?.message || "插件目录加载失败，请刷新重试。";
-    }
-    // 切换来源后，旧请求只更新自己的数据；当前页面始终按当前来源重绘。
-    if (codexPlusPluginMarketState.source === source) renderCodexPlusPluginMarket();
-  }
-
-  function updateCodexPlusPluginMarketInstalled(source, plugin) {
-    if (!plugin || typeof plugin.id !== "string") return;
-    const catalog = codexPlusPluginMarketCatalog(source);
-    // 安装以 source + id 隔离，另一来源即使同 id 也不能被标为已安装。
-    // 丢弃此前发出的本来源清单请求，避免旧 installed 状态覆盖新结果。
-    catalog.revision += 1;
-    catalog.loading = false;
-    catalog.plugins = catalog.plugins.map((item) => {
-      if (item.id !== plugin.id) return item;
-      const installedVersion = plugin.installedVersion || plugin.version || item.version;
-      return { ...item, installed: true, installedVersion, updateAvailable: Boolean(item.version && installedVersion && item.version !== installedVersion) };
-    });
-  }
-
-  function scheduleCodexPlusPluginMarketInstallPoll(source, id, delay = 1200) {
-    const job = codexPlusPluginMarketState.jobs[`${source}:${id}`];
-    if (!job?.busy || job.polling || job.timer || !codexPlusPluginMarketPanel()) return;
-    job.timer = setTimeout(() => {
-      job.timer = null;
-      void pollCodexPlusPluginMarketInstall(source, id);
-    }, delay);
-  }
-
-  async function pollCodexPlusPluginMarketInstall(source, id) {
-    const job = codexPlusPluginMarketState.jobs[`${source}:${id}`];
-    if (!job?.busy || job.polling) return;
-    job.polling = true;
-    let result;
-    try {
-      result = await postJson("/plugin-market/install-status", { source, id });
-    } catch (error) {
-      result = { timeout: true, message: error?.message || "正在等待安装状态" };
-    }
-    job.polling = false;
-    if (result?.busy === true) {
-      job.stage = result.stage || job.stage;
-      job.message = result.message || "";
-    } else if (result?.busy === false) {
-      const completed = result.status === "ok" && result.stage === "complete"
-        && (result.plugin || (typeof result.installedVersion === "string" && result.installedVersion.length > 0));
-      job.busy = false;
-      job.failed = !completed;
-      job.message = result.message || (job.failed ? "安装未完成，请重试。" : "安装完成，重启 Codex 后加载插件。");
-      if (completed) updateCodexPlusPluginMarketInstalled(source, result.plugin || { id, installedVersion: result.installedVersion });
-    } else {
-      // 桥接超时不能重新发起安装；持续查询原任务，防止并发写同一插件。
-      job.message = result?.message || "正在等待安装状态，可稍后重新打开此页查看。";
-    }
-    renderCodexPlusPluginMarket();
-    scheduleCodexPlusPluginMarketInstallPoll(source, id, result?.timeout ? 4000 : 1200);
-  }
-
-  async function installCodexPlusPluginMarketPlugin(source, id) {
-    const key = `${source}:${id}`;
-    if (codexPlusPluginMarketState.jobs[key]?.busy) return;
-    const plugin = codexPlusPluginMarketCatalog(source).plugins.find((item) => item.id === id);
-    if (!plugin || (plugin.installed && !plugin.updateAvailable)) return;
-    const job = { busy: true, stage: "downloading", message: "正在下载所选插件…", failed: false, timer: null, polling: false };
-    codexPlusPluginMarketState.jobs[key] = job;
-    renderCodexPlusPluginMarket();
-    let result;
-    try {
-      result = await postJson("/plugin-market/install", { source, id });
-    } catch (error) {
-      result = { timeout: true, message: error?.message || "正在等待安装结果" };
-    }
-    if (result?.status === "ok" && result?.plugin && result?.busy !== true) {
-      job.busy = false;
-      job.message = result.message || "安装完成，重启 Codex 后加载插件。";
-      updateCodexPlusPluginMarketInstalled(source, result.plugin);
-    } else if (result?.status === "failed" && !result?.timeout && result?.busy !== true && !/超时|timeout/i.test(result.message || "")) {
-      job.busy = false;
-      job.failed = true;
-      job.message = result.message || "安装失败";
-    } else {
-      job.stage = result?.stage || job.stage;
-      job.message = result?.message || "正在等待下载完成…";
-      scheduleCodexPlusPluginMarketInstallPoll(source, id);
-    }
-    renderCodexPlusPluginMarket();
-  }
-
-  function openCodexPlusPluginMarket() {
-    closeCodexPlusPage();
-    document.querySelectorAll('.codex-plus-modal-overlay, [data-codex-plus-dialog="true"]').forEach((node) => node.remove());
-    const overlay = document.createElement("div");
-    overlay.className = `${codexPlusPageClass} codex-plus-plugin-market-page`;
-    overlay.dataset.codexPlusPage = "true";
-    markCodexPlusExtensionNode(overlay, "builtin-plugin-market");
-    applyCodexPlusTheme(overlay);
-    applyCodexPlusZoom(overlay);
-    const state = codexPlusPluginMarketState;
-    overlay.innerHTML = `<div class="codex-plus-modal-content" role="region" aria-label="Codex 插件市场" data-codex-plus-active-tab="${codexPlusPluginMarketTab}">
-      <div class="codex-plus-modal-header"><div class="codex-plus-modal-title">Codex 插件市场</div></div>
-      <div class="codex-plus-modal-body"><div class="codex-plus-panel codex-plus-plugin-market-panel" data-codex-plugin-market-panel="true">
-        <p class="codex-plus-plugin-intro">检索插件目录，选中后下载并安装。目录浏览仅获取索引，插件文件按需下载。</p>
-        <div class="codex-plus-plugin-toolbar">
-          <div class="codex-plus-plugin-sources" role="group" aria-label="插件来源"><button type="button" data-codex-plugin-source="public" aria-pressed="false">公开市场</button><button type="button" data-codex-plugin-source="full" aria-pressed="false">完整市场</button></div>
-          <button type="button" class="codex-plus-button" data-codex-plugin-refresh="true">刷新目录</button>
-        </div>
-        <div class="codex-plus-plugin-status" data-codex-plugin-source-note="true" hidden></div>
-        <div class="codex-plus-plugin-toolbar"><input type="search" class="codex-plus-plugin-search" data-codex-plugin-query="true" aria-label="搜索插件" placeholder="搜索插件名称、简介或标签" value="${escapeHtml(state.query)}"><label class="codex-plus-plugin-filter"><input type="checkbox" data-codex-plugin-installed="true" ${state.installedOnly ? "checked" : ""}>仅已安装</label></div>
-        <div class="codex-plus-plugin-status" data-codex-plugin-market-status="true" role="status" aria-live="polite"></div>
-        <div class="codex-plus-plugin-results" data-codex-plugin-results="true" role="list" aria-label="插件结果"></div>
-        <div class="codex-plus-plugin-pagination"><span data-codex-plugin-result-count="true"></span><button type="button" class="codex-plus-button" data-codex-plugin-page="previous">上一页</button><button type="button" class="codex-plus-button" data-codex-plugin-page="next">下一页</button></div>
-      </div></div></div>`;
-    overlay.addEventListener("input", (event) => {
-      if (!event.target?.matches?.("[data-codex-plugin-query]")) return;
-      state.query = event.target.value;
-      state.page = 1;
-      renderCodexPlusPluginMarket();
-    });
-    overlay.addEventListener("change", (event) => {
-      if (!event.target?.matches?.("[data-codex-plugin-installed]")) return;
-      state.installedOnly = event.target.checked;
-      state.page = 1;
-      renderCodexPlusPluginMarket();
-    });
-    overlay.addEventListener("click", (event) => {
-      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      const source = target?.closest("[data-codex-plugin-source]");
-      if (source) {
-        state.source = source.dataset.codexPluginSource === "full" ? "full" : "public";
-        state.page = 1;
-        void loadCodexPlusPluginMarket(state.source);
-        return;
-      }
-      if (target?.closest("[data-codex-plugin-refresh]")) {
-        void loadCodexPlusPluginMarket(state.source, true);
-        return;
-      }
-      const install = target?.closest("[data-codex-plugin-install]");
-      if (install && !install.disabled) {
-        void installCodexPlusPluginMarketPlugin(state.source, install.dataset.codexPluginInstall);
-        return;
-      }
-      const page = target?.closest("[data-codex-plugin-page]");
-      if (page && !page.disabled) {
-        state.page += page.dataset.codexPluginPage === "next" ? 1 : -1;
-        renderCodexPlusPluginMarket();
-        overlay.querySelector(".codex-plus-modal-body")?.scrollTo?.({ top: 0 });
-      }
-    });
-    document.body.appendChild(overlay);
-    positionCodexPlusPage(overlay);
-    document.querySelectorAll('[data-codex-plus-ext-rail-active="true"]').forEach((node) => {
-      node.removeAttribute("data-codex-plus-ext-rail-active");
-      const button = node.querySelector("button") || node;
-      button.dataset.active = "false";
-      button.removeAttribute("data-selected");
-      button.removeAttribute("aria-current");
-    });
-    setCodexPlusSidebarNavActive(true, "plugin-market");
-    // 拓展页面可能留下捕获旧 overlay 的 resize 回调，重开后必须改为查询当前 DOM。
-    window.removeEventListener("resize", window.__codexPlusPageResizeHandler);
-    window.__codexPlusPageResizeHandler = () => positionCodexPlusPage(document.querySelector(`.${codexPlusPageClass}`));
-    window.addEventListener("resize", window.__codexPlusPageResizeHandler);
-    renderCodexPlusPluginMarket();
-    void loadCodexPlusPluginMarket(state.source);
-    Object.entries(state.jobs).forEach(([key, job]) => {
-      if (!job.busy) return;
-      const colon = key.indexOf(":");
-      scheduleCodexPlusPluginMarketInstallPoll(key.slice(0, colon), key.slice(colon + 1));
-    });
-  }
-  /**
    * 复用原生插件页面：仅接管带独立索引标记的详情与安装，其他插件仍走原接口。
-   * 当前验证的传输有 client.sendRequest、fetch envelope 和 mcp-request envelope。
+   * 当前验证的传输有 client.sendRequest、fetch envelope、mcp-request envelope，
+   * 以及页面到宿主的 MessagePort RPC（codexPlusPluginNativeRpcHandler，Codex 26.1117 上的插件请求只走这条）。
    * 安装请求只发一次；桥接超时后查询后台任务，不能回落到原生 plugin/install。
+   * 装完后按包里声明的连接器提示下一步：MCP 服务可以直接登录，ChatGPT 托管的要有 ChatGPT 登录。
    */
   const codexPlusPluginNativeVersion = "1";
   const codexPlusPluginNativeState = window.__codexPlusPluginNativeState || {
@@ -24416,11 +25468,156 @@ ${key} = ${value}`]);
     return JSON.parse(JSON.stringify(await promise));
   }
 
+  function codexPlusPluginNativeIndexMarket(market) {
+    return Boolean(codexPlusPluginNativeSource({ marketplacePath: market?.path, localMarketplaceName: market?.name }));
+  }
+
+  /**
+   * Codex 26.1117 的插件页按市场名分页签：名字或显示名规整后落在这几个里的进「公开」，其余进「个人」。
+   * 索引目录的显示名（后端 native_market）也按这条规则取，所以和官方插件同在「公开」页签、一起按分类分组。
+   */
+  const codexPlusPluginNativePublicMarketNames = new Set([
+    "codex-official", "openai-bundled", "openai-curated", "openai-curated-remote", "openai-primary-runtime",
+  ]);
+
+  function codexPlusPluginNativePublicMarket(market) {
+    return [market?.name, market?.interface?.displayName].some((value) => typeof value === "string"
+      && codexPlusPluginNativePublicMarketNames.has(value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")));
+  }
+
+  /** 同在「公开」页签的官方市场里已有同名插件时，不再列索引里的那一个；已经从索引装上的保留，方便管理。 */
+  function codexPlusPluginNativeWithoutOfficial(extra, base) {
+    const official = new Set((Array.isArray(base.marketplaces) ? base.marketplaces : [])
+      .filter((market) => codexPlusPluginNativePublicMarket(market) && !codexPlusPluginNativeIndexMarket(market))
+      .flatMap((market) => (Array.isArray(market.plugins) ? market.plugins : []).map((plugin) => plugin?.name)));
+    if (official.size === 0 || !Array.isArray(extra?.marketplaces)) return extra;
+    // 被官方同名插件顶掉的索引条目：记下它的索引 id，排版时官方那一个排在它的位置上。
+    const twins = {};
+    return {
+      ...extra,
+      marketplaces: extra.marketplaces.map((market) => codexPlusPluginNativeIndexMarket(market) && Array.isArray(market.plugins)
+        ? {
+          ...market,
+          plugins: market.plugins.filter((plugin) => {
+            if (plugin?.installed === true || !official.has(plugin?.name)) return true;
+            if (typeof plugin.codexPlusIndexId === "string") twins[plugin.name] = plugin.codexPlusIndexId;
+            return false;
+          }),
+        }
+        : market),
+      codexPlusOfficialTwins: twins,
+    };
+  }
+
+  /**
+   * 有官方目录的分组（索引里的 `sections`）时，把「公开」页签里的本机插件和官方插件排成和官方目录一样的分组：
+   * 组名用官方目录的（按当前界面语言）、组内按官方顺序，人工编排的合集（热门等）另外补一份条目。
+   * 只改顺序和组名，条目本身仍是 plugin/list 返回的那些。
+   */
+  function codexPlusPluginNativeSectionLabel(section) {
+    return codexPlusResolveText(section?.title).trim();
+  }
+
+  /** 组的标识：官方目录的 slug（`developer-tools`）按文字也能对上包清单里的分类（`Developer Tools`）。 */
+  function codexPlusPluginNativeSectionKey(label) {
+    return String(label || "").trim().toLowerCase().replaceAll(" ", "-");
+  }
+
+  /**
+   * 按官方目录排版：页面是按每个插件的分类文字分组的（分组标题就是这段文字），所以
+   * - 官方分组里的插件，分类换成那一组在当前界面语言下的组名；人工编排的合集另列一份、分类写合集名；
+   * - 不在官方分组里的按自己的分类归组（英文分类名换成同一组的组名），排在官方列过的后面。
+   * 组内先后靠返回顺序：页面按市场数组依次展开，所以同一个市场拆成几段、和别的市场穿插着排
+   * （官方插件才能排到它在官方目录里的位置）。组的先后页面按组名排，另用样式纠正（codexPlusPluginNativeSectionOrder）。
+   */
+  function codexPlusPluginNativeArrange(result, method) {
+    const { codexPlusSections, codexPlusOfficialTwins, ...rest } = result || {};
+    const sections = method === "list-plugins" && Array.isArray(codexPlusSections) ? codexPlusSections : [];
+    const markets = Array.isArray(rest.marketplaces) ? rest.marketplaces : [];
+    if (sections.length === 0 || !markets.some(codexPlusPluginNativeIndexMarket)) return rest;
+    const labels = sections.map(codexPlusPluginNativeSectionLabel);
+    const rankByKey = new Map();
+    sections.forEach((section, rank) => {
+      for (const key of [section.slug, section.title?.en, labels[rank]]) if (key) rankByKey.set(codexPlusPluginNativeSectionKey(key), rank);
+    });
+    // 本机目录永远算在内；有官方目录时，原生会排进「公开」页签的市场（官方那几个）一起排。
+    const official = markets.some((market) => codexPlusPluginNativePublicMarket(market) && !codexPlusPluginNativeIndexMarket(market));
+    const arranged = (market) => codexPlusPluginNativeIndexMarket(market) || (official && codexPlusPluginNativePublicMarket(market));
+    const entries = [];
+    markets.forEach((market) => {
+      if (!arranged(market)) return;
+      for (const plugin of market.plugins || []) entries.push({ market, plugin });
+    });
+    // 官方目录按索引 id 列成员：索引条目用自己的 id，顶掉同名索引条目的官方插件用被顶掉那一个的 id。
+    const keyed = new Map();
+    for (const entry of entries) {
+      const key = entry.plugin?.codexPlusIndexId ?? codexPlusOfficialTwins?.[entry.plugin?.name];
+      if (typeof key === "string") keyed.set(key, entry);
+    }
+    const categorized = (plugin, label) => plugin.interface && typeof plugin.interface === "object"
+      ? { ...plugin, interface: { ...plugin.interface, category: label } } : plugin;
+    const listed = [];
+    const placed = new Set();
+    sections.forEach((section, rank) => {
+      (section.plugins || []).forEach((id, member) => {
+        const entry = keyed.get(id);
+        if (!entry) return;
+        if (section.curated) {
+          // 合集里另列一份（官方目录里同一个插件既在合集、又在自己的分类里）：名字不变，详情和安装仍按名字找。
+          // 装好的只列在自己的分类里，切换和卸载按原来的 id 认。
+          const { name, installed } = entry.plugin;
+          if (installed === true || typeof name !== "string" || typeof entry.market.name !== "string") return;
+          listed.push({ market: entry.market, rank: [rank, member], plugin: { ...categorized(entry.plugin, labels[rank]), id: `${name}@${entry.market.name}-${section.slug}` } });
+        } else if (!placed.has(entry)) {
+          placed.add(entry);
+          listed.push({ market: entry.market, rank: [rank, member], plugin: categorized(entry.plugin, labels[rank]) });
+        }
+      });
+    });
+    const otherAt = rankByKey.get("other") ?? sections.length;
+    entries.forEach((entry, position) => {
+      if (placed.has(entry)) return;
+      const rank = rankByKey.get(codexPlusPluginNativeSectionKey(entry.plugin?.interface?.category || "Other")) ?? otherAt;
+      listed.push({ market: entry.market, rank: [rank + 0.5, position], plugin: rank < sections.length ? categorized(entry.plugin, labels[rank]) : entry.plugin });
+    });
+    listed.sort((left, right) => left.rank[0] - right.rank[0] || left.rank[1] - right.rank[1]);
+    const output = [];
+    for (const item of listed) {
+      const last = output.at(-1);
+      if (last && last.name === item.market.name && last.path === item.market.path) last.plugins.push(item.plugin);
+      else output.push({ ...item.market, plugins: [item.plugin] });
+    }
+    for (const market of markets) if (!arranged(market)) output.push(market);
+    codexPlusPluginNativeSectionOrder(labels);
+    return { ...rest, marketplaces: output, featuredPluginIds: [] };
+  }
+
+  const codexPlusPluginNativeSectionStyleId = "codex-plus-plugin-section-order";
+
+  /** 页面按组名的字母序排分组；这里按官方顺序给每一组定位置（分组的容器是纵向 flex）。传 null 撤掉。 */
+  function codexPlusPluginNativeSectionOrder(labels) {
+    let style = document.getElementById?.(codexPlusPluginNativeSectionStyleId);
+    if (!labels) {
+      style?.remove();
+      return;
+    }
+    if (!style) {
+      style = document.createElement("style");
+      style.id = codexPlusPluginNativeSectionStyleId;
+      (document.head || document.documentElement).appendChild(style);
+    }
+    // 分组的 id 是「plugins-」加组名（去首尾空白、转小写、空格换连字符）。
+    style.textContent = labels.map((label, order) => {
+      const id = `plugins-${codexPlusPluginNativeSectionKey(label)}`.replace(/["\\]/g, "\\$&");
+      return `section[id="${id}"] { order: ${order}; }`;
+    }).join("\n");
+  }
+
   function codexPlusPluginNativeMerge(original, extra, method) {
     const base = original && typeof original === "object" ? original : {};
+    extra = codexPlusPluginNativeWithoutOfficial(extra, base);
     const managedIds = new Set((extra?.marketplaces || []).flatMap((market) =>
-      codexPlusPluginNativeSource({ marketplacePath: market.path, localMarketplaceName: market.name })
-        ? (market.plugins || []).map((plugin) => plugin.id) : []));
+      codexPlusPluginNativeIndexMarket(market) ? (market.plugins || []).map((plugin) => plugin.id) : []));
     const markets = Array.isArray(base.marketplaces) ? base.marketplaces.map((market) => {
       if (!/^codex-plus-plugin-market-[a-f0-9]{12}$/.test(market.name || "") || !Array.isArray(market.plugins)) return market;
       // 已安装目录也会从原生本地市场返回；只消除我们自己 namespace 内同 id 的重复。
@@ -24440,9 +25637,48 @@ ${key} = ${value}`]);
       marketplaceLoadErrors: [...(Array.isArray(base.marketplaceLoadErrors) ? base.marketplaceLoadErrors : []), ...(extra?.marketplaceLoadErrors || [])],
       __codexPlusIndexMerged: true,
     };
-    if (method === "list-plugins") result.featuredPluginIds = [...new Set([...(base.featuredPluginIds || []), ...(extra?.featuredPluginIds || [])])];
+    if (method === "list-plugins") {
+      result.featuredPluginIds = [...new Set([...(base.featuredPluginIds || []), ...(extra?.featuredPluginIds || [])])];
+      // 有官方分组时按官方目录排版（组名、顺序、合集），并清掉原生 Featured：合集已经由分组给出。
+      if (Array.isArray(extra?.codexPlusSections) && extra.codexPlusSections.length > 0) {
+        result.codexPlusSections = extra.codexPlusSections;
+        result.codexPlusOfficialTwins = extra.codexPlusOfficialTwins;
+      }
+      // 索引目录并进了插件页，分类标题才做成链接（见 codexPlusPluginCategoryOpen）。
+      const listed = (extra?.marketplaces || []).some((market) => codexPlusPluginNativeIndexMarket(market) && market.plugins?.length > 0);
+      document.documentElement?.toggleAttribute(codexPlusPluginCategoryAttribute, listed);
+      if (!listed) codexPlusPluginNativeSectionOrder(null);
+    }
     codexPlusPluginNativeRemember(result);
-    return result;
+    return codexPlusPluginNativeArrange(result, method);
+  }
+
+  /**
+   * 「公开」页签的分类每组只显示 6 个。Codex 只给云端目录（要 ChatGPT 登录）的分类标题做了「看这一类全部」的链接，
+   * 本机目录的分类标题是纯文字，但同一个分类页对本机目录一样有效：这里把纯文字标题补成链接（样式见 10-style）。
+   * 「个人」页签按市场分组的标题不归这里管。
+   */
+  const codexPlusPluginCategoryAttribute = "data-codex-plus-plugin-categories";
+  const codexPlusPluginCategoryTitle = 'section[id^="plugins-"]:not([id^="plugins-marketplace-"], #plugins-created-by-you, #plugins-shared-with-you)'
+    + ' > [data-slot="section-header"] > h2:not(:has(*))';
+
+  function codexPlusPluginCategoryOpen(event) {
+    if (event.button !== 0 || event.defaultPrevented || !document.documentElement.hasAttribute(codexPlusPluginCategoryAttribute)) return;
+    const title = event.target instanceof Element ? event.target.closest(codexPlusPluginCategoryTitle) : null;
+    if (!title) return;
+    // 分类页按「plugins-<分类>」找本机目录里的这一组，分类就是这一节 id 去掉前缀。
+    const category = title.closest("section").id.slice("plugins-".length);
+    if (!category) return;
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { type: "navigate-to-route", path: `/plugins?category=${encodeURIComponent(category)}` },
+      source: window, origin: window.location.origin,
+    }));
+  }
+
+  function installCodexPlusPluginCategoryLinks() {
+    document.removeEventListener("click", window.__codexPlusPluginCategoryOpen);
+    window.__codexPlusPluginCategoryOpen = codexPlusPluginCategoryOpen;
+    document.addEventListener("click", codexPlusPluginCategoryOpen);
   }
 
   function codexPlusPluginNativeSearchTerms(value) {
@@ -24479,12 +25715,16 @@ ${key} = ${value}`]);
       return result;
     }
     const seen = new Set(data.map((entry) => entry?.plugin?.id).filter(Boolean));
+    const official = new Set(data.filter((entry) => !/^codex-plus-/.test(entry?.marketplaceName || ""))
+      .map((entry) => entry?.plugin?.name).filter(Boolean));
     const limit = Number.isInteger(operation.params?.limit) && operation.params.limit > 0 ? operation.params.limit : 50;
     const matches = [];
     for (const market of catalog.marketplaces || []) {
-      if (!codexPlusPluginNativeSource({ marketplacePath: market.path, localMarketplaceName: market.name })) continue;
+      if (!codexPlusPluginNativeIndexMarket(market)) continue;
       for (const plugin of market.plugins || []) {
         if (typeof plugin?.id !== "string" || seen.has(plugin.id)) continue;
+        // 原生结果里已有同名插件：和列表一样不重复列，已装的保留。
+        if (plugin.installed !== true && official.has(plugin.name)) continue;
         const rank = codexPlusPluginNativeSearchRank(plugin, terms);
         if (rank < 0) continue;
         seen.add(plugin.id);
@@ -24508,10 +25748,127 @@ ${key} = ${value}`]);
     }
   }
 
-  function codexPlusPluginNativeInvalidate() {
+  function codexPlusPluginNativeInvalidate(result) {
     codexPlusPluginNativeCatalogs.clear();
     clearPluginMarketplaceQueryCache();
-    showToast("插件已安装，新开聊天或重启 Codex 后加载。");
+    void codexPlusPluginNativeConnectorHint(result);
+  }
+
+  // 带按钮的提示要留够时间看完再点。
+  const codexPlusPluginNativeHintMs = 60_000;
+
+  /** 本机 app-server 里这些 MCP 服务的登录状态（name → authStatus）；还没加载出来的不在表里。 */
+  async function codexPlusPluginNativeMcpAuth(client, names) {
+    const wanted = new Set(names);
+    const found = new Map();
+    let cursor = null;
+    for (let page = 0; page < 10; page += 1) {
+      const result = await client.sendRequest("mcpServerStatus/list", { ...(cursor ? { cursor } : {}), limit: 100, detail: "toolsAndAuthOnly" });
+      for (const entry of Array.isArray(result?.data) ? result.data : []) {
+        if (wanted.has(entry?.name)) found.set(entry.name, entry.authStatus);
+      }
+      cursor = result?.nextCursor ?? null;
+      if (!cursor) break;
+    }
+    return found;
+  }
+
+  /**
+   * 装完后的提示。后端在安装结果里带上包内声明的连接器：
+   * codexPlusMcpServers 是 `.mcp.json` 里的服务名，codexPlusHostedOnly 表示只有 ChatGPT 托管的连接器、
+   * 而 Codex 现在没有 ChatGPT 登录。Codex 读配置时就会加载新装插件的 MCP 服务，不用等重启。
+   */
+  async function codexPlusPluginNativeConnectorHint(result) {
+    const servers = (Array.isArray(result?.codexPlusMcpServers) ? result.codexPlusMcpServers : [])
+      .filter((name) => typeof name === "string" && name);
+    if (servers.length === 0) {
+      if (result?.codexPlusHostedOnly !== true) {
+        showToast("插件已安装，新开聊天或重启 Codex 后加载。");
+        return;
+      }
+      showToast("插件已安装。它的连接器由 ChatGPT 托管，要有 ChatGPT 登录才能连接；Skills 新开聊天后可用。", {
+        durationMs: codexPlusPluginNativeHintMs, actionLabel: "添加 ChatGPT 账号",
+        onAction: () => postJson("/manager/open", { page: "relay" }),
+      });
+      return;
+    }
+    let auth = new Map();
+    try {
+      auth = await codexPlusPluginNativeMcpAuth(await codexPlusAppServerClient("local"), servers);
+    } catch {
+      // 查不到状态时按「还没加载」处理，下面给出手动登录的入口。
+    }
+    const pending = servers.filter((name) => auth.get(name) === "notLoggedIn");
+    if (pending.length > 0) {
+      codexPlusPluginNativeOfferMcpLogin(`插件已安装。连接器 ${pending[0]} 要登录后才能使用。`, pending);
+    } else if (servers.every((name) => auth.has(name))) {
+      // 已经登录过，或这个服务不需要登录。
+      showToast("插件已安装，新开聊天或重启 Codex 后加载。");
+    } else {
+      showToast(`插件已安装。连接器 ${servers.join("、")} 还没加载：重启 Codex 后，需要登录的话到「设置 → MCP」。`, {
+        durationMs: codexPlusPluginNativeHintMs, actionLabel: "打开 MCP 设置",
+        onAction: () => {
+          // Codex 只认 source、origin 都是本页的宿主消息，缺一个就不跳转。
+          window.dispatchEvent(new MessageEvent("message", {
+            data: { type: "navigate-to-route", path: "/settings/mcp-settings" }, source: window, origin: window.location.origin,
+          }));
+        },
+      });
+    }
+  }
+
+  function codexPlusPluginNativeOfferMcpLogin(message, names) {
+    const [name, ...rest] = names;
+    showToast(message, {
+      durationMs: codexPlusPluginNativeHintMs, actionLabel: "登录",
+      onAction: () => codexPlusPluginNativeMcpLogin(name, rest),
+    });
+  }
+
+  /**
+   * 用 Codex 自带的 MCP OAuth 登录：授权页交给系统浏览器，回调由本机 app-server 接收并保存凭据，
+   * 这里不经手 token。以后要重新登录走原生的「设置 → MCP」。
+   */
+  async function codexPlusPluginNativeMcpLogin(name, rest) {
+    const client = await codexPlusAppServerClient("local");
+    const watch = { subscription: null, handle: null, timer: 0, loginId: "" };
+    const release = () => {
+      clearTimeout(watch.timer);
+      try { watch.handle?.[Symbol.dispose]?.(); } catch {}
+      try { watch.subscription?.[Symbol.dispose]?.(); } catch {}
+    };
+    watch.subscription = client.subscribe({
+      type: "notification",
+      key: { hostId: "local" },
+      methods: ["mcpServer/oauthLogin/completed"],
+      listener: ({ params }) => {
+        if (params?.name !== name) return;
+        if (watch.loginId && params.loginId && params.loginId !== watch.loginId) return;
+        release();
+        if (params.success !== true) {
+          showToast(`连接器 ${name} 的登录没有完成${params.error ? `：${params.error}` : "。"}`, { type: "warn" });
+          return;
+        }
+        // 让已经打开的会话也重新连接这个服务。
+        Promise.resolve(client.sendRequest("config/mcpServer/reload", {})).catch(() => {});
+        if (rest.length > 0) codexPlusPluginNativeOfferMcpLogin(`连接器 ${name} 已登录。${rest[0]} 也要登录。`, rest);
+        else showToast(`连接器 ${name} 已登录，新开聊天后可用。`, { type: "success" });
+      },
+    });
+    watch.handle = await watch.subscription;
+    // 授权页一直没点完就不再等；之后可以从「设置 → MCP」重新登录。
+    watch.timer = setTimeout(release, 15 * 60_000);
+    try {
+      const result = await client.sendRequest("mcpServer/oauth/login", { name });
+      const url = String(result?.authorizationUrl || "");
+      if (!/^https?:\/\/[^\s/]/i.test(url)) throw new Error("Codex 没有返回授权地址");
+      watch.loginId = typeof result.loginId === "string" ? result.loginId : "";
+      // Electron 里只有 window.open 会把链接交给系统浏览器。
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (error) {
+      release();
+      throw new Error(`连接器 ${name} 的登录没能开始：${error?.message || error}`);
+    }
   }
 
   async function codexPlusPluginNativeManaged(operation, source) {
@@ -24536,7 +25893,7 @@ ${key} = ${value}`]);
       try {
         const result = await codexPlusPluginNativeBackend("install-plugin", operation.params, source);
         if (result?.authPolicy && Array.isArray(result.appsNeedingAuth)) {
-          codexPlusPluginNativeInvalidate();
+          codexPlusPluginNativeInvalidate(result);
           return result;
         }
         throw new Error("正在等待插件安装结果");
@@ -24556,7 +25913,7 @@ ${key} = ${value}`]);
         }
         if (status?.busy === true) { communicationFailures = 0; continue; }
         if (status?.busy === false && status.stage === "complete" && status.nativeResult?.authPolicy && Array.isArray(status.nativeResult.appsNeedingAuth)) {
-          codexPlusPluginNativeInvalidate();
+          codexPlusPluginNativeInvalidate(status.nativeResult);
           return status.nativeResult;
         }
         if (status?.busy === false) throw new Error(status.message || "插件安装未完成，请重试。");
@@ -24587,6 +25944,28 @@ ${key} = ${value}`]);
       }
       return await codexPlusPluginNativeExtend(operation, result);
     })();
+  }
+
+  /**
+   * RPC 传输（见 91-extension-rpc）下的一次插件请求。返回 null 表示不管；`{ answer }` 表示由本层作答、
+   * 原生不执行；`{ extend }` 表示等原生回包后补索引条目，extend 返回 null 时回包原样放行。
+   */
+  function codexPlusPluginNativeRpcHandler(method, params, hostId) {
+    if (!codexPluginMarketplacePatchEnabled()) return null;
+    const operation = codexPlusPluginNativeOperation(method, params, hostId);
+    const source = codexPlusPluginNativeSource(operation.params);
+    if (source && ["read-plugin", "install-plugin"].includes(operation.method)) {
+      return { answer: () => codexPlusPluginNativeManaged(operation, source) };
+    }
+    if (!codexPlusPluginNativeListAllowed(operation)) return null;
+    return {
+      extend(result, error) {
+        if (error != null) return pluginMarketplaceRemoteAuthError(error) ? codexPlusPluginNativeExtend(operation, {}) : null;
+        // 回包按序号对回请求；形状不符说明没对上，不能把目录补进别的结果里。
+        const shaped = operation.method === "search-plugins" ? Array.isArray(result?.data) : Array.isArray(result?.marketplaces);
+        return shaped ? codexPlusPluginNativeExtend(operation, result) : null;
+      },
+    };
   }
 
   function codexPlusPluginNativeEnvelope(message) {
@@ -25129,7 +26508,7 @@ ${key} = ${value}`]);
     if (!client) return;
     const queries = client.getQueryCache().findAll({
       queryKey: ["models", "list", "local"],
-      predicate: (query) => query.queryKey[3] !== "team",
+      predicate: (query) => query.queryKey[3] !== "team" && !query.queryKey.includes("page"),
     });
     for (const query of queries) {
       const response = query.state.data;
@@ -25159,7 +26538,21 @@ ${key} = ${value}`]);
   function modelReasoningEfforts(modelName) {
     const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
     if (Array.isArray(supported) && supported.length > 0) {
-      return supported.map((entry) => typeof entry === "string" ? entry : { ...entry });
+      // 目录声明存在三种形态：字符串数组（provider 配置）、Codex 原生 {effort} 对象
+      // 与前端 {reasoningEffort} 对象。归一化后再消费，避免 {...entry} 把字符串展开
+      // 成空对象、或 {effort} 条目因缺少 reasoningEffort 字段被界面过滤掉（#3210）。
+      const efforts = supported.flatMap((entry) => {
+        if (typeof entry === "string") return entry ? [{ reasoningEffort: entry }] : [];
+        if (!entry || typeof entry !== "object") return [];
+        const effort = typeof entry.reasoningEffort === "string" && entry.reasoningEffort
+          ? entry.reasoningEffort
+          : typeof entry.effort === "string" && entry.effort ? entry.effort : "";
+        if (!effort) return [];
+        const next = { ...entry, reasoningEffort: effort };
+        delete next.effort;
+        return [next];
+      });
+      return efforts;
     }
     return [];
   }
@@ -25390,6 +26783,12 @@ ${key} = ${value}`]);
       descriptor.priority = metadata.priority;
       changed = true;
     }
+    for (const [key, value] of Object.entries(codexPlusModelServiceTiers(metadata, descriptor))) {
+      if (JSON.stringify(descriptor[key] ?? []) !== JSON.stringify(value)) {
+        descriptor[key] = value;
+        changed = true;
+      }
+    }
     // 图片输入能力（#3042）：只在目录/元数据明确声明时覆盖，没声明保留原生描述符的值。
     const modalities = codexPlusModelInputModalities(metadata);
     if (modalities && JSON.stringify(descriptor.inputModalities ?? null) !== JSON.stringify(modalities)) {
@@ -25405,14 +26804,6 @@ ${key} = ${value}`]);
       const nextEfforts = modelReasoningEfforts(modelName);
       if (JSON.stringify(descriptor.supportedReasoningEfforts || []) !== JSON.stringify(nextEfforts)) {
         descriptor.supportedReasoningEfforts = nextEfforts;
-        changed = true;
-      }
-    }
-    for (const key of ["additionalSpeedTiers", "serviceTiers"]) {
-      if (!Array.isArray(metadata[key])) continue;
-      const nextValue = metadata[key].map((entry) => entry && typeof entry === "object" ? { ...entry } : entry);
-      if (JSON.stringify(descriptor[key] || []) !== JSON.stringify(nextValue)) {
-        descriptor[key] = nextValue;
         changed = true;
       }
     }
@@ -25442,17 +26833,32 @@ ${key} = ${value}`]);
       ...(Number.isInteger(metadata?.priority) ? { priority: metadata.priority } : {}),
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
-      ...(Array.isArray(metadata?.additionalSpeedTiers)
-        ? { additionalSpeedTiers: metadata.additionalSpeedTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry) }
-        : {}),
-      ...(Array.isArray(metadata?.serviceTiers)
-        ? { serviceTiers: metadata.serviceTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry) }
-        : {}),
+      ...codexPlusModelServiceTiers(metadata),
       // 图片输入能力只带目录/元数据里声明过的；没声明不写，不替未知模型宣称收图，
       // 与此前的原生行为一致。
       ...(modalities ? { inputModalities: modalities } : {}),
       ...(original !== null ? { supportsImageDetailOriginal: original } : {}),
     };
+  }
+
+  function codexPlusModelServiceTiers(metadata, descriptor) {
+    if (!metadata) return {};
+    const denyFast = metadata.prioritySupportOverride === false;
+    const fields = {};
+    // New-chat model queries use these descriptors before a thread exists.
+    for (const [key, id] of [["serviceTiers", "priority"], ["additionalSpeedTiers", "fast"]]) {
+      const declared = metadata[key];
+      if (Array.isArray(declared) && declared.length) {
+        fields[key] = structuredClone(declared);
+      }
+      if (denyFast) {
+        const existing = fields[key] ?? descriptor?.[key];
+        if (Array.isArray(existing)) {
+          fields[key] = existing.filter((tier) => String(typeof tier === "string" ? tier : tier?.id || "").trim().toLowerCase() !== id);
+        }
+      }
+    }
+    return fields;
   }
 
   // 元数据里声明的输入模态（camelCase / snake_case 都认），没声明返回 null。
@@ -26605,13 +28011,77 @@ ${key} = ${value}`]);
 
   // model/list 可在注入前进入 React Query 缓存；只拦后续 RPC 会留下隐藏的来源模型。
   // 只处理明确属于本机的模型查询，不修改远程主机、会话设置或账号身份。
+  function codexPlusLocalModelQueryKey(key) {
+    return Array.isArray(key) && key[0] === "models" && key[1] === "list" && key[2] === "local"
+      && key[3] !== "team" && !key.includes("page");
+  }
+
+  function codexPlusLocalGatewaySelection(requestedProvider, result, response) {
+    if (!codexPlusModelUnlockEnabled() || !codexGatewaySessionRoutingEnabled()
+        || response?.isTeamCatalog || result?.isTeamCatalog
+        || !Array.isArray(result?.models) || !Array.isArray(response?.data) || response.nextCursor) return result;
+    const provider = codexRemoteSessionTargetProvider();
+    if (!provider || (requestedProvider && requestedProvider !== provider)) return result;
+    // Work's local native picker can apply the login account's allowlist after model/list.
+    // Restore routes owned by the active gateway catalog, never account or team models.
+    const present = new Set(result.models.map((entry) => entry.model));
+    const append = response.data.filter((entry) => {
+      const model = entry?.model;
+      if (typeof model !== "string" || entry.hidden !== false || present.has(model)
+          || entry.availableAccessPrograms?.cyber?.length || entry.modelSpecialty
+          || !Array.isArray(entry.supportedReasoningEfforts)
+          || (entry.modelProvider && entry.modelProvider !== provider)) return false;
+      const metadata = codexPlusModelMetadata(model);
+      const group = metadata?.codex_plus_group_id;
+      const hasOwner = typeof group === "string" && group.length > 0;
+      if (metadata?.codex_plus_native_account === true
+          || !(hasOwner || /^(?:group|codex-plus-auto)\/\S/.test(model) || /^[^:/]+:\S/.test(model))
+          || codexRemoteSessionTargetProvider(model) !== provider) return false;
+      present.add(model);
+      return true;
+    });
+    return append.length ? { ...result, models: [...result.models, ...append] } : result;
+  }
+
+  function installCodexLocalModelQuerySelector(client) {
+    const previous = client.__codexPlusLocalModelQuerySelector;
+    if (previous) {
+      previous.select = codexPlusLocalGatewaySelection;
+      return;
+    }
+    if (typeof client.defaultQueryOptions !== "function") return;
+    const original = client.defaultQueryOptions;
+    const wrappers = new WeakMap();
+    const alreadyWrapped = new WeakSet();
+    const state = { select: codexPlusLocalGatewaySelection };
+    client.defaultQueryOptions = function (...args) {
+      const options = original.apply(this, args);
+      const { queryKey, select } = options || {};
+      if (!codexPlusLocalModelQueryKey(queryKey) || queryKey[3] !== "chatgpt"
+          || typeof select !== "function" || alreadyWrapped.has(select)) return options;
+      const requestedProvider = queryKey.find((part) => typeof part?.modelProvider === "string")?.modelProvider || "";
+      let variants = wrappers.get(select);
+      if (!variants) wrappers.set(select, variants = new Map());
+      let wrapped = variants.get(requestedProvider);
+      if (!wrapped) {
+        wrapped = function (response) {
+          return state.select(requestedProvider, select.call(this, response), response);
+        };
+        variants.set(requestedProvider, wrapped);
+        alreadyWrapped.add(wrapped);
+      }
+      return { ...options, select: wrapped };
+    };
+    client.__codexPlusLocalModelQuerySelector = state;
+  }
+
   function refreshCodexModelQueryCache(client = findCodexUsageQueryClient()) {
     if (!codexPlusModelUnlockEnabled() || codexModelCatalog.status !== "ok"
         || !codexPlusModelNames().length || !client?.getQueryCache || !client?.setQueryData) return 0;
     let changed = 0;
     for (const query of client.getQueryCache().findAll({ queryKey: ["models", "list", "local"] })) {
       const key = query.queryKey;
-      if (!Array.isArray(key) || key[0] !== "models" || key[1] !== "list" || key[2] !== "local"
+      if (!codexPlusLocalModelQueryKey(key) || query.state?.data?.isTeamCatalog
           || !query.state?.data || typeof query.state.data !== "object") continue;
       try {
         const data = structuredClone(query.state.data);
@@ -26629,6 +28099,7 @@ ${key} = ${value}`]);
   function installCodexModelQueryCachePatch() {
     const client = findCodexUsageQueryClient();
     if (!client?.getQueryCache) return;
+    installCodexLocalModelQuerySelector(client);
     const previous = window.__codexPlusModelQueryCacheRuntime;
     if (previous?.client === client && previous?.patch === refreshCodexModelQueryCache) {
       previous.refresh();
@@ -26643,8 +28114,7 @@ ${key} = ${value}`]);
     };
     const unsubscribe = client.getQueryCache().subscribe((event) => {
       const key = event?.query?.queryKey;
-      if (event?.type === "updated" && key?.[0] === "models" && key?.[1] === "list"
-          && key?.[2] === "local") refresh();
+      if (event?.type === "updated" && codexPlusLocalModelQueryKey(key)) refresh();
     });
     window.__codexPlusModelQueryCacheRuntime = {
       client, patch: refreshCodexModelQueryCache, refresh, dispose: unsubscribe,
@@ -27829,8 +29299,8 @@ ${key} = ${value}`]);
           back: "返回供应商列表",
           unnamed: "其他供应商",
           current: "当前使用",
-          modelCount: (count) => `${count} 个模型`,
-          groupAria: (name, count, current, isDefault) => `${name}${isDefault ? "（默认供应商）" : ""}，${count} 个模型${current ? "，当前使用" : ""}`,
+          modelCount: (count, members) => `${count} 个${members ? "成员" : "模型"}`,
+          groupAria: (name, countText, current, isDefault) => `${name}${isDefault ? "（默认供应商）" : ""}，${countText}${current ? "，当前使用" : ""}`,
           groupTitle: (name, count) => `${name} · ${count}`,
           favorite: "已收藏（在 Codex++ 里收藏的模型）",
           listView: "切换为列表视图",
@@ -27850,8 +29320,8 @@ ${key} = ${value}`]);
           back: "Back to providers",
           unnamed: "Other providers",
           current: "Currently selected",
-          modelCount: (count) => `${count} models`,
-          groupAria: (name, count, current, isDefault) => `${name}${isDefault ? " (default provider)" : ""}, ${count} models${current ? ", currently selected" : ""}`,
+          modelCount: (count, members) => `${count} ${members ? "members" : "models"}`,
+          groupAria: (name, countText, current, isDefault) => `${name}${isDefault ? " (default provider)" : ""}, ${countText}${current ? ", currently selected" : ""}`,
           groupTitle: (name, count) => `${name} · ${count}`,
           favorite: "Favorite (starred in Codex++)",
           listView: "Switch to list view",
@@ -28044,8 +29514,8 @@ ${key} = ${value}`]);
     const paths = {
       list: ["M8 6h13", "M8 12h13", "M8 18h13", "M3 6h.01", "M3 12h.01", "M3 18h.01"],
       icons: ["M3 3h7v7H3z", "M14 3h7v7h-7z", "M3 14h7v7H3z", "M14 14h7v7h-7z"],
-      expand: ["m7 10 5-5 5 5", "m7 14 5 5 5-5"],
-      collapse: ["m7 5 5 5 5-5", "m7 19 5-5 5 5"],
+      expand: ["m7 6 5 5 5-5", "m7 13 5 5 5-5"],
+      collapse: ["m7 11 5-5 5 5", "m7 18 5-5 5 5"],
       chevron: ["m9 6 6 6-6 6"],
     };
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -28867,7 +30337,11 @@ ${key} = ${value}`]);
   }
 
   function codexPlusModelPickerSelectedRow(group) {
-    return group.entries.find((entry) => entry.row.matches('[data-model-selected], [aria-checked="true"], [data-state="checked"]'))?.row;
+    return group.entries.find((entry) => entry.row.matches('[data-model-selected]:not([data-model-selected="false"]), [aria-checked="true"], [data-state="checked"]'))?.row;
+  }
+
+  function codexPlusModelPickerMemberGroup(group) {
+    return group.entries?.some((entry) => entry.slug?.startsWith("group/"));
   }
 
   /** 自定义供应商没有品牌资源时，用稳定的名称头像区分不同账号。 */
@@ -28879,7 +30353,7 @@ ${key} = ${value}`]);
       : Array.from(words[0] || "?").slice(0, 2);
     let hash = 0;
     for (const character of group.id) hash = (Math.imul(hash, 31) + character.codePointAt(0)) | 0;
-    const colors = ["#64ad94", "#809cdb", "#c78e63", "#c681a5", "#9baa5e", "#6ba5b8"];
+    const colors = ["#55957F", "#6289B0", "#B58A43", "#BD7769", "#9876A7", "#7F8991"];
     return { label: letters.join("").toLocaleUpperCase(), color: colors[(hash >>> 0) % colors.length] };
   }
 
@@ -28982,6 +30456,14 @@ ${key} = ${value}`]);
     return 5;
   }
 
+  function codexPlusModelPickerPriceFill(price) {
+    const tier = codexPlusModelPickerPriceTier(price);
+    if (tier <= 0 || tier === 5) return tier;
+    const bounds = [0, 0.35, 1.2, 4, 12];
+    const score = (price.input + price.output) / 2;
+    return Math.max(0.15, tier - 1 + (score - bounds[tier - 1]) / (bounds[tier] - bounds[tier - 1]));
+  }
+
   /** 行尾价格节点：计量条或「免费」标签；无价目返回 null。最近使用行也用它。 */
   function codexPlusModelPickerPriceNode(price) {
     const tier = codexPlusModelPickerPriceTier(price);
@@ -28997,9 +30479,12 @@ ${key} = ${value}`]);
     const node = codexPlusModelPickerElement("span", codexPlusModelPickerRowMeterClass);
     node.setAttribute("aria-hidden", "true");
     node.dataset.tier = String(tier);
+    const fill = codexPlusModelPickerPriceFill(price);
+    node.dataset.fill = String(fill);
     for (let index = 0; index < 5; index += 1) {
-      const segment = document.createElement("i");
+      const segment = codexPlusModelPickerElement("i", "");
       if (index < tier) segment.className = "on";
+      segment.style.setProperty("--codex-plus-segment-fill", `${Math.max(0, Math.min(1, fill - index)) * 100}%`);
       node.appendChild(segment);
     }
     if (title) node.title = title;
@@ -29044,10 +30529,12 @@ ${key} = ${value}`]);
       host.insertBefore(meter, identity.outer.nextSibling);
       return;
     }
-    if (meter.dataset.tier !== wanted.dataset.tier) {
+    if (meter.dataset.tier !== wanted.dataset.tier || meter.dataset.fill !== wanted.dataset.fill) {
       meter.dataset.tier = wanted.dataset.tier;
+      meter.dataset.fill = wanted.dataset.fill;
       [...meter.children].forEach((segment, index) => {
         segment.classList.toggle("on", index < Number(wanted.dataset.tier));
+        segment.style.setProperty("--codex-plus-segment-fill", wanted.children[index].style.getPropertyValue("--codex-plus-segment-fill"));
       });
     }
     if (meter.title !== wanted.title) meter.title = wanted.title;
@@ -29176,6 +30663,7 @@ ${key} = ${value}`]);
     button.type = "button";
     button.title = text.pickRecent(entry.name || entry.label, entry.provider);
     button.setAttribute("aria-label", button.title);
+    button.dataset.selected = String(!!codexPlusModelPickerSelectedRow({ entries: [entry] }));
     const icon = codexPlusModelPickerElement("span", codexPlusModelPickerRowIconClass);
     icon.setAttribute("aria-hidden", "true");
     icon.innerHTML = codexPlusModelPickerGlyphHtml(codexPlusModelPickerGlyph(entry));
@@ -29238,7 +30726,7 @@ ${key} = ${value}`]);
       state.recentsSignature = "";
       return;
     }
-    const signature = `${state.viewMode}|${matched.map((entry) => entry.label).join("|")}`;
+    const signature = JSON.stringify([state.viewMode, ...matched.map((entry) => [entry.slug, entry.label, entry.provider, entry.price, !!codexPlusModelPickerSelectedRow({entries:[entry]})])]);
     if (block && state.recentsSignature === signature && block.parentElement === list) return;
     state.recentsSignature = signature;
     block?.remove();
@@ -29296,10 +30784,10 @@ ${key} = ${value}`]);
       const name = group.name || text.unnamed;
       if (label && label.textContent !== name) label.textContent = name;
       const count = header.querySelector(".codex-plus-model-group-count");
-      const countText = text.modelCount(group.entries.length);
+      const countText = text.modelCount(group.entries.length, codexPlusModelPickerMemberGroup(group));
       if (count && count.textContent !== countText) count.textContent = countText;
       codexPlusModelPickerSyncDefaultBadge(header, group, text);
-      header.setAttribute("aria-label", text.groupAria(name, group.entries.length, current, group.isDefault));
+      header.setAttribute("aria-label", text.groupAria(name, countText, current, group.isDefault));
       header.title = `${text.groupTitle(name, group.entries.length)}${current ? ` · ${text.current}` : ""}`;
     }
   }
@@ -29332,6 +30820,7 @@ ${key} = ${value}`]);
       inner.insertBefore(own, native || null);
     }
     if (own.textContent !== entry.name) own.textContent = entry.name;
+    if (own.title !== entry.name) own.title = entry.name;
     // 收藏星标跟在模型名后面；取消收藏后下一轮扫描拿掉。
     let star = [...inner.children].find((node) => node.classList.contains(codexPlusModelPickerFavoriteClass));
     if (entry.favorite && !star) {
@@ -29405,7 +30894,7 @@ ${key} = ${value}`]);
         if (label && label.textContent !== name) label.textContent = name;
         if (label) label.title = name;
         const count = toolbar.querySelector(".codex-plus-model-group-count");
-        const countText = text.modelCount(active.entries.length);
+        const countText = text.modelCount(active.entries.length, codexPlusModelPickerMemberGroup(active));
         if (count && count.textContent !== countText) count.textContent = countText;
         codexPlusModelPickerSyncDefaultBadge(toolbar, active, text);
       }
@@ -29494,7 +30983,10 @@ ${key} = ${value}`]);
     const glyph = codexPlusModelPickerProviderGlyph(group);
     const icon = codexPlusModelPickerElement("span", "codex-plus-model-provider-icon");
     icon.setAttribute("aria-hidden", "true");
-    if (glyph) {
+    if (codexPlusModelPickerGroupsState.viewMode === "list") {
+      if (codexPlusModelPickerMemberGroup(group)) icon.appendChild(codexPlusModelPickerActionIcon("icons"));
+      else icon.textContent = Array.from(group.name || avatar.label)[0];
+    } else if (glyph) {
       icon.innerHTML = glyph.svg;
       icon.setAttribute("data-brand", "true");
     } else {
@@ -29502,7 +30994,7 @@ ${key} = ${value}`]);
       const compact = codexPlusModelPickerGroupsState.viewMode === "list" && /[^\x00-\x7f]/u.test(avatar.label);
       icon.textContent = compact ? Array.from(avatar.label)[0] : avatar.label;
     }
-    icon.style.setProperty("--codex-plus-provider-color", glyph ? "#8a8a8a" : avatar.color);
+    icon.style.setProperty("--codex-plus-provider-color", glyph && codexPlusModelPickerGroupsState.viewMode !== "list" ? "#8a8a8a" : avatar.color);
     const title = codexPlusModelPickerElement("span", "codex-plus-model-group-title");
     const count = codexPlusModelPickerElement("span", "codex-plus-model-group-count");
     header.append(icon, title, count);
@@ -29802,6 +31294,20 @@ ${key} = ${value}`]);
       .codex-plus-model-row-meter i.on:nth-child(4){background:#e07f63}
       .codex-plus-model-row-meter i.on:nth-child(5){background:#b579dd}
       .codex-plus-model-row-free{flex:0 0 auto;margin-left:8px;color:#6ea8ff;font-size:11px;line-height:1;font-weight:500;white-space:nowrap}
+      [data-codex-plus-model-view-mode="list"] :is(.codex-plus-model-decorated,.codex-plus-model-recent-row){position:relative;min-height:30px;border-radius:6px}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-recent-row{padding-inline-start:28px}
+      [data-codex-plus-model-view-mode="list"] :is(.codex-plus-model-decorated,.codex-plus-model-recent-row)::before{position:absolute;inset-inline-start:8px;top:50%;transform:translateY(-50%);color:var(--color-token-text-success,#20a461);font-weight:600;pointer-events:none}
+      [data-codex-plus-model-view-mode="list"] :is(.codex-plus-model-decorated,.codex-plus-model-recent-row):is([aria-checked="true"],[data-state="checked"],[data-model-selected]:not([data-model-selected="false"]),[data-selected="true"]){background:color-mix(in srgb,var(--color-token-text-success,#20a461) 9%,var(--color-surface-elevated-secondary,Canvas));font-weight:600}
+      [data-codex-plus-model-view-mode="list"] :is(.codex-plus-model-decorated,.codex-plus-model-recent-row):is([aria-checked="true"],[data-state="checked"],[data-model-selected]:not([data-model-selected="false"]),[data-selected="true"])::before{content:'✓'}
+      [data-codex-plus-model-view-mode="list"] [data-codex-plus-model-default-row] :is(svg,[data-codex-plus-model-check]){display:none}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-decorated [data-codex-plus-model-check]{visibility:hidden;width:0;min-width:0;overflow:hidden;margin:0;padding:0}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-row-icon{width:14px;height:14px;color:var(--color-text-tertiary,#929ba2)}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-row-icon svg{width:14px;height:14px;filter:grayscale(1);opacity:.78}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-row-icon-letter{color:var(--color-text-tertiary,#929ba2)!important}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-group-header{min-height:32px;margin-block-start:6px}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-recents{border-block:1px solid var(--color-border,#eceff1);padding-block:4px}
+      [data-codex-plus-model-view-mode="list"] .codex-plus-model-row-meter i:nth-child(n){width:5px;height:3px;border-radius:1px;background:linear-gradient(to right,var(--segment-color) var(--codex-plus-segment-fill,0%),var(--color-border,#ecedee) var(--codex-plus-segment-fill,0%))}
+      .codex-plus-model-row-meter i:nth-child(1){--segment-color:#8fa795}.codex-plus-model-row-meter i:nth-child(2){--segment-color:#a4ae96}.codex-plus-model-row-meter i:nth-child(3){--segment-color:#b8b295}.codex-plus-model-row-meter i:nth-child(4){--segment-color:#c8b58c}.codex-plus-model-row-meter i:nth-child(5){--segment-color:#d6b77d}
     `;
     if (!style.isConnected) document.head?.appendChild(style);
   }
@@ -30046,203 +31552,6 @@ ${key} = ${value}`]);
     },
   };
   if (globalThis.__codexPlusBuiltinInactive?.has("model-picker-groups")) codexPlusModelPickerScan();
-  const codexPlusWorkGatewayProject = 'form button[data-composer-navigation-target="workspace-project"]';
-  const codexPlusWorkGatewayMarker = '[data-codex-plus-ext="work-gateway"]';
-  const codexPlusWorkGatewayProjects = new WeakMap();
-
-  function codexPlusWorkGatewayProps(node, matches) {
-    const key = Object.keys(node || {}).find((name) => name.startsWith("__reactFiber$"));
-    for (let fiber = node?.[key], depth = 0; fiber && depth < 60; fiber = fiber.return, depth += 1) {
-      if (matches(fiber.memoizedProps)) return fiber.memoizedProps;
-    }
-    return null;
-  }
-
-  function codexPlusWorkGatewayDirectory(project) {
-    const state = codexPlusWorkGatewayProps(project?.form || project?.closest?.("form"), (p) => !!p?.state?.runLocationState)?.state;
-    const run = state?.runLocationState;
-    if (!project?.isConnected || state?.isTemporaryChat || state?.composerProps?.conversationOrigin !== "tpp"
-        || state.composerProps.workspaceAgent || state.composerProps.targetGizmoId
-        || !["cloud", "local"].includes(run?.effectiveLocation)
-        || run.unavailableReasons?.local != null
-        || (run.effectiveLocation === "cloud" && run.unavailableReasons?.local !== null && run.canChooseLocation !== true)) return "";
-    const props = codexPlusWorkGatewayProps(project, (p) => p?.isWorkHome === true && typeof p.isLocalWorkComposer === "boolean");
-    return props?.hostId === "local" && props.isLocalWorkComposer === (run.effectiveLocation === "local") && typeof props.cwd === "string"
-      && /^(?:[A-Za-z]:[\\/]|\/(?!\/))/.test(props.cwd) ? props.cwd : "";
-  }
-
-  function codexPlusWorkGatewayModels() {
-    if (!codexGatewaySessionRoutingEnabled()) return [];
-    const models = codexModelCatalog.models;
-    const metadata = codexModelCatalog.modelMetadata;
-    if (!Array.isArray(models)) return [];
-    return models.filter((model) => {
-      if (typeof model !== "string" || metadata?.[model]?.hidden === true) return false;
-      // `/` also occurs in bare upstream model names. Only the catalog can attest a provider pin.
-      const slash = model.indexOf("/");
-      const providerPin = slash > 0 && slash < model.length - 1
-        && metadata?.[model]?.codex_plus_group_id === model.slice(0, slash);
-      return (/^(?:group|codex-plus-auto)\/\S/.test(model) || /^[^:/]+:\S/.test(model) || providerPin)
-        && codexRemoteSessionTargetProvider(model);
-    });
-  }
-
-  function codexPlusWorkGatewayMenuEntries() {
-    return codexPlusWorkGatewayModels().map(model => {
-      const metadata = codexModelCatalog.modelMetadata?.[model];
-      const label = codexPlusModelDisplayName(metadata, model);
-      const parsed = codexPlusModelPickerSplitLabel(label);
-      return {
-        model,
-        label: parsed.name || label,
-        group: metadata?.codex_plus_group || (model.startsWith("group/") ? "group" : model.startsWith("codex-plus-auto/") ? "auto" : "gateway"),
-        favorite: metadata?.codex_plus_favorite === true,
-      };
-    }).sort((a, b) => Number(b.favorite) - Number(a.favorite));
-  }
-
-  async function codexPlusOpenWorkGatewayDraft(project, model) {
-    const cwd = codexPlusWorkGatewayDirectory(project);
-    const target = () => codexPlusWorkGatewayModels().includes(model) ? codexRemoteSessionTargetProvider(model) : "";
-    const modelProvider = target();
-    if (!cwd || !modelProvider) return false;
-    const client = await codexPlusAppServerClient("local");
-    const connection = await codexGatewayConnectionGeneration();
-    if (!connection.active || codexPlusWorkGatewayDirectory(project) !== cwd || target() !== modelProvider) return false;
-    // 只开本机空白对话，不转移 Work 的正文、附件、工具或权限设置。
-    const result = await client.sendRequest("thread/start", { cwd, model, modelProvider }, { timeoutMs: 20000 });
-    const id = result?.thread?.id;
-    if (!/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(id || "") || result.model !== model || result.modelProvider !== modelProvider
-        || codexPlusWorkGatewayDirectory(project) !== cwd || target() !== modelProvider) return false;
-    window.dispatchEvent(new MessageEvent("message", { data: { type: "navigate-to-route", path: `/local/${id}` } }));
-    return true;
-  }
-
-  function installCodexPlusWorkGateway() {
-    const project = [...document.querySelectorAll(codexPlusWorkGatewayProject)]
-      .find((button) => button.getClientRects().length && codexPlusWorkGatewayDirectory(button));
-    const models = project && codexPlusWorkGatewayModels();
-    const host = models?.length ? project.parentElement : null;
-    for (const node of document.querySelectorAll(codexPlusWorkGatewayMarker)) {
-      if (node.parentElement !== host || node.dataset.generation !== String(codexPlusRuntimeGeneration)
-          || codexPlusWorkGatewayProjects.get(node) !== project) {
-        node.querySelector("[popover]")?.hidePopover();
-        node.remove();
-      }
-      else return;
-    }
-    if (!host || typeof HTMLElement.prototype.showPopover !== "function") return;
-    const zh = /^zh\b/i.test(document.documentElement.lang || navigator.language);
-    const label = zh ? "网关模型" : "Gateway models";
-    const action = zh ? "在本机 Codex 中打开新对话" : "Open a new local Codex chat";
-    const wrapper = document.createElement("span");
-    wrapper.dataset.codexPlusExt = "work-gateway";
-    wrapper.dataset.generation = String(codexPlusRuntimeGeneration);
-    codexPlusWorkGatewayProjects.set(wrapper, project);
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = project.className;
-    button.textContent = label;
-    button.title = action;
-    button.setAttribute("aria-label", `${label}: ${action}`);
-    button.setAttribute("aria-expanded", "false");
-    button.setAttribute("aria-haspopup", "dialog");
-    const panel = document.createElement("div");
-    panel.className = "codex-plus-menu-popover";
-    panel.setAttribute("popover", "auto");
-    panel.setAttribute("role", "dialog");
-    panel.setAttribute("aria-label", button.getAttribute("aria-label"));
-    Object.assign(panel.style, { position: "fixed", inset: "auto", margin: "0", border: "0", overflow: "hidden",
-      width: "min(340px, calc(100vw - 16px))", maxHeight: "min(320px, 45vh)", display: "none" });
-    button.popoverTargetElement = panel;
-    const keyboard = (event) => {
-      if (event.target?.classList?.contains("codex-plus-work-gateway-search")
-          && panel.contains(event.target) && !["Tab", "Escape"].includes(event.key)) event.stopPropagation();
-    };
-    panel.addEventListener("beforetoggle", (event) => {
-      const open = event.newState === "open";
-      panel.style.display = open ? "flex" : "none";
-      button.dataset.state = open ? "open" : "closed";
-      button.setAttribute("aria-expanded", String(open));
-      if (!open) {
-        window.removeEventListener("keydown", keyboard, true);
-        return;
-      }
-      window.addEventListener("keydown", keyboard, true);
-      const rect = button.getBoundingClientRect();
-      panel.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - 348))}px`;
-      const above = rect.top;
-      const below = innerHeight - rect.bottom;
-      const openAbove = above >= 270 || above >= below;
-      panel.style.top = openAbove ? "auto" : `${rect.bottom + 4}px`;
-      panel.style.bottom = openAbove ? `${innerHeight - rect.top + 4}px` : "auto";
-      panel.style.maxHeight = `min(320px, ${Math.max(0, (openAbove ? above : below) - 12)}px)`;
-      panel.replaceChildren();
-      const search = document.createElement("input");
-      search.type = "search";
-      search.placeholder = zh ? "查找模型或供应商" : "Find a model or provider";
-      search.setAttribute("aria-label", search.placeholder);
-      search.className = "codex-plus-work-gateway-search";
-      const list = document.createElement("div");
-      list.className = "codex-plus-work-gateway-list";
-      const groupLabels = { group: zh ? "模型组" : "Model groups", auto: zh ? "自动组" : "Automatic groups", gateway: label };
-      const render = () => {
-        const query = search.value.trim().toLocaleLowerCase();
-        const groups = new Map();
-        for (const entry of codexPlusWorkGatewayMenuEntries()) {
-          const group = Object.hasOwn(groupLabels, entry.group) ? groupLabels[entry.group] : entry.group;
-          if (!`${entry.label} ${entry.model} ${group}`.toLocaleLowerCase().includes(query)) continue;
-          if (!groups.has(group)) groups.set(group, []);
-          groups.get(group).push(entry);
-        }
-        list.replaceChildren();
-        if (!groups.size) {
-          const empty = document.createElement("p");
-          empty.className = "codex-plus-work-gateway-heading";
-          empty.textContent = zh ? "没有匹配的网关模型" : "No matching gateway models";
-          list.append(empty);
-        }
-        for (const [group, entries] of groups) {
-          const section = document.createElement("section");
-          section.setAttribute("aria-label", group);
-          const heading = document.createElement("div");
-          heading.className = "codex-plus-work-gateway-heading";
-          heading.textContent = group;
-          section.append(heading);
-          for (const entry of entries) section.append(makeItem(entry));
-          list.append(section);
-        }
-      };
-      function makeItem(entry) {
-        const { model } = entry;
-        const item = document.createElement("button");
-        item.type = "button";
-        item.className = "codex-plus-menu-item";
-        const name = document.createElement("span");
-        name.className = "codex-plus-menu-item-label";
-        name.textContent = entry.label;
-        item.title = model;
-        item.append(name);
-        item.addEventListener("click", async () => {
-          if (button.disabled) return;
-          panel.hidePopover();
-          button.disabled = true;
-          try {
-            if (await codexPlusOpenWorkGatewayDraft(project, model)) return;
-          } catch { /* 失败时不改派到云端。 */ }
-          finally { button.disabled = false; }
-          showToast(zh ? "未打开本机网关对话，请检查当前项目与网关连接。" : "Could not open a local gateway chat. Check the project and gateway connection.", null);
-        });
-        return item;
-      }
-      search.addEventListener("input", render);
-      panel.append(search, list);
-      render();
-      requestAnimationFrame(() => { if (button.getAttribute("aria-expanded") === "true") search.focus({ preventScroll: true }); });
-    });
-    wrapper.append(button, panel);
-    project.after(wrapper);
-  }
   function normalizeWorkspacePath(path) {
     const normalized = String(path || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
     return normalized || String(path || "").trim();
@@ -30323,7 +31632,8 @@ ${key} = ${value}`]);
    *
    * `options.type` 取 info / success / warn / error，对应 styles 里的四条配色；
    * 不传则保持原先的默认外观。`options.undoToken` 会追加「撤销」按钮——这是
-   * 内部删除流程用的，拓展一般用不到。
+   * 内部删除流程用的，拓展一般用不到。`options.durationMs` 改显示时长，给带按钮、
+   * 要留时间看完再点的提示用。
    */
   function showToast(message, options = {}) {
     // 兼容旧调用点：老签名是 showToast(message, undoToken)。第二个参数传字符串
@@ -30357,11 +31667,26 @@ ${key} = ${value}`]);
         setTimeout(() => dismissCodexPlusToast(toast), 5000);
       });
       toast.appendChild(undo);
+    } else if (settings.actionLabel && typeof settings.onAction === "function") {
+      const action = document.createElement("button");
+      action.textContent = settings.actionLabel;
+      action.addEventListener("click", async () => {
+        action.disabled = true;
+        try {
+          await settings.onAction();
+          dismissCodexPlusToast(toast);
+        } catch (error) {
+          showToast(String(error?.message || error), { type: "warn" });
+          action.disabled = false;
+        }
+      });
+      toast.appendChild(action);
     }
     document.body.appendChild(toast);
     // append 之后统一重排：此时这条才进入 DOM，索引才是它真实的层号。
     layoutCodexPlusToasts();
-    setTimeout(() => dismissCodexPlusToast(toast), codexPlusToastLifetimeMs);
+    const lifetime = Number.isFinite(settings.durationMs) && settings.durationMs > 0 ? settings.durationMs : codexPlusToastLifetimeMs;
+    setTimeout(() => dismissCodexPlusToast(toast), lifetime);
     return () => dismissCodexPlusToast(toast);
   }
 
@@ -33472,6 +34797,8 @@ ${key} = ${value}`]);
     const mappings = await readMappings();
     const matches = Object.entries(mappings).filter(([id, serverId]) =>
       serverId === project.id && Object.hasOwn(projects, id));
+    // 新版侧栏可以接收未归属的原生会话。项目未登记时也刷新会话目录。
+    if (matches.length === 0 && weixinDesktopSync.rspack) return;
     if (matches.length !== 1) throw Error("微信项目的桌面归属暂不可确认");
     const assignments = await weixinDesktopSync.readState(weixinDesktopSync.keys.THREAD_PROJECT_ASSIGNMENTS);
     if (assignments != null && (typeof assignments !== "object" || Array.isArray(assignments)))
@@ -33483,6 +34810,67 @@ ${key} = ${value}`]);
       threadId: entry.threadId, hostId: "local", projectless: false,
       assignment: { projectKind: "local", projectId: matches[0][0] },
     }]);
+  }
+
+  async function discoverWeixinDesktopServices() {
+    const hasCatalog = (value) => value && typeof value === "object"
+      && Object.hasOwn(value, "localThreadCatalog")
+      && typeof value.localThreadCatalog?.notifyThread === "function"
+      && typeof value.localThreadCatalog?.readEntries === "function"
+      && typeof value.projects?.getLocalProjects === "function"
+      && typeof value.executionPaths?.readCodexHome === "function"
+      && typeof value.threadProjectAssignments?.setProjectless === "function"
+      && typeof value.threadProjectAssignments?.assignIfUnassigned === "function";
+    const hasKeys = (value) => value && typeof value === "object"
+      && typeof value.APP_SERVER_PROJECT_ID_BY_LEGACY_PROJECT_ID_BY_HOST === "string"
+      && typeof value.THREAD_PROJECT_ASSIGNMENTS === "string";
+    const legacy = Object.values(await loadOptionalCodexAppModule("app-shared-") || {});
+    const services = legacy.filter(hasCatalog);
+    const keys = legacy.filter(hasKeys);
+    const clients = legacy.filter((value) => typeof value === "function"
+      && Object.hasOwn(value, "prototype") && Object.hasOwn(value, "getInstance")
+      && typeof value.getInstance === "function"
+      && ["post", "sendRequest", "onFetchResponse", "cancelStream"]
+        .every((method) => typeof value.prototype?.[method] === "function"));
+    if (services.length === 1 && keys.length === 1 && clients.length === 1) {
+      return {
+        services: services[0], keys: keys[0], rspack: false,
+        readState: async (key) => {
+          const response = await clients[0].getInstance().post("vscode://codex/get-global-state", JSON.stringify({ key }));
+          if (!response?.body || !Object.hasOwn(response.body, "value")) throw Error("原生状态暂不可读");
+          return response.body.value;
+        },
+      };
+    }
+    // Rspack 的服务通过已初始化的模块缓存导出。不运行模块工厂，也不依赖哈希或压缩 ID。
+    for (const { src } of document.querySelectorAll('script[type="module"][src]')) {
+      if (!/^app:\/\/-\/assets\/\d+\.[a-f\d]+\.js$/.test(src)) continue;
+      const { __webpack_require__: runtime } = await import(src);
+      if (!runtime?.c) continue;
+      const modules = Object.values(runtime.c).map(({ exports }) => exports);
+      const hosts = modules.filter((module) => module && Object.hasOwn(module, "appServices")
+        && Object.hasOwn(module, "setAppServices") && hasCatalog(module.appServices));
+      if (hosts.length !== 1) continue;
+      const services = hosts[0].appServices;
+      const keys = {
+        APP_SERVER_PROJECT_ID_BY_LEGACY_PROJECT_ID_BY_HOST: "app-server-project-id-by-legacy-project-id-by-host",
+        THREAD_PROJECT_ASSIGNMENTS: "thread-project-assignments",
+      };
+      return {
+        services, keys, rspack: true,
+        readState: async (key) => {
+          if (key === keys.THREAD_PROJECT_ASSIGNMENTS) {
+            const memberships = await services.threadProjectAssignments.readMemberships();
+            if (!Object.hasOwn(memberships, "assignments")) throw Error("原生会话归属暂不可读");
+            return memberships.assignments;
+          }
+          const state = await services.applicationState.read(key);
+          if (!Object.hasOwn(state, "value")) throw Error("原生状态暂不可读");
+          return state.value;
+        },
+      };
+    }
+    throw Error("原生会话目录暂不可用");
   }
 
   async function syncWeixinDesktopThreads() {
@@ -33507,34 +34895,7 @@ ${key} = ${value}`]);
     weixinDesktopSync.flight = (async () => {
       try {
         if (!weixinDesktopSync.services) {
-          const module = await loadOptionalCodexAppModule("app-shared-");
-          // 导出名随打包变化；只接受拥有明确服务能力的唯一原生服务集合。
-          const services = Object.values(module || {}).filter((value) => value && typeof value === "object"
-            && Object.hasOwn(value, "localThreadCatalog")
-            && typeof value.localThreadCatalog?.notifyThread === "function"
-            && typeof value.localThreadCatalog?.readEntries === "function"
-            && typeof value.projects?.getLocalProjects === "function"
-            && typeof value.executionPaths?.readCodexHome === "function"
-            && typeof value.threadProjectAssignments?.setProjectless === "function"
-            && typeof value.threadProjectAssignments?.assignIfUnassigned === "function");
-          const keys = Object.values(module || {}).filter((value) => value && typeof value === "object"
-            && typeof value.APP_SERVER_PROJECT_ID_BY_LEGACY_PROJECT_ID_BY_HOST === "string"
-            && typeof value.THREAD_PROJECT_ASSIGNMENTS === "string");
-          const clients = Object.values(module || {}).filter((value) => typeof value === "function"
-            && Object.hasOwn(value, "prototype") && Object.hasOwn(value, "getInstance")
-            && typeof value.getInstance === "function"
-            && ["post", "sendRequest", "onFetchResponse", "cancelStream"]
-              .every((method) => typeof value.prototype?.[method] === "function"));
-          if (services.length !== 1 || keys.length !== 1 || clients.length !== 1)
-            throw Error("原生会话目录暂不可用");
-          // 直接使用原生请求客户端；不按函数源码中的读写关键字猜测调用器。
-          weixinDesktopSync.readState = async (key) => {
-            const response = await clients[0].getInstance().post("vscode://codex/get-global-state", JSON.stringify({ key }));
-            if (!response?.body || !Object.hasOwn(response.body, "value")) throw Error("原生状态暂不可读");
-            return response.body.value;
-          };
-          weixinDesktopSync.services = services[0];
-          weixinDesktopSync.keys = keys[0];
+          Object.assign(weixinDesktopSync, await discoverWeixinDesktopServices());
         }
         for (const entry of pending) {
           try {
@@ -34928,6 +36289,8 @@ ${key} = ${value}`]);
     "/backend/status",
     // 只读：设置的公开子集（当前供应商的名称、模式、模型、上下文窗口），不含地址、Key 与配置内容。
     "/settings/public",
+    // 只读：网关供应商的配置价，不含地址、Key 或其他设置。
+    "/provider-prices/public",
     // 只读：模型目录（模型列表与每模型元数据，含上下文窗口），去掉了来源地址与本机路径。
     "/model-catalog/public",
     // Agent 桌宠（官方拓展包）的数据服务：图片 / 音效下载、大肥鱼的素材、挂件数据、本机用量。
@@ -36340,6 +37703,9 @@ ${key} = ${value}`]);
     // apply 里提供服务会触发全体复查，又回到这个句柄：正在检查时只记下「需要再查一次」。
     let checking = false;
     let recheck = false;
+    // apply 抛错那一次的依赖 token 串。依赖没变就不重试：apply 里先 provide 再抛错时，provide 和回滚时的
+    // 撤销各触发一次复查，照旧重试会同步地一直 apply 到栈溢出。提供方重载或消失后回来（token 变了）再试。
+    let failedTokens = null;
     const fiber = {
       id: extensionId,
       scriptKey,
@@ -36373,12 +37739,15 @@ ${key} = ${value}`]);
           ctx.dispose();
         }
         if (!fiber.ctx && ready && fiber.state !== "disposed") {
+          if (fiber.state === "failed" && current === failedTokens) return;
           tokens = current;
+          failedTokens = null;
           fiber.state = "active";
           try {
             fiber.ctx = codexPlusInstantiateExtension({ apply, scriptKey, manifest, extensionId, inject, fiber });
           } catch (error) {
             fiber.state = "failed";
+            failedTokens = tokens;
             codexPlusMarkExtensionFailure(scriptKey, `${extensionId}: ${String(error?.stack || error?.message || error)}`);
           }
         }
@@ -36898,20 +38267,23 @@ ${key} = ${value}`]);
    * capnweb 的 import id 按 push 顺序隐式分配，所以改写 push 时后面的帧必须按原顺序发出。
    * 本地上下文刷新单独等待 resolve，允许它的预检请求通过；没有拓展或上下文刷新时同步放行。
    *
+   * 插件请求（`plugin/*`）也只走这里：插件市场适配层（62）按请求给出「自己作答」或「在原生结果上补条目」，
+   * 本层负责把回包对上号、摘下来、改好再投回（见 codexPlusRpcNoteFrame / codexPlusRpcAnswerIncoming）。
+   *
    * 语义（`ctx.on(name, async (params, next) => …)`，先 `await next()` 拿下游决定再改）：
    *   - `agent/pre-step`：params `{ agent, turn, step, messages, signal }`，决定是
    *     `{ kind: "enter", messages }` 或 `{ kind: "reject", reason? }`。拒绝时这一轮不发出。
    *   - `agent/request`：params `{ agent, turn, step, signal }`，返回 `{ provider, model, reasoningEffort }`。
    * 同一条用户消息只跑一次这两条链（按 clientUserMessageId 缓存），结果套用到它的所有候选帧上。
    */
-  const codexPlusRpcInterceptorVersion = 19;
+  const codexPlusRpcInterceptorVersion = 22;
   const codexPlusRpcMiddlewareTimeoutMs = (typeof codexPlusRpcMiddlewareTimeoutMsOverride === "number"
     && codexPlusRpcMiddlewareTimeoutMsOverride > 0)
     ? codexPlusRpcMiddlewareTimeoutMsOverride : 5000;
   const codexPlusRpcPreparationTimeoutMs = 120000;
   const codexPlusRpcOpaque = Symbol("codexPlusRpcOpaque");
   const codexPlusRpcSourceItem = Symbol("codexPlusRpcSourceItem");
-  const codexPlusRpcPushFailure = Symbol("codexPlusRpcPushFailure");
+  const codexPlusRpcPushFailure = window.__codexPlusRpcFrameInterceptor?.pushFailure || Symbol("codexPlusRpcPushFailure");
   const codexPlusRpcPortQueues = new WeakMap();
   const codexPlusRpcRejectionPorts = window.__codexPlusRpcRejectionPorts ||= new WeakMap();
   const codexPlusRpcCreationFailures = window.__codexPlusRpcCreationFailures ||= new WeakMap();
@@ -36921,6 +38293,54 @@ ${key} = ${value}`]);
   const codexPlusRpcHostReceivers = window.__codexPlusRpcHostReceivers
     ||= new WeakMap();
   const codexPlusRpcTurnPreparations = window.__codexPlusRpcTurnPreparations ||= new Map();
+  // 每个端口的 push 计数与待处理的回包；frames 记下要由本层作答的 push（planFrame 可能对同一帧调用多次）。
+  const codexPlusRpcAnswers = window.__codexPlusRpcAnswers ||= { trackers: new WeakMap(), frames: new WeakMap(), seq: 0 };
+  const codexPlusRpcAnswerTimeoutMs = 15_000;
+  const codexPlusRpcAnswerPendingMs = 90_000;
+  // 中间件熔断阈值：连续这么多个改写计划等满超时，就认定有拓展的中间件挂住了。
+  const codexPlusRpcBreakerThreshold = 3;
+  // 熔断冷却时间：这段时间内当作没有拓展中间件，帧原样放行；到点后再试，头一个计划又超时就立刻重新熔断。
+  const codexPlusRpcBreakerCooldownMs = 60_000;
+
+  /**
+   * 中间件熔断。超时是逐帧等的（codexPlusRpcRunPlan），一个不 resolve 的中间件会让端口队列里每一帧
+   * 各等满一次；连续超时到阈值后，冷却期内下面几个「有没有拓展要拦」的判断一律答没有：
+   * 只为拓展拦的帧同步放行，上下文刷新、供应商预检这些原生环节照常走。
+   *
+   * 状态挂在 window.__codexPlusRpcFrameInterceptor.breaker 上、每次安装都换新的：同版本重新注入时
+   * 已打补丁的 postMessage（连同它的发送循环）还是上一代闭包，判断帧的却是新一代，两边得读同一份。
+   */
+  function codexPlusRpcNewBreaker() {
+    return { timeouts: 0, openUntil: 0 };
+  }
+
+  function codexPlusRpcBreakerOpen() {
+    const breaker = window.__codexPlusRpcFrameInterceptor?.breaker;
+    return !!breaker && Date.now() < breaker.openUntil;
+  }
+
+  /** 每个计划的中间件阶段结束时记一次：超时累加，没超时（正常完成或出错放行）清零。 */
+  function codexPlusRpcNoteMiddlewareOutcome(timedOut) {
+    const breaker = window.__codexPlusRpcFrameInterceptor?.breaker;
+    if (!breaker) return;
+    const now = Date.now();
+    // 熔断前就在等的计划（别的端口）此时才回来：冷却期内不计数，也不再记日志。
+    if (now < breaker.openUntil) return;
+    if (!timedOut) {
+      breaker.timeouts = 0;
+      return;
+    }
+    breaker.timeouts += 1;
+    if (breaker.timeouts < codexPlusRpcBreakerThreshold) {
+      codexPlusMarkExtensionFailure("", "rpc 拓展中间件超时，已跳过它的改写");
+      return;
+    }
+    // 计数停在阈值前一格：冷却结束后头一个计划又超时就直接重新熔断，不必再等满三次。
+    breaker.timeouts = codexPlusRpcBreakerThreshold - 1;
+    breaker.openUntil = now + codexPlusRpcBreakerCooldownMs;
+    codexPlusMarkExtensionFailure("",
+      `rpc 拓展中间件持续超时，接下来 ${Math.round(codexPlusRpcBreakerCooldownMs / 1000)} 秒跳过拓展拦截、原样放行`);
+  }
 
   async function codexPlusRpcSerializeTurn(threadId, prepare) {
     if (typeof threadId !== "string" || !threadId) return prepare();
@@ -36989,7 +38409,7 @@ ${key} = ${value}`]);
 
   function codexPlusRpcHasListeners(name) {
     try {
-      return !!codexPlusExtensionListeners.get(name)?.size;
+      return !codexPlusRpcBreakerOpen() && !!codexPlusExtensionListeners.get(name)?.size;
     } catch {
       return false;
     }
@@ -36997,7 +38417,7 @@ ${key} = ${value}`]);
 
   function codexPlusRpcWantsRequestChain() {
     try {
-      return codexPlusExtensionInterceptors.has("codex/request");
+      return !codexPlusRpcBreakerOpen() && codexPlusExtensionInterceptors.has("codex/request");
     } catch {
       return false;
     }
@@ -37150,7 +38570,16 @@ ${key} = ${value}`]);
 
   function codexPlusRpcRejectNotice(reason) {
     try {
-      if (typeof showToast === "function") showToast(reason, { type: "warn" });
+      if (typeof showToast !== "function") return;
+      const options = { type: "warn" };
+      if (String(reason).includes("Provider sync recovery is pending:")) {
+        options.actionLabel = "打开会话维护";
+        options.onAction = async () => {
+          const result = await postJson("/manager/open", { page: "sessions" });
+          if (result?.status !== "ok") throw new Error(result?.message || "打开管理器失败");
+        };
+      }
+      showToast(reason, options);
     } catch {}
   }
 
@@ -37161,13 +38590,113 @@ ${key} = ${value}`]);
   }
 
   /**
+   * 回包对号。capnweb 的回包只带 import 序号，序号由对端按 push 顺序隐式分配，帧里看不到，
+   * 注入又可能晚于会话开始。所以每个端口从接管起数 push（count），再用看得见的序号校准起点（base）：
+   * 页面 pull 的、对端 resolve / reject 的序号都不会超过「起点 + 已发 push 数」，取这些下界里最大的。
+   * 页面 await 一次调用就会 pull 刚发的那个 push，所以起点很快就是准的，之后一直准。
+   */
+  function codexPlusRpcCalibrate(tracker, id) {
+    if (!Number.isInteger(id) || id <= 0) return;
+    const base = id - tracker.count;
+    if (tracker.base === null || base > tracker.base) tracker.base = base;
+  }
+
+  /** 页面每发一帧调用一次（排队后重放的帧不再经过这里）：数 push、校准序号、登记要处理的插件请求。 */
+  function codexPlusRpcNoteFrame(frame, port) {
+    if (!Array.isArray(frame) || (frame[0] !== "push" && frame[0] !== "pull")) return;
+    let tracker = codexPlusRpcAnswers.trackers.get(port);
+    if (!tracker) {
+      tracker = { count: 0, base: null, requests: new Map(), markers: new Map() };
+      codexPlusRpcAnswers.trackers.set(port, tracker);
+    }
+    if (frame[0] === "pull") {
+      codexPlusRpcCalibrate(tracker, frame[1]);
+      return;
+    }
+    const ordinal = ++tracker.count;
+    const expr = frame[1];
+    if (typeof codexPlusPluginNativeRpcHandler !== "function" || !Array.isArray(expr) || expr[0] !== "pipeline"
+        || !Array.isArray(expr[2]) || expr[2].length !== 1 || expr[2][0] !== "sendRequest" || !Array.isArray(expr[3])
+        || typeof expr[3][0] !== "string" || !expr[3][0].startsWith("plugin/")) return;
+    const handler = codexPlusPluginNativeRpcHandler(expr[3][0], codexPlusRpcDecode(expr[3][1]),
+      codexPlusRpcReceiverHost(port, expr));
+    if (!handler) return;
+    const now = Date.now();
+    // 回包一直没来的登记项顺手清掉，不另起定时器。
+    for (const [key, item] of tracker.requests) {
+      if (now - item.at < codexPlusRpcAnswerPendingMs) continue;
+      tracker.requests.delete(key);
+      if (item.marker) tracker.markers.delete(item.marker);
+    }
+    const entry = { ordinal, handler, at: now };
+    if (handler.answer) {
+      // 拒绝理由会原样出现在对端的 reject 里，用它认回包，不依赖序号。
+      entry.marker = `Codex++ answers ${expr[3][0]} itself (#${++codexPlusRpcAnswers.seq})`;
+      entry.outcome = Promise.resolve().then(handler.answer).then((result) => ({ result }), (error) => ({ error }));
+      tracker.markers.set(entry.marker, entry);
+      codexPlusRpcAnswers.frames.set(frame, entry.marker);
+    }
+    tracker.requests.set(ordinal, entry);
+  }
+
+  /**
+   * 对端回包先过这里。命中登记的请求时把这一帧摘下来（换成协议空操作），等适配层给出结果后
+   * 向同一端口投一帧 resolve / reject。补条目限时，超时或出错把原帧原样投回，不能让页面的请求一直挂着。
+   */
+  function codexPlusRpcAnswerIncoming(port, frame) {
+    if (!Array.isArray(frame) || (frame[0] !== "resolve" && frame[0] !== "reject")
+        || !Number.isInteger(frame[1]) || frame[1] <= 0) return null;
+    const tracker = codexPlusRpcAnswers.trackers.get(port);
+    if (!tracker) return null;
+    codexPlusRpcCalibrate(tracker, frame[1]);
+    if (!tracker.requests.size) return null;
+    const rejected = frame[0] === "reject";
+    const message = rejected && Array.isArray(frame[2]) && frame[2][0] === "error" ? String(frame[2][2] ?? "") : "";
+    let entry = rejected ? tracker.markers.get(message) : null;
+    if (entry) tracker.base = frame[1] - entry.ordinal;
+    else entry = tracker.requests.get(frame[1] - tracker.base);
+    if (!entry) return null;
+    tracker.requests.delete(entry.ordinal);
+    if (entry.marker) tracker.markers.delete(entry.marker);
+    let pending;
+    if (entry.outcome) {
+      // 自己作答的请求在对端一定被拒；收到 resolve 说明对错了号，不动它。
+      if (!rejected) return null;
+      pending = entry.outcome.then(({ result, error }) => (error
+        ? ["reject", frame[1], ["error", "Error", String(error?.message || error)]]
+        : ["resolve", frame[1], codexPlusRpcEncode(result)]));
+    } else {
+      let extended = null;
+      try {
+        extended = rejected ? entry.handler.extend(undefined, message) : entry.handler.extend(codexPlusRpcDecode(frame[2]));
+      } catch {}
+      if (!extended) return null;
+      let timer = null;
+      pending = Promise.race([
+        Promise.resolve(extended).then((result) => ["resolve", frame[1], codexPlusRpcEncode(result)]),
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("回包处理超时")), codexPlusRpcAnswerTimeoutMs);
+        }),
+      ]).finally(() => clearTimeout(timer));
+    }
+    void pending.catch((error) => {
+      codexPlusMarkExtensionFailure("", `rpc 回包处理失败，已原样转发：${String(error?.message || error)}`);
+      return frame;
+    }).then((next) => port.dispatchEvent(new MessageEvent("message", { data: next })))
+      .catch((error) => codexPlusMarkExtensionFailure("", `rpc 回包投递失败：${String(error?.message || error)}`));
+    // 未知 import 的 resolve 是协议空操作；正半整数不属于任何原生或本层编号。
+    return ["resolve", 0.5, ["undefined"]];
+  }
+
+  /**
    * 处理一轮对话的参数（就地改 decoded 里的对象）。
    * carriers：[{ method, params, conversationId }]，第一个用来取 input；settings 是本轮的模型设置
    * （缺省取第一个 carrier 的）。settingsHolders：需要同步模型设置的对象（resume 等）。返回 { reject } 或 {}。
    */
   async function codexPlusRpcProcessTurn({ messageId, carriers, settings, settingsHolders, signal }) {
     const primary = carriers[0];
-    const outcome = await codexPlusRpcTurnHooksOnce(messageId, () => codexPlusRpcRunTurnHooks({
+    // 熔断期间不碰缓存：同一条消息挂住的那次 hooks 还缓存在里面，等它就又是一次超时。
+    const outcome = codexPlusRpcBreakerOpen() ? {} : await codexPlusRpcTurnHooksOnce(messageId, () => codexPlusRpcRunTurnHooks({
       messageId,
       conversationId: primary.conversationId,
       input: primary.params.input,
@@ -37387,7 +38916,7 @@ ${key} = ${value}`]);
         } catch (error) {
           signal?.throwIfAborted();
           if (refreshContext) throw error;
-          codexPlusMarkExtensionFailure("", `网关连接检查不可用：${String(error?.message || error)}`);
+          codexPlusMarkExtensionFailure("", `本地服务连接检查不可用：${String(error?.message || error)}`);
           return nextFrame;
         }
         signal?.throwIfAborted();
@@ -37500,6 +39029,9 @@ ${key} = ${value}`]);
       }
       const hostId = codexPlusRpcReceiverHost(port, expr);
       if (expr[2][0] === "sendRequest") {
+        // 由本层作答的请求不交给对端执行：让它带着拒绝理由被拒，回包到了再换成我们的结果。
+        const answered = codexPlusRpcAnswers.frames.get(frame);
+        if (answered) return async () => codexPlusRpcRejectPush(frame, answered);
         return codexPlusRpcPlanResume(frame, hostId, codexPlusRpcPlanSendRequest(frame, hostId));
       }
       if (["resumeConversation", "resumeThread"].includes(expr[2][0])) {
@@ -37516,12 +39048,14 @@ ${key} = ${value}`]);
   async function codexPlusRpcRunPlan(plan, frame, deferContext = false) {
     const controller = new AbortController();
     let timer = null;
+    let timedOut = false;
     let replaced = null;
     try {
       replaced = await Promise.race([
         Promise.resolve().then(() => plan(controller.signal)),
         new Promise((resolve) => {
           timer = setTimeout(() => {
+            timedOut = true;
             controller.abort(new Error("Codex++ 拓展中间件超时"));
             resolve(null);
           }, codexPlusRpcMiddlewareTimeoutMs);
@@ -37532,6 +39066,9 @@ ${key} = ${value}`]);
     } finally {
       clearTimeout(timer);
     }
+    try {
+      codexPlusRpcNoteMiddlewareOutcome(timedOut);
+    } catch {}
     if (!plan.context || deferContext || replaced?.[codexPlusRpcPushFailure]) return replaced;
     // plan.context 里会等 app-server 往返（网关预检、模型刷新）；一旦挂住，
     // 端口队列会卡死后续所有帧，渲染层首批请求就永远停在 fetching（issue #3098）。
@@ -37565,6 +39102,8 @@ ${key} = ${value}`]);
   }
 
   function codexPlusRpcIncomingFrame(port, incoming) {
+    const answered = codexPlusRpcAnswerIncoming(port, incoming);
+    if (answered) return answered;
     const creation = codexPlusRpcCreationFailures.get(port);
     const rejections = codexPlusRpcRejectionPorts.get(port);
     const gates = codexPlusRpcResumeGates.get(port);
@@ -37608,6 +39147,23 @@ ${key} = ${value}`]);
     return transformed;
   }
 
+  /**
+   * 发出改写后的帧；发不出去（中间件给的参数里带函数、DOM 节点这类不可克隆的值，postMessage 抛
+   * DataCloneError）就退回原帧。import 序号按 push 顺序隐式分配，丢一帧后面的回包全部错位，
+   * 所以宁可不要这次改写。没改写过的帧只发一次，原帧也发不出去时照旧抛给调用方。
+   * 改写结果是「拒绝本轮」时不退回：改发原帧会把本该拦下的消息发出去。
+   */
+  function codexPlusRpcSendFrame(original, port, replaced, message, rest) {
+    if (!replaced || replaced === message) return original.call(port, message, ...rest);
+    try {
+      return original.call(port, replaced, ...rest);
+    } catch (error) {
+      if (replaced[0] === "reject" && message[0] !== "reject") throw error;
+      codexPlusMarkExtensionFailure("", `rpc 改写后的帧发送失败，已改发原帧：${String(error?.message || error)}`);
+    }
+    return original.call(port, message, ...rest);
+  }
+
   /** 某个端口开始等中间件：之后的帧全部排队，按原顺序逐个处理、发出。 */
   async function codexPlusRpcDrainPort(port, original, first) {
     let finish;
@@ -37620,6 +39176,8 @@ ${key} = ${value}`]);
         const deferContext = message[0] === "resolve" && plan?.before && plan.context;
         const replaced = plan ? await codexPlusRpcRunPlan(plan, message, deferContext) : null;
         try {
+          // 带拒绝标记的帧是原帧的副本（内容没改写），下面两支发送失败时不改发原帧：
+          // 原帧同样发不出去，发得出去也不行，那是把要拒绝的请求真发给对端。
           const failure = replaced?.[codexPlusRpcPushFailure];
           const readInputs = failure && replaced[1][2][0] === "startConversation"
             && replaced[1][3][1]?.readThreadCreationInputs;
@@ -37657,18 +39215,36 @@ ${key} = ${value}`]);
             gates.pending.add(id);
             const controller = new AbortController();
             (gates.controllers ||= new Map()).set(id, controller);
-            const next = replaced || message;
-            const resolving = next[0] === "resolve";
-            const expr = next[1];
-            const args = resolving ? { ...next[2] } : [...expr[3]];
-            const params = args[plan.resumeIndex];
-            const dataOnly = codexPlusRpcDataOnly(params);
-            // 含 export 的参数留在原 push 导入，失败时由 Capnweb 正常释放。
-            if (resolving || dataOnly) args[plan.resumeIndex] = ["promise", id];
-            else args.push(["promise", id]);
-            original.call(port, resolving
-              ? ["resolve", next[1], args, ...next.slice(3)]
-              : ["push", [...expr.slice(0, 3), args, ...expr.slice(4)], ...next.slice(2)], ...rest);
+            const sendGated = (next) => {
+              const resolving = next[0] === "resolve";
+              const expr = next[1];
+              const args = resolving ? { ...next[2] } : [...expr[3]];
+              const params = args[plan.resumeIndex];
+              const dataOnly = codexPlusRpcDataOnly(params);
+              // 含 export 的参数留在原 push 导入，失败时由 Capnweb 正常释放。
+              if (resolving || dataOnly) {
+                // 留在闸门后面的参数要等预检完才随 resolve 发出，那时这一帧已经占了序号、退不回原帧，
+                // 所以改写过的现在就验一遍能不能克隆。
+                if (next !== message && typeof structuredClone === "function") structuredClone(params);
+                args[plan.resumeIndex] = ["promise", id];
+              } else {
+                args.push(["promise", id]);
+              }
+              original.call(port, resolving
+                ? ["resolve", next[1], args, ...next.slice(3)]
+                : ["push", [...expr.slice(0, 3), args, ...expr.slice(4)], ...next.slice(2)], ...rest);
+              return { next, resolving, args, params, dataOnly };
+            };
+            let gated;
+            try {
+              gated = sendGated(replaced || message);
+            } catch (error) {
+              if (!replaced || replaced === message) throw error;
+              // 改写后的帧发不出去：用原帧按同一个闸门重发，理由见 codexPlusRpcSendFrame。
+              codexPlusMarkExtensionFailure("", `rpc 改写后的帧发送失败，已改发原帧：${String(error?.message || error)}`);
+              gated = sendGated(message);
+            }
+            const { next, resolving, args, params, dataOnly } = gated;
             // 先释放整个发送队列，再让预检经同一端口发出。
             void state.done.then(async () => {
               let timer;
@@ -37710,7 +39286,7 @@ ${key} = ${value}`]);
               },
             ).catch((error) => codexPlusMarkExtensionFailure("", `rpc 帧发送失败：${String(error?.message || error)}`));
           } else {
-            original.call(port, replaced || message, ...rest);
+            codexPlusRpcSendFrame(original, port, replaced, message, rest);
           }
         } catch (error) {
           // 已经是异步发送，异常没法还给调用方；记下来，后面的帧照常发。
@@ -37720,7 +39296,7 @@ ${key} = ${value}`]);
         if (!queued) break;
         let nextPlan = null;
         try {
-          nextPlan = codexPlusRpcPlanFrame(queued[0], port);
+          nextPlan = window.__codexPlusRpcFrameInterceptor.planFrame(queued[0], port);
         } catch {}
         entry = [queued[0], queued[1], nextPlan];
       }
@@ -37734,10 +39310,17 @@ ${key} = ${value}`]);
     const proto = window.MessagePort?.prototype;
     if (!proto || typeof proto.postMessage !== "function") return false;
     const installed = window.__codexPlusRpcFrameInterceptor;
-    if (installed?.version >= codexPlusRpcInterceptorVersion && proto.postMessage === installed.patched) return true;
+    if (installed?.version > codexPlusRpcInterceptorVersion && proto.postMessage === installed.patched) return true;
+    window.__codexPlusRpcIncomingFrame = codexPlusRpcIncomingFrame;
+    if (installed?.version === codexPlusRpcInterceptorVersion && proto.postMessage === installed.patched) {
+      installed.planFrame = codexPlusRpcPlanFrame;
+      installed.noteFrame = codexPlusRpcNoteFrame;
+      // 熔断状态跟注入代际走：重新注入后从头计数。
+      installed.breaker = codexPlusRpcNewBreaker();
+      return true;
+    }
     // 重复注入时包原生的那个，不叠层。
     const original = installed?.original || proto.postMessage;
-    window.__codexPlusRpcIncomingFrame = codexPlusRpcIncomingFrame;
     const eventProto = window.MessageEvent?.prototype;
     if (eventProto && !window.__codexPlusRpcMessageData) {
       const descriptor = Object.getOwnPropertyDescriptor(eventProto, "data");
@@ -37763,15 +39346,21 @@ ${key} = ${value}`]);
       const state = codexPlusRpcPortQueues.get(this);
       let plan = null;
       try {
-        plan = codexPlusRpcPlanFrame(message, this);
+        window.__codexPlusRpcFrameInterceptor.noteFrame(message, this);
+      } catch {}
+      try {
+        plan = window.__codexPlusRpcFrameInterceptor.planFrame(message, this);
       } catch {}
       // resolve 不分配隐式 RPC 序号。单独等待它，预检发出的请求才能通过同一端口。
       if (message?.[0] === "resolve" && plan?.context && !plan.before) {
         const port = this;
         void (async () => {
-          if (state) await state.done;
+          if (state) {
+            await state.done;
+            return proto.postMessage.call(port, message, ...rest);
+          }
           const replaced = await codexPlusRpcRunPlan(plan, message);
-          original.call(port, replaced || message, ...rest);
+          codexPlusRpcSendFrame(original, port, replaced, message, rest);
         })().catch((error) => {
           codexPlusMarkExtensionFailure("", `rpc 帧发送失败：${String(error?.message || error)}`);
         });
@@ -37786,7 +39375,9 @@ ${key} = ${value}`]);
       return undefined;
     };
     proto.postMessage = patched;
-    window.__codexPlusRpcFrameInterceptor = { version: codexPlusRpcInterceptorVersion, original, patched };
+    window.__codexPlusRpcFrameInterceptor = { version: codexPlusRpcInterceptorVersion, original, patched,
+      planFrame: codexPlusRpcPlanFrame, noteFrame: codexPlusRpcNoteFrame, pushFailure: codexPlusRpcPushFailure,
+      breaker: codexPlusRpcNewBreaker() };
     return true;
   }
 
@@ -41930,7 +43521,11 @@ ${key} = ${value}`]);
   function scanDeferred() {
     installCodexCapacityRetry();
     installCodexModelRequestBridgePatch();
-    runScanStep(installCodexPlusWorkGateway);
+    // Retire the old launcher on hot reload as well as on a new renderer.
+    document.querySelectorAll('[data-codex-plus-ext="work-gateway"]').forEach(node => {
+      node.querySelector("[popover]")?.hidePopover();
+      node.remove();
+    });
     // 内置拓展登记的扫描步骤（桌宠与大肥鱼、梦皮、侧聊保存……）：拓展卸下时步骤跟着撤掉，不再由扫描循环直接点名调用。
     // 已删会话的行过滤（会话删除）、对话宽度、滚动位置恢复也都是内置拓展经公开的 ctx.onScan 登记的步骤。
     runCodexPlusScanSteps();
@@ -45014,6 +46609,940 @@ ${key} = ${value}`]);
       render: ({ container }) => codexPlusContextTuningRender({ container, ctx }),
     });
   }
+  const dailyUiBookmarkPrefix = "bookmark:";
+  const dailyUiSections = {
+    projects: ["Projects", "项目", "專案"],
+    recents: ["Recents", "Chats", "最近", "最近使用", "聊天"],
+  };
+
+  function dailyUiElement(tag, className, text) {
+    const element = document.createElement(tag);
+    element.setAttribute("data-codex-plus-ext", "builtin:daily-ui");
+    if (className) element.className = className;
+    if (text !== undefined) element.textContent = text;
+    return element;
+  }
+
+  function dailyUiRow(container, title, detail, ...controls) {
+    const row = dailyUiElement("div", "codex-plus-row");
+    const copy = dailyUiElement("div");
+    copy.appendChild(dailyUiElement("div", "codex-plus-row-title", title));
+    if (detail) copy.appendChild(dailyUiElement("div", "codex-plus-row-description", detail));
+    row.append(copy, ...controls);
+    container.appendChild(row);
+  }
+
+  function dailyUiButton(label, activate) {
+    const button = dailyUiElement("button", "codex-plus-menu-trigger", label);
+    button.type = "button";
+    button.addEventListener("click", activate);
+    return button;
+  }
+
+  function dailyUiSwitch(label, initial, change) {
+    const button = dailyUiElement("button", "codex-plus-toggle");
+    button.type = "button";
+    button.setAttribute("role", "switch");
+    button.setAttribute("aria-label", label);
+    button.appendChild(dailyUiElement("span"));
+    const set = (enabled) => {
+      button.dataset.enabled = String(enabled);
+      button.setAttribute("aria-checked", String(enabled));
+    };
+    set(initial);
+    button.addEventListener("click", () => {
+      const enabled = button.dataset.enabled !== "true";
+      try { change(enabled); set(enabled); }
+      catch { showToast("保存设置失败，请重试", { type: "error" }); }
+    });
+    return button;
+  }
+
+  function dailyUiApplyPlan(root) {
+    if (!root || root.dataset.codexPlusDailyDraftSeen === "true") return;
+    const editor = root.querySelector('[data-codex-composer][contenteditable="true"]');
+    const controls = root.querySelector('[data-composer-leading-controls]');
+    if (!editor || !controls || root.closest('[data-app-shell-active-page="false"]') || !root.getClientRects().length) return;
+    root.dataset.codexPlusDailyDraftSeen = "true";
+    const locale = String(document.documentElement.lang || navigator.language || "");
+    if (!/^(?:en|zh)(?:-|$)/i.test(locale)) return;
+    const activePlan = [...controls.querySelectorAll("button[aria-label]")].some((button) =>
+      /^(?:Plan|Plan mode|计划|计划模式|规划|方案|計劃|計畫|規劃)$/i.test(button.getAttribute("aria-label").trim()));
+    if (activePlan || editor.textContent.trim() || root.querySelector('[data-above-composer-conversation-id]')) return;
+    window.dispatchEvent(new MessageEvent("message", { data: { type: "run-command", id: "composer.togglePlanMode" } }));
+  }
+
+  function dailyUiSidebarSelector(id) {
+    if (id.startsWith("section:")) {
+      const headings = dailyUiSections[id.slice(8)];
+      return Array.isArray(headings) ? headings.map((heading) => `[data-app-action-sidebar-scroll] [data-app-action-sidebar-section-heading="${heading}"]`).join(",") : "";
+    }
+    if (!/^builtin:[a-z][a-z0-9-]{0,63}$/.test(id) || /:(?:home|new-chat|settings|search)$/.test(id)) return "";
+    return `:is([data-app-action-sidebar-scroll],nav[data-app-navigation-rail]) [data-sidebar-destination="${id}"]:not([data-codex-plus-sidebar-nav] *)`;
+  }
+
+  function dailyUiSidebarChoices() {
+    const choices = new Map();
+    for (const node of document.querySelectorAll(':is([data-app-action-sidebar-scroll],nav[data-app-navigation-rail]) [data-sidebar-destination^="builtin:"]')) {
+      const id = node.dataset.sidebarDestination;
+      const label = (node.getAttribute("aria-label") || node.textContent || "").trim();
+      if (!node.closest('[data-codex-plus-sidebar-nav]') && dailyUiSidebarSelector(id) && label) choices.set(id, label);
+    }
+    choices.set("section:projects", "项目列表");
+    choices.set("section:recents", "最近会话");
+    return choices;
+  }
+
+  function dailyUiProjectPath(raw) {
+    const value = String(raw ?? "").trim();
+    if (!value) return null;
+    const valid = isWindowsPlatformForDailyUi() ? /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\]+\\[^\\]+/.test(value) : value.startsWith("/");
+    if (!valid || /[\x00-\x1f]/.test(value)) throw new Error("请输入本机目录的绝对路径");
+    return value;
+  }
+
+  function isWindowsPlatformForDailyUi() {
+    return /win/i.test(navigator.userAgentData?.platform || navigator.platform || "");
+  }
+
+  async function dailyUiProjectControl(container) {
+    const input = dailyUiElement("input", "codex-plus-width-input codex-plus-daily-project-path");
+    input.type = "text";
+    input.placeholder = "桌面默认目录";
+    input.setAttribute("aria-label", "新建项目默认目录");
+    const status = dailyUiElement("div", "codex-plus-row-description");
+    status.setAttribute("role", "status");
+    let previous;
+    const settingKey = "defaultProjectParent";
+    let busy = true;
+    const update = () => { input.disabled = busy; save.disabled = busy || input.value.trim() === (previous || ""); };
+    const save = dailyUiButton("保存目录", async () => {
+      if (busy) return;
+      busy = true;
+      update();
+      try {
+        const value = dailyUiProjectPath(input.value);
+        if ((await readCodexAppSetting(settingKey) ?? null) !== previous) throw new Error("目录已被更改，请重新打开设置");
+        await writeCodexAppSetting(settingKey, value);
+        if ((await readCodexAppSetting(settingKey) ?? null) !== value) throw new Error("桌面返回的目录与所选值不同");
+        previous = value;
+        input.value = value || "";
+        status.textContent = "已保存，新建本地项目会使用此目录。";
+      } catch (error) { status.textContent = error?.message || "保存目录失败"; }
+      finally { busy = false; update(); }
+    });
+    input.addEventListener("input", update);
+    dailyUiRow(container, "新建项目默认目录", "用于从头创建本地项目。清空并保存可恢复桌面默认目录。", input, save);
+    container.appendChild(status);
+    update();
+    try {
+      previous = await readCodexAppSetting(settingKey) ?? null;
+      input.value = previous || "";
+      busy = false;
+      update();
+    } catch { status.textContent = "读取本地桌面设置失败，请重新打开此页。"; }
+  }
+
+  function dailyUiBookmark(message) {
+    const scroller = message?.element?.closest(".thread-scroll-container");
+    if (!scroller || scroller.closest('[data-app-shell-active-page="false"]')) return null;
+    const ref = currentSessionRef();
+    const thread = normalizedCodexThreadUuid(message.conversationId || dailyUiMountedThread(scroller));
+    const anchor = message.id;
+    if (!thread || typeof anchor !== "string" || !anchor || anchor.length > 512 || !["assistant", "user"].includes(message.role)) return null;
+    const host = ref.session_id === thread ? ref.host_id || null : null;
+    const turn = normalizedCodexThreadUuid(message.turnId);
+    const offset = Math.abs(scroller.scrollTop);
+    const position = offset / Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+    return { thread, host, turn, anchor, role: message.role, title: Array.from(String(message.text || "").trim()).slice(0, 96).join(""), offset, position: Math.min(1, position), date: Date.now() };
+  }
+
+  function dailyUiMountedThread(scroller) {
+    return normalizedCodexThreadUuid(scroller?.querySelector('[data-above-composer-conversation-id]')?.getAttribute('data-above-composer-conversation-id')
+      || scroller?.querySelector('[data-response-annotation-conversation]')?.getAttribute('data-response-annotation-conversation'));
+  }
+
+  function dailyUiNavigateToMark(mark) {
+    if (dailyUiMountedThread(currentThreadScroller()) === mark.thread) return true;
+    if (mark.host === "local") {
+      window.dispatchEvent(new MessageEvent("message", { data: { type: "navigate-to-route", path: `/local/${mark.thread}` } }));
+      return true;
+    }
+    for (const row of sessionRows()) {
+      const ref = sessionRefFromRow(row);
+      if (ref.session_id === mark.thread && (!mark.host || ref.host_id === mark.host)) { row.click(); return true; }
+    }
+    showToast("请从原主机打开此会话，再打开书签以定位消息", { type: "warn" });
+    return false;
+  }
+
+  function dailyUiBookmarkKey(mark) {
+    return `${dailyUiBookmarkPrefix}${mark.thread}:${mark.role}:${encodeURIComponent(mark.anchor)}`;
+  }
+
+  function dailyUiPageDirection(scroller, turn) {
+    if (!turn) return 0;
+    const railItems = scroller.closest("main")?.querySelectorAll('button[data-thread-user-message-navigation-item-id]');
+    if (!railItems?.length) return 0;
+    const order = new Map(Array.from(railItems, (item, index) => [item.dataset.threadUserMessageNavigationItemId.split(":")[0], index]));
+    const wanted = order.get(turn);
+    if (wanted === undefined) return 0;
+    const mounted = Array.from(scroller.querySelectorAll('[data-content-search-unit-key]'), (item) => order.get(item.dataset.contentSearchUnitKey.split(":")[0])).filter(Number.isFinite);
+    if (!mounted.length) return 0;
+    if (wanted < Math.min(...mounted)) return -1;
+    if (wanted > Math.max(...mounted)) return 1;
+    return 0;
+  }
+
+  function dailyUiScrollToMark(mark, done) {
+    const deadline = Date.now() + 20000;
+    let attempts = 0;
+    let lastPositionAt = 0;
+    let usedNavigationRail = false;
+    let timer = 0;
+    const cancel = () => { clearTimeout(timer); done(); };
+    const locate = () => {
+      const scroller = currentThreadScroller();
+      if (scroller && dailyUiMountedThread(scroller) === mark.thread) {
+        cancelThreadScrollRestoreForUserIntent(mark.thread);
+        const attribute = mark.role === "assistant" ? "data-response-annotation-target" : "data-content-search-unit-key";
+        const target = scroller.querySelector(`[${attribute}="${CSS.escape(mark.anchor)}"]`);
+        if (target) { target.scrollIntoView({ block: "center", behavior: "instant" }); cancel(); return; }
+        if (!usedNavigationRail && normalizedCodexThreadUuid(mark.turn)) {
+          const rail = scroller.closest("main")?.querySelector(`button[data-thread-user-message-navigation-item-id^="${CSS.escape(mark.turn)}:"]`);
+          if (rail) { usedNavigationRail = true; lastPositionAt = Date.now() + 800; rail.click(); }
+        }
+        if (Date.now() - lastPositionAt > 320 && scroller.scrollHeight > scroller.clientHeight) {
+          const distance = scroller.scrollHeight - scroller.clientHeight;
+          const direction = dailyUiPageDirection(scroller, mark.turn);
+          const reversed = threadScrollIsReversed(scroller);
+          const fraction = Math.min(1, Math.max(0, Number(mark.position) || 0));
+          const stride = Math.ceil(Math.max(0, attempts - 1) / 2) * scroller.clientHeight * .85;
+          const position = attempts === 1 && Number.isFinite(mark.offset) ? mark.offset
+            : fraction * distance + (attempts % 2 === 0 ? stride : -stride);
+          if (direction < 0) scroller.scrollTop = reversed ? -distance : 0;
+          else if (direction > 0) scroller.scrollTop = reversed ? 0 : distance;
+          else scroller.scrollTop = (reversed ? -1 : 1) * Math.min(distance, Math.max(0, position));
+          attempts += 1;
+          lastPositionAt = Date.now();
+        }
+      }
+      if (Date.now() >= deadline) { showToast("未找到书签对应的消息，请确认原会话仍可用", { type: "warn" }); cancel(); return; }
+      timer = setTimeout(locate, 90);
+    };
+    timer = setTimeout(locate, 50);
+    return cancel;
+  }
+
+  function codexPlusDailyUiExtension(ctx) {
+    let hidden = ctx.storage.get("hiddenSidebar", {});
+    const sidebarStyle = dailyUiElement("style");
+    function syncSidebar() {
+      hidden = ctx.storage.get("hiddenSidebar", {});
+      const selectors = Object.keys(hidden || {}).map(dailyUiSidebarSelector).filter(Boolean);
+      const content = selectors.length ? `${selectors.join(",")} { display: none !important; }` : "";
+      if (sidebarStyle.textContent !== content) sidebarStyle.textContent = content;
+      if (content && !sidebarStyle.isConnected) document.head.appendChild(sidebarStyle);
+      if (!content && sidebarStyle.isConnected) sidebarStyle.remove();
+    }
+    const plan = () => {
+      if (ctx.storage.get("defaultPlan", false) === true) {
+        for (const root of document.querySelectorAll('main [data-codex-composer-root][data-composer-placement="home"]')) dailyUiApplyPlan(root);
+      }
+    };
+    let pendingJump;
+    let unregisterAction;
+    function syncActions() {
+      if (ctx.storage.get("bookmarksEnabled", false) !== true) { unregisterAction?.(); unregisterAction = null; return; }
+      if (unregisterAction) return;
+      unregisterAction = ctx.registerMessageAction({ id: "toggle-bookmark", label: "添加或移除消息书签",
+        icon: '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M4 3.4c0-.8.5-1.2 1.2-1.2h5.6c.7 0 1.2.4 1.2 1.2v10.3L8 11l-4 2.7z"/></svg>', roles: ["user","assistant"],
+        onActivate({ message }) {
+          const mark = dailyUiBookmark(message);
+          if (!mark) { showToast("这条消息尚无可定位的会话或消息编号", { type: "warn" }); return; }
+          const key = dailyUiBookmarkKey(mark);
+          try {
+            const exists = ctx.storage.get(key) !== null;
+            if (exists) ctx.storage.remove(key); else ctx.storage.set(key, mark);
+            showToast(exists ? "已移除书签" : "已添加消息书签");
+          } catch { showToast("无法保存书签", { type: "error" }); }
+        },
+      });
+    }
+    function bookmarks(container) {
+      container.replaceChildren();
+      const list = ctx.storage.keys().filter((key) => key.startsWith(dailyUiBookmarkPrefix)).map((key) => [key, ctx.storage.get(key)])
+        .filter(([,mark]) => mark && normalizedCodexThreadUuid(mark.thread) === mark.thread && typeof mark.anchor === "string" && mark.anchor.length <= 512)
+        .sort((left,right) => right[1].date - left[1].date);
+      if (!list.length) container.appendChild(dailyUiElement("p", "codex-plus-row-description", "在消息操作栏点击书签即可收藏。"));
+      for (const [key,mark] of list) {
+        dailyUiRow(container, mark.title || (mark.role === "user" ? "用户消息" : "助手消息"), `会话 ${mark.thread.slice(0,8)}`,
+          dailyUiButton("打开", () => {
+            pendingJump?.();
+            closeCodexPlusPage();
+            if (dailyUiNavigateToMark(mark)) pendingJump = dailyUiScrollToMark(mark, () => { pendingJump = null; });
+          }), dailyUiButton("移除", () => { ctx.storage.remove(key); bookmarks(container); }));
+      }
+    }
+    ctx.registerSettingsSection({ id: "daily-ui", title: "界面与日常操作", order: 45, render({ container }) {
+      container.replaceChildren();
+      dailyUiRow(container, "新任务默认 Plan 模式", "在空白的新任务中开启计划模式，可在输入框里随时切换。",
+        dailyUiSwitch("新任务默认 Plan 模式", ctx.storage.get("defaultPlan", false) === true, (enabled) => { ctx.storage.set("defaultPlan", enabled); plan(); }));
+      void dailyUiProjectControl(container);
+      const nav = dailyUiElement("section");
+      container.appendChild(nav);
+      const renderSidebar = () => {
+        nav.replaceChildren(dailyUiElement("h3", "codex-plus-settings-section-title", "侧栏显示项目"));
+        const choices = dailyUiSidebarChoices();
+        for (const [id,label] of Object.entries(hidden || {})) if (dailyUiSidebarSelector(id) && !choices.has(id)) choices.set(id, String(label));
+        for (const [id,label] of choices) dailyUiRow(nav, label, "", dailyUiSwitch(label, !Object.hasOwn(hidden || {}, id), (visible) => {
+          const next = { ...ctx.storage.get("hiddenSidebar", {}) };
+          if (visible) delete next[id]; else next[id] = label;
+          ctx.storage.set("hiddenSidebar", next);
+          syncSidebar();
+        }));
+        nav.appendChild(dailyUiButton("恢复全部侧栏项目", () => { ctx.storage.remove("hiddenSidebar"); syncSidebar(); renderSidebar(); }));
+      };
+      renderSidebar();
+      const saved = dailyUiElement("div");
+      dailyUiRow(container, "消息书签", "将消息位置和简短摘录保存在本机。", dailyUiSwitch("消息书签", ctx.storage.get("bookmarksEnabled",false) === true,
+        (enabled) => { ctx.storage.set("bookmarksEnabled", enabled); syncActions(); bookmarks(saved); }));
+      container.appendChild(saved);
+      bookmarks(saved);
+    } });
+    ctx.onScan(plan, { phase: "light" });
+    ctx.listen(window, "storage", () => { syncSidebar(); syncActions(); plan(); });
+    ctx.listen(window, "wheel", () => pendingJump?.(), { capture: true, passive: true });
+    ctx.listen(window, "touchstart", () => pendingJump?.(), { capture: true, passive: true });
+    ctx.listen(window, "keydown", () => pendingJump?.(), { capture: true });
+    ctx.effect(() => { syncSidebar(); syncActions(); plan(); return () => { sidebarStyle.remove(); pendingJump?.(); }; });
+  }
+  /**
+   * Codex++ 设置页里的「皮肤」分区（内置拓展「梦皮主题」注册，见 96-builtin-extensions.js）。
+   *
+   * 皮肤只在 Codex App 里有意义，所以界面只放这里；管理器只留「恢复默认皮肤」急救入口。
+   * 数据与动作经 bridge 路由 /dream-skin（管理器 dream_skin_bridge.rs），跑的是管理器原来那组命令函数：
+   * 主题库、主题市场、DreamSkin 社区、激活（同「应用所选主题」：先存开关再激活）、恢复原始外观。
+   *
+   * 页面拿不到也不提交本地路径：预览图按 key 由服务端读成 data URL；新建主题、导入主题包、
+   * 换素材都是把选中的文件内容传过去，由服务端落到自己的上传目录再交给核心函数校验。
+   * 换成不同主题时皮肤样式要重启 Codex 才完整切换（与管理器一致），这时给出「重启 Codex」。
+   *
+   * 「壁纸透出」（#3233）是本机偏好，存在 Codex++ 设置里、不写进主题包；服务端注入时作为
+   * userTransparency 并进主题配置交给上游渲染器，皮肤开着就当场实时重应用。
+   */
+  const codexPlusSkinState = {
+    data: null,
+    busy: "",
+    status: "",
+    tone: "",
+    tab: "local",
+    previews: {},
+    market: null,
+    community: null,
+    editing: null,
+    pendingRestart: false,
+    checks: null,
+    root: null,
+    // 「壁纸透出」提交中 / 提交中又改了的下一个值（{ value }）：松手才提交，连按方向键只发最后一个。
+    transparencyBusy: false,
+    transparencyQueued: null,
+  };
+  /** 「跟随主题」时滑块停的位置：上游渲染器给没写透明度的主题的默认透出。 */
+  const codexPlusSkinTransparencyFallback = 30;
+
+  const codexPlusSkinColorFields = [
+    ["background", "背景色"], ["panel", "面板色"], ["panelAlt", "次级面板色"], ["accent", "强调色"], ["accentAlt", "次级强调色"],
+    ["secondary", "辅助色"], ["highlight", "高亮色"], ["text", "文字色"], ["muted", "弱化文字色"], ["line", "边线色"],
+  ];
+  const codexPlusSkinTextFields = [
+    ["name", "主题名称"], ["brandSubtitle", "品牌副标题"], ["tagline", "主题标语"], ["projectPrefix", "项目前缀"],
+    ["projectLabel", "项目按钮文字"], ["statusText", "状态文字"], ["quote", "引用文字"],
+  ];
+  const codexPlusSkinCompanionLimit = 240000;
+  const codexPlusSkinMediaAccept = codexPlusDreamSkinPlatform === "windows"
+    ? ".png,.jpg,.jpeg,.webp,.gif,.bmp,.mp4,.webm"
+    : ".png,.jpg,.jpeg,.heic,.tif,.tiff,.webp,.mp4,.webm";
+
+  function codexPlusSkinRequest(action, payload = {}) {
+    return postJson("/dream-skin", { action, ...payload });
+  }
+
+  function codexPlusSkinSetStatus(message, tone = "") {
+    codexPlusSkinState.status = String(message || "");
+    codexPlusSkinState.tone = tone;
+  }
+
+  function codexPlusSkinTone(result) {
+    if (result?.status === "ok") return "ok";
+    if (result?.status === "pending_restart" || result?.status === "not_checked") return "warn";
+    return "error";
+  }
+
+  /** 命令结果里带回的开关与主题库直接并进状态，页面一次刷新完。 */
+  function codexPlusSkinMerge(result) {
+    if (!result || !Array.isArray(result.themes)) return;
+    codexPlusSkinState.data = { ...(codexPlusSkinState.data || {}), ...result };
+  }
+
+  async function codexPlusSkinLoad() {
+    const result = await codexPlusSkinRequest("overview");
+    if (result?.status !== "ok" && !Array.isArray(result?.themes)) {
+      codexPlusSkinSetStatus(result?.message || "读取皮肤失败", "error");
+    } else {
+      codexPlusSkinMerge(result);
+      if (result.message) codexPlusSkinSetStatus(result.message, "error");
+    }
+    codexPlusSkinRender();
+    void codexPlusSkinLoadPreviews();
+  }
+
+  /** 预览图逐个取（有的主题图很大，不并发）；取到就地换进卡片，不重绘整页。 */
+  async function codexPlusSkinLoadPreviews() {
+    const state = codexPlusSkinState;
+    for (const theme of state.data?.themes || []) {
+      if (!theme.hasPreview || theme.key in state.previews) continue;
+      state.previews[theme.key] = "";
+      const result = await codexPlusSkinRequest("preview", { key: theme.key });
+      state.previews[theme.key] = result?.url || "";
+      if (!state.previews[theme.key]) continue;
+      state.root?.querySelectorAll(`[data-skin-preview="${CSS.escape(theme.key)}"]`).forEach((node) => {
+        node.style.backgroundImage = `url("${state.previews[theme.key]}")`;
+        node.dataset.loaded = "true";
+      });
+    }
+  }
+
+  async function codexPlusSkinRun(busy, action, payload, { reloadPreviews = false } = {}) {
+    const state = codexPlusSkinState;
+    state.busy = busy;
+    codexPlusSkinRender();
+    const result = await codexPlusSkinRequest(action, payload);
+    state.busy = "";
+    codexPlusSkinMerge(result);
+    codexPlusSkinSetStatus(result?.message || (result?.status === "ok" ? "" : "操作失败"), codexPlusSkinTone(result));
+    if (reloadPreviews) state.previews = {};
+    codexPlusSkinRender();
+    void codexPlusSkinLoadPreviews();
+    return result;
+  }
+
+  async function codexPlusSkinActivate(key) {
+    const result = await codexPlusSkinRun(`activate:${key}`, "activate", { key });
+    if (result?.status === "ok") {
+      codexPlusSkinState.pendingRestart = result.savedForNextLaunch === true;
+      codexPlusSkinRender();
+    }
+  }
+
+  async function codexPlusSkinRestore() {
+    const result = await codexPlusSkinRun("restore", "restore", {});
+    if (result?.status === "pending_restart" || result?.status === "ok") {
+      codexPlusSkinState.pendingRestart = true;
+      codexPlusSkinRender();
+    }
+  }
+
+  /** 设置里的「壁纸透出」：0–100 的整数，其它（含未设）都是跟随主题（null）。 */
+  function codexPlusSkinTransparencyValue(value) {
+    return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(100, Math.round(value))) : null;
+  }
+
+  function codexPlusSkinTransparencyText(value) {
+    return value === null ? "跟随主题" : `${value}%`;
+  }
+
+  /** 提交「壁纸透出」（null = 跟随主题）。提交中再改只记下最新值，这一次回来后接着发。 */
+  async function codexPlusSkinSetTransparency(value) {
+    const state = codexPlusSkinState;
+    state.transparencyQueued = { value: codexPlusSkinTransparencyValue(value) };
+    if (state.transparencyBusy) return;
+    state.transparencyBusy = true;
+    let result = null;
+    while (state.transparencyQueued) {
+      const next = state.transparencyQueued.value;
+      state.transparencyQueued = null;
+      result = await codexPlusSkinRequest("transparency", { value: next });
+    }
+    state.transparencyBusy = false;
+    codexPlusSkinMerge(result);
+    if (result?.status === "pending_restart") state.pendingRestart = true;
+    codexPlusSkinSetStatus(result?.message || (result?.status === "ok" ? "" : "保存壁纸透出失败"), codexPlusSkinTone(result));
+    codexPlusSkinRender();
+  }
+
+  async function codexPlusSkinLoadCatalog(kind) {
+    const state = codexPlusSkinState;
+    state.busy = `catalog:${kind}`;
+    codexPlusSkinRender();
+    const result = await codexPlusSkinRequest(kind, {});
+    state.busy = "";
+    state[kind] = result || { status: "failed", message: "读取失败" };
+    if (result?.status !== "ok") codexPlusSkinSetStatus(result?.message || "读取失败", "error");
+    codexPlusSkinRender();
+  }
+
+  async function codexPlusSkinInstall(kind, id) {
+    const state = codexPlusSkinState;
+    state.busy = `install:${id}`;
+    codexPlusSkinRender();
+    const result = await codexPlusSkinRequest(kind === "market" ? "installMarket" : "installCommunity", { id });
+    state.busy = "";
+    if (result && (Array.isArray(result.themes) || Array.isArray(result.items))) state[kind] = result;
+    codexPlusSkinSetStatus(result?.message || "安装失败", codexPlusSkinTone(result));
+    await codexPlusSkinLoad();
+  }
+
+  /** 读选中的文件成 { name, data(base64) }。 */
+  function codexPlusSkinReadFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve({ name: file.name, data: String(reader.result || "").replace(/^data:[^,]*,/, "") });
+      reader.onerror = () => reject(new Error("读取文件失败"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function codexPlusSkinUpload(kind, file) {
+    if (!file) return;
+    if (file.size > 50 * 1024 * 1024) {
+      codexPlusSkinSetStatus("文件超过 50 MiB。", "error");
+      return codexPlusSkinRender();
+    }
+    const media = await codexPlusSkinReadFile(file).catch(() => null);
+    if (!media) {
+      codexPlusSkinSetStatus("读取文件失败，请重新选择。", "error");
+      return codexPlusSkinRender();
+    }
+    if (kind === "media") {
+      codexPlusSkinState.editing.media = media;
+      return codexPlusSkinRender();
+    }
+    await codexPlusSkinRun(kind, kind, { media }, { reloadPreviews: true });
+  }
+
+  function codexPlusSkinChooseCompanion(file) {
+    const editing = codexPlusSkinState.editing;
+    if (!file || !editing) return;
+    if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(file.type)) {
+      editing.companionError = "仅支持 PNG、JPEG、WebP 或 GIF 图片";
+      return codexPlusSkinRender();
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === "string" ? reader.result : "";
+      if (!dataUrl || dataUrl.length > codexPlusSkinCompanionLimit) {
+        editing.companionError = "图片过大，请选择 180 KB 以内的图片";
+      } else {
+        editing.companionError = "";
+        codexPlusSkinUpdateCompanion({ dataUrl });
+      }
+      codexPlusSkinRender();
+    };
+    reader.onerror = () => {
+      editing.companionError = "读取图片失败，请重新选择";
+      codexPlusSkinRender();
+    };
+    reader.readAsDataURL(file);
+  }
+
+  /** 与管理器 updateCompanion 一致：缺省宽 96、靠右、偏移 (0, 4)。 */
+  function codexPlusSkinUpdateCompanion(patch) {
+    const config = codexPlusSkinState.editing.config;
+    const companion = config.companion || {};
+    config.companion = {
+      dataUrl: companion.dataUrl || "",
+      enabled: companion.enabled ?? true,
+      width: companion.width ?? 96,
+      side: companion.side ?? "right",
+      offsetX: companion.offsetX ?? 0,
+      offsetY: companion.offsetY ?? 4,
+      ...patch,
+    };
+    codexPlusSkinState.editing.dirty = true;
+  }
+
+  async function codexPlusSkinEdit(theme) {
+    const result = await codexPlusSkinRequest("load", { key: theme.key });
+    if (result?.status !== "ok" || !result.config) {
+      codexPlusSkinSetStatus(result?.message || "读取主题失败", "error");
+      return codexPlusSkinRender();
+    }
+    const config = JSON.parse(JSON.stringify(result.config));
+    // 与管理器「保存」一致：内置主题另存成新主题，名字是默认名时改成「副本」。
+    if (result.builtin) {
+      config.id = `theme-${Date.now()}`;
+      if (config.name === "Dream Skin") config.name = "Dream Skin 副本";
+    }
+    codexPlusSkinState.editing = { key: theme.key, config, media: null, dirty: result.builtin === true, companionError: "", builtin: result.builtin === true };
+    codexPlusSkinRender();
+    codexPlusSkinState.root?.querySelector(".codex-plus-skin-editor")?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+
+  async function codexPlusSkinSave(apply) {
+    const editing = codexPlusSkinState.editing;
+    if (!editing) return;
+    if (!String(editing.config.name || "").trim()) {
+      codexPlusSkinSetStatus("请填写主题名称。", "error");
+      return codexPlusSkinRender();
+    }
+    const result = await codexPlusSkinRun("save", "save", { config: editing.config, media: editing.media }, { reloadPreviews: true });
+    if (result?.status !== "ok") return;
+    const key = `stored:${editing.config.id}`;
+    codexPlusSkinState.editing = null;
+    codexPlusSkinRender();
+    if (apply) await codexPlusSkinActivate(key);
+  }
+
+  async function codexPlusSkinRename(theme) {
+    const answer = await codexPlusAsk({ title: "重命名主题", input: { default: theme.name, placeholder: "输入新的主题名称" }, options: [{ value: "ok", label: "重命名" }] });
+    const name = String(answer?.text || "").trim();
+    if (!answer || !name || name === theme.name) return;
+    await codexPlusSkinRun(`rename:${theme.key}`, "rename", { id: theme.id, name });
+  }
+
+  async function codexPlusSkinDelete(theme) {
+    const answer = await codexPlusAsk({ title: "删除主题", message: `删除主题「${theme.name}」？此操作无法撤销。`, options: [{ value: "delete", label: "删除" }] });
+    if (!answer) return;
+    if (codexPlusSkinState.editing?.key === theme.key) codexPlusSkinState.editing = null;
+    await codexPlusSkinRun(`delete:${theme.key}`, "delete", { id: theme.id });
+  }
+
+  async function codexPlusSkinCheck() {
+    const state = codexPlusSkinState;
+    state.busy = "status";
+    codexPlusSkinRender();
+    const result = await codexPlusSkinRequest("status", {});
+    state.busy = "";
+    state.checks = result;
+    codexPlusSkinRender();
+  }
+
+  function codexPlusSkinThemeSwatch(theme, label) {
+    const url = codexPlusSkinState.previews[theme.key];
+    const initial = escapeHtml(String(label || "?").trim().slice(0, 1) || "?");
+    return `<div class="codex-plus-skin-thumb" data-skin-preview="${escapeHtml(theme.key)}" data-loaded="${String(Boolean(url))}"${url ? ` style="background-image:url(&quot;${url}&quot;)"` : ""}><span>${initial}</span></div>`;
+  }
+
+  function codexPlusSkinRemoteThumb(url, label) {
+    const initial = escapeHtml(String(label || "?").trim().slice(0, 1) || "?");
+    // 只认不带引号、括号、空白的 https 地址：它要放进 style 的 url("…") 里。
+    const safe = /^https:\/\/[^\s"'()\\]+$/i.test(String(url || "")) ? String(url) : "";
+    return `<div class="codex-plus-skin-thumb" data-loaded="${String(Boolean(safe))}"${safe ? ` style="background-image:url(&quot;${escapeHtml(safe)}&quot;)"` : ""}><span>${initial}</span></div>`;
+  }
+
+  function codexPlusSkinButton(action, label, attrs = "", busyKey = "") {
+    const state = codexPlusSkinState;
+    const busy = busyKey && state.busy === busyKey;
+    return `<button type="button" class="codex-plus-action-button" data-skin-action="${action}" ${attrs} ${state.busy ? "disabled" : ""}>${escapeHtml(busy ? `${label}中…` : label)}</button>`;
+  }
+
+  function codexPlusSkinLocalCards() {
+    const state = codexPlusSkinState;
+    const data = state.data || {};
+    const enabled = data.enabled === true && data.paused !== true;
+    const themes = data.themes || [];
+    if (!themes.length) return '<div class="codex-plus-skin-empty">主题库是空的。</div>';
+    return `<div class="codex-plus-skin-grid">${themes.map((theme) => {
+      const using = theme.active && enabled;
+      const badges = [
+        using ? '<span class="codex-plus-skin-badge" data-tone="active">使用中</span>' : theme.active ? '<span class="codex-plus-skin-badge">当前主题</span>' : "",
+        theme.builtin ? '<span class="codex-plus-skin-badge">内置</span>' : "",
+        theme.kind === "activeUnsaved" ? '<span class="codex-plus-skin-badge" data-tone="warn">未存进主题库</span>' : "",
+        theme.modified ? '<span class="codex-plus-skin-badge" data-tone="warn">已修改</span>' : "",
+      ].join("");
+      const stored = theme.kind === "stored";
+      return `<div class="codex-plus-skin-card" data-active="${String(using)}">
+        ${codexPlusSkinThemeSwatch(theme, theme.name)}
+        <div class="codex-plus-skin-card-body">
+          <div class="codex-plus-skin-card-title" title="${escapeHtml(theme.name)}">${escapeHtml(theme.name)}</div>
+          <div class="codex-plus-skin-card-badges">${badges}</div>
+          <div class="codex-plus-skin-card-actions">
+            ${using ? "" : codexPlusSkinButton("activate", "应用", `data-key="${escapeHtml(theme.key)}" data-primary="true"`, `activate:${theme.key}`)}
+            ${codexPlusSkinButton("edit", "编辑", `data-key="${escapeHtml(theme.key)}"`)}
+            ${stored ? codexPlusSkinButton("rename", "重命名", `data-key="${escapeHtml(theme.key)}"`) : ""}
+            ${stored && !theme.active ? codexPlusSkinButton("delete", "删除", `data-key="${escapeHtml(theme.key)}" data-danger="true"`) : ""}
+          </div>
+        </div>
+      </div>`;
+    }).join("")}</div>`;
+  }
+
+  function codexPlusSkinCatalogCards(kind) {
+    const state = codexPlusSkinState;
+    const catalog = state[kind];
+    if (!catalog) return `<div class="codex-plus-skin-empty">${state.busy === `catalog:${kind}` ? "正在读取…" : "还没有读取。"}</div>`;
+    const items = kind === "market" ? catalog.themes || [] : catalog.items || [];
+    const warning = catalog.warning ? `<div class="codex-plus-skin-note">${escapeHtml(catalog.warning)}</div>` : "";
+    if (!items.length) return `${warning}<div class="codex-plus-skin-empty">${escapeHtml(catalog.status === "ok" ? "这里还没有主题。" : catalog.message || "读取失败")}</div>`;
+    return `${warning}<div class="codex-plus-skin-grid">${items.map((item) => {
+      const author = kind === "market" ? item.author : item.authorDisplayName;
+      const meta = [author ? `作者 ${author}` : "", item.version ? `v${item.version}` : "", kind === "community" && item.downloadCount ? `${item.downloadCount} 次下载` : ""].filter(Boolean).join(" · ");
+      const blocked = kind === "community" && item.applyCompatible === false;
+      const action = item.updateAvailable ? "更新" : item.installed ? "" : "安装";
+      return `<div class="codex-plus-skin-card">
+        ${codexPlusSkinRemoteThumb(item.previewUrl, item.name)}
+        <div class="codex-plus-skin-card-body">
+          <div class="codex-plus-skin-card-title" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
+          <div class="codex-plus-skin-card-meta">${escapeHtml(meta)}</div>
+          ${kind === "market" && item.description ? `<div class="codex-plus-skin-card-meta" title="${escapeHtml(item.description)}">${escapeHtml(item.description)}</div>` : ""}
+          <div class="codex-plus-skin-card-actions">
+            ${item.installed && !item.updateAvailable ? '<span class="codex-plus-skin-badge" data-tone="active">已安装</span>' : ""}
+            ${blocked ? '<span class="codex-plus-skin-badge" data-tone="warn">当前版本不兼容</span>'
+              : action ? codexPlusSkinButton("install", action, `data-kind="${kind}" data-id="${escapeHtml(item.id)}" data-primary="true"`, `install:${item.id}`) : ""}
+          </div>
+        </div>
+      </div>`;
+    }).join("")}</div>`;
+  }
+
+  function codexPlusSkinRow(title, description, control) {
+    return `<div class="codex-plus-row"><div><div class="codex-plus-row-title">${escapeHtml(title)}</div>${description ? `<div class="codex-plus-row-description">${description}</div>` : ""}</div>${control || ""}</div>`;
+  }
+
+  function codexPlusSkinSegmented(field, value, options, label) {
+    return `<div class="codex-plus-provider-segmented" role="radiogroup" aria-label="${escapeHtml(label)}">${options.map(([id, text]) =>
+      `<button type="button" role="radio" aria-checked="${String(id === value)}" data-skin-choice="${field}" data-value="${escapeHtml(id)}">${escapeHtml(text)}</button>`).join("")}</div>`;
+  }
+
+  /** 「壁纸透出」行：滑块 + 当前值 + 「跟随主题」。当前主题的引擎不认这个偏好时禁用。 */
+  function codexPlusSkinTransparencyRow() {
+    const data = codexPlusSkinState.data || {};
+    const value = codexPlusSkinTransparencyValue(data.userTransparency);
+    const follow = value === null;
+    const supported = data.transparencySupported !== false;
+    const text = codexPlusSkinTransparencyText(value);
+    const description = supported
+      ? "侧栏、主区和输入框的底色透出多少壁纸（0% 不透，100% 全透）。「跟随主题」用主题配色自带的透明度，没写的透出 30%。只存在本机设置里，不写进主题包。"
+      : "当前主题使用的皮肤引擎不支持调节壁纸透出。";
+    return codexPlusSkinRow("壁纸透出", escapeHtml(description), `<span class="codex-plus-skin-inline">
+        <input type="range" class="codex-plus-skin-range" min="0" max="100" step="1" value="${follow ? codexPlusSkinTransparencyFallback : value}" data-skin-transparency data-follow="${String(follow)}" aria-label="壁纸透出" aria-valuetext="${escapeHtml(text)}" ${supported ? "" : "disabled"}>
+        <span class="codex-plus-skin-range-value" data-skin-transparency-value>${escapeHtml(text)}</span>
+        ${follow || !supported ? "" : '<button type="button" class="codex-plus-action-button" data-skin-action="transparency-follow">跟随主题</button>'}
+      </span>`);
+  }
+
+  function codexPlusSkinEditor() {
+    const editing = codexPlusSkinState.editing;
+    if (!editing) return "";
+    const config = editing.config;
+    const colors = config.colors || {};
+    const companion = config.companion || null;
+    const windows = codexPlusDreamSkinPlatform === "windows";
+    const input = (field, value, attrs = "") => `<input type="text" class="codex-plus-skin-input" data-skin-field="${field}" value="${escapeHtml(value ?? "")}" spellcheck="false" ${attrs}>`;
+    const textRows = codexPlusSkinTextFields.map(([field, label]) => codexPlusSkinRow(label, "", input(field, config[field]))).join("");
+    const colorRows = windows
+      ? codexPlusSkinRow("外观模式", "亮暗模式直接控制 Codex 外观。", codexPlusSkinSegmented("appearance", ["light", "dark"].includes(config.appearance) ? config.appearance : "auto", [["auto", "自动"], ["light", "亮色"], ["dark", "暗色"]], "外观模式"))
+        + codexPlusSkinRow("强调色", "留空时自动从主题图片提取。", `<span class="codex-plus-skin-color"><span class="codex-plus-skin-swatch" style="background:${escapeHtml(config.palette?.accent || "transparent")}"></span>${input("palette.accent", config.palette?.accent || "", 'placeholder="跟随图片配色"')}</span>`)
+      : codexPlusSkinColorFields.map(([key, label]) => codexPlusSkinRow(label, "",
+        `<span class="codex-plus-skin-color"><span class="codex-plus-skin-swatch" style="background:${escapeHtml(colors[key] || "transparent")}"></span>${input(`colors.${key}`, colors[key] || "", 'placeholder="#RRGGBB"')}</span>`)).join("");
+    const mediaName = editing.media ? editing.media.name : "沿用主题现在的图片或视频";
+    const companionRows = [
+      codexPlusSkinRow("输入框旁照片", editing.companionError ? `<span class="codex-plus-skin-error">${escapeHtml(editing.companionError)}</span>` : "显示在 Codex 输入框的左侧或右侧；180 KB 以内的 PNG、JPEG、WebP 或 GIF。",
+        `<span class="codex-plus-skin-inline">${companion?.dataUrl ? `<img class="codex-plus-skin-companion" alt="" src="${escapeHtml(companion.dataUrl)}">` : ""}
+          <label class="codex-plus-action-button codex-plus-skin-file">${companion?.dataUrl ? "更换照片" : "选择照片"}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-skin-file="companion" hidden></label>
+          ${companion?.dataUrl ? '<button type="button" class="codex-plus-action-button" data-skin-action="companion-clear">清除</button>' : ""}</span>`),
+      companion?.dataUrl ? codexPlusSkinRow("显示照片", "", `<button type="button" class="codex-plus-toggle" role="switch" aria-label="显示照片" aria-checked="${String(companion.enabled !== false)}" data-enabled="${String(companion.enabled !== false)}" data-skin-action="companion-toggle"><span></span></button>`) : "",
+      companion?.dataUrl ? codexPlusSkinRow("显示位置", "", codexPlusSkinSegmented("companion.side", companion.side || "right", [["auto", "自动"], ["left", "左侧"], ["right", "右侧"]], "显示位置")) : "",
+      companion?.dataUrl ? codexPlusSkinRow("照片宽度 / 水平偏移 / 垂直偏移", "单位像素。", `<span class="codex-plus-skin-inline">${["width", "offsetX", "offsetY"].map((key) =>
+        `<input type="text" inputmode="numeric" class="codex-plus-skin-input codex-plus-skin-number" data-skin-field="companion.${key}" value="${escapeHtml(String(companion[key] ?? (key === "width" ? 96 : key === "offsetY" ? 4 : 0)))}" aria-label="${key === "width" ? "照片宽度" : key === "offsetX" ? "水平偏移" : "垂直偏移"}">`).join("")}</span>`) : "",
+    ].join("");
+    return `<section class="codex-plus-skin-editor">
+      <div class="codex-plus-skin-section-head"><span>编辑主题：${escapeHtml(config.name || config.id)}</span>${editing.dirty ? '<span class="codex-plus-skin-badge" data-tone="warn">有未保存修改</span>' : ""}</div>
+      <div class="codex-plus-settings-card">
+        ${codexPlusSkinRow("图片或视频", escapeHtml(mediaName), `<label class="codex-plus-action-button codex-plus-skin-file">选择文件<input type="file" accept="${codexPlusSkinMediaAccept}" data-skin-file="media" hidden></label>`)}
+        ${textRows}
+      </div>
+      <div class="codex-plus-skin-section-head"><span>${windows ? "外观" : "主题配色"}</span></div>
+      <div class="codex-plus-settings-card">${colorRows}</div>
+      <div class="codex-plus-skin-section-head"><span>输入框旁照片</span></div>
+      <div class="codex-plus-settings-card">${companionRows}</div>
+      <div class="codex-plus-skin-editor-actions">
+        ${codexPlusSkinButton("save", "保存", 'data-primary="true"', "save")}
+        ${codexPlusSkinButton("save-apply", "保存并应用")}
+        <button type="button" class="codex-plus-action-button" data-skin-action="edit-cancel">取消</button>
+      </div>
+    </section>`;
+  }
+
+  function codexPlusSkinRender() {
+    const state = codexPlusSkinState;
+    const root = state.root;
+    if (!root?.isConnected) return;
+    const data = state.data;
+    if (!data) {
+      root.innerHTML = `<div class="codex-plus-settings-card">${codexPlusSkinRow(state.status || "正在读取皮肤…", "", state.status ? '<button type="button" class="codex-plus-action-button" data-skin-action="reload">重试</button>' : "")}</div>`;
+      return;
+    }
+    const enabled = data.enabled === true && data.paused !== true;
+    const activeTheme = (data.themes || []).find((theme) => theme.active);
+    const stateText = data.enhancementsEnabled === false
+      ? "Codex 增强总开关已关闭，皮肤不会生效；先在上面的「增强」里打开。"
+      : enabled ? `正在使用「${escapeHtml(activeTheme?.name || data.activeName || "未命名主题")}」。` : "皮肤已关闭，Codex 显示原始外观。";
+    const banner = state.status || state.pendingRestart
+      ? `<div class="codex-plus-skin-banner" data-tone="${escapeHtml(state.pendingRestart && !state.status ? "warn" : state.tone || "info")}" role="${state.tone === "error" ? "alert" : "status"}">
+          <span>${escapeHtml(state.status || "皮肤设置已保存，重启 Codex 后完整生效。")}</span>
+          ${state.pendingRestart ? codexPlusSkinButton("restart", "重启 Codex", "", "restart") : ""}
+        </div>`
+      : "";
+    const checks = state.checks
+      ? (state.checks.checks || []).map((check) => `<div class="codex-plus-skin-check" data-level="${escapeHtml(check.level)}"><strong>${escapeHtml(check.label)}</strong>${escapeHtml(check.message)}</div>`).join("") || escapeHtml(state.checks.message || "")
+      : "确认 Codex 里的皮肤有没有装上、素材有没有加载。";
+    const counts = { local: (data.themes || []).length, community: state.community?.items?.length, market: state.market?.themes?.length };
+    const tabs = `<div class="codex-plus-skin-toolbar">
+      <div class="codex-plus-provider-segmented" role="tablist" aria-label="主题来源">${[["local", "我的主题"], ["community", "DreamSkin 社区"], ["market", "主题市场"]].map(([id, text]) =>
+        `<button type="button" role="tab" aria-checked="${String(state.tab === id)}" aria-selected="${String(state.tab === id)}" data-skin-tab="${id}">${text}${counts[id] != null ? ` · ${counts[id]}` : ""}</button>`).join("")}</div>
+      <div class="codex-plus-skin-toolbar-actions">${state.tab === "local"
+        ? `<label class="codex-plus-action-button codex-plus-skin-file">从图片或视频新建<input type="file" accept="${codexPlusSkinMediaAccept}" data-skin-file="create" hidden></label>
+           <label class="codex-plus-action-button codex-plus-skin-file">导入主题包<input type="file" accept=".zip" data-skin-file="import" hidden></label>`
+        : codexPlusSkinButton("catalog-refresh", "刷新", `data-kind="${state.tab}"`, `catalog:${state.tab}`)}</div>
+    </div>`;
+    const body = state.tab === "local" ? codexPlusSkinLocalCards() : codexPlusSkinCatalogCards(state.tab);
+    const scroll = root.closest(".codex-plus-modal-body")?.scrollTop;
+    root.innerHTML = `<div class="codex-plus-skin">
+      ${banner}
+      <div class="codex-plus-settings-card">
+        ${codexPlusSkinRow("启用皮肤", stateText, `<button type="button" class="codex-plus-toggle" role="switch" aria-label="启用皮肤" aria-checked="${String(enabled)}" data-enabled="${String(enabled)}" data-pending="${String(Boolean(state.busy))}" data-skin-action="toggle" ${state.busy ? "disabled" : ""}><span></span></button>`)}
+        ${codexPlusSkinTransparencyRow()}
+        ${codexPlusSkinRow("恢复 Codex 原始外观", "关掉皮肤并清掉当前窗口里的皮肤，主题库不受影响。", codexPlusSkinButton("restore", "恢复", "", "restore"))}
+        ${codexPlusSkinRow("检查运行状态", checks, codexPlusSkinButton("check", "检查", "", "status"))}
+      </div>
+      ${tabs}
+      ${body}
+      ${codexPlusSkinEditor()}
+    </div>`;
+    if (scroll != null) root.closest(".codex-plus-modal-body").scrollTop = scroll;
+  }
+
+  /** 编辑区的输入：就地写回草稿不重绘（重绘会丢焦点），色块跟着变。 */
+  function codexPlusSkinHandleInput(event) {
+    const target = event.target;
+    // 拖动「壁纸透出」只改旁边的数字，不重绘（重绘会打断拖动）；松手的 change 才提交。
+    if (target?.dataset && "skinTransparency" in target.dataset) {
+      const text = codexPlusSkinTransparencyText(codexPlusSkinTransparencyValue(Number(target.value)));
+      target.dataset.follow = "false";
+      target.setAttribute("aria-valuetext", text);
+      const label = target.parentElement?.querySelector("[data-skin-transparency-value]");
+      if (label) label.textContent = text;
+      return;
+    }
+    const editing = codexPlusSkinState.editing;
+    const field = target?.dataset?.skinField;
+    if (!editing || !field) return;
+    const value = target.value;
+    const config = editing.config;
+    if (field.startsWith("colors.")) {
+      config.colors = { ...(config.colors || {}), [field.slice(7)]: value };
+    } else if (field === "palette.accent") {
+      const palette = { ...(config.palette || {}) };
+      if (value.trim()) palette.accent = value;
+      else delete palette.accent;
+      if (Object.keys(palette).length) config.palette = palette;
+      else delete config.palette;
+    } else if (field.startsWith("companion.")) {
+      const number = Number.parseInt(value, 10);
+      if (!Number.isFinite(number)) return;
+      // 范围与皮肤运行时一致：宽 48–160，水平偏移 ±48，垂直偏移 ±160。
+      const key = field.slice(10);
+      const [min, max] = { width: [48, 160], offsetX: [-48, 48], offsetY: [-160, 160] }[key] || [number, number];
+      codexPlusSkinUpdateCompanion({ [key]: Math.max(min, Math.min(max, number)) });
+    } else {
+      config[field] = value;
+    }
+    editing.dirty = true;
+    const swatch = target.closest(".codex-plus-skin-color")?.querySelector(".codex-plus-skin-swatch");
+    if (swatch) swatch.style.background = value || "transparent";
+  }
+
+  async function codexPlusSkinHandleChange(event) {
+    const target = event.target;
+    if (target?.dataset && "skinTransparency" in target.dataset) return codexPlusSkinSetTransparency(Number(target.value));
+    const kind = target?.dataset?.skinFile;
+    if (!kind) return;
+    const file = target.files?.[0];
+    target.value = "";
+    if (kind === "companion") return codexPlusSkinChooseCompanion(file);
+    await codexPlusSkinUpload(kind, file);
+  }
+
+  async function codexPlusSkinHandleClick(event) {
+    const target = event.target instanceof Element ? event.target : null;
+    const state = codexPlusSkinState;
+    if (!target) return;
+    const tab = target.closest("[data-skin-tab]");
+    if (tab) {
+      state.tab = tab.dataset.skinTab;
+      codexPlusSkinRender();
+      if (state.tab !== "local" && !state[state.tab] && !state.busy) void codexPlusSkinLoadCatalog(state.tab);
+      return;
+    }
+    const choice = target.closest("[data-skin-choice]");
+    if (choice && state.editing) {
+      const field = choice.dataset.skinChoice;
+      if (field === "appearance") state.editing.config.appearance = choice.dataset.value;
+      else if (field === "companion.side") codexPlusSkinUpdateCompanion({ side: choice.dataset.value });
+      state.editing.dirty = true;
+      return codexPlusSkinRender();
+    }
+    const button = target.closest("[data-skin-action]");
+    if (!button || button.disabled) return;
+    const theme = (state.data?.themes || []).find((item) => item.key === button.dataset.key);
+    switch (button.dataset.skinAction) {
+      case "reload": return codexPlusSkinLoad();
+      case "toggle": {
+        if (state.data?.enabled === true && state.data?.paused !== true) return codexPlusSkinRestore();
+        const active = (state.data?.themes || []).find((item) => item.active) || state.data?.themes?.[0];
+        return active ? codexPlusSkinActivate(active.key) : undefined;
+      }
+      case "restore": return codexPlusSkinRestore();
+      case "check": return codexPlusSkinCheck();
+      case "transparency-follow": return codexPlusSkinSetTransparency(null);
+      case "restart": {
+        const result = await codexPlusSkinRun("restart", "restart", {});
+        if (result?.status === "accepted" || result?.status === "ok") codexPlusSkinSetStatus("正在重启 Codex…", "ok");
+        return codexPlusSkinRender();
+      }
+      case "activate": return theme ? codexPlusSkinActivate(theme.key) : undefined;
+      case "edit": return theme ? codexPlusSkinEdit(theme) : undefined;
+      case "rename": return theme ? codexPlusSkinRename(theme) : undefined;
+      case "delete": return theme ? codexPlusSkinDelete(theme) : undefined;
+      case "install": return codexPlusSkinInstall(button.dataset.kind, button.dataset.id);
+      case "catalog-refresh": return codexPlusSkinLoadCatalog(button.dataset.kind);
+      case "save": return codexPlusSkinSave(false);
+      case "save-apply": return codexPlusSkinSave(true);
+      case "edit-cancel":
+        state.editing = null;
+        return codexPlusSkinRender();
+      case "companion-clear":
+        delete state.editing.config.companion;
+        state.editing.dirty = true;
+        return codexPlusSkinRender();
+      case "companion-toggle":
+        codexPlusSkinUpdateCompanion({ enabled: state.editing.config.companion?.enabled === false });
+        return codexPlusSkinRender();
+      default:
+        return undefined;
+    }
+  }
+
+  function codexPlusDreamSkinPageRender({ container }) {
+    const state = codexPlusSkinState;
+    state.root = container;
+    state.editing = null;
+    const onClick = (event) => { void codexPlusSkinHandleClick(event); };
+    const onChange = (event) => { void codexPlusSkinHandleChange(event); };
+    container.addEventListener("click", onClick);
+    container.addEventListener("input", codexPlusSkinHandleInput);
+    container.addEventListener("change", onChange);
+    codexPlusSkinRender();
+    void codexPlusSkinLoad();
+    return () => {
+      container.removeEventListener("click", onClick);
+      container.removeEventListener("input", codexPlusSkinHandleInput);
+      container.removeEventListener("change", onChange);
+      if (state.root === container) state.root = null;
+    };
+  }
   /**
    * 内置拓展：Codex++ 自带的功能也挂在拓展内核上，和第三方拓展走同一套生命周期
    * （没有特权功能：自带的也能单独停用、被别的拓展顶替）。
@@ -45078,6 +47607,7 @@ ${key} = ${value}`]);
       { id: "prompt-args", name: "自定义 prompt 参数", apply: codexPlusPromptArgsExtension },
       { id: "shell-command", name: "! 命令", apply: codexPlusShellCommandExtension },
       { id: "context-tuning", name: "上下文与压缩", apply: codexPlusContextTuningExtension },
+      { id: "daily-ui", name: "界面与日常操作", apply: codexPlusDailyUiExtension },
       { id: "offline-auto-review", name: "拿不到远程开关时补开「替我审批」", apply: codexPlusOfflineAutoReviewExtension },
       { id: "statsig-overrides", name: "Statsig 界面增强", apply: codexPlusStatsigOverridesExtension },
       { id: "weixin-desktop-sync", name: "微信会话同步", apply: codexPlusWeixinDesktopSyncExtension },
@@ -45212,9 +47742,10 @@ ${key} = ${value}`]);
     codexPlusAlignWith(ctx, () => window.__codexPlusModelPickerGroupsRuntime?.sync?.());
   }
 
-  /** 梦皮主题：主界面重建时补皮肤，设置变了就重装或清理。 */
+  /** 梦皮主题：主界面重建时补皮肤，设置变了就重装或清理；Codex++ 设置页里的「皮肤」分区也由它登记。 */
   function codexPlusDreamSkinExtension(ctx) {
     codexPlusAlignWith(ctx, refreshDreamSkin, { settings: "heartbeat", scan: "deferred" });
+    ctx.registerSettingsSection({ id: "dream-skin", title: "皮肤", order: 40, render: codexPlusDreamSkinPageRender });
   }
 
   /** 插件市场解锁：补丁装上后撤不掉，停用后刷新页面才完全恢复。 */
@@ -45363,7 +47894,12 @@ ${key} = ${value}`]);
 
   /** 微信会话同步：微信写入的会话通知桌面目录，读到设置（含心跳）时按设置里的待同步清单跑一次。 */
   function codexPlusWeixinDesktopSyncExtension(ctx) {
-    ctx.on("settings/loaded", () => void syncWeixinDesktopThreads());
+    const sync = () => void syncWeixinDesktopThreads();
+    ctx.on("settings/loaded", sync);
+    ctx.effect(() => {
+      codexPlusWeixinSyncHeartbeat = sync;
+      return () => { codexPlusWeixinSyncHeartbeat = null; };
+    });
   }
 
   /**
@@ -46827,7 +49363,6 @@ ${key} = ${value}`]);
       '[class*="user-message"]',
       '[class*="UserMessage"]',
       ".composer-footer",
-      codexPlusWorkGatewayProject,
       selectors.appHeader,
       selectors.archiveNav,
       selectors.pluginNavButton,
@@ -47038,6 +49573,7 @@ ${key} = ${value}`]);
   installCodexForkStatsigFallback();
   installCodexPlusForceChineseLocale();
   installCodexPlusFastStartup();
+  installCodexPlusPluginCategoryLinks();
   // 打字特效、桌宠（含大肥鱼）由各自的内置拓展装上（syncCodexPlusBuiltinExtensions），这里不再直接调用。
   let codexPlusResizeRafId = 0;
   window.__codexPlusResizeHandler = () => {

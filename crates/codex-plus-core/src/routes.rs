@@ -102,6 +102,10 @@ pub trait BridgeSettingsService: Send + Sync {
         crate::paths::default_app_state_dir().join("whale-balance.sqlite3")
     }
 
+    fn gateway_store(&self) -> crate::gateway::store::GatewayStore {
+        crate::gateway::store::GatewayStore::default()
+    }
+
     /// 有没有启用中的拓展包在清单里声明了这条路由。桌宠 / 大肥鱼的数据路由（图片、音效、用量、余额）
     /// 只在有拓展用它时才干活：Agent 桌宠拓展停用后不联网、不扫会话日志、不查余额。测试可覆盖。
     fn extension_route_declared(&self, route: &str) -> bool {
@@ -182,6 +186,17 @@ pub trait BridgeRuntimeService: Send + Sync {
     ) -> anyhow::Result<Value> {
         let config = crate::user_scripts::default_user_script_manager()
             .set_extension_config(&key, &values)?;
+        Ok(json!({ "status": "ok", "config": config }))
+    }
+    /// 同上，但只覆盖给出的项、其余已存的值保留。拓展自己调的 `saveConfig(values)` 走这个：
+    /// 拓展常常只传改动的那一项，整份替换会把别的项（含密钥）悄悄打回默认值。
+    async fn merge_extension_config(
+        &self,
+        key: String,
+        values: serde_json::Map<String, Value>,
+    ) -> anyhow::Result<Value> {
+        let config = crate::user_scripts::default_user_script_manager()
+            .update_extension_config(&key, &values)?;
         Ok(json!({ "status": "ok", "config": config }))
     }
     /// 拓展的 README（Codex 里「拓展」详情页的「细节」页签用），见 [`crate::user_scripts::UserScriptManager::extension_readme`]。
@@ -329,6 +344,9 @@ pub trait BridgeDataService: Send + Sync {
     /// 独立消费者封存，不是原生账单或归属验证，不参与 usage_history。
     async fn usage_archive(&self, _request: Value) -> anyhow::Result<Value> {
         Ok(json!({"status":"unavailable","code":"archive-unavailable"}))
+    }
+    async fn usage_history_storage_info(&self) -> anyhow::Result<Value> {
+        Ok(json!({"status": "unavailable"}))
     }
     /// 关闭查询时释放本进程的只读缓存，默认实现兼容其他数据服务。
     async fn clear_usage_history(&self) {}
@@ -557,6 +575,7 @@ pub async fn handle_bridge_request(
         }
         // 只读：设置项清单（标题、说明、分组等），注入页据此生成设置行。
         "/settings/catalog" => crate::settings_catalog::enhancement_settings_catalog(),
+        "/settings/usage-history-storage" => ctx.data.usage_history_storage_info().await,
         // 只读：Codex 自定义 prompt（<CODEX_HOME>/prompts/*.md），给「prompt 参数展开」发送前展开占位符。
         "/custom-prompts/list" => Ok(json!({
             "status": "ok",
@@ -609,7 +628,7 @@ pub async fn handle_bridge_request(
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result)
         }
-        // 网关供应商池：分发到管理器的网关命令（同步命令里有文件锁、可能联网），放到阻塞线程池。
+        // 网关共享供应商：分发到管理器的网关命令（同步命令里有文件锁、可能联网），放到阻塞线程池。
         "/providers/gateway" => {
             let payload = payload.clone();
             tokio::task::spawn_blocking(move || crate::provider_page::route_gateway(&payload))
@@ -626,6 +645,8 @@ pub async fn handle_bridge_request(
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result)
         }
+        // 同一页里的「钉钉与飞书通知」。不在拓展路由白名单里：能改机器人 Webhook、开关推送。
+        "/remote-control/robots" => crate::remote_control::robots_bridge_route(&payload).await,
         // Codex 页面里的「微信连接」页（45-weixin-connect-page.js）。不在拓展路由白名单里：能扫码登录、启停连接、改微信设置。
         // 扫码会话和运行中的连接都在管理器进程内存里，由管理器启动时登记成宿主路由（与它的 Tauri 命令共用实现）；
         // bridge 不在管理器进程里时没有登记，照实提示，而不是报「未知路径」。
@@ -653,6 +674,13 @@ pub async fn handle_bridge_request(
             }
             Err(error) => Err(error),
         },
+        // 供应商配置价只读投影；读取失败仍返回失败，但不向页面暴露状态文件路径。
+        "/provider-prices/public" => ctx
+            .settings
+            .gateway_store()
+            .load()
+            .map(|gateway| crate::extension_manager_data::gateway_provider_prices(&gateway))
+            .map_err(|_| anyhow::anyhow!("无法读取供应商配置价")),
         "/user-scripts/list" => {
             ctx.runtime
                 .user_script_inventory_with_runtime_status(payload.clone())
@@ -702,7 +730,17 @@ pub async fn handle_bridge_request(
             if key.is_empty() {
                 Ok(json!({ "status": "failed", "message": "拓展 key 不能为空" }))
             } else {
-                match ctx.runtime.set_extension_config(key, values).await {
+                // merge：拓展自己的设置面板保存（只覆盖给出的项）；通用表单逐项保存时传的是整份，照旧整份替换。
+                let saved = if payload
+                    .get("merge")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    ctx.runtime.merge_extension_config(key, values).await
+                } else {
+                    ctx.runtime.set_extension_config(key, values).await
+                };
+                match saved {
                     Ok(value) => Ok(value),
                     Err(error) => {
                         Ok(json!({ "status": "failed", "message": format!("{error:#}") }))
@@ -1575,6 +1613,7 @@ fn settings_payload_value(
         match value {
             Value::Object(object) => {
                 object.remove("apiKeys");
+                object.remove("inactiveMixedApi");
                 for child in object.values_mut() {
                     remove_named_keys(child);
                 }
@@ -2070,6 +2109,21 @@ fn backend_status_value(
             })
             .unwrap_or_default();
         object.insert("settingsRevision".to_string(), Value::from(revision));
+        match crate::connect::desktop_sync::revision(home) {
+            Ok(Some(revision)) => {
+                object.insert(
+                    "weixinDesktopSyncRevision".to_string(),
+                    Value::from(revision),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "weixin.desktop_sync_revision_failed",
+                    json!({"error": error.to_string()}),
+                );
+            }
+        }
     }
     Ok(status)
 }

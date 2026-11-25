@@ -48,6 +48,7 @@ fn apply_page_settings_round_trips_whitelisted_fields() {
         &json!({
             "weixinConnectAllowFrom": " a@im.wechat,b@im.wechat ",
             "weixinConnectWorkDir": "/tmp/other",
+            "weixinConnectProjectId": " project-1 ",
             "weixinConnectModel": "gpt-5.5",
             "weixinConnectReasoningEffort": "high",
             "weixinConnectDefaultMode": "direct",
@@ -63,6 +64,7 @@ fn apply_page_settings_round_trips_whitelisted_fields() {
         "首尾空白去掉"
     );
     assert_eq!(view["weixinConnectWorkDir"], "/tmp/other");
+    assert_eq!(view["weixinConnectProjectId"], "project-1");
     assert_eq!(view["weixinConnectModel"], "gpt-5.5");
     assert_eq!(view["weixinConnectReasoningEffort"], "high");
     assert_eq!(view["weixinConnectDefaultMode"], "direct");
@@ -81,6 +83,9 @@ fn apply_page_settings_rejects_unknown_keys_and_bad_values_without_partial_write
     for patch in [
         json!({ "weixinConnectToken": "evil" }),
         json!({ "weixinConnectBaseUrl": "https://evil.example" }),
+        json!({ "weixinConnectRouteTag": "evil" }),
+        json!({ "weixinConnectCodexPath": "/tmp/evil" }),
+        json!({ "weixinConnectProjectId": 7 }),
         json!({ "weixinConnectAllowFrom": "x@im.wechat", "weixinConnectAccountId": "evil" }),
         json!({ "weixinConnectAllowFrom": "x@im.wechat", "weixinConnectSandbox": "root" }),
         json!({ "weixinConnectDefaultMode": "auto" }),

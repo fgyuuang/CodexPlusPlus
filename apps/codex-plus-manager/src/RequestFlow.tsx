@@ -5,6 +5,7 @@ import "./flow-provider-colors.css";
  * 光点动画画在 HubTopology 上（HubOverview.tsx），这里只读取请求列表。
  */
 import { useEffect, useState } from "react";
+import { keepIfSame } from "./use-polling";
 import { invoke } from "@tauri-apps/api/core";
 import { t, tf } from "./i18n";
 import { agentName, formatElapsed, formatTokens, modelDisplay, maskAccountName, relativeTime, usageProviderLabel, type GatewayPayload } from "./gateway-model";
@@ -16,9 +17,10 @@ import "./RequestFlow.css";
  * 按间隔轮询 `load_request_flow`，窗口不可见时不读。
  * 返回最近的请求（开始时间倒序），动画直接使用当前进行中的状态。
  */
-export function useRequestFlow(intervalMs: number, limit = 30, includeThreadTitles = false): { entries: FlowEntry[]; loaded: boolean } {
+export function useRequestFlow(intervalMs: number, limit = 30, includeThreadTitles = false): { entries: FlowEntry[]; loaded: boolean; failed: boolean } {
   const [entries, setEntries] = useState<FlowEntry[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -29,10 +31,12 @@ export function useRequestFlow(intervalMs: number, limit = 30, includeThreadTitl
           const result = await invoke<{ entries?: FlowEntry[] }>("load_request_flow", includeThreadTitles ? { limit, includeThreadTitles } : { limit });
           if (cancelled) return;
           const next = result.entries ?? [];
-          setEntries(next);
+          // 列表没变（没有新请求、状态也没动）就沿用旧数组，总览不用每 1.5 秒整页重渲染。
+          setEntries((previous) => keepIfSame(previous, next));
           setLoaded(true);
+          setFailed(false);
         } catch {
-          // 读不到时保持上一轮的列表。
+          if (!cancelled) setFailed(true);
         }
       }
       if (!cancelled) timer = window.setTimeout(() => void tick(), intervalMs);
@@ -44,7 +48,7 @@ export function useRequestFlow(intervalMs: number, limit = 30, includeThreadTitl
     };
   }, [intervalMs, limit, includeThreadTitles]);
 
-  return { entries, loaded };
+  return { entries, loaded, failed };
 }
 
 /**

@@ -3,15 +3,17 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import test from "node:test";
 import ts from "typescript";
+import { readAppSource } from "./app-source.test-helper.ts";
 
 // 独立运行真实页面函数和事件处理器，替换 hooks/IPC；不启动本机 Claude 或探测 PATH。
-const app = ts.createSourceFile("App.tsx", readFileSync(new URL("./App.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const app = ts.createSourceFile("App.tsx", readAppSource(), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const component = app.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === "ClaudeLocalizationScreen");
 assert.ok(component);
 const transpile = (text: string) => ts.transpileModule(text, {
   compilerOptions: { jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const source = transpile(component.getText(app));
+// 页面拆到 ClaudeDesktopPage.tsx 后带 `export`，放进 vm 前去掉。
+const source = transpile(component.getText(app).replace(/^export /, ""));
 
 // 页面用到的两个纯格式函数也直接取 App.tsx 里的真实实现（不复制一份，改了实现这边会跟着变）。
 function functionSource(file: ts.SourceFile, name: string) {
@@ -32,6 +34,7 @@ const formatHelpers = transpile([
   functionSource(gatewayModel, "trimNumber"),
   functionSource(gatewayModel, "formatTokens"),
   functionSource(app, "formatContextWindow"),
+  functionSource(app, "claudeTemplateLabel"),
 ].join("\n"));
 
 type Element = { type: string; props: Record<string, any> };
@@ -43,6 +46,8 @@ const localReady = {
   config: { enabled: false, model: "claude-test", localization: true, voiceInput: true, computerUse: false, backgroundMode: false },
   models: ["claude-test", "gpt-test"], warning: null, needsRestart: false,
 };
+/** 增强生效方式（claude-enhance 的全局状态）：默认按完整功能模式，个别用例改成补丁副本。 */
+const enhanceDelivery = { value: "full" as "full" | "copy" };
 /** memo 对应模块级的 claudeLocalizationMemo：传同一个对象模拟「Codex++ 运行期间再次进入页面」。 */
 function harness(
   memo: Memo = { status: null, autoDetected: false },
@@ -52,11 +57,13 @@ function harness(
     openAdvanced?: boolean;
     mode?: "local" | "patch";
     onLocalStatus?: (status: unknown) => void;
+    notify?: (title: string, message: string, status?: string) => Promise<void>;
   } = {},
 ) {
   const props = {
     ...(options.mode ? { mode: options.mode } : {}),
     ...(options.onLocalStatus ? { onLocalStatus: options.onLocalStatus } : {}),
+    ...(options.notify ? { notify: options.notify } : {}),
   };
   const renderArgs = Object.keys(props).length > 0 ? props : undefined;
   const hooks: any[] = [];
@@ -81,7 +88,7 @@ function harness(
   };
   const context = vm.createContext({
     React: { Fragment: "Fragment", createElement: (type: string, props: object, ...children: unknown[]) => ({ type, props: { ...props, children } }) },
-    ...Object.fromEntries(["Panel", "CardHead", "CardContent", "Button", "Input", "Info", "RefreshCw", "ToggleVisual", "PackageOpen", "Play", "Plug", "Rocket", "ShieldCheck", "Menu", "MenuItem", "Square", "ChevronRight", "AppSelect"].map((name) => [name, name])),
+    ...Object.fromEntries(["Panel", "CardHead", "CardContent", "Button", "Input", "Info", "RefreshCw", "ToggleVisual", "PackageOpen", "Play", "Plug", "Rocket", "ShieldCheck", "Menu", "MenuItem", "Square", "ChevronRight", "AppSelect", "ClaudeAutoTakeoverRow"].map((name) => [name, name])),
     // 页面骨架组件（cx-layout）按名字渲染成占位元素。
     AgentCx: new Proxy({}, { get: (_target, name) => String(name) }),
     t: (text: string) => text,
@@ -103,6 +110,14 @@ function harness(
     document: { querySelector: (selector: string) => (selector === "[data-topbar-actions]" ? topbarSlot : null) },
     createPortal: (child: unknown, target: typeof topbarSlot) => { target.portal = child; return null; },
     stringifyError: String,
+    // 增强生效方式：这些用例都按完整功能模式跑（与没做过副本时的默认推断一致）。
+    useClaudeEnhance: () => ({ delivery: enhanceDelivery.value, bashTimeout: { enabled: false, defaultEnabled: true, defaultSeconds: 120, maxEnabled: true, maxSeconds: 1800 }, claudeExtensions: false }),
+    setClaudeDelivery: () => Promise.resolve(null),
+    patchClaudeEnhance: () => {},
+    FullModeBashTimeout: "FullModeBashTimeout",
+    ClaudeProviders: "ClaudeProviders",
+    onTabListKeyDown: () => {},
+    CxBanner: "CxBanner",
     // Computer Use 接入状态不计入设置操作；同时记录 Bash 保存的参数和失败结果。
     invoke: (command: string, ...args: unknown[]) => command === "computer_use_status"
       ? Promise.resolve(cuStatus)
@@ -649,15 +664,19 @@ test("会话同步：开关默认关闭，切换走 configure，立即同步走 
   assert.equal((screen.calls[1].args[0] as { action: string }).action, "sync_sessions");
 });
 
-test("默认模型不在这一页选：只留一句说明，不放下拉也不放跳转", () => {
+test("默认模型和供应商在 Claude 的「供应商」页选：Desktop 增强页里不再有默认模型和供应商那一块", () => {
+  const notify = async () => {};
   const screen = harness(undefined, {}, {
     localMemo: { status: { ...localReady, config: { ...localReady.config, enabled: true } }, autoDetected: true },
     openAdvanced: false,
+    notify,
   });
   const page = screen.render();
   assert.equal(findElements(page, "AppSelect").some((item) => item.props.ariaLabel === "Claude 默认模型"), false, "不再有默认模型下拉");
   assert.equal(findElements(page, "AppSelect").some((item) => item.props.ariaLabel === "启动模式"), true, "启动模式那一行还在");
-  assert.match(text(page), /模型在「Agent 接入」里的 Claude Desktop 行选择，改完需要重新启动本地服务。/);
+  assert.doesNotMatch(text(page), /模型在「Agent 接入」里的 Claude Desktop 行选择/);
+  // 供应商从「Desktop 增强」移到了 Claude 自己的「供应商」页（和 Codex 的「连接与供应商」一样）。
+  assert.equal(findElements(page, "ClaudeProviders").length, 0, "供应商那一块不在这一页");
   assert.equal(buttons(page).some((button) => text(button).includes("去「Agent 接入」")), false, "不给跳转按钮");
   // 模型字段还留在配置类型里（后端旧值兜底），页面只是不再让人在这里改。
   assert.equal(screen.calls.length, 0, "页面不写配置");
@@ -685,6 +704,80 @@ test("完整功能模式的五项能力分别保存，不修改补丁版开关�
   }
   assert.equal(screen.calls.length, 5);
   assert.equal(screen.calls.some((call) => /permission|computer_use|claude_localization/.test(call.command)), false);
+});
+
+test("Cowork、合并式主页、界面版本：按后端默认值显示，各自保存；3p 模式下不显示", async () => {
+  const templates = [{ build: "a4ced7f85b", builtAt: 1794603257 }, { build: "0f183c1216", builtAt: null }];
+  const saved = { ...localReady, templates, config: { ...localReady.config, enabled: true } };
+  const screen = harness(undefined, {}, { localMemo: { status: saved, autoDetected: true }, openAdvanced: false });
+  const toggle = (label: string) => inputs(screen.render()).find((item) => item.props["aria-label"] === label)!;
+  const version = () => findElements(screen.render(), "AppSelect").find((item) => item.props.ariaLabel === "界面版本")!;
+
+  // 旧配置里没有这几个字段：Cowork 按开、合并式主页按关、版本按最新。
+  assert.equal(toggle("本地 Cowork").props.checked, true);
+  assert.equal(toggle("本地合并式主页").props.checked, false);
+  assert.equal(version().props.value, "");
+  const day = new Date(1794603257 * 1000);
+  const date = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
+  assert.deepEqual(structuredClone(version().props.options), [
+    { value: "", label: `最新（${date} · a4ced7f85b）` },
+    { value: "a4ced7f85b", label: `${date} · a4ced7f85b` },
+    { value: "0f183c1216", label: "0f183c1216" },
+  ]);
+
+  let config: Record<string, unknown> = saved.config;
+  const expectSaved = async (index: number, patch: Record<string, unknown>) => {
+    assert.equal(screen.calls[index].command, "claude_local_configure");
+    config = { ...config, ...patch };
+    assert.deepEqual(structuredClone((screen.calls[index].args[0] as { config: object }).config), config);
+    screen.calls[index].resolve({ ...saved, config });
+    await tick();
+  };
+  toggle("本地 Cowork").props.onChange({ currentTarget: { checked: false } });
+  await expectSaved(0, { cowork: false });
+  assert.equal(toggle("本地 Cowork").props.checked, false);
+  toggle("本地合并式主页").props.onChange({ currentTarget: { checked: true } });
+  await expectSaved(1, { hubHome: true });
+  version().props.onChange("0f183c1216");
+  await expectSaved(2, { template: "0f183c1216" });
+  assert.equal(version().props.value, "0f183c1216");
+
+  // 已下架的版本按最新显示；只有一个版本时没有可选的，不显示这一行。
+  const retired = harness(undefined, {}, {
+    localMemo: { status: { ...saved, config: { ...saved.config, template: "gone" } }, autoDetected: true }, openAdvanced: false,
+  });
+  assert.equal(findElements(retired.render(), "AppSelect").find((item) => item.props.ariaLabel === "界面版本")!.props.value, "");
+  const single = harness(undefined, {}, { localMemo: { status: { ...saved, templates: [templates[0]] }, autoDetected: true }, openAdvanced: false });
+  assert.equal(findElements(single.render(), "AppSelect").some((item) => item.props.ariaLabel === "界面版本"), false);
+
+  // 这几项只作用于完整功能模式。
+  const threeP = harness(undefined, {}, { localMemo: { status: { ...localReady, templates }, autoDetected: true }, openAdvanced: false });
+  const page = threeP.render();
+  assert.equal(inputs(page).some((item) => /Cowork|合并式主页/.test(item.props["aria-label"] ?? "")), false);
+  assert.equal(findElements(page, "AppSelect").some((item) => item.props.ariaLabel === "界面版本"), false);
+});
+
+test("系统证书：只在支持的系统上、Cowork 开着时显示，未安装时可以安装", async () => {
+  const saved = { ...localReady, caMachineSupported: true, caMachineTrusted: false, config: { ...localReady.config, enabled: true } };
+  const screen = harness(undefined, {}, { localMemo: { status: saved, autoDetected: true }, openAdvanced: false });
+  let page = screen.render();
+  assert.match(text(page), /系统证书未安装/);
+  buttons(page).find((button) => text(button) === "安装系统证书")!.props.onClick();
+  assert.equal(JSON.stringify(screen.calls[0].args[0]), JSON.stringify({ action: "trust_machine" }));
+  screen.calls[0].resolve({ ...saved, caMachineTrusted: true });
+  await tick();
+  page = screen.render();
+  assert.match(text(page), /系统证书已安装/);
+  assert.equal(buttons(page).some((button) => text(button) === "安装系统证书"), false);
+
+  for (const status of [
+    { ...saved, caMachineSupported: false },
+    { ...saved, config: { ...saved.config, cowork: false } },
+    { ...localReady, caMachineSupported: true, caMachineTrusted: false },
+  ]) {
+    const hidden = harness(undefined, {}, { localMemo: { status, autoDetected: true }, openAdvanced: false });
+    assert.doesNotMatch(text(hidden.render()), /系统证书/);
+  }
 });
 
 test("原版显示证书准备与信任操作，本地服务在线不冒充 Claude 已连接", async () => {
@@ -839,4 +932,80 @@ test("页面里启动 / 停止后把本地状态交给 App，侧栏的播放键�
   screen.calls[1].resolve({ status: "failed", message: "停止失败" });
   await tick();
   assert.equal(seen.length, 1, "失败不覆盖 App 里的状态");
+});
+
+test("启动模式选补丁副本：副本块直接显示在 Desktop 增强页，页头启动补丁版，不再跳到另一页", async () => {
+  enhanceDelivery.value = "copy";
+  try {
+    const memo: Memo = { status: ready, autoDetected: true };
+    const screen = harness(memo, {}, { localMemo: { status: localReady, autoDetected: true }, openAdvanced: false });
+    screen.render();
+    const page = screen.render();
+    const mode = findElements(page, "AppSelect").find((item) => item.props.ariaLabel === "启动模式")!;
+    assert.equal(mode.props.value, "copy");
+    assert.deepEqual(Array.from(mode.props.options, (option: { value: string }) => option.value), ["3p", "full", "copy"]);
+    assert.doesNotMatch(text(page), /检测原版 Claude/, "原版那张状态卡收起");
+    assert.doesNotMatch(text(page), /去补丁 Desktop/);
+    assert.match(text(page), /补丁版 Claude/);
+    assert.match(text(page), /补丁项/);
+    // 页头的启动键就是补丁版的启动；副本卡片里不再重复一个。
+    assert.equal(buttons(screen.topbar()).map(text).join(""), "启动补丁版");
+    assert.equal(buttons(page).filter((button) => text(button) === "启动补丁版").length, 0);
+    buttons(screen.topbar())[0].props.onClick();
+    assert.equal(screen.calls[0].command, "claude_localization_action");
+    assert.equal(JSON.stringify(screen.calls[0].args[0]), JSON.stringify({ action: "launch" }));
+  } finally {
+    enhanceDelivery.value = "full";
+  }
+});
+
+test("Desktop 增强的设置按页签分开：完整功能模式四个页签，3p 两个，补丁副本没有；切页签只藏起别的面板", () => {
+  const tabsOf = (page: Element) => findElements(page, "button").filter((button) => button.props.role === "tab");
+  const panelsOf = (page: Element) => findElements(page, "div").filter((div) => div.props.role === "tabpanel");
+  const full = { ...localReady, config: { ...localReady.config, enabled: true } };
+  const screen = harness(undefined, {}, { localMemo: { status: full, autoDetected: true }, openAdvanced: false, notify: async () => {} });
+  let page = screen.render();
+  assert.deepEqual(tabsOf(page).map(text), ["模型", "账号与会话", "功能", "证书与环境"]);
+  assert.deepEqual(panelsOf(page).map((panel) => panel.props.hidden), [false, true, true, true], "默认在「模型」");
+  // 启动模式在页签上面，哪个页签都看得到。
+  assert.equal(findElements(page, "AppSelect").some((item) => item.props.ariaLabel === "启动模式"), true);
+  tabsOf(page)[2].props.onClick();
+  page = screen.render();
+  assert.deepEqual(tabsOf(page).map((tab) => tab.props["aria-selected"]), [false, false, true, false]);
+  const shown = panelsOf(page).filter((panel) => !panel.props.hidden);
+  assert.deepEqual(shown.map((panel) => panel.props.id), ["claude-local-panel-features"], "只显示「功能」那一页");
+  assert.ok(inputs(shown[0]).some((item) => item.props["aria-label"] === "本地界面汉化"));
+  // 藏起来的面板仍在页面里：切走不丢草稿，账号页签里的输入框照样渲染着。
+  const account = panelsOf(page).find((panel) => panel.props.id === "claude-local-panel-account")!;
+  assert.equal(account.props.hidden, true);
+  assert.ok(inputs(account).some((item) => item.props["aria-label"] === "用户名"));
+  assert.equal(screen.calls.length, 0, "切页签不写配置");
+
+  const threeP = harness(undefined, {}, { localMemo: { status: localReady, autoDetected: true }, openAdvanced: false, notify: async () => {} });
+  assert.deepEqual(tabsOf(threeP.render()).map(text), ["模型", "账号与会话"], "3p 模式没有功能、证书与环境");
+
+  enhanceDelivery.value = "copy";
+  try {
+    const copy = harness({ status: ready, autoDetected: true }, {}, { localMemo: { status: localReady, autoDetected: true }, openAdvanced: false });
+    copy.render();
+    assert.equal(tabsOf(copy.render()).length, 0, "补丁副本没有这些设置，不显示页签");
+  } finally {
+    enhanceDelivery.value = "full";
+  }
+});
+
+test("证书没信任或缺 Node 时，「证书与环境」页签带提示点", () => {
+  const untrusted = { ...localReady, caTrusted: false, config: { ...localReady.config, enabled: true } };
+  const screen = harness(undefined, {}, { localMemo: { status: untrusted, autoDetected: true }, openAdvanced: false });
+  const tabs = findElements(screen.render(), "button").filter((button) => button.props.role === "tab");
+  const dots = tabs.map((tab) => findElements(tab, "span").some((span) => span.props.className === "claude-local-tab-dot"));
+  assert.deepEqual(dots, [false, false, false, true]);
+});
+
+test("汉化、语音输入、Computer Use 三个开关共用 setClaudeFlag，不再各写一份", () => {
+  const body = component.getText(app);
+  assert.equal(body.match(/statusGeneration\.current\+\+;\n\s*setBusy\(key\)/g)?.length, 1);
+  assert.match(body, /const toggleLocalization = \(enabled: boolean\) => setClaudeFlag\("localization", "claude_localization_set_localization", enabled\);/);
+  assert.match(body, /const toggleVoiceInput = \(enabled: boolean\) => setClaudeFlag\("voiceInput", "claude_localization_set_voice_input", enabled\);/);
+  assert.match(body, /const toggleComputerUse = \(enabled: boolean\) => setClaudeFlag\("computerUse", "claude_localization_set_computer_use", enabled\);/);
 });

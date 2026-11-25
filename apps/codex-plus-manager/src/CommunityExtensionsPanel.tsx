@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Download, Loader2, RefreshCw, ShieldAlert, ShieldCheck, Star } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -8,16 +8,38 @@ import { Switch } from "./gateway-ui";
 import { t, tf } from "./i18n";
 import { ExtensionCard } from "./ExtensionCard";
 import { CurationReviewDialog, useCurationStatus } from "./ExtensionCuration";
+import { errorText } from "./lib/utils";
+import { useModalShell } from "./use-modal-shell";
 import "./CommunityExtensionsPanel.css";
 
-// 与 crates/codex-plus-core/src/extension_discovery.rs 对应。
+// 与 crates/codex-plus-core/src/extension_discovery.rs 的 manifest_permissions 对应。
+// 后加的字段都是可选的：社区列表有缓存，旧缓存里的条目没有它们。
 export type Permissions = {
   backend: string | null;
+  backendHttp?: boolean;
+  schedules?: number;
+  launchBefore?: string | null;
+  launchAfter?: string | null;
+  launchArgs?: string[];
+  mcpServers?: string[];
+  dsh?: string | null;
   hooks: { event: string; matcher: string }[];
+  toolPipeline?: number;
   gatewayRequest: number;
   gatewayResponse: number;
+  gatewayError?: number;
+  gatewayReplaces?: string[];
+  providers?: string[];
   tools: string[];
+  skills?: string[];
+  agents?: string[];
+  prompts?: string[];
+  instructions?: boolean;
+  replaces?: string[];
+  managerReplaces?: string[];
+  managerData?: string[];
   routes: string[];
+  preload?: string[];
   renderer: string[];
 };
 // channel 为 "local"：本机就是这个仓库的源码（自己写的、从这里发布的），不是从 GitHub 装的。
@@ -75,36 +97,67 @@ export function request<T>(action: string, payload?: unknown): Promise<T> {
   return invoke<T>("extension_community_request", { action, payload: payload ?? null });
 }
 
-export function errorText(error: unknown): string {
-  return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
-}
-
 function engineWarning(engine: Entry["engine"]): string {
   return typeof engine === "number"
     ? tf("需要拓展 API v{0}，请先更新 Codex++", [engine])
     : tf("需要 Codex++ {0}，当前版本不兼容", [engine]);
 }
 
-/** 按风险从高到低列出声明的能力；空数组表示只是页面脚本以外什么也没有。 */
+/**
+ * 按风险从高到低列出声明的能力；空数组表示清单什么也没声明。
+ * 高：在页面之外以你的用户权限运行，或能看到 / 改写模型请求与工具调用；中：改 Codex 的配置与行为；低：只在页面里。
+ * Codex 页内的安装确认框（40-backend-settings.js 的 codexPlusPackagePermissionLines）是同一套文案，改这里要同步改那边。
+ */
 export function permissionLines(permissions: Permissions): { risk: "high" | "medium" | "low"; text: string }[] {
   const lines: { risk: "high" | "medium" | "low"; text: string }[] = [];
-  if (permissions.backend) lines.push({ risk: "high", text: tf("常驻后台进程 {0}：可读写本机文件、访问网络", [permissions.backend]) });
+  const list = (items?: string[]) => (items ?? []).join("、");
+  if (permissions.backend) {
+    lines.push({ risk: "high", text: tf("常驻后台进程 {0}：可读写本机文件、访问网络", [permissions.backend]) });
+    if (permissions.backendHttp) lines.push({ risk: "high", text: t("后台处理本机 HTTP 请求：本机其它程序可以调用它") });
+    if (permissions.schedules) lines.push({ risk: "medium", text: tf("定时任务 {0} 条：按时调用它的后台", [permissions.schedules]) });
+  }
+  if (permissions.launchBefore) lines.push({ risk: "high", text: tf("启动前脚本 {0}：每次启动 Codex 前在本机运行，可读写本机文件、访问网络", [permissions.launchBefore]) });
+  if (permissions.launchAfter) lines.push({ risk: "high", text: tf("退出后脚本 {0}：每次 Codex 退出后在本机运行，可读写本机文件、访问网络", [permissions.launchAfter]) });
+  if (permissions.mcpServers?.length) lines.push({ risk: "high", text: tf("MCP 服务器 {0}：写进 Codex 配置，由 Codex 在本机启动它指定的命令", [list(permissions.mcpServers)]) });
+  if (permissions.dsh) lines.push({ risk: "high", text: tf("dsh 插件 {0}：插件代码在本机常驻进程里运行", [permissions.dsh]) });
   for (const hook of permissions.hooks) {
     lines.push({ risk: "high", text: hook.matcher ? tf("Codex 钩子 {0}（匹配 {1}）：可拦截或改写工具调用", [hook.event, hook.matcher]) : tf("Codex 钩子 {0}：可拦截或改写工具调用", [hook.event]) });
   }
+  if (permissions.toolPipeline) lines.push({ risk: "high", text: tf("工具调用管线 {0} 个：可改参数、拦截、代为执行工具调用或改写结果", [permissions.toolPipeline]) });
   if (permissions.gatewayRequest) lines.push({ risk: "high", text: tf("网关请求中间件 {0} 个：可读取并改写发往模型的完整请求", [permissions.gatewayRequest]) });
   if (permissions.gatewayResponse) lines.push({ risk: "high", text: tf("网关响应中间件 {0} 个：可读取并改写模型回复", [permissions.gatewayResponse]) });
+  if (permissions.gatewayError) lines.push({ risk: "high", text: tf("网关失败重试 {0} 个：请求失败后可改写并重发", [permissions.gatewayError]) });
+  if (permissions.gatewayReplaces?.length) {
+    lines.push({
+      risk: "high",
+      text: permissions.gatewayReplaces.includes("builtin:auth-headers")
+        ? tf("关掉内置网关环节 {0}：由它接管，其中鉴权头会把供应商 Key 交给它", [list(permissions.gatewayReplaces)])
+        : tf("关掉内置网关环节 {0}：由它接管", [list(permissions.gatewayReplaces)]),
+    });
+  }
+  if (permissions.providers?.length) lines.push({ risk: "high", text: tf("模型供应商 {0}：并入供应商池，选用时请求发往它指定的地址", [list(permissions.providers)]) });
   if (permissions.tools.length) lines.push({ risk: "medium", text: tf("模型工具：{0}", [permissions.tools.join("、")]) });
+  if (permissions.launchArgs?.length) lines.push({ risk: "medium", text: tf("Codex 启动参数：{0}", [permissions.launchArgs.join(" ")]) });
+  if (permissions.instructions) lines.push({ risk: "medium", text: t("全局指令：追加到 Codex 的系统指令") });
+  if (permissions.skills?.length) lines.push({ risk: "medium", text: tf("Skills：{0}（同步进 Codex 的技能目录）", [list(permissions.skills)]) });
+  if (permissions.agents?.length) lines.push({ risk: "medium", text: tf("子 Agent：{0}", [list(permissions.agents)]) });
+  if (permissions.prompts?.length) lines.push({ risk: "medium", text: tf("提示词：{0}", [list(permissions.prompts)]) });
+  if (permissions.replaces?.length) lines.push({ risk: "medium", text: tf("顶替内置拓展 {0}：对应的内置功能停用，由它接管", [list(permissions.replaces)]) });
+  if (permissions.managerReplaces?.length) lines.push({ risk: "medium", text: tf("顶替管理器页面：{0}", [list(permissions.managerReplaces)]) });
+  if (permissions.managerData?.length) lines.push({ risk: "medium", text: tf("读取管理器数据：{0}", [list(permissions.managerData)]) });
   for (const route of permissions.routes) lines.push({ risk: "medium", text: tf("本地路由 {0}", [route]) });
+  if (permissions.preload?.length) lines.push({ risk: "medium", text: tf("页面最早期脚本 {0}：在 Codex 自己的脚本之前运行", [list(permissions.preload)]) });
   if (permissions.renderer.length) lines.push({ risk: "low", text: tf("在 Codex 页面里运行脚本：{0}", [permissions.renderer.join("、")]) });
   return lines;
 }
 
 export function riskBadges(permissions: Permissions): string[] {
   const badges: string[] = [];
-  if (permissions.backend) badges.push(t("后台进程"));
-  if (permissions.hooks.length) badges.push(t("钩子"));
-  if (permissions.gatewayRequest || permissions.gatewayResponse) badges.push(t("网关"));
+  if (permissions.backend || permissions.dsh) badges.push(t("后台进程"));
+  if (permissions.launchBefore || permissions.launchAfter) badges.push(t("启动脚本"));
+  if (permissions.mcpServers?.length) badges.push("MCP");
+  if (permissions.hooks.length || permissions.toolPipeline) badges.push(t("钩子"));
+  if (permissions.gatewayRequest || permissions.gatewayResponse || permissions.gatewayError || permissions.gatewayReplaces?.length || permissions.providers?.length) badges.push(t("网关"));
   if (permissions.tools.length) badges.push(t("模型工具"));
   return badges;
 }
@@ -304,8 +357,8 @@ export function CommunityExtensionsPanel({
         <Switch label={t("显示社区拓展")} on={enabled} onToggle={() => void setEnabled(!enabled)} />
       </CxBanner>
       {listing?.message ? <div className={`community-ext-notice${listing.stale ? " is-error" : ""}`}>{listing.message}</div> : null}
-      {error ? <div className="community-ext-notice is-error">{error}</div> : null}
-      {notice ? <div className="community-ext-notice">{notice}</div> : null}
+      {error ? <div className="community-ext-notice is-error" role="alert">{error}</div> : null}
+      {notice ? <div className="community-ext-notice" role="status">{notice}</div> : null}
       {enabled && installed.length ? (
         <CxSection aside={refreshed} count={installed.length} title={t("已安装")}>
           <CxCard>{installed.map(row)}</CxCard>
@@ -352,12 +405,17 @@ export function InstallDialog({ prepared, onCancel, onInstall }: { prepared: Pre
   const lines = permissionLines(prepared.permissions);
   // 精选 / 官方拓展审核过，不用危险样式吓人；社区拓展保持红色确认。
   const reviewed = prepared.channel === "official" || prepared.channel === "curated";
+  // 已装的官方 / 精选版本不能被社区里同 id 的拓展替换：后端会拒绝（extension_discovery.rs），这里只给「关闭」。
+  const blocked = Boolean(prepared.conflict && prepared.conflict.source === "github" && prepared.conflict.channel
+    && prepared.conflict.channel !== "community" && prepared.channel === "community");
+  const titleId = useId();
+  const { backdropProps, dialogProps } = useModalShell<HTMLDivElement>({ onClose: onCancel, labelledBy: titleId });
   return (
-    <div aria-modal="true" className="modal-backdrop app-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }} role="dialog">
-      <div className="modal-card confirm-modal app-dialog community-ext-dialog" data-danger={reviewed ? undefined : true}>
+    <div className="modal-backdrop app-dialog-backdrop" {...backdropProps}>
+      <div className="modal-card confirm-modal app-dialog community-ext-dialog" data-danger={reviewed || blocked ? undefined : true} {...dialogProps}>
         <div className="modal-head">
           <div>
-            <h2>{tf("安装 {0}", [prepared.name])}</h2>
+            <h2 id={titleId}>{tf("安装 {0}", [prepared.name])}</h2>
           </div>
           <button aria-label={t("关闭")} className="toast-close" onClick={onCancel} type="button">×</button>
         </div>
@@ -387,23 +445,31 @@ export function InstallDialog({ prepared, onCancel, onInstall }: { prepared: Pre
           )}
           {prepared.conflict ? (
             <p className="community-ext-dialog-warning">
-              {prepared.conflict.source === "github" && prepared.conflict.channel && prepared.conflict.channel !== "community" && prepared.channel === "community"
+              {blocked
                 ? tf("本机已装 {0} 的{1}版本 {2}，社区里的同 id 拓展不能替换它。", [prepared.conflict.repo ?? "", prepared.conflict.channel === "official" ? t("官方") : t("精选"), prepared.id])
                 : prepared.conflict.source === "github"
                 ? tf("本机已有来自 {0} 的同名拓展 {1}，安装会替换它（旧版本移到备份目录）。", [prepared.conflict.repo ?? "", prepared.id])
                 : tf("本机已有手动或对话生成的同名拓展 {0}，安装会替换它（旧版本移到备份目录）。", [prepared.id])}
             </p>
           ) : null}
-          <label className="community-ext-dialog-enable">
-            <input checked={enable} onChange={(event) => setEnable(event.currentTarget.checked)} type="checkbox" />
-            {t("安装后立即启用")}
-          </label>
+          {blocked ? null : (
+            <label className="community-ext-dialog-enable">
+              <input checked={enable} onChange={(event) => setEnable(event.currentTarget.checked)} type="checkbox" />
+              {t("安装后立即启用")}
+            </label>
+          )}
         </div>
         <div className="app-dialog-actions">
-          <Button onClick={onCancel} variant="secondary">{t("取消")}</Button>
-          <Button className={reviewed ? undefined : "app-dialog-danger"} onClick={() => onInstall(enable)}>
-            {prepared.conflict ? t("替换并安装") : t("安装")}
-          </Button>
+          {blocked ? (
+            <Button onClick={onCancel} variant="secondary">{t("关闭")}</Button>
+          ) : (
+            <>
+              <Button onClick={onCancel} variant="secondary">{t("取消")}</Button>
+              <Button className={reviewed ? undefined : "app-dialog-danger"} onClick={() => onInstall(enable)}>
+                {prepared.conflict ? t("替换并安装") : t("安装")}
+              </Button>
+            </>
+          )}
         </div>
       </div>
     </div>

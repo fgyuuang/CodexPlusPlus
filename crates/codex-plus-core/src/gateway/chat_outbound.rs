@@ -858,6 +858,7 @@ pub(crate) fn upstream_failure(event: &Value) -> (String, String) {
 pub(crate) struct ResponsesUsage {
     pub(crate) input_tokens: u64,
     pub(crate) cached_tokens: u64,
+    pub(crate) cached_tokens_known: bool,
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_tokens: u64,
     pub(crate) total_tokens: u64,
@@ -874,6 +875,7 @@ pub(crate) fn responses_usage(usage: Option<&Value>) -> ResponsesUsage {
     ResponsesUsage {
         input_tokens,
         cached_tokens: number("/input_tokens_details/cached_tokens").unwrap_or(0),
+        cached_tokens_known: number("/input_tokens_details/cached_tokens").is_some(),
         output_tokens,
         reasoning_tokens: number("/output_tokens_details/reasoning_tokens").unwrap_or(0),
         total_tokens: number("/total_tokens").unwrap_or(input_tokens + output_tokens),
@@ -881,6 +883,19 @@ pub(crate) fn responses_usage(usage: Option<&Value>) -> ResponsesUsage {
 }
 
 impl ResponsesUsage {
+    /// 请求日志用的 usage：与 Anthropic 那边一致，input 含缓存命中。
+    #[cfg(test)]
+    pub(crate) fn request_usage(&self) -> RequestUsage {
+        RequestUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_tokens: self.cached_tokens,
+            cached_tokens_known: Some(self.cached_tokens_known),
+            reasoning_tokens: self.reasoning_tokens,
+            workbuddy_credits: None,
+        }
+    }
+
     /// Chat 的 usage：`prompt_tokens` 同样含缓存命中，`completion_tokens` 含推理。
     fn chat_usage(&self) -> Value {
         json!({
@@ -896,6 +911,18 @@ impl ResponsesUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_request_usage_preserves_cache_presence() {
+        for (details, known) in [
+            (json!({}), false),
+            (json!({"input_tokens_details": {"cached_tokens": 0}}), true),
+        ] {
+            let usage = responses_usage(Some(&details)).request_usage();
+            assert_eq!(usage.cached_tokens, 0);
+            assert_eq!(usage.cached_tokens_known, Some(known));
+        }
+    }
 
     fn sse(events: &[Value]) -> String {
         events

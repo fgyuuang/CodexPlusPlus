@@ -3,9 +3,9 @@ import { appConfirm } from "./app-dialog";
 import { useEffect, useRef, useState } from "react";
 import { RefreshCw, Trash2 } from "lucide-react";
 import { t, tf } from "./i18n";
-import { cacheApps, cacheCleanupSummary, cacheKindTotals, cacheSelection, selectableCacheGroups, type CacheGroup } from "./agent-cache-model";
+import { cacheApps, cacheCleanupSummary, cacheSelection, selectableCacheGroups, type CacheGroup } from "./agent-cache-model";
 import { APP_LOGO_URL } from "./gateway-ui";
-import { AgentGlyph } from "./HubOverview";
+import { AgentGlyph } from "./hub-shared";
 import { TopbarActions } from "./TopbarActions";
 import { CxBadge, CxBanner, CxCard, CxEmpty, CxRow, CxSection, CxStats } from "./cx-layout";
 import { Menu, MenuItem } from "./ManagementPages";
@@ -62,22 +62,21 @@ export function AgentCachePanel() {
     return () => { mounted.current = false; };
   }, []);
 
-  const chosen = selectableCacheGroups(report?.groups ?? []).filter((group) => selected.includes(group.id));
+  const groups = report?.groups ?? [];
+  const chosen = selectableCacheGroups(groups).filter((group) => selected.includes(group.id));
   const chosenSummary = cacheCleanupSummary(chosen);
   const chosenBytes = chosenSummary.bytes;
   const chosenFiles = chosenSummary.files;
-  const totalBytes = report?.groups.reduce((sum, group) => sum + group.totalBytes, 0) ?? 0;
-  const eligibleBytes = report?.groups.reduce((sum, group) => sum + group.eligibleBytes, 0) ?? 0;
-  const apps = cacheApps(report?.groups ?? []);
-  const selectable = cacheSelection(report?.groups ?? [], "all");
+  const totalBytes = groups.reduce((sum, group) => sum + group.totalBytes, 0);
+  const eligibleBytes = groups.reduce((sum, group) => sum + group.eligibleBytes, 0);
+  const apps = cacheApps(groups);
+  const selectable = cacheSelection(groups, "all");
 
-  /** `keepResult`：清理后自动重扫时保留上一次的清理结果或失败原因。 */
+  /** `keepResult`：清理后自动重扫时保留上一次的清理结果或失败原因。重扫期间旧报告留在页面上，扫完再换。 */
   async function scan(keepResult = false) {
     if (inFlight.current) return;
     inFlight.current = true;
     setBusy("scan");
-    setReport(null);
-    setSelected([]);
     if (!keepResult) { setResult(null); setError(""); }
     try {
       const response = await invoke<Response<{ report?: CacheReport }>>("scan_agent_cache");
@@ -109,7 +108,7 @@ export function AgentCachePanel() {
       if (!accepted || !mounted.current) return;
       submitted = true;
       const response = await invoke<Response<{ result?: CleanResult }>>("clean_agent_cache", {
-        scanId: report.scanId, groupIds: selected, confirmed: true,
+        scanId: report.scanId, groupIds: chosen.map((group) => group.id), confirmed: true,
       });
       if (response.status !== "ok" || !response.result) throw new Error(t(response.message));
       if (mounted.current) setResult(response.result);
@@ -119,7 +118,8 @@ export function AgentCachePanel() {
       inFlight.current = false;
       if (mounted.current) {
         setBusy(null);
-        if (submitted) { setReport(null); setSelected([]); }
+        // 旧报告留着，等紧接着的重扫换成新的；选择清空，免得对着已删掉的目录再点一次清理。
+        if (submitted) setSelected([]);
       }
     }
     // 清理后旧快照已失效：直接重扫给出剩余占用，不让用户对着空卡片再手动点一次。
@@ -142,7 +142,7 @@ export function AgentCachePanel() {
           {busy === "scan" ? t("正在扫描缓存…") : report ? t("重新扫描") : t("扫描缓存")}
         </button>
         <Menu>
-          <MenuItem disabled={busy !== null || selectable.length === 0} onClick={() => setSelected(cacheSelection(report?.groups ?? [], "recommended"))}>{t("推荐选择")}</MenuItem>
+          <MenuItem disabled={busy !== null || selectable.length === 0} onClick={() => setSelected(cacheSelection(groups, "recommended"))}>{t("推荐选择")}</MenuItem>
           <MenuItem disabled={busy !== null || selectable.length === 0} onClick={() => setSelected(selectable)}>{t("全部选择（含日志）")}</MenuItem>
           <MenuItem disabled={busy !== null || selected.length === 0} onClick={() => setSelected([])}>{t("取消选择")}</MenuItem>
         </Menu>
@@ -162,7 +162,7 @@ export function AgentCachePanel() {
       </div>
 
       <div role="status" aria-live="polite">
-        {result ? <CxBanner title={tf("已删除 {0} 个文件（逻辑大小 {1}），跳过 {2} 个，失败 {3} 个。请重新扫描查看剩余占用。", [result.removedFiles, bytes(result.removedBytes), result.skippedFiles, result.failures.length])} tone="ok" /> : null}
+        {result ? <CxBanner title={tf("已删除 {0} 个文件（逻辑大小 {1}），跳过 {2} 个，失败 {3} 个。", [result.removedFiles, bytes(result.removedBytes), result.skippedFiles, result.failures.length])} tone="ok" /> : null}
       </div>
       {error ? <div role="alert"><CxBanner title={error} tone="warn" /></div> : null}
 

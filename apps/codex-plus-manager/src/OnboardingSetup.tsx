@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ArrowRight, Check, ChevronDown, ChevronUp, CircleHelp, Loader2, Play, Plus, RefreshCw, Settings2, X, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AppSelect } from "./AppSelect";
-import { AgentGlyph } from "./HubOverview";
+import { AgentGlyph } from "./hub-shared";
 import { AgentConnectDialog } from "./GatewayAgents";
 import { ProviderAdder } from "./GatewayProviders";
 import { ProviderTestDialog } from "./ProviderTestDialog";
@@ -22,6 +22,7 @@ type ClaudeSetupStatus = {
   localization: boolean; voiceInput: boolean; extensions: boolean; computerUse: boolean; computerUseSupported: boolean;
 };
 type VerifiedProbe = { fingerprint: string; candidateId: string; ok: boolean };
+type ActiveProbe = Omit<VerifiedProbe, "ok">;
 
 export function OnboardingSetup({
   focus, codexInstalled, codexRunning, launchPending, codexEnhancementsEnabled,
@@ -51,7 +52,8 @@ export function OnboardingSetup({
   const [busy, setBusy] = useState<string | null>(null);
   const [adding, setAdding] = useState<"provider" | "agent" | null>(null);
   const [candidateId, setCandidateId] = useState("");
-  const [testing, setTesting] = useState<{ candidateId: string; fingerprint: string } | null>(null);
+  const [testing, setTesting] = useState<ActiveProbe | null>(null);
+  const activeProbe = useRef<ActiveProbe | null>(null);
   const [verified, setVerified] = useState<VerifiedProbe | null>(null);
   const [claude, setClaude] = useState<ClaudeSetupStatus | null>(null);
   const [checking, setChecking] = useState(false);
@@ -86,7 +88,9 @@ export function OnboardingSetup({
       setLoadError("");
       publishGatewayPayload(result);
     } catch {
-      if (mounted.current && sequence === loadSequence.current) setLoadError(t("配置读取失败，请重试。"));
+      if (mounted.current && sequence === loadSequence.current && generation === gatewayGeneration()) {
+        setLoadError(t("配置读取失败，请重试。"));
+      }
     } finally {
       window.clearTimeout(timeout);
       if (sequence === loadSequence.current) {
@@ -97,7 +101,7 @@ export function OnboardingSetup({
   }, []);
 
   useEffect(() => {
-    mounted.current = true;
+    if (enhance) return;
     const unsubscribe = subscribeGatewayPayload((next) => {
       setPayload(next);
       setLoadError("");
@@ -106,15 +110,22 @@ export function OnboardingSetup({
     void refresh();
     const timer = window.setInterval(() => { if (document.visibilityState === "visible") void refresh(); }, 5000);
     return () => {
-      mounted.current = false;
-      checkSequence.current += 1;
       loadSequence.current += 1;
       loadingRequest.current = false;
       unsubscribe();
       window.clearInterval(timer);
       window.clearTimeout(loadTimeout.current);
     };
-  }, [refresh]);
+  }, [enhance, refresh]);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      checkSequence.current += 1;
+      activeProbe.current = null;
+    };
+  }, []);
 
   const agents = enhance
     ? [{ value: "codex", label: "Codex" }, { value: "claude", label: "Claude" }]
@@ -125,6 +136,7 @@ export function OnboardingSetup({
   useEffect(() => {
     if (previousConfiguration.current !== gateway.fingerprint) {
       previousConfiguration.current = gateway.fingerprint;
+      activeProbe.current = null;
       setVerified(null);
       setTesting(null);
     }
@@ -137,6 +149,7 @@ export function OnboardingSetup({
   const testProvider = activeTest ? payload?.pool.find((item) => item.id === activeTest.providerId) : undefined;
   useEffect(() => {
     if (testing && (!activeTest || loadError)) {
+      activeProbe.current = null;
       setTesting(null);
       setVerified(null);
     }
@@ -152,6 +165,7 @@ export function OnboardingSetup({
   const run = makeRun(setBusy, publishGatewayPayload, notify);
   const changeAgent = (next: string) => {
     checkSequence.current += 1;
+    activeProbe.current = null;
     setSelectedAgent(next);
     setVerified(null);
     setTesting(null);
@@ -295,7 +309,13 @@ export function OnboardingSetup({
               ) : (
                 <>
                   {gateway.candidates.length > 1 ? <AppSelect ariaLabel={t("测试供应商与模型")} disabled={Boolean(testing)} onChange={(next) => { setCandidateId(next); setVerified(null); }} options={gateway.candidates.map((item) => ({ value: item.id, label: `${maskAccountName(item.providerName)} · ${item.model}` }))} size="sm" value={candidate?.id ?? ""} /> : null}
-                  <Button disabled={!configured || !candidate} onClick={() => { if (candidate) { setVerified(null); setTesting({ candidateId: candidate.id, fingerprint: gateway.fingerprint }); } }} size="sm" variant="secondary"><Zap size={13} />{tested ? t("重新测试模型请求") : t("测试模型请求")}</Button>
+                  <Button disabled={!configured || !candidate || Boolean(testing)} onClick={() => {
+                    if (!candidate || activeProbe.current) return;
+                    const probe = { candidateId: candidate.id, fingerprint: gateway.fingerprint };
+                    activeProbe.current = probe;
+                    setVerified(null);
+                    setTesting(probe);
+                  }} size="sm" variant="secondary"><Zap size={13} />{tested ? t("重新测试模型请求") : t("测试模型请求")}</Button>
                   <p>{tested ? t("所选供应商的模型请求测试通过。") : t("手动发送一条短请求，可能产生少量用量。")}</p>
                   {gateway.multipleTargets ? <p>{t("这里只验证所选供应商与模型，不代表整个模型组。")}</p> : null}
                 </>
@@ -315,9 +335,15 @@ export function OnboardingSetup({
           initialModel={activeTest.model}
           lockModel
           keyId={null}
-          onClose={() => setTesting(null)}
-          onStart={() => setVerified(null)}
-          onResult={(result) => setVerified({ ...testing, ok: result.ok === true })}
+          onClose={() => {
+            if (activeProbe.current !== testing) return;
+            activeProbe.current = null;
+            setTesting(null);
+          }}
+          onStart={() => { if (activeProbe.current === testing) setVerified(null); }}
+          onResult={(result) => {
+            if (activeProbe.current === testing) setVerified({ ...testing, ok: result.ok === true });
+          }}
         />
       ) : null}
     </section>

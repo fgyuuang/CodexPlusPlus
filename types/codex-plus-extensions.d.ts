@@ -29,6 +29,7 @@ type CodexPlusExtensionRoute =
   | "/thread-usage-live"
   | "/backend/status"
   | "/settings/public"
+  | "/provider-prices/public"
   | "/model-catalog/public"
   | "/agent-pet/catalog"
   | "/agent-pet/image"
@@ -39,6 +40,23 @@ type CodexPlusExtensionRoute =
   | "/whale/history"
   | "/whale/session"
   | "/image-overlay/image";
+
+/** 每百万 Token 的网关配置价；0 可能是未填写，也可能是免费。 */
+interface CodexPlusProviderPrice {
+  currency: string;
+  input: number;
+  cachedInput: number;
+  output: number;
+}
+
+interface CodexPlusProviderPrices {
+  providers: Array<{
+    id: string;
+    name: string;
+    price: CodexPlusProviderPrice | null;
+    modelPrices: Record<string, CodexPlusProviderPrice | undefined>;
+  }>;
+}
 
 interface CodexPlusToastOptions {
   type?: CodexPlusToastType;
@@ -509,6 +527,7 @@ interface CodexPlusSessionQuery {
   listSessions(options?: { archived?: boolean; limit?: number; offset?: number }): Promise<CodexPlusSession[]>;
   filterSessions(filters: { id?: string; cwd?: string; archived?: boolean; createdAfter?: number; createdBefore?: number; limit?: number }): Promise<CodexPlusSession[]>;
   readSession(id: string): Promise<{ session: CodexPlusSession; events: CodexPlusSessionEvent[] }>;
+  /** 优先返回侧栏名称，无名称时返回数据库标题。 */
   readTitle(id: string): Promise<string>;
   listEvents(id: string, options?: { types?: string[]; offset?: number; limit?: number; fromEnd?: boolean }): Promise<CodexPlusSessionEvent[]>;
   filterEvents(id: string, filters?: { types?: string[]; text?: string; limit?: number }): Promise<CodexPlusSessionEvent[]>;
@@ -765,7 +784,7 @@ interface CodexPlusManagerRouteGroup {
 interface CodexPlusManagerPanelApi {
   config: {
     get(): Promise<Record<string, unknown>>;
-    /** 只能写清单 config 里声明过的项；保存后返回最新配置。 */
+    /** 只能写清单 config 里声明过的项；只覆盖给出的项，其余已存的值保留；保存后返回最新配置。 */
     set(values: Record<string, unknown>): Promise<Record<string, unknown>>;
     onChange(handler: (config: Record<string, unknown>) => void): () => void;
   };

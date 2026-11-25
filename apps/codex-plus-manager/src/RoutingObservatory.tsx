@@ -24,7 +24,7 @@ const sessionName = (group: { title?: string; thread?: string }) => group.title 
 
 export function RecentRouteFeed({ payload }: { payload: GatewayPayload | null }) {
   const scope = useAgentFocus();
-  const { entries, loaded } = useRequestFlow(3000, limit, true);
+  const { entries, loaded, failed } = useRequestFlow(3000, limit, true);
   const [view, setView] = useState<"sessions" | "requests">("requests");
   const [status, setStatus] = useState<"all" | keyof typeof statusLabel>("all");
   const [period, setPeriod] = useState<keyof typeof periodLabel>("recent");
@@ -156,7 +156,7 @@ export function RecentRouteFeed({ payload }: { payload: GatewayPayload | null })
           data-active={purpose === value} onClick={() => { setPurpose(value); resetList(); }}>{t(purposeLabel[value])}</button>)}
       </div>
     </div>
-    {!loaded || !entry || !active ? <CxEmpty title={t(!loaded ? "读取中…" : filtered ? "没有匹配的路由请求" : "暂无网关路由记录")} /> : (
+    {!loaded || !entry || !active ? <CxEmpty title={t(failed ? "读取失败" : !loaded ? "读取中…" : filtered ? "没有匹配的路由请求" : "暂无网关路由记录")} /> : (
         <div className="route-observatory-sidebar">
           <div className="route-observatory-list" role="group" aria-label={t(view === "sessions" ? "会话" : "请求")}>
             {view === "sessions" ? matching.slice(0, visible).map(({ group, shows }) => {

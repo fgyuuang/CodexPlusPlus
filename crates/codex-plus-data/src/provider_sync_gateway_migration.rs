@@ -183,6 +183,7 @@ pub fn migrate_gateway_thread_provider(
             .iter()
             .map(|change| crate::sync_journal::JournalRollout {
                 path: change.path.clone(),
+                recovery_path: None,
                 before_sha256: format!("{:x}", Sha256::digest(change.original_text.as_bytes())),
                 after_sha256: format!("{:x}", Sha256::digest(change.next_text.as_bytes())),
                 original_meta_lines: change.original_session_meta_lines.clone(),

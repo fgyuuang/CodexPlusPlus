@@ -2,6 +2,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readFile, readdir } from "node:fs/promises";
+import { readAppSource } from "./app-source.test-helper.ts";
+import { resolveRouteAlias } from "./route-aliases.ts";
 
 function providerSwitchHelperSource(renderer: string) {
   const start = renderer.indexOf("  async function prepareCodexGatewaySourceRequest(");
@@ -939,12 +941,14 @@ ${slice("  let codexPlusSettingsCatalog = null;", "  function refreshCodexPlusSe
   function refreshCodexPlusSettingsCatalogView() { refreshes += 1; }
   return {
     load: loadCodexPlusSettingsCatalog,
+    loadUsageStorage: loadCodexPlusUsageStorage,
     sections: renderCodexPlusSettingsCatalogSections,
     status: () => codexPlusSettingsCatalogStatus,
     refreshes: () => refreshes,
   };`,
   )(postJson, (name: string, detail: unknown) => { diagnostics.push({ name, detail }); }, platform.windows, platform.mac, backendSettings) as {
     load: () => Promise<unknown>;
+    loadUsageStorage: (element: unknown) => Promise<void>;
     sections: () => string;
     status: () => { status: string; message: string };
     refreshes: () => number;
@@ -1251,10 +1255,40 @@ describe("renderer injection header compatibility", () => {
     // 只搬动已有的 modal-body，不重建里面的 data-codex-* 挂载点，
     // 否则 renderUserScripts / 各 toggle 的 querySelector 会找不到目标。
     assert.match(renderer, /main\.appendChild\(body\)/);
-    // 左面板按页面决定：「拓展」是脚本列表，设置页是分组导航；推荐内容是单栏内容页，没有左面板。
+    // 左面板按页面决定：「拓展」是脚本列表，设置页是分组导航；推荐内容、远程控制、微信连接走分组左栏。
     assert.match(renderer, /if \(tab === codexPlusExtensionsTab\) \{[\s\S]{0,400}nav\.className = "codex-plus-page-nav"/);
     assert.match(renderer, /\} else if \(tab === "home"\) \{[\s\S]{0,400}nav\.className = "codex-plus-page-nav"/);
     assert.match(renderer, /data-codex-plus-page-nav-body="true"/);
+    // 目录是常量，页面里的左栏和图标栏悬浮卡片共用。
+    assert.match(renderer, /if \(tab === codexPlusSponsorTab\) installCodexPlusSectionNav\(overlay, codexPlusSponsorSectionNav\);/);
+    assert.match(renderer, /const codexPlusSponsorSectionNav = \{ title: "推荐内容", groups: \[\{ id: "partners"/);
+    assert.match(renderer, /const codexPlusRemoteSectionNav = \{\s*title: "远程控制",[\s\S]{0,200}groups: \[\s*\{ id: "remote"[\s\S]{0,80}\{ id: "devices"[\s\S]{0,80}\{ id: "notify"[\s\S]{0,80}\{ id: "help"/);
+    assert.match(renderer, /const codexPlusWeixinSectionNav = \{\s*title: "微信连接",\s*groups: \[\s*\{ id: "connection"[\s\S]{0,80}\{ id: "session"[\s\S]{0,80}\{ id: "jiajia"[\s\S]{0,80}\{ id: "permission"/);
+    assert.match(renderer, /installCodexPlusSectionNav\(overlay, codexPlusRemoteSectionNav\);/);
+    assert.match(renderer, /installCodexPlusSectionNav\(overlay, codexPlusWeixinSectionNav\);/);
+    // 两页的面板用设置页的分页样式；重画后由 MutationObserver 补回当前组，左栏不占 refreshCodexPlusPageNav 认的挂载点。
+    assert.match(renderer, /codex-plus-settings" data-codex-plus-settings-paged="true" data-codex-remote-panel="true"/);
+    assert.match(renderer, /codex-plus-settings" data-codex-plus-settings-paged="true" data-codex-weixin-panel="true"/);
+    const sectionNav = renderer.slice(renderer.indexOf("function installCodexPlusSectionNav("), renderer.indexOf("function codexPlusSectionGroupHtml("));
+    assert.match(sectionNav, /data-codex-plus-section-nav-body="true"/);
+    assert.doesNotMatch(sectionNav, /data-codex-plus-page-nav-body/);
+    assert.match(sectionNav, /new MutationObserver\(sync\)\.observe\(body, \{ childList: true, subtree: true \}\)/);
+    assert.match(sectionNav, /window\.localStorage\.setItem\(storageKey, active\)/);
+    // 克隆来的图标栏入口去掉原生悬浮区标记，否则停在我们的入口上会浮出模板那一项的原生侧栏。
+    const railButton = renderer.slice(renderer.indexOf("function createCodexPlusRailButton("), renderer.indexOf("function createCodexPlusRailButton(") + 2500);
+    assert.match(railButton, /button\.removeAttribute\("data-slate-sidebar-peek-area"\);/);
+    assert.match(railButton, /button\.removeAttribute\("data-slate-sidebar-peek-product-mode"\);/);
+    // 左栏样式同设置页左栏；图标栏悬浮卡片里的左栏（.codex-plus-rail-peek-content）也用这一套。
+    assert.match(renderer, /:is\(\.\$\{codexPlusPageClass\} \.codex-plus-modal-content, \.codex-plus-rail-peek-content\):is\(\[data-codex-plus-active-tab="home"\], \[data-codex-plus-section-nav\]\) \.codex-plus-page-nav \{/);
+    assert.match(renderer, /:is\(\.\$\{codexPlusPageClass\} \.codex-plus-modal-content, \.codex-plus-rail-peek-content\)\[data-codex-plus-active-tab="extensions"\] \.codex-plus-page-nav \{/);
+    // 侧栏收起时每个入口浮出自己的卡片：处理函数随图标栏入口一起装（原生页面上也要有）。
+    assert.match(renderer, /installCodexPlusNavPeek\(\);\s*return true;\s*\}/);
+    const peekSpec = renderer.slice(renderer.indexOf("function codexPlusRailPeekSpec("), renderer.indexOf("function codexPlusSettingsPeekNavItems("));
+    for (const [rail, nav] of [["codexPlusRailRemoteId", "codexPlusRemoteSectionNav"], ["codexPlusRailWeixinId", "codexPlusWeixinSectionNav"], ["codexPlusRailSponsorId", "codexPlusSponsorSectionNav"]]) {
+      assert.match(peekSpec, new RegExp(`if \\(railId === ${rail}\\) return section\\(${nav}, `));
+    }
+    assert.match(peekSpec, /if \(railId === codexPlusRailNavId\) \{[\s\S]{0,900}openCodexPlusPage\(\);\s*selectCodexPlusSettingsGroup\(id\);/);
+    assert.match(peekSpec, /if \(railId === codexPlusRailExtensionsId\) \{[\s\S]{0,400}items: renderCodexPlusExtensionsNav\(\)/);
     // 布局必须在 selectCodexPlusTab 之前建好，否则刷新左面板时找不到容器。
     assert.match(renderer, /installCodexPlusPageLayout\(overlay, initialTab\);[\s\S]{0,900}selectCodexPlusTab\(initialTab\);/);
     // 左面板分组导航走同一个选中函数。
@@ -1274,7 +1308,9 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /id: codexPlusRailNavId, label: "Codex\+\+"/);
     assert.match(renderer, /id: codexPlusRailExtensionsId, label: "拓展"/);
     const manager = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
-    assert.match(manager, /id: "recommendations"/);
+    assert.equal(resolveRouteAlias("recommendations"), "home");
+    assert.match(manager, /!isRouteAlias\(target\) && !routes\.some/);
+    assert.doesNotMatch(manager, /id: "recommendations"/);
     assert.match(manager, /<CuratedPackagesSection/);
     // 保留旧页面的选中态兼容映射。
     assert.match(renderer, /\[codexPlusRailSponsorId, "sponsor"\],/);
@@ -3736,7 +3772,7 @@ it("opens Stepwise service settings in the Codex++ settings page, not the manage
 
 describe("Stepwise generation mode contracts", () => {
   it("exposes automatic and manual generation in the Codex settings page", async () => {
-    const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+    const app = readAppSource();
     const renderer = await readFile(
       new URL("../../../assets/inject/renderer-inject.js", import.meta.url),
       "utf8",
@@ -4292,7 +4328,7 @@ describe("拓展接口层", () => {
     assert.ok(routes.includes("/cdp/targets"), "CDP 页面列表应开放给拓展");
     assert.ok(routes.includes("/cdp/evaluate"), "CDP evaluate 应开放给拓展");
     assert.ok(routes.includes("/request-log/recent"), "只读的最近请求日志应开放给拓展");
-    for (const route of ["/proxy-status", "/thread-usage-live", "/backend/status", "/settings/public", "/model-catalog/public"]) {
+    for (const route of ["/proxy-status", "/thread-usage-live", "/backend/status", "/settings/public", "/provider-prices/public", "/model-catalog/public"]) {
       assert.ok(routes.includes(route), `只读的 ${route} 应开放给拓展`);
     }
     // 原始模型目录带供应商地址与本机路径，拓展只能拿 /model-catalog/public 的脱敏版本。
@@ -4323,6 +4359,40 @@ describe("拓展接口层", () => {
     assert.ok(mount >= 0, "找不到 window.codexPlus 的挂载点");
     // 挂载必须在主 IIFE 结束之前，否则闭包里的函数已经不可达。
     assert.ok(mount < tail, "挂载点必须位于 IIFE 收尾之前");
+  });
+
+  it("生成产物挂载的公开接口能调用供应商配置价且仍拒绝内部写路由", async () => {
+    const renderer = await readFile(artifactPath, "utf8");
+    const routeStart = renderer.indexOf("  const codexPlusExtensionRoutes = new Set([");
+    const onceStart = renderer.indexOf("  function codexPlusExtensionCallOnce(", routeStart);
+    const routeEnd = renderer.indexOf("\n  /**", onceStart);
+    const buildStart = renderer.indexOf("  function buildCodexPlusExtensionApi() {");
+    const buildEnd = renderer.indexOf("\n  }\n", buildStart) + "\n  }\n".length;
+    const mount = "window.codexPlus = buildCodexPlusExtensionApi();";
+    assert.ok(routeStart >= 0 && onceStart > routeStart && routeEnd > onceStart);
+    assert.ok(buildStart >= 0 && buildEnd > buildStart && renderer.includes(mount));
+    const calls: unknown[] = [];
+    const fakeWindow: { codexPlus?: { call: (route: string) => Promise<unknown> }; __codexSessionDeleteBridge: (route: string, payload: unknown) => Promise<unknown> } = {
+      __codexSessionDeleteBridge: async (route, payload) => {
+        calls.push([route, payload]);
+        return { providers: [{ id: "p", name: "P", price: null, modelPrices: {} }] };
+      },
+    };
+    new Function("window", `
+      const codexPlusExtensionApiVersion = 1;
+      const codexPlusExtensionAdapterVersion = "test";
+      const codexPlusExtensionConstants = {};
+      const codexPlusCreateExtension = () => {};
+      ${renderer.slice(routeStart, routeEnd)}
+      ${renderer.slice(buildStart, buildEnd)}
+      ${mount}
+    `)(fakeWindow);
+    assert.deepEqual(await fakeWindow.codexPlus!.call("/provider-prices/public"), {
+      providers: [{ id: "p", name: "P", price: null, modelPrices: {} }],
+    });
+    assert.deepEqual(calls, [["/provider-prices/public", {}]]);
+    await assert.rejects(fakeWindow.codexPlus!.call("/settings/set"), /未开放的路由/);
+    assert.equal(calls.length, 1);
   });
 });
 
@@ -4848,6 +4918,30 @@ describe("renderer model reasoning efforts patch", () => {
     );
   });
 
+  it("字符串与 Codex 原生 {effort} 条目也能归一化出档位（#3210）", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    for (const declaration of [
+      { supportedReasoningEfforts: ["low", "high", "max"] },
+      { supportedReasoningEfforts: ["low", "high", "max"].map((effort) => ({ effort, description: `${effort} effort` })) },
+    ]) {
+      const efforts = reasoningRuntime(renderer, declaration)("cpx-relay/deepseek-flash");
+      assert.deepEqual(
+        efforts.map((entry) => entry.reasoningEffort),
+        ["low", "high", "max"],
+      );
+      assert.ok(efforts.every((entry) => (entry as Record<string, unknown>).effort === undefined), "原生 effort 字段不应残留在产物里");
+    }
+  });
+
+  it("档位声明存在但全部无法解析时不补出未知档位", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const efforts = reasoningRuntime(renderer, { supportedReasoningEfforts: [42, null] })("deepseek-flash");
+    assert.deepEqual(
+      efforts.map((entry) => entry.reasoningEffort),
+      [],
+    );
+  });
+
   it("目录尚未声明能力时不猜测推理档位", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
     const efforts = reasoningRuntime(renderer, null)("deepseek-flash");
@@ -4899,6 +4993,33 @@ describe("Codex++ 设置页按设置项清单生成", () => {
       const source = await readFile(new URL(fragment.name, fragmentDir), "utf8");
       for (const item of catalog.items) assert.ok(!source.includes(item.description), `${fragment.name} 里有「${item.title}」说明的副本`);
     }
+  });
+
+  it("按需显示用量历史目录和占用，读取失败不冒充零字节", async () => {
+    const requests: string[] = [];
+    const catalog = await readCatalog();
+    const page = await settingsCatalogRuntime(async (path) => {
+      if (path === "/settings/catalog") return catalog;
+      requests.push(path);
+      if (requests.length === 1) return { status: "ok", bytes: 1572864, directory: "example/usage-history" };
+      throw new Error("storage unavailable");
+    });
+    await page.load();
+    assert.match(page.sections(), /data-codex-plus-usage-storage/);
+    assert.equal(requests.length, 0);
+    const bytes = { textContent: "" }, directory = { textContent: "" };
+    const details = {
+      dataset: {},
+      querySelector: (selector: string) => selector === "[data-usage-storage-bytes]" ? bytes : directory,
+    };
+    await page.loadUsageStorage(details);
+    assert.equal(bytes.textContent, `${(1.5).toLocaleString()} MiB`);
+    assert.equal(directory.textContent, "example/usage-history");
+    await page.loadUsageStorage(details);
+    assert.equal(bytes.textContent, "读取失败");
+    assert.equal(directory.textContent, "storage unavailable");
+    assert.deepEqual(details.dataset, {});
+    assert.deepEqual(requests, ["/settings/usage-history-storage", "/settings/usage-history-storage"]);
   });
 
   it("每个在 Codex 显示的设置项生成一行，文案与绑定都取自清单", async () => {

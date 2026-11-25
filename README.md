@@ -32,7 +32,7 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
 
 它还内置一个本地网关：Codex、Claude Code、Gemini CLI、OpenCode、Zed 等 50 多个 Agent 共用一份供应商池，按模型名选供应商，Key 冷却或供应商熔断时自动换上游，ChatGPT、GitHub Copilot、Cursor 等订阅也能登录进池。原来的直连模式（官方登录、官方 + API、纯 API、聚合供应商）完整保留，Codex 在「经网关」和「直连」之间一键切换。
 
-此外还有会话管理、Codex 界面增强、Claude Desktop 增强版、跨 Agent 的 Computer Use 与子 Agent 协作。管理器是一个桌面程序的样子：侧栏切 Agent 和页面，顶部页签切分页，齿轮进设置目录；只用 Codex 或只想要增强功能，可以切换使用模式把用不到的页面藏起来。双击打开管理界面，再从界面启动各个应用；它不修改任何官方应用的安装文件。
+此外还有会话管理、Codex 界面增强、Claude Desktop 增强版、跨 Agent 的 Computer Use 与子 Agent 协作。管理器是一个桌面程序的样子：侧栏切 Agent 和页面，顶部页签切分页，齿轮进设置目录。双击打开管理界面，再从界面启动各个应用；它不修改任何官方应用的安装文件。
 
 本 fork 当前整合目标为正式 **v2.1.4**，保留本地官方多账号、聚合路由、父子来源跟随和插件持久化，并新增默认停用的 WorkBuddy CLI 协作目标。网关独立登录与 Codex 登录保持隔离；WorkBuddy 需要独立 CLI 登录，真实任务仍待验收。详见[本地功能清单](docs/local-features.md)、[本轮整合与交付记录](docs/reports/2026-11-03-v2.1.4-model-cache-recovery.md)及[快速开发与缓存管理](docs/development-workflow.md)。上方下载链接仍指向上游发行版，不包含本 fork 的全部本地扩展。
 
@@ -76,11 +76,11 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
   </tr>
   <tr>
     <td align="center">
-      <a href="https://apikey.fun/register?aff=CODEX">
+      <a href="https://apikey.fan/register?aff=CODEX">
         <img src="docs/images/sponsor-apikey-fun.png" alt="APIKEY.FUN" height="80">
       </a>
     </td>
-    <td><a href="https://apikey.fun/register?aff=CODEX"><strong>APIKEY.FUN</strong></a><br>感谢 APIKEY.FUN 赞助了本项目！APIKEY.FUN 是一家致力于提供开放、稳定、高性价比的全球主流大模型的 AI 中转站。平台支持 Claude、OpenAI、Gemini 等热门模型的 API 中转服务，价格低至官方原价的 7%。通过专属链接<a href="https://apikey.fun/register?aff=CODEX">注册 APIKEY</a>，可享受最高充值永久 95 折优惠。</td>
+    <td><a href="https://apikey.fan/register?aff=CODEX"><strong>APIKEY.FUN</strong></a><br>感谢 APIKEY.FUN 赞助了本项目！APIKEY.FUN 是一家致力于提供开放、稳定、高性价比的全球主流大模型的 AI 中转站。平台支持 Claude、OpenAI、Gemini 等热门模型的 API 中转服务，价格低至官方原价的 7%。通过专属链接<a href="https://apikey.fan/register?aff=CODEX">注册 APIKEY</a>，可享受最高充值永久 95 折优惠。</td>
   </tr>
   <tr>
     <td align="center">
@@ -138,6 +138,14 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
     </td>
     <td><a href="https://dzhsmartai.com/register?promo=CODEXPLUSPLUS"><strong>ccccccAPI</strong></a><br>感谢 ccccccAPI 赞助本项目！ccccccAPI 量贩式中转站 —— 实惠 Token，一站式接入。ccccccAPI 是一家专注服务开发者与企业的 AI API 中转站，主打「量贩式」定价：ChatGPT、Claude、Kimi、Grok、Gemini 等主流模型基本全覆盖，一个 API Key、一套兼容 OpenAI 的接口，改一行 base_url 就能自由切换，不用再分别注册、分别充值。目标很朴素：让更多人用上实惠的 Token——用 ccccccAPI，不烧钱、不烧心。通过<a href="https://dzhsmartai.com/register?promo=CODEXPLUSPLUS">此链接注册</a>，即得 1 美元使用额度。</td>
   </tr>
+  <tr>
+    <td align="center">
+      <a href="https://vegaapi.com/">
+        <img src="docs/images/sponsor-vegaapi.png" alt="VegaAPI" width="96">
+      </a>
+    </td>
+    <td><a href="https://vegaapi.com/"><strong>VegaAPI</strong></a><br>感谢 VegaAPI 赞助本项目！VegaAPI 提供稳定高速的 AI API 服务，一个 API Key 即可接入 GPT、Claude、Gemini、Grok 等主流模型，兼容 OpenAI、Anthropic 和 Gemini 接口，改一下 base_url 就能用。按量计费，支持支付宝和微信充值，10 元起充。欢迎<a href="https://vegaapi.com/">注册使用</a>。</td>
+  </tr>
 </table>
 
 想支持项目或展示品牌？[联系维护者](mailto:1727532@qq.com)。
@@ -192,7 +200,7 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
   </tr>
   <tr>
     <td valign="top"><strong>🖥️ 托盘快捷面板</strong><br>点托盘图标就能换模型、看用量和最近请求。</td>
-    <td valign="top"><strong>📱 微信连接</strong><br>扫码连接本机 Codex。</td>
+    <td valign="top"><strong>📱 微信连接与任务通知</strong><br>扫码连接本机 Codex。<a href="docs/guides/chat-robot-notifications.md">钉钉、飞书通知与手机审批</a>。</td>
   </tr>
   <tr>
     <td valign="top"><strong>🐳 Agent 桌宠</strong><br>点一下会压扁、带音效，图片随心换。</td>

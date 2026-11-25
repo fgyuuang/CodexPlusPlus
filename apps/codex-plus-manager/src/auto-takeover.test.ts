@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { appDeclarationSource, readAppSource } from "./app-source.test-helper.ts";
 
 /**
  * 「自动接管官方 App」的接线契约。
@@ -15,7 +16,7 @@ import test from "node:test";
  */
 
 const root = path.resolve(import.meta.dirname, "..");
-const appSource = readFileSync(path.join(root, "src/App.tsx"), "utf8");
+const appSource = readAppSource();
 const libSource = readFileSync(
   path.join(root, "src-tauri/src/lib.rs"),
   "utf8",
@@ -100,6 +101,20 @@ test("auto-takeover status fields stay aligned with the Rust payload", () => {
       `App.tsx 的 AutoTakeoverResult 缺少 ${camelField}`,
     );
   }
+});
+
+test("auto-takeover switch is on the home screen, right under the Codex row", () => {
+  // 只放在设置页太深，用户找不到，还以为必须从 Codex++ 启动 Codex。
+  const home = appDeclarationSource("HomeScreen");
+  assert.match(home, /const takeoverRow = [\s\S]*?actions\.setAutoTakeover\(/, "首页必须有自动接管开关");
+  assert.match(home, /<\/CxRow>,\s*takeoverRow,\s*\]/, "开关行必须紧跟在 Codex 那一行后面");
+  assert.match(home, /actions\.setWatcherEnabled\(true\)/, "没开登录自启时首页要能直接打开");
+});
+
+test("turning the switch on does not read the stale settings closure", () => {
+  // setAutoTakeover 闭包里的 settings 还是旧值（关）；照它判断会把状态清空，状态行一直显示「未运行」。
+  assert.ok(appSource.includes("await refreshAutoTakeover(true, true);"), "打开开关后刷新必须显式传 enabled");
+  assert.ok(appSource.includes('invoke<AutoTakeoverResult>("load_auto_takeover_state")'), "首页 / 设置页要轮询接管状态");
 });
 
 test("auto-takeover copy is translated in the English dictionary", () => {

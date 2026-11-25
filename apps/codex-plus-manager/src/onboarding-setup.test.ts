@@ -109,7 +109,7 @@ function harness(focus: focusModel.AgentFocus = "codex") {
     "lucide-react": Object.fromEntries(["ArrowRight", "Check", "ChevronDown", "ChevronUp", "CircleHelp", "Loader2", "Play", "Plus", "RefreshCw", "Settings2", "X", "Zap"].map((name) => [name, name])),
     "@/components/ui/button": { Button: "Button" },
     "./AppSelect": { AppSelect: "AppSelect" },
-    "./HubOverview": { AgentGlyph: "AgentGlyph" },
+    "./hub-shared": { AgentGlyph: "AgentGlyph" },
     "./GatewayAgents": { AgentConnectDialog: "AgentConnectDialog" },
     "./GatewayProviders": { ProviderAdder: "ProviderAdder" },
     "./ProviderTestDialog": { ProviderTestDialog: "ProviderTestDialog" },
@@ -275,7 +275,10 @@ test("供应商探测明确失败不允许完成，只有成功且启动确认�
   tree = f.render();
   assert.equal(button(tree, "启动 Codex 并完成").props.disabled, false);
   probeDialog(tree).props.onClose();
-  button(f.render(), "启动 Codex 并完成").props.onClick();
+  const start = button(f.render(), "启动 Codex 并完成");
+  start.props.onClick();
+  start.props.onClick();
+  assert.equal(f.launches.length, 1, "快速重复点击只启动一次");
   assert.deepEqual(f.dismissed, []);
   f.launches[0].resolve(false);
   await flush();
@@ -329,7 +332,8 @@ test("切换 Agent 撤销已有验证，正在测试的旧 Agent 结果不作用
 test("关键配置变化关闭旧测试并撤销验证，改回原配置不会复活旧结果", async () => {
   const f = harness();
   await load(f);
-  openProbe(f).props.onResult({ ok: true });
+  const previousProbe = openProbe(f);
+  previousProbe.props.onResult({ ok: true });
   assert.equal(button(f.render(), "启动 Codex 并完成").props.disabled, false);
   const next = fixture();
   next.pool[0].baseUrl = "https://changed.invalid";
@@ -338,6 +342,8 @@ test("关键配置变化关闭旧测试并撤销验证，改回原配置不会�
   assert.equal(button(tree, "启动 Codex 并完成").props.disabled, true);
   assert.equal(children(tree).some((element) => element.type === "ProviderTestDialog"), false);
   f.publish(fixture());
+  f.render();
+  previousProbe.props.onResult({ ok: true });
   tree = f.render();
   assert.equal(button(tree, "启动 Codex 并完成").props.disabled, true);
   f.unmount();
@@ -346,7 +352,9 @@ test("关键配置变化关闭旧测试并撤销验证，改回原配置不会�
 test("Codex 检查失败或抛错不完成，重复点击只执行一次且可以重试", async () => {
   for (const failure of ["false", "throw"]) {
     const f = harness("enhance");
-    await load(f);
+    f.render();
+    f.poll();
+    assert.equal(f.requests.length, 0, "不读取无关的网关配置");
     const check = button(f.render(), "检查安装与配置");
     check.props.onClick();
     check.props.onClick();
@@ -371,7 +379,6 @@ test("Codex 检查失败或抛错不完成，重复点击只执行一次且可�
 
 test("检查返回成功仍需最新应用状态就绪，旧 Agent 的检查结果不能跨选择生效", async () => {
   const f = harness("enhance");
-  await load(f);
   button(f.render(), "检查安装与配置").props.onClick();
   f.props.codexInstalled = false;
   f.checks[0].resolve(true);
@@ -392,7 +399,6 @@ test("Codex 检查采用等待期间父层刷新的增强配置，开启后可�
   for (const enabled of [true, false]) {
     const f = harness("enhance");
     f.props.codexEnhancementsEnabled = !enabled;
-    await load(f);
     button(f.render(), "检查安装与配置").props.onClick();
     assert.equal(f.checks.length, 1);
     f.props.codexEnhancementsEnabled = enabled;

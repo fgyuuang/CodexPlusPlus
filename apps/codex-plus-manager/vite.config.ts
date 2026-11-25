@@ -1,7 +1,8 @@
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { realpathSync } from "node:fs";
 import path from "node:path";
-import { defineConfig } from "vite";
+import { defineConfig, searchForWorkspaceRoot } from "vite";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -23,5 +24,12 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 1420,
     strictPort: true,
+    fs: {
+      // 隔离工作树可共用 node_modules；只开放实际使用的本地字体文件。
+      allow: [
+        searchForWorkspaceRoot(__dirname),
+        realpathSync(path.join(__dirname, "node_modules/@fontsource/jetbrains-mono/files")),
+      ],
+    },
   },
 });

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import ts from "typescript";
+import { readAppSource } from "./app-source.test-helper.ts";
 import { EN_BACKEND, EN_PLAIN, EN_TEMPLATE } from "./i18n-en.ts";
 import { tourSteps } from "./onboarding-model.ts";
 
@@ -36,27 +37,15 @@ function checkKeys(keys: Keys) {
   }
 }
 
-test("模式问卷与入门清单的所有状态、按钮和错误均有英文", () => {
+test("启动引导与界面导览的所有状态、按钮和错误均有英文", () => {
   const keys = emptyKeys();
-  for (const file of ["./AgentFocusDialog.tsx", "./OnboardingSetup.tsx", "./OnboardingTour.tsx"]) {
-    const tree = source(file);
-    collectCalls(tree, keys);
-    if (file === "./AgentFocusDialog.tsx") {
-      const visit = (node: ts.Node) => {
-        if (ts.isPropertyAssignment(node) && ["name", "hint"].includes(node.name.getText(tree))) {
-          collectLiterals(node.initializer, keys.plain);
-        }
-        ts.forEachChild(node, visit);
-      };
-      visit(tree);
-    }
-  }
-  assert.ok(keys.plain.has("重试保存"), "需要扫描嵌套条件分支中的失败状态");
-  assert.ok(keys.plain.has("管理 Codex 的供应商、增强、皮肤和拓展。隐藏其他 Agent 的界面，已有网关连接保持不变。"), "需要扫描动态读取的模式说明");
+  for (const file of ["./OnboardingSetup.tsx", "./OnboardingTour.tsx"]) collectCalls(source(file), keys);
+  assert.ok(keys.plain.has("只用增强功能"), "需要扫描 t() 中的嵌套条件分支");
+  assert.ok(keys.template.has("{0} 已接入 · {1}"), "需要扫描带占位符的状态");
   checkKeys(keys);
 });
 
-test("全部、单 Agent 和增强模式的实际导览步骤均有英文且保留占位符", () => {
+test("导览每一步的标题和正文均有英文", () => {
   const keys = emptyKeys();
   for (const steps of [tourSteps(null), tourSteps("Codex"), tourSteps(null, true)]) {
     for (const step of steps) {
@@ -67,20 +56,19 @@ test("全部、单 Agent 和增强模式的实际导览步骤均有英文且保�
   checkKeys(keys);
 });
 
-test("App 的模式影响说明、事务保存提示和重新打开引导说明均有英文", () => {
-  const tree = source("./App.tsx");
+test("设置页里重新打开引导、开始导览的说明均有英文", () => {
+  const tree = ts.createSourceFile("App.tsx", readAppSource(), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const keys = emptyKeys();
   const visit = (node: ts.Node) => {
-    if (ts.isFunctionDeclaration(node) && node.name?.text === "agentFocusDescription") collectCalls(node, keys);
-    if (ts.isVariableDeclaration(node) && node.name.getText(tree) === "closeAgentFocus" && node.initializer) collectCalls(node.initializer, keys);
     if (ts.isFunctionDeclaration(node) && node.name?.text === "GlobalSettingsScreen") {
       const settings = emptyKeys();
       collectCalls(node, settings);
-      for (const key of settings.plain) if (/引导|导览/.test(key)) keys.plain.add(key);
+      // 标题、按钮和各自那一行的说明。
+      for (const key of settings.plain) if (/引导|导览|重新走一遍|认识侧栏/.test(key)) keys.plain.add(key);
     }
     ts.forEachChild(node, visit);
   };
   visit(tree);
-  assert.ok(keys.plain.has("完成配置、验证连接并开始使用，也可以查看各个入口的导览。"));
+  for (const key of ["启动引导", "重新打开引导", "界面导览", "开始导览"]) assert.ok(keys.plain.has(key), key);
   checkKeys(keys);
 });

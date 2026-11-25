@@ -34,7 +34,6 @@
       '[class*="user-message"]',
       '[class*="UserMessage"]',
       ".composer-footer",
-      codexPlusWorkGatewayProject,
       selectors.appHeader,
       selectors.archiveNav,
       selectors.pluginNavButton,

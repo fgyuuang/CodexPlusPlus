@@ -258,6 +258,7 @@ struct Fixture {
     dir: tempfile::TempDir,
     logs: Logs,
     settings: WeixinCodexPath,
+    outbound: crate::connect::outbound::OutboundPolicy,
 }
 
 impl Fixture {
@@ -269,6 +270,7 @@ impl Fixture {
             dir: tempfile::tempdir().unwrap(),
             logs: Arc::new(Mutex::new(Vec::new())),
             settings: WeixinCodexPath::new(""),
+            outbound: crate::connect::outbound::OutboundPolicy::new(false, "", ""),
         }
     }
 
@@ -290,6 +292,7 @@ impl Fixture {
         .with_focus(
             self.sessions.clone(),
             &self.dir.path().display().to_string(),
+            self.outbound.clone(),
         )
     }
 

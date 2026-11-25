@@ -845,6 +845,49 @@ fn server_starts_serves_page_and_stops() {
 }
 
 #[test]
+fn occupied_loopback_port_uses_a_system_assigned_port_without_changing_settings() {
+    use codex_plus_core::remote_control as remote;
+    use std::io::{Read, Write as _};
+    let _guard = crate::common::global_state_lock();
+    let temp = TempState::new();
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let preferred = occupied.local_addr().unwrap().port();
+    remote::update_state(|settings| settings.port = preferred).unwrap();
+
+    let status = remote::set_enabled(true).unwrap();
+    let actual = remote::running_port().unwrap();
+    assert_ne!(actual, preferred);
+    assert_eq!(status["port"], actual);
+    assert!(
+        status["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("http://127.0.0.1:{actual}/"))
+    );
+    assert_eq!(
+        remote::load_state_from(&temp.dir.path().join("remote-control.json")).port,
+        preferred
+    );
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", actual)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{actual}\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 401"));
+
+    remote::set_enabled(false).unwrap();
+    assert!(std::net::TcpStream::connect(("127.0.0.1", actual)).is_err());
+    assert_eq!(remote::status()["port"], preferred);
+}
+
+#[test]
 fn permission_mode_is_derived_like_the_desktop_presets() {
     use codex_plus_core::remote_control::follower::{PERMISSION_PRESETS, permission_mode_of};
     // 每个预设写出去的设置，读回来要还是同一个预设。
@@ -981,6 +1024,89 @@ async fn codex_page_bridge_route_shares_the_manager_dispatch() {
     assert!(dispatch("revokeDevice", &json!({ "id": "missing" })).is_err());
     let cancelled = bridge_route(&json!({ "action": "cancelPairing" })).unwrap();
     assert_eq!(cancelled["pairing"], Value::Null);
+}
+
+/// Codex 远程控制页的「钉钉与飞书通知」（bridge `/remote-control/robots`）：与管理器共用一份分发，
+/// 只在管理器进程里放行；Webhook 和密钥读不回来；平台、地址、配置格式不对时整体拒绝。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_page_robot_route_shares_the_manager_dispatch() {
+    use codex_plus_core::remote_control::{mark_hosted_by_this_process, robots_bridge_route};
+    let _guard = crate::common::global_state_lock();
+    let _temp = TempState::new();
+
+    // 托管标记是进程级的：同进程里别的用例先标记过就跳过这一步。
+    if let Err(error) = robots_bridge_route(&json!({ "action": "status" })).await {
+        assert!(error.to_string().contains("管理器未运行"), "{error}");
+    }
+    mark_hosted_by_this_process();
+
+    let status = robots_bridge_route(&json!({})).await.unwrap();
+    assert_eq!(
+        status["status"], "ok",
+        "缺省动作是 status，回包带 status: ok"
+    );
+    assert_eq!(status["dingtalk"]["hasWebhook"], false);
+
+    let saved = robots_bridge_route(&json!({
+        "action": "save",
+        "provider": "dingtalk",
+        "update": {
+            "webhook": "https://oapi.dingtalk.com/robot/send?access_token=fixture-token",
+            "secret": "SECfixture",
+            "linkNetwork": "none",
+            "enabled": true
+        }
+    }))
+    .await
+    .unwrap();
+    assert_eq!(saved["dingtalk"]["hasWebhook"], true);
+    assert_eq!(saved["dingtalk"]["hasSecret"], true);
+    assert_eq!(saved["dingtalk"]["enabled"], true);
+    assert_eq!(saved["dingtalk"]["linkNetwork"], "none");
+    let text = saved.to_string();
+    assert!(
+        !text.contains("fixture-token") && !text.contains("SECfixture"),
+        "Webhook 和密钥读不回来：{saved}"
+    );
+
+    for (payload, needle) in [
+        (
+            json!({ "action": "save", "provider": "dingtalk", "update": { "webhook": "https://evil.example/robot/send?access_token=x" } }),
+            "Webhook",
+        ),
+        (
+            json!({ "action": "save", "provider": "wechat", "update": {} }),
+            "不支持的机器人平台",
+        ),
+        (
+            json!({ "action": "save", "provider": "feishu", "update": { "url": "x" } }),
+            "机器人配置格式不对",
+        ),
+        (
+            json!({ "action": "save", "provider": "feishu" }),
+            "缺少机器人配置",
+        ),
+        (json!({ "action": "nope" }), "不支持的机器人操作"),
+    ] {
+        let error = robots_bridge_route(&payload).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains(needle),
+            "{payload}: {error:#}"
+        );
+    }
+    assert_eq!(
+        robots_bridge_route(&json!({ "action": "status" }))
+            .await
+            .unwrap()["dingtalk"]["enabled"],
+        true,
+        "被拒的改动不动原配置"
+    );
+
+    let cleared = robots_bridge_route(&json!({ "action": "clear", "provider": "dingtalk" }))
+        .await
+        .unwrap();
+    assert_eq!(cleared["dingtalk"]["hasWebhook"], false);
+    assert_eq!(cleared["dingtalk"]["enabled"], false);
 }
 
 /// 网页的两种对话样式：Codex 样式（桌面形态）与聊天样式（独立的手机界面，照微信与 Codex 手机端做），切换按设备记住。

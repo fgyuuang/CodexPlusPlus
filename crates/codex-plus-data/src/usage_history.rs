@@ -19,6 +19,55 @@ pub(crate) fn storage_dir(home: &Path, settings_path: &Path) -> std::path::PathB
         .join(&id[..16])
 }
 
+/// 设置页只统计当前实例的用量数据库；不打开数据库，也不创建目录。
+pub fn storage_info(home: &Path, settings_path: &Path) -> anyhow::Result<Value> {
+    let directory = storage_dir(home, settings_path);
+    let mut bytes = 0;
+    for database in ["usage-provider-cache.sqlite", "usage-summary.sqlite"] {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let path = directory.join(format!("{database}{suffix}"));
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => bytes += metadata.len(),
+                Ok(_) => anyhow::bail!("用量库路径不是普通文件：{}", path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(json!({"status": "ok", "directory": directory, "bytes": bytes}))
+}
+
+#[cfg(test)]
+#[test]
+fn storage_info_reports_only_current_usage_database_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let settings = temp.path().join("settings.json");
+    let directory = storage_dir(&home, &settings);
+    assert_eq!(
+        storage_info(&home, &settings).unwrap(),
+        json!({"status": "ok", "directory": directory, "bytes": 0})
+    );
+    assert!(!directory.exists());
+    fs::create_dir_all(&directory).unwrap();
+    for (name, size) in [
+        ("usage-summary.sqlite", 4096),
+        ("usage-summary.sqlite-wal", 32),
+        ("usage-provider-cache.sqlite", 2048),
+        ("usage-provider-cache.sqlite-shm", 64),
+        ("usage-provider-cache.sqlite-journal", 16),
+        ("unrelated.sqlite", 1000),
+    ] {
+        fs::write(directory.join(name), vec![0; size]).unwrap();
+    }
+    assert_eq!(storage_info(&home, &settings).unwrap()["bytes"], 6256);
+    assert_eq!(
+        storage_info(&temp.path().join("other-home"), &settings).unwrap()["bytes"],
+        0
+    );
+}
+
 pub(crate) fn normalize_session_id(id: &str) -> Option<String> {
     let id = id.strip_prefix("local:").unwrap_or(id);
     let normalized = uuid::Uuid::parse_str(id).ok()?.to_string();
@@ -56,6 +105,47 @@ pub(crate) struct Tokens {
     cached_known: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CacheAccounting {
+    input: u64,
+    read: u64,
+    write: u64,
+    output: u64,
+    total: u64,
+}
+
+impl CacheAccounting {
+    fn parse(value: &Value, raw: Tokens) -> Option<Self> {
+        Some(Self {
+            input: raw.input_tokens,
+            read: value["cached_input_tokens"].as_u64()?,
+            write: value["cache_write_input_tokens"].as_u64()?,
+            output: raw.output_tokens,
+            total: value["total_tokens"].as_u64()?,
+        })
+    }
+
+    fn checked_delta(self, before: Self) -> Option<Self> {
+        Some(Self {
+            input: self.input.checked_sub(before.input)?,
+            read: self.read.checked_sub(before.read)?,
+            write: self.write.checked_sub(before.write)?,
+            output: self.output.checked_sub(before.output)?,
+            total: self.total.checked_sub(before.total)?,
+        })
+    }
+
+    fn exact(self) -> bool {
+        self.read
+            .checked_add(self.write)
+            .zip(self.total.checked_sub(self.output))
+            .is_some_and(|(cache, input)| {
+                cache <= input
+                    && (Some(input) == self.input.checked_add(cache) || input == self.input)
+            })
+    }
+}
+
 impl Default for Tokens {
     fn default() -> Self {
         Self::new(0, 0, 0)
@@ -86,6 +176,45 @@ impl Tokens {
             .as_u64()
             .filter(|n| *n <= tokens.output_tokens);
         Some(tokens)
+    }
+
+    fn normalize_cache_input(
+        mut self,
+        value: Option<CacheAccounting>,
+        previous: Option<(CacheAccounting, Self)>,
+        last: Option<CacheAccounting>,
+    ) -> Self {
+        if let Some(value) = value
+            && let Some(cache) = value.read.checked_add(value.write)
+            && let Some(input) = value.total.checked_sub(value.output)
+            && let Some(omitted) = input.checked_sub(value.input)
+            && omitted > 0
+            && cache <= input
+            && omitted <= cache
+            && (omitted == cache
+                || previous.is_some_and(|(before, accounted)| {
+                    before.total.checked_sub(before.output) == Some(accounted.input_tokens)
+                        && ((value.input == before.input
+                            && value.output == before.output
+                            && value.total == before.total)
+                            || value
+                                .checked_delta(before)
+                                .is_some_and(CacheAccounting::exact))
+                })
+                || last.is_some_and(|last| {
+                    last.exact()
+                        && value
+                            .checked_delta(last)
+                            .is_some_and(CacheAccounting::exact)
+                }))
+        {
+            // 混合口径的累计值须由相邻差量，或完整末次用量及其剩余前缀，证明漏计缓存。
+            self.input_tokens = input;
+            self.total_tokens = value.total;
+            self.cached_input_tokens = value.read;
+            self.cached_known = true;
+        }
+        self
     }
 
     fn value(self) -> Value {

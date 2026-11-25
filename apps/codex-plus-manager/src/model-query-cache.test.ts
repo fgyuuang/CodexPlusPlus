@@ -5,11 +5,16 @@ import test from "node:test";
 const source = await readFile(new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
 const between = (start: string, end: string) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
 const functions = between("  function codexPlusModelDisplayName(", "  function modelJsonResponseLooksPatchable(")
-  + between("  function refreshCodexModelQueryCache(", "  function refreshCodexUsageLimitQueryCache(");
+  + between("  function codexPlusLocalModelQueryKey(", "  function refreshCodexUsageLimitQueryCache(");
 
 type Model = { model: string; hidden: boolean; displayName?: string; modelProvider?: string };
 type Query = { queryKey: unknown[]; state: { data: { data: Model[]; nextCursor?: string | null } } };
 function fixture() {
+  const settings = { gateway: true, unlock: true, provider: "openai" };
+  const group = { model: "group/lab", hidden: false, supportedReasoningEfforts: [{ reasoningEffort: "high" }] };
+  const supplier = { ...group, model: "deepseek-v4-pro" };
+  const native = { ...group, model: "gpt-native-hidden-by-account" };
+  const unknown = { ...group, model: "unowned" };
   const route = "codex_plus_official_schedule:gpt-6.1-sol";
   const local: Query = { queryKey: ["models", "list", "local", "chatgpt"], state: { data: { data: [
     { model: "gpt-6.1-sol", hidden: false }, { model: route, hidden: true },
@@ -18,7 +23,11 @@ function fixture() {
   remote.queryKey[2] = "ssh:other";
   const unrelated = structuredClone(local);
   unrelated.queryKey = ["thread", "list", "local"];
-  const queries = [local, remote, unrelated];
+  const team = structuredClone(local);
+  team.queryKey = ["models", "list", "local", "team", { accountId: "managed" }];
+  const page = structuredClone(local);
+  page.queryKey = ["models", "list", "local", "chatgpt", 100, "page"];
+  const queries = [local, remote, unrelated, team, page];
   const listeners = new Set<(event: { type: string; query: Query }) => void>();
   let writes = 0;
   const cache = {
@@ -29,6 +38,7 @@ function fixture() {
     },
   };
   const client = {
+    defaultQueryOptions: <T>(options: T) => options,
     getQueryCache: () => cache,
     setQueryData: (key: unknown[], data: Query["state"]["data"]) => {
       assert.ok(++writes < 10, "cache recovery must not feed its own updates forever");
@@ -38,23 +48,31 @@ function fixture() {
     },
   };
   const catalog = { status: "ok", model: "gpt-6.1-sol", default_model: "gpt-6.1-sol", models: ["gpt-6.1-sol", route] };
-  const metadata = { [route]: { displayName: "GPT-6.1 Sol(官方顺序调度)", providerId: "codex_plus_official_schedule", sourceKind: "directOfficial" } };
+  const metadata = {
+    [route]: { displayName: "GPT-6.1 Sol(官方顺序调度)", providerId: "codex_plus_official_schedule", sourceKind: "directOfficial" },
+    [supplier.model]: { codex_plus_group_id: "deepseek" },
+    [native.model]: { codex_plus_group_id: "login", codex_plus_native_account: true },
+  };
+  const gatewayModels = [group, supplier, native, unknown].map(({ model }) => model);
   const window = {};
-  const create = new Function("window", "client", "codexModelCatalog", "metadata", `
+  const create = new Function("window", "client", "codexModelCatalog", "metadata", "settings", "gatewayModels", `
     const codexPlusModelCollectionSnapshots = new WeakMap(), codexPlusModelDefaultSnapshots = new WeakMap();
     const codexPlusBackendSettingsLoaded = true;
     const codexPlusBackendSettings = {};
-    const codexPlusModelUnlockEnabled = () => true;
+    const codexPlusModelUnlockEnabled = () => settings.unlock;
     const codexPlusModelNames = () => codexModelCatalog.models;
     const codexPlusModelMetadata = (name) => metadata[name];
     const modelReasoningEfforts = () => [];
     const codexRemoteSessionActiveProfile = () => null;
+    const codexGatewaySessionRoutingEnabled = () => settings.gateway;
+    const codexRemoteSessionTargetProvider = (name) => !name || gatewayModels.includes(name) ? settings.provider : "";
     const findCodexUsageQueryClient = () => client;
     const sendCodexPlusDiagnostic = () => {};
     ${functions}
     return { refresh: () => refreshCodexModelQueryCache(client), install: installCodexModelQueryCachePatch };
-  `) as (window: object, client: unknown, catalog: unknown, metadata: unknown) => { refresh: () => number; install: () => void };
-  return { local, remote, unrelated, catalog, listeners, writes: () => writes, create: () => create(window, client, catalog, metadata) };
+  `) as (...args: unknown[]) => { refresh: () => number; install: () => void };
+  return { local, remote, unrelated, team, page, catalog, listeners, client, settings, group, supplier, native, unknown,
+    writes: () => writes, create: () => create(window, client, catalog, metadata, settings, gatewayModels) };
 }
 
 test("warm local model cache exposes source models and preserves routing IDs without mutating the old snapshot", () => {
@@ -68,7 +86,42 @@ test("warm local model cache exposes source models and preserves routing IDs wit
   assert.equal(f.local.state.data.nextCursor, null);
   assert.equal(f.remote.state.data.data[1].hidden, true);
   assert.equal(f.unrelated.state.data.data[1].hidden, true);
+  assert.equal(f.team.state.data.data[1].hidden, true);
+  assert.equal(f.page.state.data.data[1].hidden, true);
   assert.equal(runtime.refresh(), 0);
+});
+
+test("local Work receives gateway models through the native selector without replacing its default", () => {
+  const f = fixture();
+  f.create().install();
+  const official = { model: "gpt-6.1-sol", hidden: false };
+  const source = {
+    data: [official, f.group, { ...f.group }, f.supplier, f.native, f.unknown, { ...f.group, model: "other:unknown" }],
+    nextCursor: null as string | null,
+  };
+  const select = () => ({ models: [official], defaultModel: official });
+  const options = { queryKey: f.local.queryKey, select };
+  const wrapped = f.client.defaultQueryOptions(options).select as (value: typeof source) => ReturnType<typeof select>;
+  const selected = wrapped(source);
+  assert.deepEqual(selected.models, [official, f.group, f.supplier]);
+  assert.equal(selected.defaultModel, official);
+  assert.equal(f.client.defaultQueryOptions(options).select, wrapped);
+  f.create().install();
+  assert.equal(f.client.defaultQueryOptions(options).select, wrapped);
+  assert.deepEqual(wrapped({ ...source, nextCursor: "more" }), select());
+  const apiKey = ["models", "list", "local", "apikey"];
+  for (const key of [f.remote.queryKey, f.team.queryKey, f.page.queryKey, apiKey]) {
+    assert.equal(f.client.defaultQueryOptions({ queryKey: key, select }).select, select);
+  }
+  const otherProvider = f.client.defaultQueryOptions({
+    queryKey: [...f.local.queryKey, { modelProvider: "oldProvider" }], select,
+  }).select as typeof wrapped;
+  assert.deepEqual(otherProvider(source), select());
+  f.settings.unlock = false;
+  assert.deepEqual(wrapped(source), select());
+  f.settings.unlock = true;
+  f.settings.gateway = false;
+  assert.deepEqual(wrapped(source), select());
 });
 
 test("failed catalog leaves native cached models alone", () => {

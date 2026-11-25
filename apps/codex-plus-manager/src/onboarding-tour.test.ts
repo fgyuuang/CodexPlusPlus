@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
-import * as model from "./onboarding-model.ts";
 import * as focusModel from "./agent-focus-model.ts";
+import * as model from "./onboarding-model.ts";
 
 const source = ts.transpileModule(readFileSync(new URL("./OnboardingTour.tsx", import.meta.url), "utf8"), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
@@ -90,9 +90,9 @@ function harness() {
       tf: (text: string, args: unknown[]) => text.replace(/\{(\d+)\}/g, (_, index) => String(args[Number(index)])),
     },
     "./command-palette-model": { paletteShortcut: "Ctrl K" },
-    "./onboarding-model": model,
     "./agent-focus-model": focusModel,
     "./gateway-model": { agentName: (agent: string) => agent },
+    "./onboarding-model": model,
     "./use-escape-layer": { useEscapeLayer: (_enabled: boolean, close: () => void) => { escape = close; } },
     "./use-modal-focus": { useModalFocus: () => {} },
     "./OnboardingTour.css": {},
@@ -109,7 +109,7 @@ function harness() {
       for (let pass = 0; pass < 6; pass += 1) {
         cursor = 0;
         dirty = false;
-        tree = exports.OnboardingTour({ focus: "all", onClose: (finished: boolean) => closed.push(finished) });
+        tree = exports.OnboardingTour({ focus: null, onClose: (finished: boolean) => closed.push(finished) });
         while (effects.length) effects.shift()!();
         if (!dirty) return tree;
       }

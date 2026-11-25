@@ -16,7 +16,8 @@
 //!    activate 不重注入。这种状态必须显式暴露，不能显示成「已接管」。
 //! 4. **多开**：`osascript quit` 按应用名发事件，会把用户正在用的多开实例一起退出，
 //!    必须先跳过。
-//! 5. **平台**：Windows 走 AUMID 激活，语义完全不同，非 macOS 一律 `Skip`。
+//! 5. **平台**：macOS、Linux、Windows 支持，其它平台一律 `Skip`。Windows 上旧实例退出后
+//!    要收掉它留下的 crashpad（#2573 的白色小窗），见 `reap_leftover_children`。
 
 use std::path::Path;
 use std::time::Duration;
@@ -27,6 +28,8 @@ pub const TAKEOVER_GRACE_MS: u64 = 10_000;
 pub const WAKE_GRACE_MS: u64 = 30_000;
 /// 活跃探针间隔。
 pub const PROBE_INTERVAL_ACTIVE_MS: u64 = 2_000;
+/// 判定「需要接管」前，CDP 要连续探测失败这么多次。
+pub const CDP_MISS_CONFIRMATIONS: u32 = 3;
 /// App 长时间未出现后的探针间隔（降频，避免白烧 CPU）。
 pub const PROBE_INTERVAL_IDLE_MS: u64 = 10_000;
 /// 进入降频前，「App 未出现」需要持续多久。
@@ -148,16 +151,19 @@ pub fn has_other_desktop_instance(
             .to_string();
         let all = crate::watcher::find_macos_codex_desktop_main_processes(None);
         let excluded = crate::watcher::find_macos_codex_desktop_main_processes(Some(exclude_port));
-        let mut excluded = excluded
+        let on_our_port = excluded
             .into_iter()
             .map(|process| process.pid)
             .collect::<Vec<_>>();
-        if let Some(pid) = current_pid {
-            excluded.push(pid);
-        }
-        return all
-            .iter()
-            .any(|process| process.executable == expected && !excluded.contains(&process.pid));
+        return all.iter().any(|process| {
+            process.executable == expected
+                && counts_as_other_instance(
+                    process.pid,
+                    process.has_debug_port,
+                    &on_our_port,
+                    current_pid,
+                )
+        });
     }
     #[cfg(windows)]
     {
@@ -166,16 +172,16 @@ pub fn has_other_desktop_instance(
         // 主实例 = 同名同路径且**不是** Electron 子进程。调试端口相同的那个是
         // 「我们正在管的实例」，也不算多开。
         let debug_port_pids = crate::watcher::find_codex_processes_for_debug_port(exclude_port);
-        let main_pids = processes
-            .iter()
-            .filter(|process| {
-                windows_executable_matches(process, &expected)
-                    && windows_is_electron_child(process) != Some(true)
-            })
-            .map(|process| process.process_id)
-            .collect::<Vec<_>>();
-        return main_pids.iter().any(|process_id| {
-            !debug_port_pids.contains(process_id) && Some(*process_id) != current_pid
+        return processes.iter().any(|process| {
+            windows_executable_matches(process, &expected)
+                && windows_is_electron_child(process) != Some(true)
+                && counts_as_other_instance(
+                    process.process_id,
+                    crate::windows_integration::process_command_line(process.process_id)
+                        .is_some_and(|line| line.contains("--remote-debugging-port")),
+                    &debug_port_pids,
+                    current_pid,
+                )
         });
     }
     #[cfg(target_os = "linux")]
@@ -184,19 +190,22 @@ pub fn has_other_desktop_instance(
         let expected_str = expected.to_string_lossy();
         let all = crate::watcher::find_linux_codex_desktop_main_processes(None);
         let excluded = crate::watcher::find_linux_codex_desktop_main_processes(Some(exclude_port));
-        let mut excluded = excluded
+        let on_our_port = excluded
             .into_iter()
             .map(|process| process.pid)
             .collect::<Vec<_>>();
-        if let Some(pid) = current_pid {
-            excluded.push(pid);
-        }
         return all.iter().any(|process| {
             let matches_expected = process.executable == expected_str
                 || std::fs::read_link(format!("/proc/{}/exe", process.pid))
                     .map(|target| target == expected || target.starts_with(app_dir))
                     .unwrap_or(false);
-            matches_expected && !excluded.contains(&process.pid)
+            matches_expected
+                && counts_as_other_instance(
+                    process.pid,
+                    process.has_debug_port,
+                    &on_our_port,
+                    current_pid,
+                )
         });
     }
     #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
@@ -204,6 +213,28 @@ pub fn has_other_desktop_instance(
         let _ = (app_dir, exclude_port, current_pid);
         false
     }
+}
+
+/// 一个主进程算不算「别的实例」（多开判据的纯逻辑部分）。
+///
+/// - 跑在我们调试端口上的，是我们管的实例，不算。
+/// - 当前评估的实例本身也不算——**除非**它自带了别的调试端口：那是多开实例、
+///   截图/调试用的隔离实例，或别的工具拉起的，不是用户裸启动的。接管它要先
+///   `osascript quit`，而那会按应用名把所有实例一起退出。
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
+fn counts_as_other_instance(
+    pid: u32,
+    has_debug_port: bool,
+    on_our_port: &[u32],
+    current_pid: Option<u32>,
+) -> bool {
+    if on_our_port.contains(&pid) {
+        return false;
+    }
+    Some(pid) != current_pid || has_debug_port
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,10 +561,66 @@ fn request_windows_exit(instance: &InstanceKey, graceful: bool) -> bool {
     accepted
 }
 
+/// 旧实例退出后，收掉它留下的 Electron 子进程（只 Windows 有事做）。
+///
+/// #2573 实测：`WM_CLOSE` 让主进程退了，crashpad 却留了下来（父进程链
+/// crashpad → crashpad → 旧主进程），它的 `crashpad_SessionEndWatcher` 窗口随后
+/// 变成一个可见的白色小窗。只动「同目录同名、带 `--type=`、父进程链追得到旧主进程」的，
+/// 新实例此时还没拉起，不会误伤。
+#[allow(unused_variables)]
+pub fn reap_leftover_children(app_dir: &Path, instance: &InstanceKey) {
+    #[cfg(windows)]
+    {
+        let expected = crate::app_paths::build_codex_executable(app_dir);
+        let processes = crate::windows_integration::enumerate_processes();
+        let parents = processes
+            .iter()
+            .map(|process| (process.process_id, process.parent_process_id))
+            .collect::<Vec<_>>();
+        let descendants = descendants_of(instance.pid, &parents);
+        let leftovers = processes
+            .iter()
+            .filter(|process| {
+                descendants.contains(&process.process_id)
+                    && windows_executable_matches(process, &expected)
+                    && windows_is_electron_child(process) == Some(true)
+            })
+            .map(|process| process.process_id)
+            .collect::<Vec<_>>();
+        if leftovers.is_empty() {
+            return;
+        }
+        for pid in &leftovers {
+            let _ = crate::windows_integration::close_process_tree(*pid, true);
+        }
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "takeover.reaped_leftover_children",
+            serde_json::json!({ "pid": instance.pid, "children": leftovers }),
+        );
+    }
+}
+
+/// `root` 的所有后代（按 (pid, 父 pid) 表逐层找）。父进程退了以后，Windows 上
+/// 子进程记下的父 pid 不会变，所以旧主进程退出后仍能顺着链找到它的遗留子进程。
+#[cfg(any(windows, test))]
+fn descendants_of(root: u32, parents: &[(u32, u32)]) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for &(pid, ppid) in parents {
+            if ppid == parent && pid != root && !found.contains(&pid) {
+                found.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    found
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TakeoverInputs {
     pub enabled: bool,
-    /// 仅 macOS 为 true；其它平台恒 `Skip`。
+    /// macOS、Linux、Windows 为 true；其它平台恒 `Skip`。
     pub platform_supported: bool,
     pub session: SessionSnapshot,
     pub app: AppProbe,
@@ -631,6 +718,44 @@ pub fn backoff_delay_ms(consecutive_failures: u32) -> u64 {
         .checked_shl((consecutive_failures - 1).min(16))
         .unwrap_or(u64::MAX);
     (30_000_u64.saturating_mul(factor)).min(BACKOFF_CAP_MS)
+}
+
+/// 唤醒检测（纯逻辑，供探针线程与单测共用）。
+///
+/// 单调时钟的间隙**在 macOS 上不可靠**：`Instant` 走的是
+/// `CLOCK_UPTIME_RAW`（mach 绝对时间），系统睡眠期间不走字，
+/// 「长睡眠后唤醒」不会留下单调间隙，于是唤醒宽限从未生效，
+/// CDP 还没恢复就被判成「需要接管」，形成 quit 风暴（#3188）。
+/// 墙钟（`SystemTime`）在睡眠期间照常前进，必须一并参与判定。
+/// 墙钟也可能因 NTP 校时前跳，误报一次唤醒的代价只是多等一段宽限，无害。
+pub fn is_wake_gap(
+    mono_gap: Option<Duration>,
+    wall_gap: Option<Result<Duration, std::time::SystemTimeError>>,
+    threshold: Duration,
+) -> bool {
+    let mono_jumped = mono_gap.is_some_and(|gap| gap > threshold);
+    let wall_jumped = match wall_gap {
+        Some(Ok(gap)) => gap > threshold,
+        // 墙钟倒拨：几毫秒的 NTP 校时不算，大幅回拨才当作唤醒给一段宽限。
+        Some(Err(back)) => back.duration() > threshold,
+        None => false,
+    };
+    mono_jumped || wall_jumped
+}
+
+/// CDP 探测失败要连续够次数才算数。
+///
+/// 探针单次只等 300ms，App 刚启动或正忙时端口明明在却会偶发超时（#3188 的日志里
+/// `cdpReady` 两秒内真假交替）。只凭一次失败就接管，会把刚拉起来的 App 再杀一遍。
+pub fn confirm_cdp_miss(
+    decision: TakeoverDecision,
+    consecutive_cdp_misses: u32,
+) -> TakeoverDecision {
+    if decision.is_takeover() && consecutive_cdp_misses < CDP_MISS_CONFIRMATIONS {
+        TakeoverDecision::Wait("cdp_unconfirmed")
+    } else {
+        decision
+    }
 }
 
 /// 滑动一小时窗口内的重启次数。
@@ -736,6 +861,33 @@ mod tests {
         ));
     }
 
+    /// 只剩一个自带别的调试端口的实例（截图隔离实例、别的工具拉起的）：
+    /// 它不是裸启动，不能当成要接管的那个去 quit。
+    #[test]
+    fn instance_with_a_foreign_debug_port_counts_as_other() {
+        // 当前实例、没带端口：裸启动，不算别的实例。
+        assert!(!counts_as_other_instance(10, false, &[], Some(10)));
+        // 当前实例、自带别的端口：算。
+        assert!(counts_as_other_instance(10, true, &[], Some(10)));
+        // 跑在我们端口上的：不算。
+        assert!(!counts_as_other_instance(10, true, &[10], Some(10)));
+        assert!(!counts_as_other_instance(20, true, &[20], Some(10)));
+        // 另一个进程：算。
+        assert!(counts_as_other_instance(20, false, &[], Some(10)));
+    }
+
+    /// #2573 的父进程链：crashpad(3) → crashpad(2) → 旧主进程(1)；4 是无关进程。
+    #[test]
+    fn descendants_follow_the_whole_parent_chain() {
+        let parents = [(2, 1), (3, 2), (4, 9), (5, 3)];
+        let mut found = descendants_of(1, &parents);
+        found.sort();
+        assert_eq!(found, vec![2, 3, 5]);
+        assert!(descendants_of(7, &parents).is_empty());
+        // 成环（pid 复用的极端情况）也要能停下。
+        assert_eq!(descendants_of(1, &[(2, 1), (1, 2)]), vec![2]);
+    }
+
     fn running_instance() -> AppProbe {
         AppProbe::Running(InstanceKey::new(4242, "Tue Oct 13 13:19:56 2026"))
     }
@@ -766,6 +918,23 @@ mod tests {
     #[test]
     fn bare_launch_is_taken_over() {
         assert!(decide(&base_inputs()).is_takeover());
+    }
+
+    #[test]
+    fn single_cdp_probe_miss_does_not_trigger_takeover() {
+        let takeover = decide(&base_inputs());
+        for misses in 0..CDP_MISS_CONFIRMATIONS {
+            assert_eq!(
+                confirm_cdp_miss(takeover, misses),
+                TakeoverDecision::Wait("cdp_unconfirmed")
+            );
+        }
+        assert!(confirm_cdp_miss(takeover, CDP_MISS_CONFIRMATIONS).is_takeover());
+        // 其它决策不受影响。
+        assert_eq!(
+            confirm_cdp_miss(TakeoverDecision::Wait("grace"), 0),
+            TakeoverDecision::Wait("grace")
+        );
     }
 
     #[test]
@@ -906,6 +1075,47 @@ mod tests {
         let mut history = vec![0, 1_000];
         push_restart(&mut history, RESTART_WINDOW_MS + 10);
         assert_eq!(history, vec![1_000, RESTART_WINDOW_MS + 10]);
+    }
+
+    #[test]
+    fn wake_gap_detects_wall_clock_jump_after_sleep() {
+        // macOS 长睡眠：单调时钟没走（间隙 < 阈值），墙钟走了一晚。
+        let threshold = Duration::from_secs(90);
+        assert!(is_wake_gap(
+            Some(Duration::from_secs(2)),
+            Some(Ok(Duration::from_secs(12 * 3600))),
+            threshold,
+        ));
+        // 单调间隙足够大（Windows 等睡眠也走字的平台）照旧检测。
+        assert!(is_wake_gap(
+            Some(Duration::from_secs(120)),
+            Some(Ok(Duration::from_secs(120))),
+            threshold,
+        ));
+        // 两个钟都没跳：不是唤醒。
+        assert!(!is_wake_gap(
+            Some(Duration::from_secs(2)),
+            Some(Ok(Duration::from_secs(2))),
+            threshold,
+        ));
+        // 首次 tick（无历史）：不算唤醒。
+        assert!(!is_wake_gap(None, None, threshold));
+        // 墙钟倒拨：大幅回拨当唤醒给宽限，几毫秒的 NTP 校时不算。
+        let back = |by: Duration| {
+            Some(Err(std::time::UNIX_EPOCH
+                .duration_since(std::time::UNIX_EPOCH + by)
+                .unwrap_err()))
+        };
+        assert!(is_wake_gap(
+            Some(Duration::from_secs(2)),
+            back(Duration::from_secs(1_000)),
+            threshold
+        ));
+        assert!(!is_wake_gap(
+            Some(Duration::from_secs(2)),
+            back(Duration::from_millis(5)),
+            threshold
+        ));
     }
 
     #[test]

@@ -1,7 +1,85 @@
 use super::*;
 
+const BASE_ROLLOUT: &str = "00000000-0000-4000-8000-000000000081";
+const NEXT_ROLLOUT: &str = "00000000-0000-4000-8000-000000000082";
+
+#[test]
+fn cold_scan_reads_recently_changed_rollout_before_historical_backlog() {
+    let mut fixture = Fixture::new();
+    let older = fixture.home.join("sessions/rollout-a.jsonl");
+    let recent = fixture.home.join("sessions/rollout-z.jsonl");
+    let tool_free_row = json!({
+        "type":"response_item",
+        "payload":{"type":"message","text":"a".repeat(128 * 1024)}
+    });
+    // 一个旧来源就可耗尽整轮 4 MiB 读取配额。
+    fixture.write_segment("rollout-a.jsonl", vec![tool_free_row; 40]);
+    fixture.write_segment(
+        "rollout-z.jsonl",
+        vec![
+            fixture.context(500, "current-model"),
+            fixture.usage(1_000, 1),
+        ],
+    );
+    File::options()
+        .write(true)
+        .open(&older)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(86_400))
+        .unwrap();
+    let first = fixture
+        .index
+        .update_with_request_log(&fixture.home, &fixture.log);
+    assert!(first.indexed < first.files);
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(first.events[0].model, "current-model");
+    assert_eq!(first.events[0].delta.total_tokens, 110);
+    let response = snapshot_response(&first);
+    assert_eq!(response["status"], "partial");
+    assert_eq!(response["days"][0]["usage"]["totalTokens"], 110);
+    assert_eq!(
+        fixture.index.files[&recent].offset,
+        fs::metadata(recent).unwrap().len()
+    );
+    let finished = fixture.snapshot();
+    assert!(finished.ready);
+    assert_eq!(finished.indexed, 2);
+    assert_eq!(finished.events.len(), 1);
+    assert_eq!(finished.events[0].id, first.events[0].id);
+}
+
 #[path = "actual_attribution_tests.rs"]
 mod actual_attribution_tests;
+
+#[test]
+fn request_evidence_waits_for_in_process_log_trimming() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("request-log.jsonl");
+    fs::write(&path, "").unwrap();
+    let guard = codex_plus_core::request_log::lock_request_log().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let read_path = path.clone();
+    let thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let mut cache = RequestEvidenceCache::default();
+        cache.refresh(&read_path);
+        result_tx.send(cache.records).unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert!(matches!(
+        result_rx.recv_timeout(std::time::Duration::from_millis(50)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    fs::write(&path, "{\"id\":\"retained\"}\n").unwrap();
+    drop(guard);
+    let records = result_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, "retained");
+    thread.join().unwrap();
+}
 
 #[test]
 fn local_large_json_strings_keep_only_safe_skill_receipts() {
@@ -85,14 +163,131 @@ fn local_missing_initial_baseline_does_not_assign_lifetime_usage_to_today() {
     let mut fixture = Fixture::new();
     let mut segment = fixture.usage(2_000, 100);
     segment["payload"]["info"]["last_token_usage"] = Value::Null;
-    fixture.write_continuation_segment("rollout-b.jsonl", vec![segment]);
+    let prefix = fixture.paged_segment(SESSION, None, vec![fixture.usage(1_000, 99)]);
+    let continuation = fixture.paged_segment(
+        SESSION,
+        Some((BASE_ROLLOUT, 2, prefix.len())),
+        vec![segment],
+    );
+    fixture.write_paged_segment(NEXT_ROLLOUT, &continuation);
     let response = snapshot_response(&fixture.snapshot());
     assert_eq!(response["complete"], false);
     assert_eq!(response["days"], json!([]));
-    fixture.write_segment("rollout-a.jsonl", vec![fixture.usage(1_000, 99)]);
+    fixture.write_paged_segment(BASE_ROLLOUT, &prefix);
     let response = snapshot_response(&fixture.snapshot());
     assert_eq!(response["complete"], true);
     assert_eq!(response["days"][0]["usage"]["totalTokens"], 220);
+}
+
+#[test]
+fn local_fork_and_revert_bind_physical_prefix_instead_of_later_source_tail() {
+    for owner in [SESSION, "00000000-0000-4000-8000-000000000083"] {
+        let mut fixture = Fixture::new();
+        let prefix_event = fixture.usage(1_000, 1);
+        let prefix = fixture.paged_segment(SESSION, None, vec![prefix_event.clone()]);
+        let full_source = fixture.paged_segment(
+            SESSION,
+            None,
+            vec![prefix_event.clone(), fixture.usage(2_000, 4)],
+        );
+        fixture.write_paged_segment(BASE_ROLLOUT, &full_source);
+        let mut replayed = prefix_event;
+        replayed["timestamp"] = json!(fixture.at(3_000));
+        let continuation = fixture.paged_segment(
+            owner,
+            Some((BASE_ROLLOUT, 2, prefix.len())),
+            vec![replayed.clone(), fixture.usage(4_000, 2)],
+        );
+        fixture.write_paged_segment(NEXT_ROLLOUT, &continuation);
+        let snapshot = fixture.snapshot();
+        let response = snapshot_response(&snapshot);
+        assert_eq!(response["complete"], true, "{owner}");
+        assert_eq!(response["days"][0]["usage"]["inputTokens"], 500, "{owner}");
+        assert_eq!(snapshot.events.len(), 3);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.session == owner)
+                .last()
+                .unwrap()
+                .delta
+                .input_tokens,
+            100
+        );
+
+        let wrong_cutoff = fixture.paged_segment(
+            owner,
+            Some((BASE_ROLLOUT, 2, full_source.len())),
+            vec![replayed, fixture.usage(4_000, 2)],
+        );
+        fixture.write_paged_segment(NEXT_ROLLOUT, &wrong_cutoff);
+        let snapshot = fixture.snapshot();
+        assert_eq!(snapshot_response(&snapshot)["complete"], false);
+        assert!(snapshot.events.iter().any(|event| event.count_pending));
+    }
+}
+
+#[test]
+fn local_revert_uses_expired_count_as_baseline_without_replaying_it() {
+    let mut fixture = Fixture::new();
+    let mut old_count = fixture.usage(1_000, 1);
+    old_count["timestamp"] = json!((Local::now() - Days::days(RETENTION_DAYS + 2)).to_rfc3339());
+    let prefix = fixture.paged_segment(SESSION, None, vec![old_count]);
+    fixture.write_paged_segment(BASE_ROLLOUT, &prefix);
+    let mut next = fixture.usage(2_000, 2);
+    next["payload"]["info"]["last_token_usage"] = Value::Null;
+    fixture.write_paged_segment(
+        NEXT_ROLLOUT,
+        &fixture.paged_segment(SESSION, Some((BASE_ROLLOUT, 2, prefix.len())), vec![next]),
+    );
+    let response = snapshot_response(&fixture.snapshot());
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["days"][0]["usage"]["inputTokens"], 100);
+}
+
+#[test]
+fn unanchored_continuation_only_blocks_nearby_request_log_proof() {
+    for gap in [2_000, 300_000] {
+        let mut fixture = Fixture::new();
+        fixture.start -= 400_000;
+        let prefix = fixture.paged_segment(SESSION, None, vec![fixture.usage(500, 1)]);
+        fixture.write_paged_segment(
+            NEXT_ROLLOUT,
+            &fixture.paged_segment(
+                SESSION,
+                Some((BASE_ROLLOUT, 2, prefix.len())),
+                vec![
+                    fixture.context(700, "model-a"),
+                    fixture.usage(1_000, 2),
+                    fixture.usage(1_000 + gap, 3),
+                ],
+            ),
+        );
+        let before = fixture.snapshot();
+        assert!(before.events[0].count_pending);
+        assert!(before.events[0].count_uncertain && !before.events[0].count_incomplete);
+        let mut proof = request();
+        proof.timestamp_ms = fixture.start + 990 + gap;
+        proof.started_at_ms = proof.timestamp_ms - 100;
+        fs::write(
+            &fixture.log,
+            format!("{}\n", serde_json::to_string(&proof).unwrap()),
+        )
+        .unwrap();
+        let after = fixture.snapshot();
+        assert_eq!(after.events.len(), 2);
+        assert_eq!(
+            after.events[1].provider == "supplier-a",
+            gap > DELAYED_REQUEST_MATCH_WINDOW_MS,
+        );
+        assert_eq!(before.events[1].delta, after.events[1].delta);
+        fixture.write_paged_segment(BASE_ROLLOUT, &prefix);
+        let recovered = fixture.snapshot();
+        assert_eq!(snapshot_response(&recovered)["complete"], true);
+        assert_eq!(recovered.events.len(), 3);
+        assert!(!recovered.events[1].count_uncertain);
+    }
 }
 
 #[test]
@@ -131,6 +326,186 @@ fn local_component_corrections_change_proof_without_replaying_consumption() {
     assert_ne!(
         original["days"][0]["accountingFingerprint"],
         response["days"][0]["accountingFingerprint"]
+    );
+}
+
+#[test]
+fn local_exclusive_cache_usage_preserves_last_and_cumulative_counts() {
+    let parse = |value: Value| {
+        let raw = Tokens::parse(&value).unwrap();
+        raw.normalize_cache_input(CacheAccounting::parse(&value, raw), None, None)
+    };
+    let before = parse(json!({
+        "input_tokens": 32_489, "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0, "output_tokens": 285, "total_tokens": 32_774
+    }));
+    let total = parse(json!({
+        "input_tokens": 43_781, "cached_input_tokens": 32_486,
+        "cache_write_input_tokens": 0, "output_tokens": 590, "total_tokens": 76_857
+    }));
+    let last = parse(json!({
+        "input_tokens": 11_292, "cached_input_tokens": 32_486,
+        "cache_write_input_tokens": 0, "output_tokens": 305,
+        "reasoning_output_tokens": 10, "total_tokens": 44_083
+    }));
+    assert_eq!(last.input_tokens, 43_778);
+    assert_eq!(last.cached_input_tokens, 32_486);
+    assert_eq!(last.total_tokens, 44_083);
+    assert!(last.cached_known);
+    assert_eq!(last.reasoning_output_tokens, Some(10));
+    let delta = total.usage_delta(Some(before), Some(last));
+    assert_eq!(delta.input_tokens, last.input_tokens);
+    assert_eq!(delta.output_tokens, last.output_tokens);
+    assert_eq!(delta.cached_input_tokens, last.cached_input_tokens);
+    assert_eq!(delta.total_tokens, last.total_tokens);
+    assert!(delta.cached_known);
+    assert_eq!(total.usage_delta(Some(total), Some(last)).total_tokens, 0);
+}
+
+#[test]
+fn local_exclusive_cache_usage_counts_write_once_and_keeps_read_separate() {
+    for (input, cached, written, output) in [(10, 5, 3, 2), (0, 40, 10, 5)] {
+        let inclusive_input = input + cached + written;
+        let value = json!({
+            "input_tokens": input, "cached_input_tokens": cached,
+            "cache_write_input_tokens": written, "output_tokens": output,
+            "reasoning_output_tokens": 1, "total_tokens": inclusive_input + output
+        });
+        let raw = Tokens::parse(&value).unwrap();
+        let parsed = raw.normalize_cache_input(CacheAccounting::parse(&value, raw), None, None);
+        assert_eq!(parsed.input_tokens, inclusive_input);
+        assert_eq!(parsed.cached_input_tokens, cached);
+        assert_eq!(parsed.total_tokens, inclusive_input + output);
+        assert_eq!(parsed.reasoning_output_tokens, Some(1));
+        assert!(parsed.cached_known);
+    }
+}
+
+#[test]
+fn local_cache_usage_requires_a_complete_consistent_exclusive_equation() {
+    for value in [
+        json!({"input_tokens": 100, "cached_input_tokens": 80,
+            "cache_write_input_tokens": 20, "output_tokens": 10, "total_tokens": 110}),
+        json!({"input_tokens": 100, "cached_input_tokens": 80,
+            "cache_write_input_tokens": 20, "output_tokens": 10, "total_tokens": 500}),
+        json!({"input_tokens": 100, "cached_input_tokens": 80,
+            "cache_write_input_tokens": 20, "output_tokens": 10}),
+        json!({"input_tokens": 100, "cached_input_tokens": 80,
+            "output_tokens": 10, "total_tokens": 190}),
+    ] {
+        let raw = Tokens::parse(&value).unwrap();
+        let parsed = raw.normalize_cache_input(CacheAccounting::parse(&value, raw), None, None);
+        assert_eq!(parsed.input_tokens, 100);
+        assert_eq!(parsed.cached_input_tokens, 80);
+        assert_eq!(parsed.total_tokens, 110);
+        assert!(parsed.cached_known);
+    }
+    let missing_cache = Tokens::parse(&json!({
+        "input_tokens": 100, "cache_write_input_tokens": 20,
+        "output_tokens": 10, "total_tokens": 210
+    }))
+    .unwrap();
+    assert_eq!(missing_cache.input_tokens, 100);
+    assert!(!missing_cache.cached_known);
+    let overflow = Tokens::parse(&json!({
+        "input_tokens": u64::MAX, "cached_input_tokens": 1,
+        "cache_write_input_tokens": 0, "output_tokens": 1, "total_tokens": 1
+    }))
+    .unwrap();
+    assert_eq!(overflow.input_tokens, u64::MAX);
+}
+
+#[test]
+fn local_mixed_cache_input_keeps_each_model_delta_and_deduplicates_repeated_counts() {
+    for (first_exclusive, missing_last) in [(true, false), (false, false), (true, true)] {
+        let mut fixture = Fixture::new();
+        let mut cumulative = [0; 5];
+        let mut expected = Vec::new();
+        let mut rows = Vec::new();
+        for (index, exclusive) in [first_exclusive, !first_exclusive, first_exclusive]
+            .into_iter()
+            .enumerate()
+        {
+            let usage = if exclusive {
+                [10, 40, 3, 5, 58]
+            } else {
+                [100, 80, 4, 10, 110]
+            };
+            let normalized = if exclusive {
+                Tokens::new(53, 40, 5)
+            } else {
+                Tokens::new(100, 80, 10)
+            };
+            let source = if exclusive {
+                ("model-b", "supplier-b")
+            } else {
+                ("model-a", "supplier-a")
+            };
+            expected.push((source, normalized));
+            let at = 1_000 + index as i64 * 2_000;
+            for (total, part) in cumulative.iter_mut().zip(usage) {
+                *total += part;
+            }
+            let counts = |[input, cached, written, output, total]: [u64; 5]| {
+                json!({
+                    "input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": written,
+                    "output_tokens": output, "total_tokens": total,
+                })
+            };
+            let mut row = fixture.usage(at, index as u64);
+            row["payload"]["info"] = json!({
+                "total_token_usage": counts(cumulative),
+                "last_token_usage": if index == 1 && missing_last { Value::Null } else { counts(usage) }
+            });
+            let mut context = fixture.context(at - 1, source.0);
+            context["payload"]["model_provider"] = json!(source.1);
+            rows.push(context);
+            rows.push(row.clone());
+            row["timestamp"] = json!(fixture.at(at + 1));
+            rows.push(row);
+        }
+        fixture.write_segment("rollout-a.jsonl", rows);
+        let snapshot = fixture.snapshot();
+        assert_eq!(snapshot.events.len(), expected.len());
+        for (event, ((model, provider), counts)) in snapshot.events.iter().zip(expected) {
+            assert_eq!(
+                (&*event.model, &*event.provider, event.delta),
+                (model, provider, counts)
+            );
+        }
+    }
+}
+
+#[test]
+fn local_partial_cache_omission_requires_independent_counts() {
+    let last = CacheAccounting {
+        input: 100,
+        read: 80,
+        write: 0,
+        output: 10,
+        total: 110,
+    };
+    let mut value = json!({
+        "input_tokens": 110, "cached_input_tokens": 120, "cache_write_input_tokens": 0,
+        "output_tokens": 15, "total_tokens": 165
+    });
+    let raw = Tokens::parse(&value).unwrap();
+    let cumulative = CacheAccounting::parse(&value, raw);
+    assert_eq!(raw.normalize_cache_input(cumulative, None, None), raw);
+    assert_eq!(
+        raw.normalize_cache_input(cumulative, None, Some(last)),
+        Tokens::new(150, 120, 15)
+    );
+    for total in [90, 125, 140, 166, 246, u64::MAX] {
+        value["total_tokens"] = json!(total);
+        let cumulative = CacheAccounting::parse(&value, raw);
+        assert_eq!(raw.normalize_cache_input(cumulative, None, Some(last)), raw);
+    }
+    value["total_tokens"] = json!(165);
+    value["cache_write_input_tokens"] = Value::Null;
+    assert_eq!(
+        raw.normalize_cache_input(CacheAccounting::parse(&value, raw), None, Some(last)),
+        raw
     );
 }
 
@@ -379,8 +754,16 @@ fn local_missing_cache_preserves_cumulative_counts_across_segments() {
         });
         let third = fixture.usage(3_000, 3);
         if split {
-            fixture.write_segment("rollout-a.jsonl", vec![first]);
-            fixture.write_continuation_segment("rollout-b.jsonl", vec![second, third]);
+            let prefix = fixture.paged_segment(SESSION, None, vec![first]);
+            fixture.write_paged_segment(BASE_ROLLOUT, &prefix);
+            fixture.write_paged_segment(
+                NEXT_ROLLOUT,
+                &fixture.paged_segment(
+                    SESSION,
+                    Some((BASE_ROLLOUT, 2, prefix.len())),
+                    vec![second, third],
+                ),
+            );
         } else {
             fixture.write_segment("rollout-a.jsonl", vec![first, second, third]);
         }
@@ -567,13 +950,9 @@ fn local_competing_last_values_are_incomplete_in_both_orders() {
             fixture.write_segment("rollout-b.jsonl", vec![second]);
             let snapshot = fixture.snapshot();
             let response = snapshot_response(&snapshot);
-            let uncertain = if metadata_variant == 0 { 2 } else { 3 };
             assert_eq!(response["complete"], false);
-            assert_eq!(response["scan"]["uncertainCountEvents"], uncertain);
-            assert_eq!(
-                response["days"][0]["usage"]["totalTokens"],
-                if metadata_variant == 0 { 220 } else { 110 }
-            );
+            assert_eq!(response["scan"]["uncertainCountEvents"], 2);
+            assert_eq!(response["days"][0]["usage"]["totalTokens"], 220);
             assert!(!snapshot.events.last().unwrap().count_uncertain);
             let db = rusqlite::Connection::open(
                 fixture
@@ -595,6 +974,40 @@ fn local_competing_last_values_are_incomplete_in_both_orders() {
                     2
                 );
             }
+            if !short_first && metadata_variant == 0 {
+                let downstream = snapshot.events.last().unwrap();
+                let mut marker: Value = serde_json::from_str(
+                    &db.query_row(
+                        "SELECT data FROM native_attributions WHERE id=?1",
+                        [snapshot.events[0].id.as_slice()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                marker.as_object_mut().unwrap().remove("count_basis");
+                marker["at"] = json!(
+                    DateTime::parse_from_rfc3339(&downstream.timestamp)
+                        .unwrap()
+                        .timestamp_millis()
+                );
+                db.execute(
+                    "INSERT INTO native_attributions(id,at,data) VALUES(?1,?2,?3)",
+                    rusqlite::params![
+                        downstream.id.as_slice(),
+                        marker["at"].as_i64().unwrap(),
+                        marker.to_string()
+                    ],
+                )
+                .unwrap();
+                drop(db);
+                reopen_index(&mut fixture);
+                let upgraded = fixture.snapshot();
+                assert!(!upgraded.events.last().unwrap().count_uncertain);
+                let response = snapshot_response(&upgraded);
+                assert_eq!(response["scan"]["uncertainCountEvents"], 2);
+                assert_eq!(response["days"][0]["usage"]["totalTokens"], 220);
+            }
         }
     }
 }
@@ -602,9 +1015,18 @@ fn local_competing_last_values_are_incomplete_in_both_orders() {
 #[test]
 fn local_original_event_id_retains_legacy_provider_evidence() {
     let mut fixture = Fixture::new();
-    let row = fixture.usage(1_000, 1);
-    let total = Tokens::parse(&row["payload"]["info"]["total_token_usage"]).unwrap();
-    let last = Tokens::parse(&row["payload"]["info"]["last_token_usage"]);
+    let mut row = fixture.usage(1_000, 1);
+    let reported = json!({
+        "input_tokens": 10, "cached_input_tokens": 40, "cache_write_input_tokens": 0,
+        "output_tokens": 5, "total_tokens": 55,
+    });
+    row["payload"]["info"] = json!({
+        "total_token_usage": reported, "last_token_usage": reported,
+    });
+    let raw = json!({
+        "inputTokens":10, "cachedInputTokens":10, "outputTokens":5,
+        "totalTokens":15, "reasoningOutputTokens":null,
+    });
     let timestamp = DateTime::parse_from_rfc3339(row["timestamp"].as_str().unwrap())
         .unwrap()
         .with_timezone(&chrono::Utc)
@@ -612,11 +1034,12 @@ fn local_original_event_id_retains_legacy_provider_evidence() {
     let mut hash = Sha256::new();
     hash.update(SESSION.as_bytes());
     hash.update(timestamp.as_bytes());
-    hash.update(serde_json::to_vec(&json!([total, last])).unwrap());
+    hash.update(serde_json::to_vec(&json!([raw, raw])).unwrap());
     let legacy_id: [u8; 32] = hash.finalize().into();
     fixture.write_segment("rollout-a.jsonl", vec![row]);
     let initial = fixture.snapshot();
     assert_eq!(initial.events[0].id, legacy_id);
+    assert_eq!(initial.events[0].delta, Tokens::new(50, 40, 5));
     let mut record = evidence(&initial.events[0], "model-a");
     record["eventId"] = json!(
         legacy_id
@@ -625,11 +1048,23 @@ fn local_original_event_id_retains_legacy_provider_evidence() {
             .collect::<String>()
     );
     fixture.write_evidence(vec![record]);
+    let mut inherited_conflict = initial.events[0].clone();
+    inherited_conflict.inherited = true;
+    inherited_conflict.count_uncertain = true;
+    let mut old_cache = native_endpoints::Cache::default();
+    assert!(old_cache.observe_count_conflicts(&mut [inherited_conflict], true));
+    fixture
+        .index
+        .provider_cache
+        .save_native(&old_cache.verified)
+        .unwrap();
     reopen_index(&mut fixture);
     let restored = fixture.snapshot();
     assert_eq!(restored.events[0].id, legacy_id);
     assert_eq!(restored.events[0].provider, "supplier-a");
     assert_eq!(restored.provider_evidence["appliedEvents"], 1);
+    assert_eq!(restored.unobserved_count_conflicts, 0);
+    assert_eq!(snapshot_response(&restored)["complete"], true);
 }
 
 #[test]
@@ -647,8 +1082,16 @@ fn local_missing_last_after_reset_does_not_claim_complete() {
             "reasoning_output_tokens": 2
         });
         if split {
-            fixture.write_segment("rollout-a.jsonl", vec![first]);
-            fixture.write_continuation_segment("rollout-b.jsonl", vec![reset, later]);
+            let prefix = fixture.paged_segment(SESSION, None, vec![first]);
+            fixture.write_paged_segment(BASE_ROLLOUT, &prefix);
+            fixture.write_paged_segment(
+                NEXT_ROLLOUT,
+                &fixture.paged_segment(
+                    SESSION,
+                    Some((BASE_ROLLOUT, 2, prefix.len())),
+                    vec![reset, later],
+                ),
+            );
         } else {
             fixture.write_segment("rollout-a.jsonl", vec![first, reset, later]);
         }
@@ -815,14 +1258,40 @@ impl Fixture {
         fs::write(self.home.join("sessions").join(name), text).unwrap();
     }
 
-    fn write_continuation_segment(&self, name: &str, mut rows: Vec<Value>) {
-        rows.insert(
-            0,
-            json!({"type":"session_meta","payload":{
-                "id":SESSION,"history_base":{"end_ordinal_exclusive":1}
-            }}),
-        );
-        self.write_segment(name, rows);
+    fn paged_segment(
+        &self,
+        session: &str,
+        base: Option<(&str, u64, usize)>,
+        rows: Vec<Value>,
+    ) -> String {
+        let mut head = json!({
+            "type":"session_meta", "timestamp":self.at(0),
+            "payload":{"id":session,"model_provider":"custom","history_mode":"paginated"}
+        });
+        if let Some((rollout, ordinal, bytes)) = base {
+            head["payload"]["history_base"] = json!({
+                "thread_id":rollout, "end_ordinal_exclusive":ordinal, "end_byte_offset":bytes
+            });
+        }
+        let start = base.map_or(0, |(_, ordinal, _)| ordinal);
+        std::iter::once(head)
+            .chain(rows)
+            .enumerate()
+            .map(|(index, mut row)| {
+                row["ordinal"] = json!(start + index as u64);
+                format!("{row}\n")
+            })
+            .collect()
+    }
+
+    fn write_paged_segment(&self, rollout: &str, text: &str) {
+        fs::write(
+            self.home
+                .join("sessions")
+                .join(format!("rollout-{rollout}.jsonl")),
+            text,
+        )
+        .unwrap();
     }
 
     fn write_classified_segment(&self, name: &str, model: &str, provider: &str, role: &str) {
@@ -1007,8 +1476,9 @@ fn oversized_model_blocks_old_context_evidence_and_duplicate_recovery() {
 #[test]
 fn oversized_context_recovers_on_a_later_continuation() {
     let mut fixture = Fixture::new();
-    fixture.write_segment(
-        "rollout-a.jsonl",
+    let prefix = fixture.paged_segment(
+        SESSION,
+        None,
         vec![
             fixture.context(500, "old-model"),
             fixture.usage(1_000, 1),
@@ -1016,10 +1486,17 @@ fn oversized_context_recovers_on_a_later_continuation() {
             fixture.usage(2_000, 2),
         ],
     );
-    fixture.write_continuation_segment(
-        "rollout-b.jsonl",
-        vec![fixture.context(2_500, "new-model"), fixture.usage(3_000, 3)],
+    fixture.write_paged_segment(BASE_ROLLOUT, &prefix);
+    let continuation = fixture.paged_segment(
+        SESSION,
+        Some((BASE_ROLLOUT, 5, prefix.len())),
+        vec![
+            fixture.context(1_500, &"x".repeat(257)),
+            fixture.context(2_500, "new-model"),
+            fixture.usage(3_000, 3),
+        ],
     );
+    fixture.write_paged_segment(NEXT_ROLLOUT, &continuation);
     for phase in ["fresh", "reopened"] {
         if phase == "reopened" {
             reopen_index(&mut fixture);
@@ -2005,7 +2482,7 @@ fn shared_session_baseline_can_make_different_file_deltas_agree() {
 }
 
 #[test]
-fn zero_or_missing_reasoning_delta_cannot_hide_a_duplicate_conflict() {
+fn missing_reasoning_preserves_counts_but_zero_delta_remains_a_conflict() {
     for zero_delta in [false, true] {
         for baseline_first in [false, true] {
             let mut fixture = Fixture::new();
@@ -2028,9 +2505,15 @@ fn zero_or_missing_reasoning_delta_cannot_hide_a_duplicate_conflict() {
             let snapshot = fixture.snapshot();
             let response = snapshot_response(&snapshot);
             assert_eq!(snapshot.events.len(), 1);
-            assert_eq!(response["complete"], false);
-            assert_eq!(response["scan"]["uncertainCountEvents"], 1);
-            assert_eq!(response["days"], json!([]));
+            if zero_delta {
+                assert_eq!(response["complete"], false);
+                assert_eq!(response["scan"]["uncertainCountEvents"], 1);
+                assert_eq!(response["days"], json!([]));
+            } else {
+                assert_eq!(response["complete"], true);
+                assert_eq!(response["days"][0]["usage"]["totalTokens"], 110);
+                assert_eq!(response["days"][0]["usage"]["reasoningKnown"], false);
+            }
         }
     }
 }
@@ -2110,6 +2593,42 @@ fn conflict_survives_first_cache_open_failure_and_retry() {
         snapshot_response(&fixture.snapshot())["scan"]["uncertainCountEvents"],
         1
     );
+}
+
+#[test]
+fn incomplete_source_and_cache_failure_recover_without_a_durable_conflict() {
+    let mut fixture = Fixture::new();
+    let cache = fixture._root.path().join("cache");
+    fs::write(&cache, "not a directory").unwrap();
+    let event = fixture.usage(1_000, 1);
+    let mut previous = fixture.usage(0, 1);
+    previous["timestamp"] = json!((Local::now() - Days::days(RETENTION_DAYS + 2)).to_rfc3339());
+    previous["payload"]["info"]["total_token_usage"] = json!({
+        "input_tokens": 80, "output_tokens": 5, "cached_input_tokens": 10,
+        "reasoning_output_tokens": 1
+    });
+    let mut invalid = fixture.usage(2_000, 2);
+    invalid["payload"]["info"]["total_token_usage"]
+        .as_object_mut()
+        .unwrap()
+        .remove("input_tokens");
+    fixture.write_segment("rollout-a.jsonl", vec![previous, event.clone(), invalid]);
+    fixture.write_segment("rollout-b.jsonl", vec![event.clone()]);
+    let failed = fixture
+        .index
+        .update_with_request_log(&fixture.home, &fixture.log);
+    assert!(failed.issues > 0);
+    assert!(failed.events[0].count_incomplete);
+    assert!(!failed.events[0].count_uncertain);
+
+    fs::remove_file(&cache).unwrap();
+    fixture.write_segment("rollout-a.jsonl", vec![event.clone()]);
+    fixture.write_segment("rollout-b.jsonl", vec![event]);
+    let recovered = snapshot_response(&fixture.snapshot());
+    assert_eq!(recovered["complete"], true);
+    assert_eq!(recovered["days"][0]["usage"]["totalTokens"], 110);
+    reopen_index(&mut fixture);
+    assert_eq!(snapshot_response(&fixture.snapshot())["complete"], true);
 }
 
 #[test]
@@ -2754,6 +3273,314 @@ fn uncertain_counts_do_not_make_another_event_match_a_request_uniquely() {
     let result = cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new());
     assert_eq!(result["recoveredEvents"], 0);
     assert!(unknown_provider(&events[0].provider));
+}
+
+#[test]
+fn uncertain_events_only_block_requests_in_their_competition_window() {
+    let mut fixture = Fixture::new();
+    fixture.write_classified_segment("rollout-a.jsonl", "model-a", "custom", "main");
+    let mut event = fixture.snapshot().events.remove(0);
+    let at = DateTime::parse_from_rfc3339(&event.timestamp)
+        .unwrap()
+        .timestamp_millis();
+    let mut proof = request();
+    proof.started_at_ms = at - 100;
+    proof.timestamp_ms = at - 10;
+    event.provider.clear();
+
+    for lag in [10, 100_000] {
+        proof.timestamp_ms = at - lag;
+        proof.started_at_ms = proof.timestamp_ms - 100;
+        for kind in ["counts", "cache", "context"] {
+            for scope in ["same", "alias", "other"] {
+                for offset in [-120_001, -120_000, 120_000, 120_001] {
+                    let mut uncertain = event.clone();
+                    uncertain.id = [33; 32];
+                    uncertain.timestamp =
+                        DateTime::from_timestamp_millis(proof.timestamp_ms + offset)
+                            .unwrap()
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    uncertain.delta = Tokens::new(20, 0, 2);
+                    match kind {
+                        "counts" => uncertain.count_uncertain = true,
+                        "cache" => uncertain.delta.cached_known = false,
+                        "context" => uncertain.context_conflicts.model = true,
+                        _ => unreachable!(),
+                    }
+                    let mut aliases = BTreeMap::new();
+                    match scope {
+                        "alias" => {
+                            uncertain.session = "alias-child".into();
+                            aliases.insert(uncertain.session.clone(), event.session.clone());
+                        }
+                        "other" => uncertain.session = "another-session".into(),
+                        _ => {}
+                    }
+                    let mut events = vec![event.clone(), uncertain.clone()];
+                    let mut cache = RequestEvidenceCache::default();
+                    cache.records.push(proof.clone());
+                    let result = cache.attribute(&mut events, &mut BTreeMap::new(), &aliases);
+                    let recovered =
+                        scope == "other" || offset.abs() > DELAYED_REQUEST_MATCH_WINDOW_MS;
+                    assert_eq!(
+                        result["recoveredEvents"],
+                        usize::from(recovered),
+                        "{kind}, {scope}, {lag}, {offset}"
+                    );
+                    assert_eq!(
+                        events[0].delta, event.delta,
+                        "{kind}, {scope}, {lag}, {offset}"
+                    );
+                    assert_eq!(
+                        events[1].delta, uncertain.delta,
+                        "{kind}, {scope}, {lag}, {offset}"
+                    );
+                    assert_eq!(
+                        unknown_provider(&events[0].provider),
+                        !recovered,
+                        "{kind}, {scope}, {lag}, {offset}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn request_log_recovers_after_a_distant_uncertain_counter_reset() {
+    for reset_gap in [2_000, 300_000] {
+        let mut fixture = Fixture::new();
+        fixture.start -= 400_000;
+        let mut reset = fixture.usage(2_000, 1);
+        reset["payload"]["info"]["total_token_usage"] = json!({
+            "input_tokens": 5, "cached_input_tokens": 0, "output_tokens": 1
+        });
+        reset["payload"]["info"]["last_token_usage"] = Value::Null;
+        let mut target = fixture.usage(2_000 + reset_gap, 1);
+        target["payload"]["info"]["total_token_usage"] = json!({
+            "input_tokens": 105, "cached_input_tokens": 20, "output_tokens": 11
+        });
+        fixture.write_segment(
+            "rollout-a.jsonl",
+            vec![
+                fixture.context(500, "model-a"),
+                fixture.usage(1_000, 1),
+                reset,
+                target,
+            ],
+        );
+        let before = fixture.snapshot();
+        assert_eq!(before.events.len(), 3);
+        assert!(before.events[1].count_uncertain);
+        assert!(!before.events[2].count_uncertain);
+        assert!(unknown_provider(&before.events[2].provider));
+        let original = before.events[2].clone();
+        let at = DateTime::parse_from_rfc3339(&original.timestamp)
+            .unwrap()
+            .timestamp_millis();
+        let mut proof = request();
+        proof.started_at_ms = at - 100;
+        proof.timestamp_ms = at - 10;
+        fs::write(
+            &fixture.log,
+            format!("{}\n", serde_json::to_string(&proof).unwrap()),
+        )
+        .unwrap();
+        let after = fixture.snapshot();
+        assert_eq!(after.events.len(), before.events.len());
+        for (left, right) in before.events.iter().zip(&after.events) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.delta, right.delta);
+            assert_eq!(left.timestamp, right.timestamp);
+        }
+        let recovered = reset_gap > DELAYED_REQUEST_MATCH_WINDOW_MS;
+        assert_eq!(
+            unknown_provider(&after.events[2].provider),
+            !recovered,
+            "reset_gap={reset_gap}"
+        );
+        if recovered {
+            assert_eq!(after.events[2].provider, "supplier-a");
+            reopen_index(&mut fixture);
+            let restored = fixture.snapshot();
+            assert_eq!(restored.events[2].provider, "supplier-a");
+            assert_eq!(restored.events[2].delta, original.delta);
+        }
+    }
+}
+
+#[test]
+fn incomplete_counts_remain_a_session_wide_attribution_gap() {
+    let mut fixture = Fixture::new();
+    fixture.write_classified_segment("rollout-a.jsonl", "model-a", "custom", "main");
+    let mut event = fixture.snapshot().events.remove(0);
+    let at = DateTime::parse_from_rfc3339(&event.timestamp)
+        .unwrap()
+        .timestamp_millis();
+    let mut proof = request();
+    proof.started_at_ms = at - 100;
+    proof.timestamp_ms = at - 10;
+    event.provider.clear();
+    let mut incomplete = event.clone();
+    incomplete.id = [33; 32];
+    incomplete.count_incomplete = true;
+    incomplete.timestamp = DateTime::from_timestamp_millis(at + 600_000)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut cache = RequestEvidenceCache::default();
+    cache.records.push(proof);
+    let mut events = vec![event, incomplete];
+    let result = cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new());
+    assert_eq!(result["recoveredEvents"], 0);
+    assert!(unknown_provider(&events[0].provider));
+}
+
+#[test]
+fn temporary_uncertain_competition_does_not_reject_saved_attribution() {
+    let mut fixture = Fixture::new();
+    fixture.write_classified_segment("rollout-a.jsonl", "model-a", "custom", "main");
+    let mut event = fixture.snapshot().events.remove(0);
+    let at = DateTime::parse_from_rfc3339(&event.timestamp)
+        .unwrap()
+        .timestamp_millis();
+    let mut proof = request();
+    proof.started_at_ms = at - 100;
+    proof.timestamp_ms = at - 10;
+    event.provider.clear();
+    let mut cache = RequestEvidenceCache::default();
+    cache.records.push(proof);
+    let mut events = vec![event.clone()];
+    assert_eq!(
+        cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+        1
+    );
+    for same_counts in [false, true] {
+        let mut uncertain = event.clone();
+        uncertain.id = [33; 32];
+        uncertain.count_uncertain = true;
+        if !same_counts {
+            uncertain.delta = Tokens::new(20, 0, 2);
+        }
+        events = vec![event.clone(), uncertain];
+        assert_eq!(
+            cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+            0
+        );
+        assert!(!cache.verified[&event.id].rejected);
+        events = vec![event.clone()];
+        assert_eq!(
+            cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+            1
+        );
+    }
+    let mut confirmed_competitor = event.clone();
+    confirmed_competitor.id = [33; 32];
+    events = vec![event.clone(), confirmed_competitor];
+    assert_eq!(
+        cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+        0
+    );
+    assert!(cache.verified[&event.id].rejected);
+    events = vec![event];
+    assert_eq!(
+        cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+        0
+    );
+}
+
+#[test]
+fn uncertain_competition_does_not_hide_a_saved_evidence_conflict() {
+    for conflict in ["event-model", "request-identity"] {
+        let mut fixture = Fixture::new();
+        fixture.write_classified_segment("rollout-a.jsonl", "model-a", "custom", "main");
+        let mut event = fixture.snapshot().events.remove(0);
+        let at = DateTime::parse_from_rfc3339(&event.timestamp)
+            .unwrap()
+            .timestamp_millis();
+        let mut proof = request();
+        proof.started_at_ms = at - 100;
+        proof.timestamp_ms = at - 10;
+        event.provider.clear();
+        let mut cache = RequestEvidenceCache::default();
+        cache.records.push(proof.clone());
+        let mut events = vec![event.clone()];
+        assert_eq!(
+            cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+            1
+        );
+        let mut changed = event.clone();
+        if conflict == "event-model" {
+            changed.model = "model-b".into();
+        } else {
+            let mut conflicting_request = proof.clone();
+            conflicting_request.relay_id = "supplier-b".into();
+            cache.records.push(conflicting_request);
+            let mut other_request = proof.clone();
+            other_request.id = "another-request".into();
+            cache.records.push(other_request);
+        }
+        let mut uncertain = event.clone();
+        uncertain.id = [33; 32];
+        uncertain.count_uncertain = true;
+        uncertain.delta = Tokens::new(20, 0, 2);
+        events = vec![changed, uncertain];
+        assert_eq!(
+            cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+            0,
+            "{conflict}"
+        );
+        assert!(cache.verified[&event.id].rejected, "{conflict}");
+        cache.records = vec![proof];
+        events = vec![event.clone()];
+        assert_eq!(
+            cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+            0,
+            "{conflict}"
+        );
+    }
+}
+
+#[test]
+fn temporary_event_count_gaps_do_not_reject_saved_attribution() {
+    let mut fixture = Fixture::new();
+    fixture.write_classified_segment("rollout-a.jsonl", "model-a", "custom", "main");
+    let mut event = fixture.snapshot().events.remove(0);
+    let at = DateTime::parse_from_rfc3339(&event.timestamp)
+        .unwrap()
+        .timestamp_millis();
+    let mut proof = request();
+    proof.started_at_ms = at - 100;
+    proof.timestamp_ms = at - 10;
+    event.provider.clear();
+    let mut cache = RequestEvidenceCache::default();
+    cache.records.push(proof);
+    let mut events = vec![event.clone()];
+    assert_eq!(
+        cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+        1
+    );
+    for gap in ["uncertain", "incomplete", "cache"] {
+        let mut incomplete = event.clone();
+        match gap {
+            "uncertain" => incomplete.count_uncertain = true,
+            "incomplete" => incomplete.count_incomplete = true,
+            "cache" => incomplete.delta.cached_known = false,
+            _ => unreachable!(),
+        }
+        events = vec![incomplete];
+        assert_eq!(
+            cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+            0,
+            "{gap}"
+        );
+        assert!(!cache.verified[&event.id].rejected, "{gap}");
+        events = vec![event.clone()];
+        assert_eq!(
+            cache.attribute(&mut events, &mut BTreeMap::new(), &BTreeMap::new())["recoveredEvents"],
+            1,
+            "{gap}"
+        );
+    }
 }
 
 #[test]

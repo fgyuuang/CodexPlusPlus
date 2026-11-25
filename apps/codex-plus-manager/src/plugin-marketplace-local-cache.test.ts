@@ -18,7 +18,8 @@ function fixture() {
   ] }];
   const window: any = { __CODEX_PLUS_PLUGIN_MARKETPLACES__: clone(cache) };
   const context = vm.createContext({
-    window, codexPlusBackendSettingsLoaded: true, codexPluginMarketplaceUnlockVersion: "fixture",
+    window, document: { documentElement: { toggleAttribute() {} } },
+    codexPlusBackendSettingsLoaded: true, codexPluginMarketplaceUnlockVersion: "fixture",
     codexPlusSettings: () => ({ pluginMarketplaceUnlock: enabled }),
     codexPluginUsesBroadCatalogKinds: () => true, codexPlusIsWindowsPlatform: true,
     sendCodexPlusDiagnostic: (event: string, detail: any) => diagnostics.push({ event, detail }),

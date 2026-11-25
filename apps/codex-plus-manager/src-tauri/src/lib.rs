@@ -2,11 +2,13 @@ mod agent_collaboration_commands;
 mod agent_launch_commands;
 mod agent_mcp_commands;
 mod auto_takeover;
+mod claude_auto_takeover;
 pub mod cliproxy;
 pub mod commands;
 mod computer_use_commands;
 mod config_doctor_commands;
 mod cu_pip;
+pub mod dream_skin_bridge;
 mod dsh_plugin_commands;
 mod extension_community_commands;
 mod extension_creator_commands;
@@ -47,6 +49,8 @@ const SHUTDOWN_WATCHDOG: u64 = 10;
 const TRAY_MENU_SHOW: &str = "tray_show_main";
 const TRAY_MENU_QUIT: &str = "tray_quit_app";
 const MANAGER_NAVIGATION_EVENT: &str = "manager-navigation-requested";
+/// 网页链接存下待确认的供应商导入 / 一键换肤后通知界面读取。
+const PENDING_IMPORT_CHANGED_EVENT: &str = "manager-pending-import-changed";
 
 pub(crate) fn app_is_exiting() -> bool {
     APP_EXITING.load(Ordering::SeqCst)
@@ -216,7 +220,7 @@ pub fn run_computer_use_cli(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Codex 拓展页的「社区 / 我发布的 / dsh 插件」分栏、Codex 里的「微信连接」页：实现在管理器里，
+/// Codex 拓展页的「社区 / 我发布的 / dsh 插件」分栏、Codex 里的「微信连接」页与「皮肤」分区：实现在管理器里，
 /// 经 helper 桥接分发给页面。helper 跑在本进程里，登记一次即可。
 fn register_codex_bridge_routes() {
     use codex_plus_core::routes::{HostRouteHandler, register_host_route};
@@ -235,6 +239,10 @@ fn register_codex_bridge_routes() {
     register_host_route("/extension-market/published", published);
     register_host_route("/extension-market/dsh", dsh);
     register_host_route(codex_plus_core::connect::page::BRIDGE_ROUTE, weixin);
+    // 皮肤只在 Codex 里有界面：主题库、市场、激活、恢复都调管理器原来的命令函数。
+    let dream_skin: HostRouteHandler =
+        std::sync::Arc::new(|payload| Box::pin(dream_skin_bridge::bridge_request(payload)));
+    register_host_route("/dream-skin", dream_skin);
 }
 
 pub fn run() {
@@ -393,6 +401,8 @@ pub fn run() {
             gateway_commands::start_from_saved_state_in_background();
             gateway_commands::start_model_watch();
             auto_takeover::start_supervisor();
+            // Claude 自动接管（默认关闭，只在完整功能模式下动作）：同上，开着才起守护线程。
+            claude_auto_takeover::start_supervisor();
             if let Err(error) = global_dictation::apply_config() {
                 let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                     "dictation.global_hotkey_start_failed",
@@ -423,6 +433,7 @@ pub fn run() {
             commands::load_settings,
             config_doctor_commands::config_doctor_request,
             remote_control_commands::remote_control_request,
+            remote_control_commands::chat_robot_request,
             commands::load_request_logs,
             commands::load_request_flow,
             commands::request_context_preview,
@@ -442,6 +453,16 @@ pub fn run() {
             commands::claude_localization_set_localization,
             commands::claude_localization_set_computer_use,
             commands::claude_localization_set_bash_timeout,
+            commands::claude_enhance_status,
+            commands::claude_enhance_set_delivery,
+            commands::claude_enhance_set_bash_timeout,
+            commands::claude_page_extensions,
+            commands::claude_page_extension_enable,
+            commands::claude_page_extension_import,
+            commands::claude_page_extension_remove,
+            commands::claude_page_extension_open_folder,
+            commands::claude_page_extension_market,
+            commands::claude_page_extension_install,
             computer_use_commands::computer_use_status,
             computer_use_commands::computer_use_install,
             computer_use_commands::computer_use_uninstall,
@@ -511,7 +532,6 @@ pub fn run() {
             gateway_commands::consume_gateway_reset_card,
             gateway_commands::abandon_gateway_reset_operation,
             gateway_commands::delete_gateway_provider,
-            gateway_commands::check_gateway_provider_models,
             gateway_commands::preview_gateway_provider_models_sync,
             gateway_commands::apply_gateway_provider_models_sync,
             gateway_commands::preview_gateway_provider_meta_sync,
@@ -591,30 +611,15 @@ pub fn run() {
             commands::export_official_accounts,
             commands::query_builtin_model_metadata,
             commands::builtin_model_metadata_index,
-            commands::dream_skin_status,
-            commands::import_dream_skin_image,
-            commands::reset_dream_skin_image,
-            commands::reset_dream_skin_theme,
-            commands::apply_dream_skin,
             commands::restore_dream_skin,
-            commands::verify_dream_skin,
-            commands::list_dream_skin_themes,
-            commands::refresh_dream_skin_market,
-            commands::refresh_dream_skin_community,
             commands::load_pending_dream_skin_community,
             commands::confirm_pending_dream_skin_community,
             commands::dismiss_pending_dream_skin_community,
-            commands::install_dream_skin_market_theme,
-            commands::install_dream_skin_community_theme,
-            commands::import_dream_skin_theme_package,
-            commands::load_dream_skin_theme,
-            commands::create_dream_skin_theme,
-            commands::save_dream_skin_theme,
-            commands::rename_dream_skin_theme,
-            commands::delete_dream_skin_theme,
-            commands::activate_dream_skin_theme,
+            dream_skin_bridge::activate_installed_dream_skin_theme,
             commands::load_ccs_providers,
             commands::import_ccs_providers,
+            commands::load_magpie_providers,
+            commands::import_magpie_providers,
             commands::load_pending_provider_import,
             commands::confirm_pending_provider_import,
             commands::dismiss_pending_provider_import,
@@ -624,7 +629,11 @@ pub fn run() {
             commands::open_zed_remote,
             commands::forget_zed_remote_project,
             commands::delete_local_session,
+            commands::delete_local_sessions,
+            commands::undo_delete_local_sessions,
             commands::archive_local_sessions,
+            commands::preview_session_relocation,
+            commands::apply_session_relocation,
             commands::load_provider_sync_targets,
             commands::repair_session_index,
             commands::load_session_index_repair_report,
@@ -669,6 +678,8 @@ pub fn run() {
             commands::execute_skill_in_place_update,
             commands::import_ccs_skills,
             commands::import_local_skills,
+            commands::export_skill_bundle,
+            commands::import_skill_bundle,
             commands::install_skill,
             commands::update_skill,
             commands::set_skill_enabled,
@@ -692,6 +703,7 @@ pub fn run() {
             commands::set_watcher_start_codex,
             commands::set_watcher_start_codex_on_open,
             commands::load_relay_proxy,
+            commands::load_relay_proxies,
             commands::set_relay_proxy,
             commands::load_relay_feature,
             commands::set_relay_feature,
@@ -700,6 +712,11 @@ pub fn run() {
             commands::load_auto_takeover_state,
             commands::take_over_codex_now,
             commands::pause_auto_takeover_for_instance,
+            // Claude 自动接管：同样只能靠这里注册（契约测试会守）。
+            commands::load_claude_auto_takeover_state,
+            commands::set_claude_auto_takeover,
+            commands::take_over_claude_now,
+            commands::pause_claude_auto_takeover_for_instance,
             commands::read_latest_logs,
             commands::codex_app_tools_status,
             commands::clear_logs,
@@ -722,6 +739,7 @@ pub fn run() {
             commands::read_live_context_entries,
             commands::sync_live_context_entries,
             commands::upsert_context_entry,
+            commands::apply_context_entry,
             commands::delete_context_entry,
             commands::parse_mcp_entry,
             commands::inspect_mcp_startup,
@@ -805,6 +823,7 @@ pub fn run() {
                 record_shutdown_entry("app.exit_requested", detail);
                 if start_shutdown {
                     auto_takeover::stop_supervisor();
+                    claude_auto_takeover::stop_supervisor();
                     let app = app_handle.clone();
                     tauri::async_runtime::spawn_blocking(move || {
                         // 退出前先等待自有 CLI 任务清理，避免进程退出后遗留执行器。
@@ -837,6 +856,8 @@ pub fn run() {
                             || handle_provider_import_url(url.as_str())
                         {
                             show_main_window(app_handle);
+                            // 界面收到后读一次待确认导入 / 一键换肤并弹确认框（不再轮询）。
+                            let _ = app_handle.emit(PENDING_IMPORT_CHANGED_EVENT, ());
                         }
                     }
                 }
@@ -860,8 +881,9 @@ pub fn run() {
     }
 }
 
-/// 网页导入链接（codexplusplus://v1/import/provider?…）：存为待确认导入，界面轮询到后弹出确认框。
-/// Windows 从启动参数传进来，macOS 由系统的「打开 URL」事件送达（应用已在运行时也走这里）。
+/// 网页导入链接（codexplusplus://v1/import/provider?…）：存为待确认导入，界面读到后弹出确认框。
+/// Windows 从启动参数传进来（新进程存好后唤起已有窗口，界面在窗口获得焦点时读取），
+/// macOS 由系统的「打开 URL」事件送达（应用已在运行时也走这里，随后发 `PENDING_IMPORT_CHANGED_EVENT`）。
 pub fn handle_provider_import_url(url: &str) -> bool {
     if !url.starts_with("codexplusplus://") {
         return false;
@@ -1292,7 +1314,7 @@ pub(crate) fn request_app_exit<R: tauri::Runtime>(app_handle: &tauri::AppHandle<
 /// 窗口在就显示并聚焦，轻量模式下已销毁就按原配置重建再显示（#2677）。必须在主线程调用。
 fn show_main_window<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
     lightweight::cancel_pending_release();
-    // 主窗口销毁后，Windows 上二次启动按进程找窗口时可能把隐藏的快捷面板翻出来，这里顺手收起。
+    // 打开主窗口时顺手收起快捷面板（开着才会真的收起）。
     tray_panel::hide(app_handle);
     let Some((window, created)) = ensure_main_window(app_handle) else {
         return;
@@ -1340,6 +1362,10 @@ pub fn focus_existing_manager_window() {
         .as_nanos()
         .to_string();
     let _ = std::fs::write(path, request);
+    // Windows 上本进程刚由用户启动，持有前台权限，借它把已显示的主窗口提到前台。
+    // 只碰可见窗口：隐藏窗口若用 Win32 直接翻出来，会绕过 tao 的可见标记，主窗口已销毁时
+    // 还会翻出隐藏的托盘快捷面板且收不起来（issue #3223）。隐藏/已销毁的主窗口由上面的请求文件
+    // 交给主进程 show_main_window 处理。
     #[cfg(windows)]
     {
         let current_process_id = std::process::id();
@@ -1350,7 +1376,7 @@ pub fn focus_existing_manager_window() {
             if ["codex-plus-plus.exe", "codex-plus-plus-manager.exe"]
                 .iter()
                 .any(|name| process.exe_file.eq_ignore_ascii_case(name))
-                && codex_plus_core::windows_activate_process_window(process.process_id)
+                && codex_plus_core::windows_activate_visible_process_window(process.process_id)
             {
                 break;
             }

@@ -269,6 +269,36 @@ pub fn list_codex_providers_from_db(path: &Path) -> anyhow::Result<Vec<CcsProvid
     Ok(providers)
 }
 
+/// 这个来源里已经导入过（来源记录还在、对应的供应商也还在）的条目 id，导入对话框里标「已导入」用。
+pub fn imported_source_ids(
+    settings: &crate::settings::BackendSettings,
+    source: &CcsProviderSource,
+) -> Vec<String> {
+    let Ok(database) = source.db_path.canonicalize() else {
+        return Vec::new();
+    };
+    let database = database.to_string_lossy().to_string();
+    source
+        .providers
+        .iter()
+        .filter(|provider| {
+            settings
+                .ccs_import_sources
+                .iter()
+                .any(|(profile_id, origin)| {
+                    origin.kind == "cc-switch"
+                        && origin.database == database
+                        && origin.source_id == provider.source_id
+                        && settings
+                            .relay_profiles
+                            .iter()
+                            .any(|profile| &profile.id == profile_id)
+                })
+        })
+        .map(|provider| provider.source_id.clone())
+        .collect()
+}
+
 pub fn imported_provider_identity(provider: &RelayProfile) -> String {
     ccs_import_key(
         strip_ccs_name_suffix(&provider.name),
@@ -304,6 +334,7 @@ pub fn relay_profile_from_ccs(
         protocol: provider.protocol,
         relay_mode: RelayMode::PureApi,
         official_mix_api_key: false,
+        inactive_mixed_api: None,
         official_account_ref: String::new(),
         no_auth: false,
         hide_official_usage_alert: false,
@@ -336,6 +367,7 @@ pub fn relay_profile_from_ccs(
         strict_responses_reasoning: false,
         strip_image_generation_tool: false,
         strip_responses_image_detail: false,
+        strip_responses_output_encrypted_content: false,
         disable_tool_search: false,
         pure_api_image_generation: false,
         auto_review_model: String::new(),
@@ -347,6 +379,30 @@ pub fn relay_profile_from_ccs(
         anthropic_thinking_mode: String::new(),
         ..RelayProfile::default()
     }
+}
+
+/// 别的第三方来源（Magpie）导入成直连供应商：只有名称、地址、Key、协议，其余字段和 cc-switch 导入用同一套默认值。
+pub(crate) fn third_party_relay_profile(
+    id_base: &str,
+    name: String,
+    base_url: &str,
+    api_key: &str,
+    protocol: RelayProtocol,
+    existing_ids: &[String],
+) -> RelayProfile {
+    let provider = CcsProviderImport {
+        source_id: String::new(),
+        name: String::new(),
+        base_url: base_url.to_string(),
+        api_key: api_key.to_string(),
+        protocol,
+        config_contents: build_config_toml(base_url, api_key, protocol),
+        auth_contents: build_auth_json(api_key),
+    };
+    let mut profile = relay_profile_from_ccs(&provider, existing_ids);
+    profile.id = unique_profile_id(&sanitize_id(id_base), existing_ids);
+    profile.name = name;
+    profile
 }
 
 fn import_from_ccs_value(source_id: &str, name: &str, config: &Value) -> Option<CcsProviderImport> {

@@ -10,7 +10,7 @@ import { appConfirm, appPrompt } from "./app-dialog";
 import { matchesManagementQuery, sessionGroups, type ManagedSession } from "./management-model";
 import { AgentToggle, ManagementDrawer, Menu, MenuItem } from "./ManagementPages";
 import { CxBadge, CxBanner, CxCard, CxEmpty, CxFilters, CxRow, CxStatusIcon, CxToolbar } from "./cx-layout";
-import { AgentGlyph } from "./HubOverview";
+import { AgentGlyph } from "./hub-shared";
 import { MCP_AGENTS, type McpAgentId } from "./agent-mcp-model";
 import { agentVisible } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
@@ -167,7 +167,7 @@ function SkillRepoDrawer({ repos, catalog, counts, initialKey, busy, updates, co
   const deferredQuery = useDeferredValue(query);
   const filtered = useMemo(() => skills.filter((s) => matchesManagementQuery([s.id, s.name, s.description, s.repoPath || ""], deferredQuery)), [skills, deferredQuery]);
   const locked = busy || scanning;
-  return <ManagementDrawer wide dismissOnBackdrop={false} title={t("管理 Skills 仓库")} onClose={onClose}>
+  return <ManagementDrawer modal="workspace" dismissOnBackdrop={false} title={t("管理 Skills 仓库")} onClose={onClose}>
     <div className="mg-repo-workspace" data-editing={formOpen}><aside className="mg-repo-sidebar">
     <div className="mg-repo-manager"><div className="mg-repo-manager-head"><strong>{t("已添加仓库")} <span className="mg-repo-total">{repos.length}</span></strong><button className="mg-icon-button" title={t("添加仓库")} aria-label={t("添加仓库")} onClick={() => { cancelScan(); setEditing(null); setFormOpen(true); setInput(""); setParseError(""); setDraft({ owner: "", name: "", branch: "main", subdir: "", enabled: true }); }}><Plus size={16}/></button></div>
       {!repos.length && <p className="mg-muted">{t("还没有添加仓库。")}</p>}

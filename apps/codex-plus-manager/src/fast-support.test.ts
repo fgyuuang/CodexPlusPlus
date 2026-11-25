@@ -103,17 +103,20 @@ test("reinjection removes the retired composer Fast badge", () => {
   assert.match(fragment("95-conversation-view.js"), /if \(codexPlusSettings\(\)\.nativeFastUnlock\) removeLegacyCodexServiceTierBadges\(\);\s*else installCodexServiceTierBadge\(\);/);
 });
 
-test("Fast-only UI metadata leaves an existing native descriptor's name and reasoning default intact", () => {
+test("Fast flows into new-chat descriptors without changing native names or reasoning defaults", () => {
   const metadata: Record<string, unknown> = {
     prioritySupportOverride: true,
     serviceTiers: [{ id: "priority", name: "Fast", description: "Provider-declared priority" }],
+    additionalSpeedTiers: ["fast"],
     supportedReasoningEfforts: [],
   };
   const context = vm.createContext({
     codexPlusModelMetadata: () => metadata,
+    codexModelCatalog: {},
+    structuredClone,
     modelReasoningEfforts: () => { throw new Error("Fast does not configure reasoning choices"); },
   });
-  vm.runInContext(["applyCodexPlusModelMetadata", "codexPlusModelInputModalities", "codexPlusModelImageDetailOriginal"]
+  vm.runInContext(["applyCodexPlusModelMetadata", "codexPlusModelDescriptor", "codexPlusModelServiceTiers", "codexPlusModelInputModalities", "codexPlusModelImageDetailOriginal"]
     .map((name) => extract(fragment("70-model-catalog.js"), name)).join("\n"), context);
   const descriptor = { displayName: "Native Grok", description: "Native details", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] };
   const original = structuredClone(descriptor);
@@ -126,4 +129,8 @@ test("Fast-only UI metadata leaves an existing native descriptor's name and reas
   assert.equal(descriptor.displayName, "Explicit name");
   assert.equal(descriptor.description, "Explicit details");
   assert.equal(descriptor.defaultReasoningEffort, "low");
+  Object.assign(metadata, { prioritySupportOverride: false, serviceTiers: [], additionalSpeedTiers: [] });
+  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "gpt-6.2-sol"), true);
+  assert.equal(JSON.stringify(Reflect.get(descriptor, "serviceTiers")), "[]");
+  assert.equal(JSON.stringify(Reflect.get(descriptor, "additionalSpeedTiers")), "[]");
 });

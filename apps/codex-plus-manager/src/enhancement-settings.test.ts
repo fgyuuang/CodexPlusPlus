@@ -13,8 +13,9 @@ import {
   type EnhancementPlatform,
 } from "./enhancement-catalog.ts";
 import { EN_PLAIN } from "./i18n-en.ts";
+import { readAppSource } from "./app-source.test-helper.ts";
 
-const appSource = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+const appSource = readAppSource();
 const app = ts.createSourceFile("App.tsx", appSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 
 function descendants(node: ts.Node): ts.Node[] {
@@ -177,8 +178,10 @@ test("enhancement switches come only from the settings catalog", () => {
   const catalogStrings = new Set(enhancementCatalogStrings());
   for (const name of ENHANCEMENT_COMPONENTS) {
     const node = component(name);
+    // 启动急救页另有两个不属于设置清单的本地拓展整体开关（立即生效，不走设置表单）。
     assert.deepEqual(elements(node).filter((element) => element.tagName.getText(app) === "FeatureToggle"
-      && /^t\("/.test(attribute(element, "title") ?? "")).map((element) => attribute(element, "title")), [], `${name} has a hard-coded switch`);
+      && /^t\("/.test(attribute(element, "title") ?? "")).map((element) => attribute(element, "title")),
+    [], `${name} has a hard-coded switch`);
     const literals = descendants(node).filter(ts.isCallExpression)
       .filter((call) => call.expression.getText(app) === "t" && call.arguments[0] && ts.isStringLiteral(call.arguments[0]))
       .map((call) => (call.arguments[0] as ts.StringLiteral).text)
@@ -298,7 +301,9 @@ test("manager deep links only pick the route", () => {
     && ts.isIdentifier(node.name) && node.name.text === "consumePendingManagerNavigation");
   assert.ok(navigation);
   const calls = descendants(navigation).filter(ts.isCallExpression).map((node) => node.expression.getText(app));
-  assert.ok(calls.includes("setRoute"));
+  // 和侧栏点进去走同一条 navigate：页面要的数据（会话列表等）一起读。
+  assert.ok(calls.includes("navigate"));
+  assert.ok(!calls.includes("setRoute"));
   assert.ok(!calls.includes("setEnhancementTab"));
 });
 
@@ -363,4 +368,17 @@ test("native Fast unlock and the retained local Fast controls live in Codex sett
   assert.deepEqual(enhancementCatalog.items.filter((item) => /Fast/.test(item.title)).map((item) => item.key), ["codexAppServiceTierControls", "codexAppNativeFastUnlock"]);
   assert.deepEqual(enhancementItem("codexAppServiceTierControls").surfaces, ["codex"]);
   assert.match(appSource, /codexAppNativeFastUnlock: false,/);
+});
+
+test("启动急救页集中恢复操作，独立皮肤页继续处理换肤深链", () => {
+  const enhance = component("EnhanceScreen");
+  const calls = descendants(enhance).filter(ts.isCallExpression).map((node) => node.expression.getText(app));
+  for (const name of ["actions.setUserScriptsEnabled", "actions.setUserScriptsSkipNextStart", "actions.restoreDreamSkin"]) {
+    assert.ok(calls.includes(name), name);
+  }
+  assert.ok(!app.statements.some((node) => ts.isFunctionDeclaration(node) && node.name?.text === "DreamSkinRescueScreen"));
+  assert.match(appSource, /route === "enhance" \? \(\n\s*<EnhanceScreen/);
+  assert.match(appSource, /route === "dreamSkin" \? \(\n\s*<DreamSkinScreen/);
+  const confirm = appSource.slice(appSource.indexOf("const confirmPendingDreamSkinCommunity"), appSource.indexOf("const dismissPendingDreamSkinCommunity"));
+  assert.match(confirm, /setRoute\("dreamSkin"\)/);
 });

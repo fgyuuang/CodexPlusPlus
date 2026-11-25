@@ -185,7 +185,7 @@ const STEPWISE_SCRIPT: &str = concat!(
     "\n})();\n",
 );
 pub const DIAGNOSTIC_BUILD_ID: &str = "diag-20260518-1";
-const DREAM_SKIN_RENDERER_REVISION: &str = "27-dream-skin-1.5.20-wallpaper-shell";
+const DREAM_SKIN_RENDERER_REVISION: &str = "28-dream-skin-local-video";
 
 pub fn renderer_script() -> &'static str {
     RENDERER_SCRIPT
@@ -208,12 +208,23 @@ pub fn dream_skin_art_data_uri(settings: &BackendSettings) -> String {
             Path::new(custom_path),
             &crate::paths::default_app_state_dir(),
         )
-        && let Some(data_uri) = image_file_data_uri(Path::new(custom_path))
+        && let Some(data_uri) = dream_skin_file_data_uri(Path::new(custom_path))
     {
         return data_uri;
     }
     let (content_type, image) = dream_skin_default_image();
     image_data_uri(content_type, image)
+}
+
+fn dream_skin_file_data_uri(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?;
+    if let Some(mime) = crate::dream_skin::video_mime(extension) {
+        return Some(image_data_uri(
+            mime,
+            &crate::dream_skin::read_skin_video(path, extension).ok()?,
+        ));
+    }
+    image_file_data_uri(path)
 }
 
 fn dream_skin_platform() -> &'static str {
@@ -243,6 +254,31 @@ fn dream_skin_target_assets(
     }
 }
 
+/// 当前主题用的上游皮肤引擎；只有 `dream-skin` 引擎认 `userTransparency`。
+pub fn dream_skin_target_engine(settings: &BackendSettings) -> &'static str {
+    dream_skin_target_assets(settings).0
+}
+
+/// 交给渲染器的主题配置：设置里的主题配置，再并进只存在 Codex++ 设置里的用户偏好。
+/// 上游渲染器约定偏好由本地注入方提供、不来自主题包：`userTransparency` 是壁纸透出百分比
+/// （30 => 面板 alpha .70）。没设时原样序列化主题配置，字节不变，现有用户外观和签名都不变（#3233）。
+fn dream_skin_theme_json(settings: &BackendSettings) -> String {
+    let theme = &settings.codex_app_dream_skin_theme_config;
+    let serialized = match settings.codex_app_dream_skin_user_transparency {
+        None => serde_json::to_string(theme),
+        Some(percent) => {
+            let mut theme = theme.clone();
+            // 设了偏好就盖过主题配置里同名的值（老版本手写进设置里的那份）。
+            theme.extra_fields.insert(
+                "userTransparency".to_string(),
+                Value::from(percent.min(100)),
+            );
+            serde_json::to_string(&theme)
+        }
+    };
+    serialized.expect("dream skin target theme should serialize")
+}
+
 fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: bool) -> String {
     if !settings.codex_app_dream_skin_enabled || settings.codex_app_dream_skin_paused {
         return String::new();
@@ -254,14 +290,29 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
     let native_shell_css =
         include_str!("../../../assets/inject/dream-skin-native-shell-compat.css");
     let css = format!("{base_css}\n{native_shell_css}\n{managed_css}");
-    let theme = serde_json::to_string(&settings.codex_app_dream_skin_theme_config)
-        .expect("dream skin target theme should serialize");
+    let theme = dream_skin_theme_json(settings);
     let style_revision = dream_skin_content_signature(css.as_bytes());
     let payload_revision =
         dream_skin_target_payload_signature(settings, engine, &style_revision, &theme);
+    let media_path = Path::new(settings.codex_app_dream_skin_image_path.trim());
+    let video = media_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(crate::dream_skin::video_mime)
+        .is_some()
+        && crate::dream_skin::is_managed_dream_skin_image(
+            media_path,
+            &crate::paths::default_app_state_dir(),
+        );
+    let static_art = if video {
+        let (mime, bytes) = dream_skin_default_image();
+        serde_json::to_string(&image_data_uri(mime, bytes)).unwrap()
+    } else {
+        "window.__CODEX_PLUS_DREAM_SKIN_ART__".into()
+    };
     let mut payload = renderer
         .replace("__DREAM_CSS_JSON__", &serde_json::to_string(&css).unwrap())
-        .replace("__DREAM_ART_JSON__", "window.__CODEX_PLUS_DREAM_SKIN_ART__")
+        .replace("__DREAM_ART_JSON__", &static_art)
         .replace(
             "__DREAM_THEME_JSON__",
             "window.__CODEX_PLUS_DREAM_SKIN_THEME__",
@@ -274,18 +325,12 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
             "__GLASS_VISION_CSS_JSON__",
             &serde_json::to_string(&css).unwrap(),
         )
-        .replace(
-            "__GLASS_VISION_ART_JSON__",
-            "window.__CODEX_PLUS_DREAM_SKIN_ART__",
-        )
+        .replace("__GLASS_VISION_ART_JSON__", &static_art)
         .replace(
             "__DREAM_SKIN_CSS_JSON__",
             &serde_json::to_string(&css).unwrap(),
         )
-        .replace(
-            "__DREAM_SKIN_ART_JSON__",
-            "window.__CODEX_PLUS_DREAM_SKIN_ART__",
-        )
+        .replace("__DREAM_SKIN_ART_JSON__", &static_art)
         .replace(
             "__DREAM_SKIN_THEME_JSON__",
             "window.__CODEX_PLUS_DREAM_SKIN_THEME__",
@@ -315,8 +360,13 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
         )
     });
     let skin_api_bootstrap = dream_skin_skin_api_bootstrap_script(&theme);
+    let video_install = if video {
+        include_str!("../../../assets/inject/dream-skin-local-video.js")
+    } else {
+        ""
+    };
     payload = format!(
-        "(() => {{\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_CLEAR_DREAM_SKIN__?.();\n{}window.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__ = {};\n{}const result = {};\nconst state = window.__CODEX_DREAM_SKIN_STATE__ || window.__CODEX_GLASS_VISION_SKIN_STATE__;\nif (state) {{\n  state.version = `codex-plus:${{String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || 'unknown')}}:${{window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__}}:r${{window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__}}`;\n}}\nwindow.__CODEX_PLUS_DREAM_SKIN_PAYLOAD_SIGNATURE__ = {};\nreturn result;\n}})()",
+        "(() => {{\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_CLEAR_DREAM_SKIN__?.();\n{}window.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__ = {};\n{}const result = {};\nconst state = window.__CODEX_DREAM_SKIN_STATE__ || window.__CODEX_GLASS_VISION_SKIN_STATE__;\nif (state) {{\n  state.version = `codex-plus:${{String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || 'unknown')}}:${{window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__}}:r${{window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__}}`;\n{video_install}\n}}\nwindow.__CODEX_PLUS_DREAM_SKIN_PAYLOAD_SIGNATURE__ = {};\nreturn result;\n}})()",
         art_assignment.unwrap_or_default(),
         serde_json::to_string(&dream_skin_art_content_signature(settings)).unwrap(),
         theme,
@@ -638,8 +688,8 @@ fn renderer_after_document_ready(script: &str) -> String {
 
 /// 注入脚本里的皮肤运行时：等文档就绪再安装（#2680）。
 ///
-/// 注入脚本同时登记为新文档脚本；只要启动器发过 Page.enable（开了原生 Fast / 输入预测），
-/// Page.reload、启动壳自救重载等每次新文档都会在根节点建立前执行它。这时
+/// 注入脚本同时登记为新文档脚本，桥接连接总是先发 Page.enable，
+/// 所以 Page.reload、启动壳自救重载等每次新文档都会在根节点建立前执行它。这时
 /// `document.documentElement` 为空，皮肤 API 引导里的 `root.style.setProperty` 和
 /// `observer.observe(document.documentElement)` 直接抛错，整个皮肤运行时没装上，
 /// 页面里只剩 Codex++ 的其它增强，看起来就是「重启 Codex 后皮肤不生效」。
@@ -674,18 +724,16 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
     );
     let dream_skin_art = dream_skin_art_data_uri(settings);
     let dream_skin_art_signature = dream_skin_art_content_signature(settings);
-    let dream_skin_theme = &settings.codex_app_dream_skin_theme_config;
+    let dream_skin_theme = dream_skin_theme_json(settings);
     let dream_skin_target_runtime = dream_skin_target_runtime_after_document_ready(settings);
     let paste_fix = paste_fix_enabled_config(settings);
     let force_chinese_locale = force_chinese_locale_config(settings);
     let statsig_overrides = statsig_overrides_config(settings);
     let hide_official_usage_alert = hide_official_usage_alert_config(settings);
-    // 原生模块补丁的新文档脚本需要 Page.enable；DOM 增强必须等正常文档就绪，不能访问空的根节点。
-    let renderer_runtime = if crate::native_predictions::native_modules_requested(settings) {
-        renderer_after_document_ready(renderer_script())
-    } else {
-        renderer_script().to_string()
-    };
+    // 注入脚本同时登记为新文档脚本，桥接连接又总是先发 Page.enable（见 bridge::install_bridge），
+    // 所以页面每次刷新它都会在根节点建立之前执行一次：DOM 增强必须等文档就绪，不能访问空的根节点。
+    // 实时注入时 body 已在，包这一层等于立即执行。以前只在开了原生 Fast / 输入预测时才包（那时才发 Page.enable）。
+    let renderer_runtime = renderer_after_document_ready(renderer_script());
     let stepwise_runtime =
         if settings.codex_app_stepwise_enabled || settings.codex_app_answer_outline_enabled {
             stepwise_script()
@@ -704,7 +752,7 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&dream_skin_art).expect("dream skin art should serialize"),
         serde_json::to_string(&dream_skin_art_signature)
             .expect("dream skin art signature should serialize"),
-        serde_json::to_string(dream_skin_theme).expect("dream skin theme should serialize"),
+        dream_skin_theme,
         serde_json::to_string(&paste_fix).expect("paste fix config should serialize"),
         serde_json::to_string(&force_chinese_locale)
             .expect("force Chinese locale config should serialize"),
@@ -748,7 +796,12 @@ pub fn dream_skin_art_content_signature(settings: &BackendSettings) -> String {
             Path::new(custom_path),
             &crate::paths::default_app_state_dir(),
         )
-        && let Ok(bytes) = std::fs::read(custom_path)
+        && let Ok(bytes) = match Path::new(custom_path).extension().and_then(|s| s.to_str()) {
+            Some(ext) if crate::dream_skin::video_mime(ext).is_some() => {
+                crate::dream_skin::read_skin_video(Path::new(custom_path), ext)
+            }
+            _ => std::fs::read(custom_path).map_err(anyhow::Error::from),
+        }
     {
         return dream_skin_content_signature(&bytes);
     }
@@ -757,8 +810,7 @@ pub fn dream_skin_art_content_signature(settings: &BackendSettings) -> String {
 
 pub fn dream_skin_runtime_content_signature(settings: &BackendSettings) -> String {
     let (engine, _, css) = dream_skin_target_assets(settings);
-    let theme = serde_json::to_string(&settings.codex_app_dream_skin_theme_config)
-        .expect("dream skin target theme should serialize");
+    let theme = dream_skin_theme_json(settings);
     let style_revision = dream_skin_content_signature(css.as_bytes());
     dream_skin_target_payload_signature(settings, engine, &style_revision, &theme)
 }
@@ -1136,6 +1188,26 @@ mod tests {
         );
     }
 
+    /// 桥接连接总是先发 Page.enable，注入脚本每次页面刷新都会在根节点建立之前执行：
+    /// 不管开没开原生 Fast / 输入预测，页面脚本都得包在「等文档就绪」里，且只出现这一份。
+    /// 没包的话它在空的根节点上直接抛错（实测是 98-avatar-overlay-layout 的 root.toggleAttribute），
+    /// 刷新后 window.codexPlus 就没了，要等看门狗重新注入。
+    #[test]
+    fn renderer_in_injection_always_waits_for_document_ready() {
+        let wrapped = renderer_after_document_ready(renderer_script());
+        for native_fast in [false, true] {
+            let mut settings = BackendSettings::default();
+            settings.codex_app_native_fast_unlock = native_fast;
+            let script = injection_script_with_settings(57321, &settings);
+            assert!(script.contains(&wrapped), "native_fast={native_fast}");
+            assert_eq!(
+                script.matches(renderer_script()).count(),
+                1,
+                "native_fast={native_fast}"
+            );
+        }
+    }
+
     // 回归 #2680：注入脚本作为新文档脚本执行时根节点还不存在，皮肤运行时必须等文档就绪。
     #[test]
     fn dream_skin_runtime_in_injection_waits_for_document_ready() {
@@ -1203,6 +1275,100 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    // #3233：壁纸透出是 Codex++ 设置里的偏好，注入时作为 userTransparency 并进主题配置。
+    #[test]
+    fn dream_skin_user_transparency_is_injected_only_when_set() {
+        let mut settings = BackendSettings::default();
+        settings.codex_app_dream_skin_enabled = true;
+        let theme_assignment = |settings: &BackendSettings| {
+            format!(
+                "window.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};",
+                dream_skin_theme_json(settings)
+            )
+        };
+
+        // 没设：主题配置原样序列化，字节和签名都与以前一致，现有用户外观不变。
+        let plain = serde_json::to_string(&settings.codex_app_dream_skin_theme_config).unwrap();
+        assert_eq!(dream_skin_theme_json(&settings), plain);
+        assert!(!plain.contains("userTransparency"));
+        let unset_signature = dream_skin_runtime_content_signature(&settings);
+        assert!(
+            injection_script_with_settings(57321, &settings).contains(&theme_assignment(&settings))
+        );
+
+        settings.codex_app_dream_skin_user_transparency = Some(40);
+        let theme: Value = serde_json::from_str(&dream_skin_theme_json(&settings)).unwrap();
+        assert_eq!(theme["userTransparency"], 40);
+        // 设置里存的主题配置本身不带它：主题库「已修改」比较、导出主题包都不受影响。
+        assert!(
+            !settings
+                .codex_app_dream_skin_theme_config
+                .extra_fields
+                .contains_key("userTransparency")
+        );
+        // 启动注入和实时更新拿到的是同一份主题配置；签名跟着变，实时应用才会重跑皮肤。
+        assert!(
+            injection_script_with_settings(57321, &settings).contains(&theme_assignment(&settings))
+        );
+        assert!(
+            dream_skin_live_update_script(&settings, false).contains(&theme_assignment(&settings))
+        );
+        assert_ne!(
+            dream_skin_runtime_content_signature(&settings),
+            unset_signature
+        );
+
+        // 设了偏好就盖过主题配置里手写的同名值；没设时那份手写值照旧生效。
+        settings
+            .codex_app_dream_skin_theme_config
+            .extra_fields
+            .insert("userTransparency".to_string(), json!(100));
+        let theme: Value = serde_json::from_str(&dream_skin_theme_json(&settings)).unwrap();
+        assert_eq!(theme["userTransparency"], 40);
+        settings.codex_app_dream_skin_user_transparency = None;
+        let theme: Value = serde_json::from_str(&dream_skin_theme_json(&settings)).unwrap();
+        assert_eq!(theme["userTransparency"], 100);
+    }
+
+    // 字段名和换算以上游渲染器为准：透出 40% => 面板 alpha .6；没设时回到上游自己的默认。
+    #[test]
+    fn upstream_dream_skin_renderer_reads_injected_user_transparency() {
+        for renderer in [
+            include_str!("../../../assets/inject/upstream/dream-skin/macos/renderer-inject.js"),
+            include_str!("../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js"),
+        ] {
+            let start = renderer
+                .find("const userAlpha =")
+                .expect("upstream userAlpha");
+            let end = renderer[start..]
+                .find("const backgroundAlpha")
+                .expect("upstream panelAlpha")
+                + start;
+            let formula = &renderer[start..end];
+            let mut settings = BackendSettings::default();
+            settings.codex_app_dream_skin_user_transparency = Some(40);
+            let set = dream_skin_theme_json(&settings);
+            let test = format!(
+                r#"
+                  const assert=require('node:assert/strict');
+                  const alpha=(THEME)=>{{const explicitAlpha=()=>null;{formula}return panelAlpha;}};
+                  assert.equal(alpha({set}),0.6);
+                  assert.equal(alpha({{}}),0.7);
+                "#,
+            );
+            let output = std::process::Command::new("node")
+                .arg("-e")
+                .arg(test)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

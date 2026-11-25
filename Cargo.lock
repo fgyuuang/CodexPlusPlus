@@ -537,12 +537,13 @@ dependencies = [
 
 [[package]]
 name = "claude-local"
-version = "0.1.0"
-source = "git+https://github.com/BigPizzaV3/ClaudeMom?rev=fa43296c23cc31734a770f9cdacd03c28b5ab8ec#fa43296c23cc31734a770f9cdacd03c28b5ab8ec"
+version = "0.1.14"
+source = "git+https://github.com/BigPizzaV3/ClaudeMom?rev=e341a973307052d557f3e78e167b7caa220db827#e341a973307052d557f3e78e167b7caa220db827"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "directories",
+ "libc",
  "rcgen",
  "serde",
  "serde_json",
@@ -552,6 +553,7 @@ dependencies = [
  "url",
  "uuid",
  "windows 0.58.0",
+ "zip",
 ]
 
 [[package]]
@@ -572,6 +574,7 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-util",
+ "hmac",
  "http",
  "httpdate",
  "libc",

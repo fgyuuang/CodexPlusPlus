@@ -185,7 +185,7 @@ async fn open_candidates(
     }
     if plan.candidates.is_empty() {
         let Some(wait) = plan.cooling else {
-            anyhow::bail!("网关没有可用的上游：请检查绑定的供应商或模型组是否配置了地址和 Key");
+            anyhow::bail!("本地服务没有可用的上游：请检查绑定的供应商或模型组是否配置了地址和 Key");
         };
         // 所有 Key 都在冷却（#2802）：最早的那个很快恢复时等它一等再试，不马上回本地 429——
         // Codex 自己的重试几秒内就用完了，冷却稍长一点就会整轮失败，而直连时这几秒后上游多半已恢复。
@@ -193,6 +193,13 @@ async fn open_candidates(
             Some(ready) => pending = vec![ready],
             None => {
                 recorder.cooling(wait.as_millis() as u64);
+                // 请求没发出去（attempts 仍为 0），但请求日志要能看出本来要发给哪家、哪个模型（#3229）：
+                // 记最早恢复的那个冷却中的候选，也就是本地 429 里「约 N 秒后恢复」说的那个。
+                if let Some(first) = plan.waiting.first() {
+                    trace.relay_id = first.candidate.relay.id.clone();
+                    trace.relay_name = first.candidate.relay.name.clone();
+                    trace.upstream_model = first.candidate.upstream_model.clone();
+                }
                 return Ok(GatewayOutcome {
                     upstream: GatewayUpstream::Cooling(wait),
                     trace,
@@ -221,7 +228,7 @@ async fn open_candidates(
                 if crate::official_login::member_uses_official_login_transport(&candidate.relay) {
                     crate::gateway::store::GatewayStore::default()
                         .load()
-                        .map_err(|error| anyhow::anyhow!("读取网关额度策略失败：{error}"))?
+                        .map_err(|error| anyhow::anyhow!("读取本地服务额度策略失败：{error}"))?
                 } else {
                     crate::gateway::store::GatewaySettings::default()
                 };
@@ -346,7 +353,11 @@ async fn open_candidates(
                     recorder.step(candidate, "answered", None, upstream.status_code());
                     // 排在它前面的候选因为限速满了被跳过：这次只是临时顶替，不改会话固定
                     // （同一家的 Key 粘性、模型组记住的成员都保持原样）。
-                    key_pool::record_success(&candidate.key, conversation);
+                    key_pool::record_success(
+                        &candidate.key,
+                        &candidate.upstream_model,
+                        conversation,
+                    );
                     crate::gateway::speed::record(
                         &candidate.relay.id,
                         &candidate.upstream_model,
@@ -389,7 +400,8 @@ async fn open_candidates(
                         Some(class.label()),
                         upstream.status_code(),
                     );
-                    let failover = record_key_failure(&candidate.key, &class);
+                    let failover =
+                        record_key_failure(&candidate.key, &candidate.upstream_model, &class);
                     // 失败也算「试过了」：速度优先的组不再把它当没测过的排第一。
                     crate::gateway::speed::record_failure(
                         &candidate.relay.id,
@@ -409,7 +421,11 @@ async fn open_candidates(
                 Err(AttemptError::Fatal(error)) => return Err(error),
                 Err(AttemptError::Transport(error)) => {
                     recorder.step(candidate, "transport", Some("server_error"), None);
-                    record_key_failure(&candidate.key, &FailureClass::ServerError);
+                    record_key_failure(
+                        &candidate.key,
+                        &candidate.upstream_model,
+                        &FailureClass::ServerError,
+                    );
                     crate::gateway::speed::record_failure(
                         &candidate.relay.id,
                         &candidate.upstream_model,
@@ -458,15 +474,20 @@ async fn open_candidates(
         queued += now.elapsed();
         pending = deferred;
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("网关的所有上游都失败了")))
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("本地服务的所有上游都失败了")))
 }
 
-/// 把一次失败记进 Key 池，返回要不要换下一个候选。
+/// 把一次失败记进 Key 池，返回要不要换下一个候选。`upstream_model` 是这次发给上游的模型：
+/// 429 只冷却这个模型（#3229）。
 ///
 /// 拓展用 `gateway.replaces` 关掉 `builtin:key-cooldown` 时 429 / 额度耗尽不再让 Key 冷却，
 /// 关掉 `builtin:key-breaker` 时 5xx / 连接失败不再计入供应商熔断；换不换下一个候选照旧按分类定，
 /// 要不要避开这个 Key / 供应商由拓展在 route 段自己决定。
-pub(crate) fn record_key_failure(key: &key_pool::KeyRef, class: &FailureClass) -> bool {
+pub(crate) fn record_key_failure(
+    key: &key_pool::KeyRef,
+    upstream_model: &str,
+    class: &FailureClass,
+) -> bool {
     let replaced = match class {
         FailureClass::RateLimited { .. } | FailureClass::QuotaExhausted { .. } => {
             crate::extension_gateway::builtin_replaced("builtin:key-cooldown")
@@ -479,7 +500,7 @@ pub(crate) fn record_key_failure(key: &key_pool::KeyRef, class: &FailureClass) -
     if replaced {
         return class.should_failover();
     }
-    key_pool::record_failure(key, class, Instant::now())
+    key_pool::record_failure(key, upstream_model, class, Instant::now())
 }
 
 /// 所有 Key 都在冷却时，最早恢复的那个最多等这么久（#2802）。
@@ -514,8 +535,12 @@ async fn wait_for_cooling_key<'a>(
             .waiting
             .iter()
             .map(|item| {
-                let remaining =
-                    key_pool::cooling_remaining(&item.candidate.key, now).unwrap_or_default();
+                let remaining = key_pool::cooling_remaining(
+                    &item.candidate.key,
+                    &item.candidate.upstream_model,
+                    now,
+                )
+                .unwrap_or_default();
                 (&item.candidate, remaining)
             })
             .min_by_key(|(_, remaining)| *remaining);
@@ -595,7 +620,7 @@ impl LocalRateLimited {
         Self {
             message: format!(
                 "Codex++ 本地限速：{} 的 Key 都已达到你设置的请求上限，排队等待 {} 秒仍没有空出名额。\
-                 这是 Codex++ 网关自己的限速，不是上游返回的错误；可以在网关「供应商池」里调高这家的限速上限，或给它添加更多 Key。",
+                 这是 Codex++ 本地服务自己的限速，不是上游返回的错误；可以在网关「共享供应商」里调高这家的限速上限，或给它添加更多 Key。",
                 providers.join("、"),
                 waited.as_secs()
             ),
@@ -711,7 +736,7 @@ async fn attempt_pipeline(
             prompt.as_deref(),
             crate::responses_websocket::active(),
         );
-        let version = crate::gateway::chatgpt_backend::codex_version(&home);
+        let version = crate::gateway::chatgpt_backend::codex_version(&home).await;
         relay.user_agent = crate::gateway::chatgpt_backend::codex_user_agent(&version);
         for (key, value) in [
             ("version", version.as_str()),
@@ -813,7 +838,7 @@ async fn attempt_pipeline(
     })
 }
 
-/// 只发一次、只发给这个候选（供应商池的「测试」用，见 [`crate::gateway::probe`]）。
+/// 只发一次、只发给这个候选（共享供应商的「测试」用，见 [`crate::gateway::probe`]）。
 ///
 /// 和候选循环里的一次尝试走同一条路（ChatGPT 后端的请求整理、协议转换、代理、认证都一样），
 /// 但调用方要自己先做 `prepare_relay` / OpenCode 的 prepare；这里不占限速名额、不记 Key 冷却 /
@@ -829,7 +854,7 @@ pub(crate) async fn attempt_once(
     if crate::official_login::member_uses_official_login_transport(&candidate.relay) {
         let gateway = crate::gateway::store::GatewayStore::default()
             .load()
-            .context("读取网关额度策略失败")?;
+            .context("读取本地服务额度策略失败")?;
         crate::gateway::quota::dispatch_decision(&gateway, &candidate.relay)?;
     }
     let upstream = match attempt_pipeline(settings, candidate, request).await {
@@ -843,7 +868,7 @@ pub(crate) async fn attempt_once(
     }
 }
 
-/// ChatGPT 后端的响应头带着这个账号的额度，顺手记下（模型组「额度优先」、供应商池显示用）。
+/// ChatGPT 后端的响应头带着这个账号的额度，顺手记下（模型组「额度优先」、共享供应商显示用）。
 fn observe_quota(relay: &crate::settings::RelayProfile, upstream: &GatewayUpstream) {
     let headers = match upstream {
         GatewayUpstream::Pipeline(response) => {

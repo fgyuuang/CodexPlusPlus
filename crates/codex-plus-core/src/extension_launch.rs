@@ -163,9 +163,11 @@ fn validate_launch_arg(arg: &str) -> anyhow::Result<()> {
             "launch.args 里的 {arg} 不合法：只能是 --名字 或 --名字=值，不超过 {LAUNCH_ARG_MAX_LEN} 个字符"
         );
     }
+    // 按前缀拦：--inspect-brk、--inspect-port、--remote-debugging-xxx 这类变体同样由 Codex++ 管。
+    let lowered = name.to_ascii_lowercase();
     if BLOCKED_ARG_PREFIXES
         .iter()
-        .any(|blocked| name.eq_ignore_ascii_case(blocked))
+        .any(|blocked| lowered.starts_with(blocked))
     {
         anyhow::bail!("launch.args 不能设置 {name}：调试端口与用户数据目录由 Codex++ 管理");
     }

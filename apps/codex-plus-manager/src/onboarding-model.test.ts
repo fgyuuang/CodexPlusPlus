@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { placeCard, shouldShowTour, tourSteps, TOUR_STEPS, TOUR_VERSION } from "./onboarding-model.ts";
+import { placeCard, shouldShowTour, TOUR_STEPS, TOUR_VERSION, tourSteps } from "./onboarding-model.ts";
 
 test("首次使用和引导升级后自动弹出，看过当前版本就不再弹", () => {
   assert.equal(shouldShowTour(null), true);
@@ -27,26 +27,11 @@ test("说明卡优先放目标右侧，放不下换左侧，再不行放下方�
   assert.ok(bottom.top + card.height <= viewport.height - 12);
 });
 
-test("只管理 Codex 时引导换成单 Agent 说法，步骤和目标不变", () => {
-  assert.equal(tourSteps(null), TOUR_STEPS);
-  const solo = tourSteps("Codex");
-  assert.deepEqual(solo.map((step) => [step.id, step.target]), TOUR_STEPS.map((step) => [step.id, step.target]));
-  const welcome = solo.find((step) => step.id === "welcome")!;
-  assert.equal(welcome.title, TOUR_STEPS[0].title);
-  assert.equal(welcome.plainTitle, true);
-  assert.deepEqual(welcome.args, ["Codex"]);
-  assert.match(welcome.body, /\{0\}/);
-  const connect = solo.find((step) => step.id === "agents-connect")!;
-  assert.ok(!connect.plainTitle && connect.title.includes("{0}"));
-  // 没改写的步骤原样保留。
-  assert.equal(solo.find((step) => step.id === "providers"), TOUR_STEPS.find((step) => step.id === "providers"));
-});
-
-test("只用增强功能时去掉网关、供应商池、Agent 接入三步，欢迎卡不提供应商", () => {
-  const steps = tourSteps(null, true);
-  const ids = steps.map((step) => step.id);
-  for (const hidden of ["hub", "providers", "agents-connect"]) assert.ok(!ids.includes(hidden));
-  assert.deepEqual(ids, ["welcome", "management", "agents", "palette", "settings"]);
-  assert.match(steps[0].body, /供应商仍由你自己的工具管理/);
-  assert.equal(steps[0].args, undefined);
+test("导览跟随侧栏顺序和使用模式，不把用户引到隐藏的网关入口", () => {
+  assert.deepEqual(TOUR_STEPS.map((step) => step.id), ["welcome", "management", "hub", "providers", "agents-connect", "agents", "palette", "settings"]);
+  assert.equal(TOUR_STEPS.find((step) => step.id === "providers")?.target, "nav-gatewayProviders");
+  assert.deepEqual(tourSteps("Codex").find((step) => step.id === "agents-connect")?.args, ["Codex"]);
+  const enhance = tourSteps(null, true);
+  assert.deepEqual(enhance.map((step) => step.id), ["welcome", "management", "agents", "palette", "settings"]);
+  assert.doesNotMatch(enhance.map((step) => step.body).join(" "), /网关|\{\d+\}/);
 });

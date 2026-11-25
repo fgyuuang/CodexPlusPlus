@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { readAppSource } from "./app-source.test-helper.ts";
 
 const read = (name: string) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8");
 
@@ -27,8 +28,7 @@ test("界面不再出现「路由组」，统一叫模型组", () => {
 
 test("路由页：「我的组」和「自动组」两段卡片，卡片上直接改路由方式、会话固定、隐藏成员，手动模式点成员锁定", () => {
   const page = read("GatewayPage.tsx");
-  assert.match(page, /\{ id: "routing", label: t\("路由"\) \}/);
-  assert.match(read("App.tsx"), /id: "gatewayRouting", get label\(\) \{ return t\("路由"\); \}/);
+  assert.match(readAppSource(), /id: "gatewayRouting", get label\(\) \{ return t\("路由"\); \}/);
   assert.doesNotMatch(page, /RouteDiagram|RouteCard|routeNarrative|DispatchTable|<ModelMatrix/);
   assert.match(page, /\{t\("我的组"\)\}/);
   assert.match(page, /\{t\("自动组"\)\}/);
@@ -41,9 +41,9 @@ test("路由页：「我的组」和「自动组」两段卡片，卡片上直�
   assert.match(page, /hideMembers: previous\?\.hideMembers \?\? false, pick: previous\?\.pick \?\? ""/);
 });
 
-test("侧栏顺序：供应商池 → Agent 接入 → 路由；供应商池只有按供应商的列表（「按模型」矩阵已去掉）", () => {
-  const app = read("App.tsx");
-  assert.match(app, /const gatewayNavigationRoutes: Route\[\] = \["hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewaySettings"\];/);
+test("本地服务的顺序：共享供应商 → Agent 接入 → 路由；共享供应商只有按供应商的列表（「按模型」矩阵已去掉）", () => {
+  const app = readAppSource();
+  assert.match(app, /const gatewayNavigationRoutes: Route\[\] = \["gatewayProviders", "gateway", "gatewayRouting", "gatewaySettings"\];/);
   const providers = read("GatewayProviders.tsx");
   assert.doesNotMatch(providers, /<ModelMatrix\s|t\("按模型"\)/);
   assert.match(providers, /placeholder=\{t\("查找供应商"\)\}/);

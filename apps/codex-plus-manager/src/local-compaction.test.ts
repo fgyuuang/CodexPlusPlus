@@ -9,6 +9,7 @@ import {
   requestCompatibilityEnabled,
   stripImageGenerationToolEnabled,
   stripResponsesImageDetailEnabled,
+  stripResponsesOutputEncryptedContentEnabled,
   pureApiImageGenerationEnabled,
   modelRouteSaveRequiresRestart,
   normalizeRelayModelRoutes,
@@ -16,8 +17,9 @@ import {
   settingsRequireLocalHelper,
   localCompactionPromptAtEndEnabled,
 } from "./model-routes.ts";
+import { readAppSource } from "./app-source.test-helper.ts";
 
-const source = (await readFile(new URL("./App.tsx", import.meta.url), "utf8")) + "\n" + (await readFile(new URL("./relay-profile-editing.ts", import.meta.url), "utf8"));
+const source = readAppSource() + "\n" + (await readFile(new URL("./relay-profile-editing.ts", import.meta.url), "utf8"));
 const app = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const names = ["applyRelayProfilePatchToFiles", "buildRelayConfigToml", "normalizeRelaySessionProvider", "tomlString"];
 const functions = names.map((name) => {
@@ -63,7 +65,7 @@ test("experimental local compaction is per-provider and starts the helper only w
 
 test("checkbox draft and generated config route to proxy and restore the real upstream on disable", () => {
   const context = vm.createContext({
-    requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, pureApiImageGenerationEnabled, independentProxyEnabled, PROTOCOL_PROXY_BASE_URL, localCompactionPromptAtEndEnabled, normalizeRelayModelRoutes,
+    requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, stripResponsesOutputEncryptedContentEnabled, pureApiImageGenerationEnabled, independentProxyEnabled, PROTOCOL_PROXY_BASE_URL, localCompactionPromptAtEndEnabled, normalizeRelayModelRoutes,
     relaySessionProvider: () => "custom",
     sessionProviderForProtocol: (provider: string) => provider,
     isAggregateRelayProfile: () => false,
@@ -123,7 +125,7 @@ test("provider checkbox binds draft state and is hidden for Anthropic and aggreg
   assert.match(checkbox, /updateDraft\(\{ localCompactionPromptAtEnd: event\.currentTarget\.checked \}\)/);
   assert.match(checkbox, /type="checkbox"/);
   assert.match(checkbox, /本地压缩缓存复用（实验）/);
-  assert.match(checkbox, /仅支持旧版直连供应商，暂不支持 2\.0 网关/);
+  assert.match(checkbox, /仅支持直连供应商，暂不支持经本地服务/);
   assert.match(checkbox, /缓存按 Key 隔离，切换或轮换 Key 可能降低命中率/);
   assert.match(checkbox, /实测可改善压缩请求的缓存命中概率/);
   assert.doesNotMatch(checkbox, /用户实测/);

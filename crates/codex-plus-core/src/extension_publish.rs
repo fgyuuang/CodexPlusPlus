@@ -354,8 +354,45 @@ pub fn generate_readme(manifest: &Value, repo: &str) -> String {
     };
     let permissions = crate::extension_discovery::manifest_permissions(manifest);
     let mut rows = Vec::new();
+    let list = |key: &str| -> Vec<String> {
+        permissions
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|item| format!("`{item}`"))
+            .collect()
+    };
+    let number = |key: &str| permissions.get(key).and_then(Value::as_u64).unwrap_or(0);
+    // 与安装确认框同一个顺序：先是在页面之外运行的，再是改请求、改工具的，最后是页面里的。
     if let Some(backend) = permissions.get("backend").and_then(Value::as_str) {
-        rows.push(format!("| 常驻后台进程 | `{backend}` |"));
+        let http = if permissions["backendHttp"] == true {
+            "（处理本机 HTTP 请求）"
+        } else {
+            ""
+        };
+        rows.push(format!("| 常驻后台进程 | `{backend}`{http} |"));
+    }
+    if number("schedules") > 0 {
+        rows.push(format!("| 定时任务 | {} 条 |", number("schedules")));
+    }
+    for (key, label) in [
+        ("launchBefore", "启动前脚本"),
+        ("launchAfter", "退出后脚本"),
+        ("dsh", "dsh 插件"),
+    ] {
+        if let Some(script) = permissions.get(key).and_then(Value::as_str) {
+            rows.push(format!("| {label} | `{script}` |"));
+        }
+    }
+    for (key, label) in [
+        ("launchArgs", "Codex 启动参数"),
+        ("mcpServers", "MCP 服务器"),
+    ] {
+        if !list(key).is_empty() {
+            rows.push(format!("| {label} | {} |", list(key).join(" ")));
+        }
     }
     for hook in permissions
         .get("hooks")
@@ -370,36 +407,35 @@ pub fn generate_readme(manifest: &Value, repo: &str) -> String {
         ));
     }
     for (key, label) in [
+        ("toolPipeline", "工具调用管线"),
         ("gatewayRequest", "网关请求中间件"),
         ("gatewayResponse", "网关响应中间件"),
+        ("gatewayError", "网关失败重试"),
     ] {
-        if permissions.get(key).and_then(Value::as_u64).unwrap_or(0) > 0 {
-            rows.push(format!("| {label} | {} 个 |", permissions[key]));
+        if number(key) > 0 {
+            rows.push(format!("| {label} | {} 个 |", number(key)));
         }
     }
-    for tool in permissions
-        .get("tools")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        rows.push(format!("| 模型工具 | `{}` |", tool.as_str().unwrap_or("")));
+    for (key, label) in [
+        ("gatewayReplaces", "关掉的内置网关环节"),
+        ("providers", "模型供应商"),
+        ("tools", "模型工具"),
+        ("skills", "Skills"),
+        ("agents", "子 Agent"),
+        ("prompts", "提示词"),
+        ("replaces", "顶替的内置拓展"),
+        ("managerReplaces", "顶替的管理器页面"),
+        ("managerData", "读取的管理器数据"),
+        ("routes", "本地路由"),
+        ("preload", "页面最早期脚本"),
+        ("renderer", "页面脚本"),
+    ] {
+        if !list(key).is_empty() {
+            rows.push(format!("| {label} | {} |", list(key).join(" ")));
+        }
     }
-    for route in permissions
-        .get("routes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        rows.push(format!("| 本地路由 | `{}` |", route.as_str().unwrap_or("")));
-    }
-    for entry in permissions
-        .get("renderer")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        rows.push(format!("| 页面脚本 | `{}` |", entry.as_str().unwrap_or("")));
+    if permissions["instructions"] == true {
+        rows.push("| 全局指令 | 追加到 Codex 的系统指令 |".to_string());
     }
     let table = if rows.is_empty() {
         "这个拓展没有声明额外能力。".to_string()
@@ -557,6 +593,28 @@ struct StepLog<'a> {
     on_progress: &'a dyn Fn(&StepEvent),
 }
 
+/// 远端仓库已经有这个版本的 tag：前端据 `errorCode: "version_taken"` 提示把版本号 +1，不靠匹配错误文案。
+#[derive(Debug)]
+struct VersionTaken {
+    repo: String,
+    tag: String,
+}
+
+impl std::fmt::Display for VersionTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} 已经有 {}，先把版本号 +1 再发布", self.repo, self.tag)
+    }
+}
+
+impl std::error::Error for VersionTaken {}
+
+/// 发布失败时给前端的结构化错误码；没有专门处理的错误返回 None。
+fn publish_error_code(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .downcast_ref::<VersionTaken>()
+        .map(|_| "version_taken")
+}
+
 impl StepLog<'_> {
     /// 跑一步并记下结果，原样返回：失败时调用方用 `?` 停下。
     fn run(
@@ -683,7 +741,14 @@ impl Publisher {
                 "url": format!("https://github.com/{repo}"),
                 "steps": steps,
             }),
-            Err(error) => json!({ "ok": false, "error": format!("{error:#}"), "steps": steps }),
+            Err(error) => {
+                let mut value =
+                    json!({ "ok": false, "error": format!("{error:#}"), "steps": steps });
+                if let Some(code) = publish_error_code(&error) {
+                    value["errorCode"] = json!(code);
+                }
+                value
+            }
         }
     }
 
@@ -736,7 +801,11 @@ impl Publisher {
                 .gh(&["api", &format!("repos/{repo}/git/ref/tags/{tag}")])
                 .is_ok()
             {
-                bail!("{repo} 已经有 {tag}，先把版本号 +1 再发布");
+                return Err(VersionTaken {
+                    repo: repo.clone(),
+                    tag: tag.clone(),
+                }
+                .into());
             }
             Ok(format!("{repo} 已存在，发布 {tag}"))
         })?;

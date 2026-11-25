@@ -204,6 +204,20 @@ fn manager_pages_declare_nav_replacements_and_data() {
         "management"
     );
 
+    // 已经并进别处的旧页面 id：老清单不报错，但不再记为顶替。
+    write_package(
+        &temp,
+        "retired",
+        json!({ "id": "retired", "manager": { "page": "page.html", "replaces": ["recommendations", "gatewayUsage", "dreamSkin"] } }),
+        &[("page.html", b"<p>hi</p>")],
+    );
+    let retired = script(&manager, "user:retired");
+    assert_eq!(retired["error"], "", "{retired}");
+    assert_eq!(
+        retired["package"]["managerPage"]["replaces"],
+        json!(["gatewayUsage"])
+    );
+
     // 「万物皆拓展」「设置」这类是停用拓展的入口，不能顶替；不认识的数据名、分组也报错。
     for (id, manager_field, needle) in [
         (

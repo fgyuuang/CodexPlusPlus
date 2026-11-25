@@ -216,6 +216,54 @@ fn list_masks_named_api_keys() {
 }
 
 #[test]
+fn official_profile_restores_its_private_mixed_configuration_after_reopening_the_page() {
+    use codex_plus_core::settings::{InactiveMixedApi, RelayModelRoute};
+
+    let snapshot = InactiveMixedApi {
+        config_contents: "model = \"fixture-model\"\n".into(),
+        upstream_base_url: "https://fixture.example/v1".into(),
+        model_routes: vec![RelayModelRoute {
+            model: "old-alias".into(),
+            target_relay_id: "b".into(),
+            target_model: "remote".into(),
+        }],
+    };
+    let fixture = Fixture::new(vec![RelayProfile {
+        id: "toggle".into(),
+        name: "Toggle".into(),
+        inactive_mixed_api: Some(snapshot.clone()),
+        ..RelayProfile::default()
+    }]);
+    let live_before = (fixture.live("config.toml"), fixture.live("auth.json"));
+    for mixed in [false, true] {
+        let list = fixture.list();
+        let mut profiles = profiles_of(&list);
+        let row = profile_mut(&mut profiles, "toggle");
+        assert!(row.get("inactiveMixedApi").is_none());
+        row["officialMixApiKey"] = json!(mixed);
+        fixture
+            .commit(json!({ "revision": list["revision"], "relayProfiles": profiles }))
+            .unwrap();
+        let saved = fixture.stored("toggle");
+        if mixed {
+            assert!(saved.config_contents.contains(&snapshot.config_contents));
+            assert_eq!(saved.upstream_base_url, snapshot.upstream_base_url);
+            assert_eq!(saved.model_routes, snapshot.model_routes);
+            assert!(saved.inactive_mixed_api.is_none());
+        } else {
+            assert_eq!(saved.inactive_mixed_api.as_ref(), Some(&snapshot));
+            assert!(saved.config_contents.is_empty());
+        }
+    }
+    assert_eq!(fixture.store.load().unwrap().active_relay_id, "a");
+    assert_eq!(fixture.switches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        (fixture.live("config.toml"), fixture.live("auth.json")),
+        live_before
+    );
+}
+
+#[test]
 fn editing_inactive_profile_restores_masked_keys_and_only_saves() {
     let fixture = Fixture::new(Vec::new());
     let list = fixture.list();
@@ -415,7 +463,7 @@ fn new_plain_key_is_kept_and_unknown_masked_key_is_dropped() {
 #[test]
 fn gateway_entry_is_kept_from_storage() {
     let gateway = RelayProfile {
-        name: "Codex++ 网关".to_string(),
+        name: "Codex++ 本地服务".to_string(),
         ..pure_profile(
             CODEX_GATEWAY_RELAY_ID,
             "http://127.0.0.1:57321/gw/codex/v1",
@@ -449,6 +497,89 @@ fn gateway_entry_is_kept_from_storage() {
     assert_eq!(
         key_values(&fixture.stored(CODEX_GATEWAY_RELAY_ID)),
         key_values(&gateway)
+    );
+}
+
+/// 页面编辑聚合供应商：成员 / 策略只在 aggregateRelayProfiles 里，供应商条目本身不变。
+fn fixture_with_aggregate(active_aggregate: bool) -> (Fixture, Value) {
+    use codex_plus_core::settings::{
+        AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, RelaySessionProvider,
+    };
+
+    let fixture = Fixture::new(vec![RelayProfile {
+        id: "agg".into(),
+        name: "聚合".into(),
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    }]);
+    let mut settings = fixture.store.load().unwrap();
+    settings.aggregate_relay_profiles = vec![AggregateRelayProfile {
+        id: "agg".into(),
+        name: "聚合".into(),
+        session_provider: RelaySessionProvider::Custom,
+        model_aggregation_enabled: false,
+        strategy: AggregateRelayStrategy::Failover,
+        model_mappings_enabled: true,
+        model_mappings: Vec::new(),
+        members: vec![AggregateRelayMember {
+            relay_id: "a".into(),
+            weight: 1,
+        }],
+        routes: Vec::new(),
+        default_relay_id: String::new(),
+        sync_default_member_login: false,
+        auto_review_relay_id: String::new(),
+    }];
+    if active_aggregate {
+        settings.active_relay_id = "agg".into();
+        settings.active_aggregate_relay_id = "agg".into();
+    }
+    fixture.store.save(&settings).unwrap();
+    let list = fixture.list();
+    let mut aggregates = list["settings"]["aggregateRelayProfiles"].clone();
+    aggregates[0]["strategy"] = json!("weightedRoundRobin");
+    aggregates[0]["members"] =
+        json!([{ "relayId": "a", "weight": 3 }, { "relayId": "b", "weight": 1 }]);
+    let request = json!({
+        "revision": list["revision"],
+        "relayProfiles": profiles_of(&list),
+        "aggregateRelayProfiles": aggregates,
+        "activeAggregateRelayId": list["settings"]["activeAggregateRelayId"],
+    });
+    (fixture, request)
+}
+
+#[test]
+fn editing_inactive_aggregate_only_saves_members_and_strategy() {
+    use codex_plus_core::settings::AggregateRelayStrategy;
+
+    let (fixture, request) = fixture_with_aggregate(false);
+    let outcome = fixture.commit(request).unwrap();
+    assert!(!outcome.switched);
+    assert_eq!(fixture.switches.load(Ordering::SeqCst), 0);
+    let saved = fixture.store.load().unwrap();
+    let aggregate = &saved.aggregate_relay_profiles[0];
+    assert_eq!(
+        aggregate.strategy,
+        AggregateRelayStrategy::WeightedRoundRobin
+    );
+    let members: Vec<(String, u32)> = aggregate
+        .members
+        .iter()
+        .map(|member| (member.relay_id.clone(), member.weight))
+        .collect();
+    assert_eq!(members, vec![("a".to_string(), 3), ("b".to_string(), 1)]);
+}
+
+#[test]
+fn editing_active_aggregate_members_reapplies_it() {
+    let (fixture, request) = fixture_with_aggregate(true);
+    // 切换本身成不成功取决于测试环境里的聚合代理，这里只关心「改了当前聚合」会走切换流程。
+    let _ = fixture.commit(request);
+    assert_eq!(
+        fixture.switches.load(Ordering::SeqCst),
+        1,
+        "改了当前聚合的成员要像管理器一样重新应用"
     );
 }
 

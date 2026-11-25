@@ -1,5 +1,5 @@
 //! 按模型聚合：发布带供应商身份的模型目录，并精确解析到成员与真实模型。
-//! 模型聚合和供应商池策略互斥；未带绑定身份的请求不能进入轮转池。
+//! 模型聚合和共享供应商策略互斥；未带绑定身份的请求不能进入轮转池。
 //!
 //! 聚合解析规则：
 //! - `cpx-<成员>/<模型>` 按成员前缀精确归因；解析不出来（成员被移除、模型被移出列表、
@@ -868,6 +868,19 @@ pub fn catalog_summary(
     }))
 }
 
+/// 官方池成员补的 GPT-6.2 Fast 档位，只解析一次。内置资产解析失败只可能是改坏了 JSON，
+/// 按空表处理（不补档位），`gpt62_fast_tiers_reach_the_gateway_catalog` 会兜住。
+fn official_fast_defaults() -> &'static Map<String, Value> {
+    static DEFAULTS: std::sync::OnceLock<Map<String, Value>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        crate::relay_config::parse_model_metadata_map(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/gpt62-model-metadata-compat.json"
+        )))
+        .unwrap_or_default()
+    })
+}
+
 pub(crate) fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Value> {
     let entries = profile_catalog_entries(profile)?;
     if entries.is_empty() {
@@ -883,9 +896,32 @@ pub(crate) fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Val
         false,
         None,
     );
-    let metadata = crate::relay_config::parse_model_metadata_map(&profile.model_metadata)?;
+    let mut metadata = crate::relay_config::parse_model_metadata_map(&profile.model_metadata)?;
+    // 官方池成员同步的是模型 ID，不一定有同版本的本机目录。只补已知型号的
+    // 官方 Fast 档位，不把同家族旧模板的能力移给未知型号或第三方供应商。
+    if crate::official_login::member_uses_official_login_transport(profile) {
+        let fast_defaults = official_fast_defaults();
+        for entry in &entries {
+            let slug = entry.slug.to_ascii_lowercase();
+            let Some(defaults) = fast_defaults.get(&slug) else {
+                continue;
+            };
+            if crate::model_suffix::requires_bundled_metadata_catalog(&slug) {
+                continue;
+            }
+            let fields = metadata.entry(slug).or_insert_with(|| json!({}));
+            if fields.get("service_tiers").is_none()
+                && fields.get("additional_speed_tiers").is_none()
+            {
+                fields["service_tiers"] = defaults["service_tiers"].clone();
+                fields["additional_speed_tiers"] = defaults["additional_speed_tiers"].clone();
+            }
+        }
+    }
     let catalog_json =
         crate::relay_config::apply_model_metadata_overrides(&catalog_json, &metadata)?;
+    let catalog_json =
+        crate::gateway::opencode::apply_hy4_catalog_json_metadata(profile, &catalog_json)?;
     // 聚合代理按成员原生协议转发，成员上游不认 tool_search 时同样要在目录里关掉；
     // 放在元数据覆盖之后，已保存的整份元数据不能把它重新打开。
     let catalog_json = if crate::relay_config::upstream_rejects_tool_search(profile) {

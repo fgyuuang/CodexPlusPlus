@@ -805,6 +805,8 @@ fn thread_provider_prepare_honors_lifecycle_lock_and_pending_recovery() {
     let error =
         prepare_thread_provider(home, true, &thread_provider_prepare_request()).unwrap_err();
     assert!(error.to_string().contains("recovery is pending"), "{error}");
+    assert!(error.to_string().contains("恢复未完成修复"));
+    assert!(error.to_string().contains("unfinished"));
     assert_eq!(fs::read(&db_path).unwrap(), before);
     assert!(!home.join("backups_state/thread-provider-prepare").exists());
 }

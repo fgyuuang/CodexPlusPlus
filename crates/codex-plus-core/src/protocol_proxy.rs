@@ -526,7 +526,7 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
-/// 压缩请求、以及发给 Codex++ 网关的请求等响应头的上限（#2759）。
+/// 压缩请求、以及发给 Codex++ 本地服务的请求等响应头的上限（#2759）。
 ///
 /// - 原生压缩要整段读完、确认拿到 checkpoint 才回响应头，大上下文压缩常超过两分钟；
 /// - Codex 登录 ChatGPT 时请求先到本地代理、再转给网关：网关这一跳自己也会等上游响应头、
@@ -1603,8 +1603,29 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
 }
 
 pub fn responses_to_chat_completions_with_options(
+    body: Value,
+    standard: bool,
+) -> anyhow::Result<Value> {
+    responses_to_chat_completions_with_context(body, standard, false)
+}
+
+/// 按真实供应商上下文转换。HY4 的 `none/high` 上限只在 OpenCode Go 上成立，
+/// 不能仅凭模型名影响其它供应商。
+pub fn responses_to_chat_completions_for_relay(
+    body: Value,
+    relay: &crate::settings::RelayProfile,
+) -> anyhow::Result<Value> {
+    responses_to_chat_completions_with_context(
+        body,
+        relay.standard_openai_protocol,
+        crate::gateway::opencode::is_go_relay(relay),
+    )
+}
+
+fn responses_to_chat_completions_with_context(
     mut body: Value,
     standard: bool,
+    opencode_go_hy4_reasoning: bool,
 ) -> anyhow::Result<Value> {
     remove_unsupported_native_search(&mut body)?;
     validate_chat_attachments(&body)?;
@@ -1676,7 +1697,13 @@ pub fn responses_to_chat_completions_with_options(
         result["stream_options"] = stream_options;
     }
 
-    apply_chat_reasoning_options(&mut result, &body, model, standard);
+    apply_chat_reasoning_options(
+        &mut result,
+        &body,
+        model,
+        standard,
+        opencode_go_hy4_reasoning,
+    );
 
     let ChatToolProjection {
         context: tool_context,
@@ -2107,11 +2134,8 @@ fn chat_completion_to_response_with_context(
     if let Some(mut message) = chat_message_to_response_output_item(message, &response_id) {
         // 与流式转换一致：无工具调用的消息即本轮最终回答（issue #2659，设置里打开才补）。
         if message_phase_fill_enabled() {
-            message["phase"] = json!(if tool_items.is_empty() {
-                "final_answer"
-            } else {
-                "commentary"
-            });
+            let text = response_message_item_text(&message);
+            message["phase"] = json!(filled_message_phase(&text, !tool_items.is_empty()));
         }
         output.push(message);
     }
@@ -4482,14 +4506,20 @@ async fn open_vendor_responses_request(
         } else {
             relay
         };
-        // Kimi 官方 Responses 只认 `reasoning.encrypted_content`：Codex 私有的
-        // `output.encrypted_content` 会让整包 400（issue #3026），发出前去掉。
-        // 经第三方中转调 Kimi 模型时地址认不出来，按模型名再判一次（#3068）。
-        if wire_api == UpstreamWireApi::Responses
-            && (crate::relay_config::upstream_is_kimi_official_responses(&relay)
-                || request_model_is_kimi(&upstream_body))
+        // 部分 Responses 上游只认 `reasoning.encrypted_content`：Codex 私有的
+        // `output.encrypted_content` 会让整包 400（#3026）。Kimi 继续自动识别；
+        // 其他严格上游由供应商级开关显式启用。
+        if should_strip_responses_output_encrypted_content(&relay, wire_api, &upstream_body)
+            && strip_responses_output_encrypted_content(&mut upstream_body)
         {
-            tidy_kimi_include(&mut upstream_body);
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.strip_responses_output_encrypted_content",
+                json!({
+                    "relayId": relay.id,
+                    "relayName": relay.name,
+                    "manual": relay.strips_responses_output_encrypted_content(),
+                }),
+            );
         }
         if local_exec_adapted && wire_api == UpstreamWireApi::Responses && !xai_upstream {
             // 声明与当前全部历史同时转换，不能对已转换的声明再拼入原始新工具结果。
@@ -6523,36 +6553,49 @@ fn upstream_rejects_custom_tools(relay: &crate::settings::RelayProfile) -> bool 
         })
 }
 
-/// Kimi 官方 Responses 的 `include` 只认 `reasoning.encrypted_content`（#3026）：
-/// 去掉 Codex 私有的 `output.encrypted_content`，其余项保留；过滤后为空就整个去掉。
-/// 请求的模型名带 `kimi`（如 `kimi-k3.1-pro`、`moonshot/kimi-k2`）：中转站转发的也是 Kimi 的接口（#3068）。
+/// 请求的模型名带 `kimi`（如 `kimi-k3.1-pro`、`moonshot/kimi-k2`）：
+/// 中转站转发的也是 Kimi 的接口（#3068）。
 fn request_model_is_kimi(body: &Value) -> bool {
     body.get("model")
         .and_then(Value::as_str)
         .is_some_and(|model| model.to_ascii_lowercase().contains("kimi"))
 }
 
-fn tidy_kimi_include(body: &mut Value) {
+/// 手工开关优先命中普通严格上游；Kimi 官方地址和带 kimi 的模型名继续自动命中。
+fn should_strip_responses_output_encrypted_content(
+    relay: &crate::settings::RelayProfile,
+    wire_api: UpstreamWireApi,
+    body: &Value,
+) -> bool {
+    wire_api == UpstreamWireApi::Responses
+        && (relay.strips_responses_output_encrypted_content()
+            || crate::relay_config::upstream_is_kimi_official_responses(relay)
+            || request_model_is_kimi(body))
+}
+
+/// 去掉 Responses 顶层 `include` 里的 Codex 私有 `output.encrypted_content`，
+/// 保留 `reasoning.encrypted_content` 及其他合法项；过滤后为空就整个去掉。
+fn strip_responses_output_encrypted_content(body: &mut Value) -> bool {
     let Some(object) = body.as_object_mut() else {
-        return;
+        return false;
     };
-    let kept = object
-        .get("include")
-        .and_then(Value::as_array)
-        .map(|include| {
-            include
-                .iter()
-                .filter(|entry| entry.as_str() != Some("output.encrypted_content"))
-                .cloned()
-                .collect::<Vec<_>>()
-        });
-    if let Some(kept) = kept {
-        if kept.is_empty() {
-            object.remove("include");
-        } else {
-            object.insert("include".to_string(), Value::Array(kept));
-        }
+    let Some(include) = object.get("include").and_then(Value::as_array) else {
+        return false;
+    };
+    let kept = include
+        .iter()
+        .filter(|entry| entry.as_str() != Some("output.encrypted_content"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if kept.len() == include.len() {
+        return false;
     }
+    if kept.is_empty() {
+        object.remove("include");
+    } else {
+        object.insert("include".to_string(), Value::Array(kept));
+    }
+    true
 }
 
 /// 只处理 Responses `input[].content[]` 与 `function_call_output.output[]`
@@ -7180,15 +7223,17 @@ async fn open_official_image_proxy_request(
     })
 }
 
+/// 模型请求等上游响应头的上限。非流式请求要整段生成完才回响应头，和压缩是同一种情况：
+/// 按探测类请求的 30 秒等，大上下文的非流式调用必然超时，客户端重试同一请求就一直 502（#3164）。
 fn response_header_timeout(is_stream: bool) -> Duration {
     if is_stream {
         stream_header_timeout()
     } else {
-        UPSTREAM_HEADER_TIMEOUT
+        UPSTREAM_SLOW_HEADER_TIMEOUT
     }
 }
 
-/// Responses 代理一次上游请求等响应头的上限：压缩请求、发给 Codex++ 网关的请求放宽到
+/// Responses 代理一次上游请求等响应头的上限：压缩请求、发给 Codex++ 本地服务的请求放宽到
 /// [`UPSTREAM_SLOW_HEADER_TIMEOUT`]，其余按是否流式。
 fn responses_request_header_timeout(
     is_stream: bool,
@@ -7569,10 +7614,9 @@ async fn upstream_request_parts(
     let mut body = match relay.protocol {
         _ if !request_conversion => request_json,
         RelayProtocol::Responses => request_json,
-        RelayProtocol::ChatCompletions => responses_to_chat_completions_with_options(
-            request_json,
-            relay.standard_openai_protocol,
-        )?,
+        RelayProtocol::ChatCompletions => {
+            responses_to_chat_completions_for_relay(request_json, relay)?
+        }
         // Responses → Chat → Anthropic：第一跳复用上面同一份实现，第二跳在桥接模块里。
         RelayProtocol::AnthropicMessages => {
             crate::anthropic_bridge::responses_to_anthropic_messages(
@@ -8283,6 +8327,20 @@ mod image_proxy_tests {
     }
 
     #[test]
+    fn non_stream_model_requests_wait_for_the_whole_generation() {
+        // 非流式请求整段生成完才回响应头，不能按探测类请求的 30 秒等（#3164）。
+        assert_eq!(
+            super::response_header_timeout(false),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            super::responses_request_header_timeout(false, false, false),
+            Duration::from_secs(600)
+        );
+        assert_eq!(super::upstream_header_timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
     fn local_protocol_proxy_detection_covers_common_loopback_forms() {
         for base_url in [
             "http://127.0.0.1:57321",
@@ -8966,11 +9024,10 @@ impl ChatSseState {
             "content": [{ "type": "output_text", "text": self.text.text, "annotations": [] }]
         });
         if message_phase_fill_enabled() {
-            item["phase"] = json!(if self.tools.is_empty() {
-                "final_answer"
-            } else {
-                "commentary"
-            });
+            item["phase"] = json!(filled_message_phase(
+                &self.text.text,
+                !self.tools.is_empty()
+            ));
         }
         self.output_items.push((output_index, item.clone()));
         self.text.done = true;
@@ -12781,10 +12838,28 @@ fn canonical_json_string(value: &Value) -> String {
     }
 }
 
-fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str, standard: bool) {
+fn apply_chat_reasoning_options(
+    result: &mut Value,
+    body: &Value,
+    model: &str,
+    standard: bool,
+    opencode_go_hy4_reasoning: bool,
+) {
     let Some(reasoning_enabled) = reasoning_requested(body) else {
         return;
     };
+    // OpenCode Go 的 HY4 上游只接受 none/high 两档。Codex 选中的任何非零 effort
+    // 都映射成 high，避免 medium 等档位被静默丢弃、表现为完全不思考。
+    if opencode_go_hy4_reasoning && crate::gateway::opencode::is_hy4_flash_model(model) {
+        if reasoning_enabled {
+            result["reasoning_effort"] = json!("high");
+        } else {
+            if let Some(object) = result.as_object_mut() {
+                object.remove("reasoning_effort");
+            }
+        }
+        return;
+    }
     let style = if standard {
         ChatReasoningStyle::Default
     } else {
@@ -13695,6 +13770,28 @@ mod kimi_include_tests {
     }
 
     #[test]
+    fn manual_switch_strips_non_kimi_responses_upstream() {
+        let relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            relay_mode: crate::settings::RelayMode::PureApi,
+            upstream_base_url: "https://strict.example/v1".to_string(),
+            strip_responses_output_encrypted_content: true,
+            ..Default::default()
+        };
+        let body = json!({ "model": "ep-cl-glm-flash" });
+        assert!(should_strip_responses_output_encrypted_content(
+            &relay,
+            UpstreamWireApi::Responses,
+            &body
+        ));
+        assert!(!should_strip_responses_output_encrypted_content(
+            &relay,
+            UpstreamWireApi::ChatCompletions,
+            &body
+        ));
+    }
+
+    #[test]
     fn include_drops_only_output_encrypted_content() {
         let mut body = json!({
             "model": "k3.1-pro",
@@ -13704,7 +13801,7 @@ mod kimi_include_tests {
                 "message.output_text.logprobs"
             ]
         });
-        tidy_kimi_include(&mut body);
+        assert!(strip_responses_output_encrypted_content(&mut body));
         assert_eq!(
             body["include"],
             json!([
@@ -13720,7 +13817,7 @@ mod kimi_include_tests {
             "include": ["output.encrypted_content"],
             "input": []
         });
-        tidy_kimi_include(&mut body);
+        assert!(strip_responses_output_encrypted_content(&mut body));
         assert!(body.get("include").is_none());
         // 其他字段不受影响。
         assert_eq!(body["input"], json!([]));
@@ -13729,7 +13826,7 @@ mod kimi_include_tests {
     #[test]
     fn include_without_private_entries_is_untouched() {
         let mut body = json!({"include": ["reasoning.encrypted_content"]});
-        tidy_kimi_include(&mut body);
+        assert!(!strip_responses_output_encrypted_content(&mut body));
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     }
 
@@ -13747,7 +13844,7 @@ mod kimi_include_tests {
         let mut body =
             json!({"include": ["reasoning.encrypted_content", "output.encrypted_content"]});
         if crate::relay_config::upstream_is_kimi_official_responses(&relay) {
-            tidy_kimi_include(&mut body);
+            strip_responses_output_encrypted_content(&mut body);
         }
         assert_eq!(
             body["include"],
@@ -14465,6 +14562,36 @@ fn is_client_tool_call_item_type(item_type: &str) -> bool {
     )
 }
 
+/// Codex 桌面端的独立界面指令（目前只有浏览器任务结束标记）。
+///
+/// 桌面端只在 `phase == "commentary"` 的助手消息里识别它，并且整条消息只能是这一条指令；
+/// 标成 `final_answer` 的话指令原文会当作最终回复显示在聊天里（issue #3244）。
+fn is_standalone_ui_directive(text: &str) -> bool {
+    let text = text.trim_end();
+    text.starts_with("::browser-complete{") && text.ends_with('}') && !text.contains('\n')
+}
+
+/// 给缺 `phase` 的助手消息选阶段：后面还有工具调用，或整条消息只是一条界面指令时是
+/// `commentary`，否则是本轮最终回答。
+fn filled_message_phase(text: &str, followed_by_tool_call: bool) -> &'static str {
+    if followed_by_tool_call || is_standalone_ui_directive(text) {
+        "commentary"
+    } else {
+        "final_answer"
+    }
+}
+
+/// Responses 消息项里的全部文字（各 `output_text` 段按顺序拼接）。
+fn response_message_item_text(item: &Value) -> String {
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect()
+}
+
 /// 缺 `phase` 的助手消息完成事件。
 fn is_phaseless_assistant_message_done(event_type: &str, data: &Value) -> bool {
     if event_type != "response.output_item.done" {
@@ -14505,12 +14632,13 @@ impl MessagePhaseFill {
                     self.release(Some("commentary"))
                 }
                 "response.completed" => {
-                    let phase = if self.saw_client_tool_call {
-                        "commentary"
-                    } else {
-                        "final_answer"
-                    };
-                    self.release(Some(phase))
+                    let text = self
+                        .pending
+                        .as_ref()
+                        .and_then(|(_, data)| data.get("item"))
+                        .map(response_message_item_text)
+                        .unwrap_or_default();
+                    self.release(Some(filled_message_phase(&text, self.saw_client_tool_call)))
                 }
                 // 失败/中断：不猜阶段，原样放行。
                 "response.failed" | "response.incomplete" | "error" => self.release(None),
@@ -15134,6 +15262,47 @@ mod responses_sse_transformer_tests {
             "消息必须先于 completed 写出: {text}"
         );
         assert!(t.finish().is_none());
+    }
+
+    #[test]
+    fn standalone_browser_complete_directive_becomes_commentary() {
+        // Codex 桌面端只在 commentary 消息里消费 `::browser-complete{…}`（issue #3244）。
+        let directive = sse(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "::browser-complete{title=\"Blocked GitHub banner upload\"}\n",
+                    "annotations": []
+                }]
+            }
+        }));
+        let completed = sse(json!({ "type": "response.completed", "response": {} }));
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
+        assert!(t.push_bytes(directive.as_bytes()).is_empty());
+        let out = t.push_bytes(completed.as_bytes());
+        assert_eq!(message_phases(&out), vec![Some("commentary".to_string())]);
+
+        assert_eq!(
+            filled_message_phase("::browser-complete{title=\"x\"}", false),
+            "commentary"
+        );
+        // 指令后面还有正文、或只是正文里提到它：仍是最终回答。
+        assert_eq!(
+            filled_message_phase("::browser-complete{title=\"x\"}\n已完成上传。", false),
+            "final_answer"
+        );
+        assert_eq!(
+            filled_message_phase("见 ::browser-complete{title=\"x\"}", false),
+            "final_answer"
+        );
+        assert_eq!(filled_message_phase("好的", false), "final_answer");
+        assert_eq!(filled_message_phase("好的", true), "commentary");
     }
 
     #[test]

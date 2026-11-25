@@ -4,14 +4,15 @@ import { test } from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 import { modelSlugFromRowName, suffixWindowString } from "./model-metadata.ts";
-import { independentProxyEnabled, setIndependentProxyConfigured, requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, pureApiImageGenerationEnabled, normalizeRelayModelRoutes } from "./model-routes.ts";
+import { independentProxyEnabled, setIndependentProxyConfigured, requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, stripResponsesOutputEncryptedContentEnabled, pureApiImageGenerationEnabled, normalizeRelayModelRoutes } from "./model-routes.ts";
 import { sessionProviderForProtocol } from "./relay-session.ts";
 import { aggregateMemberCandidates, isAggregateProfile, isOfficialLoginMemberProfile } from "./aggregate-members.ts";
 import { relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey } from "./provider-api-keys.ts";
 import { resolveProviderName, tomlSectionStringValue } from "./provider-name.ts";
 
 // 执行 App 中实际使用的配置 helper，避免把另一份实现复制进测试。
-const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8") + "\n" + readFileSync(new URL("./relay-profile-editing.ts", import.meta.url), "utf8");
+const source = ["./App.tsx", "./relay-profile-editing.ts"]
+  .map((file) => readFileSync(new URL(file, import.meta.url), "utf8")).join("\n");
 const app = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const names = new Set([
   "withGeneratedRelayFiles", "buildRelayConfigToml", "buildRelayAuthJson", "buildOfficialRelayAuthJson",
@@ -40,7 +41,7 @@ const context = vm.createContext({
   exports: {},
   PROTOCOL_PROXY_BASE_URL: "http://127.0.0.1:57321/v1",
   CHAT_UPSTREAM_BASE_URL_KEY: "codex_plus_chat_base_url",
-  requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, pureApiImageGenerationEnabled, independentProxyEnabled, normalizeRelayModelRoutes, sessionProviderForProtocol, modelSlugFromRowName, suffixWindowString,
+  requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, stripResponsesOutputEncryptedContentEnabled, pureApiImageGenerationEnabled, independentProxyEnabled, normalizeRelayModelRoutes, sessionProviderForProtocol, modelSlugFromRowName, suffixWindowString,
   aggregateMemberCandidates, isAggregateProfile, isOfficialLoginMemberProfile,
   relayProfileWithUpdatedApiKey, resolveProviderName, tomlSectionStringValue,
 });

@@ -1037,6 +1037,26 @@ fn take_sse_block(buffer: &mut String) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn responses_to_anthropic_request_usage_preserves_cache_presence() {
+        for (details, known) in [
+            (json!({}), false),
+            (json!({"input_tokens_details": {"cached_tokens": 0}}), true),
+        ] {
+            let mut converter = ResponsesSseToAnthropicSse::new("test-model", 0);
+            let mut usage = json!({"input_tokens": 100, "output_tokens": 20});
+            usage
+                .as_object_mut()
+                .unwrap()
+                .extend(details.as_object().unwrap().clone());
+            converter.finish_message(&json!({"usage":usage}), &mut String::new());
+            let usage = converter.usage().unwrap();
+            assert_eq!((usage.input_tokens, usage.output_tokens), (100, 20));
+            assert_eq!(usage.cached_tokens, 0);
+            assert_eq!(usage.cached_tokens_known, Some(known));
+        }
+    }
+
     fn sse(events: &[Value]) -> String {
         events
             .iter()

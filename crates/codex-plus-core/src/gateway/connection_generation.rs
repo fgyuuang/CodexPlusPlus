@@ -25,7 +25,8 @@ pub fn publish(home: &Path) -> anyhow::Result<String> {
         .read(true)
         .write(true)
         .open(home.join(format!("{FILE_NAME}.lock")))?;
-    lock.lock_exclusive().context("获取网关连接代际写锁失败")?;
+    lock.lock_exclusive()
+        .context("获取本地服务连接代际写锁失败")?;
     let generation = uuid::Uuid::new_v4().to_string();
     // Windows 上刚写完的临时文件可能被杀毒/索引短暂占用，替换会拿到 ERROR_ACCESS_DENIED；
     // 代次本身是可重试的（只换一个 uuid），这里做几次短退避重试，避免让连接代次发布失败。

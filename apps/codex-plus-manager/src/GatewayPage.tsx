@@ -1,15 +1,17 @@
-/** 本地网关：让 Claude Code、Grok 经 Codex++ 使用统一的供应商池，支持多 Key 轮换与模型组。 */
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+/** 本地网关：让 Claude Code、Grok 经 Codex++ 使用统一的共享供应商，支持多 Key 轮换与模型组。 */
+import { memo, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
-import { AlertTriangle, Asterisk, Check, ChevronDown, ChevronRight, ChevronUp, Copy, Plus, RefreshCw, Search, Shuffle, Waypoints, X } from "lucide-react";
+import { AlertTriangle, Asterisk, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, ListChecks, Plus, RefreshCw, Search, Shuffle, Waypoints, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
 import {
   glanceAgents,
-  agentName,
+  appendGroupMembers,
+  batchMemberRows,
+  type BatchMemberRow,
   formatElapsed,
   groupModeDescription,
   groupModeLabel,
@@ -17,72 +19,58 @@ import {
   groupStickyDescription,
   groupStickyLabel,
   isPattern,
-  memberLabel,
   parseWeight,
   dispatchStatus,
-  modelDispatch,
   modelDisplay,
   patternMatches,
   prettyModelName,
   speedOf,
   type GatewayGroupEntry,
   type GatewayPayload,
-  type GatewayResult,
+  type GatewayPoolEntry,
   type GroupMember,
+  type MemberStatus,
+  type ModelView,
   type GroupMode,
   type GroupSticky,
-  agentPoolProviders,
   maskAccountName,
-  type DispatchRow,
-  type MemberStatus,
   memberTarget,
   type AutoGroupEntry,
   type GatewayPortInfo,
   MAX_GATEWAY_PORT,
   MIN_GATEWAY_PORT,
   parseGatewayPort,
+  shortProviderName,
 } from "./gateway-model";
 import { AgentsView, Floating, ModelList, type CodexRunControls } from "./GatewayAgents";
 import { AppSelect } from "./AppSelect";
 import { ProvidersView } from "./GatewayProviders";
-import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
-import { Avatar, MemberStatusLabel, QuotaBadge, SectionLabel, Switch, makeRun, type Notify, type Run } from "./gateway-ui";
-import { shortProviderName } from "./GatewayModelMatrix";
+import { Avatar, GatewayLoadError, MemberStatusLabel, QuotaBadge, SectionLabel, Switch, makeRun, moveOptionFocus, type Notify, type Run } from "./gateway-ui";
 import { TopbarActions } from "./TopbarActions";
-import { GatewayNavContext } from "./gateway-store";
-import { useEscapeLayer } from "./use-escape-layer";
-import { gatewayGeneration, publishGatewayPayload, subscribeGatewayPayload } from "./gateway-store";
-import { visibleAgents } from "./agent-focus-model";
-import { useAgentFocus } from "./agent-focus-store";
+import { GatewayNavContext, publishGatewayPayload, refreshGateway, useGatewayState, useGatewayViewState } from "./gateway-store";
+import { useModalShell } from "./use-modal-shell";
 import "./GatewayPage.css";
-import { CxBadge, CxCard, CxRow, CxSection } from "./cx-layout";
+import { CxBadge, CxCard, CxLoading, CxRow, CxSection } from "./cx-layout";
 import { Menu, MenuItem } from "./ManagementPages";
-import { AgentGlyph } from "./HubOverview";
+import { AgentGlyph } from "./hub-shared";
 import { RecentRouteFeed } from "./RoutingObservatory";
 
-type Tab = "agents" | "sessions" | "providers" | "routing" | "usage" | "gateway";
+type Tab = "agents" | "providers" | "routing" | "usage" | "gateway";
 export type GatewayTab = Tab;
-
-const memo: { payload: GatewayPayload | null; tab: Tab } = { payload: null, tab: "agents" };
 
 /** 组编辑器的模型选择不排除任何供应商；模块级常量，避免每次渲染都换新数组让列表重算。 */
 const NO_EXCLUDE: string[] = [];
 
-/** 路由页刷新供应商状态的间隔。 */
+/** 路由、供应商页刷新供应商状态的间隔。 */
 const LIVE_REFRESH_MS = 2500;
+/** 其它页签的刷新间隔（和侧栏一样，不额外加读取）。 */
+const IDLE_REFRESH_MS = 10_000;
 
-function hasPayload(result: GatewayResult): result is GatewayResult & GatewayPayload {
-  return Boolean(result.gateway && Array.isArray(result.pool));
-}
-
-/**
- * 传入 `tab` 时由外层侧栏决定当前页签（不再显示页内标签条），页内跳转通过 `onTabChange` 交还外层；
- * 不传时保持原来的自管页签。
- */
+/** 当前页签由外层侧栏决定（每个页签是一条路由），页内跳转通过 `onTabChange` 交还外层。 */
 export function GatewayPage({
   notify,
-  tab: controlledTab,
+  tab,
   onTabChange,
   extraSettings,
   onOpenCodexProviderSettings,
@@ -90,166 +78,81 @@ export function GatewayPage({
   codexRun,
 }: {
   notify: Notify;
-  tab?: Tab;
-  onTabChange?: (tab: Tab) => void;
+  tab: Tab;
+  onTabChange: (tab: Tab) => void;
   /** 「网关设置」末尾附加的内容：主窗口传进来的新旧共用本地服务设置。 */
   extraSettings?: ReactNode;
-  onOpenCodexProviderSettings?: () => void;
+  onOpenCodexProviderSettings?: (addDirectProvider?: boolean) => void;
   /** 管理仍被供应商池引用的本地账号库，不混入 Codex 连接页。 */
   onOpenLocalOfficialAccounts?: () => void;
   /** Codex 行的启动 / 停止：主窗口传进来才显示，不传就只留模型选择与接入开关。 */
   codexRun?: CodexRunControls;
 }) {
-  const [payload, setPayload] = useState<GatewayPayload | null>(memo.payload);
-  const [busy, setBusy] = useState<string | null>(memo.payload ? null : "load");
-  const [ownTab, setTabState] = useState<Tab>(memo.tab);
-  const tab = controlledTab ?? ownTab;
-  const setTab = (next: Tab) => {
-    if (controlledTab) {
-      onTabChange?.(next);
-      return;
-    }
-    memo.tab = next;
-    setTabState(next);
-  };
+  // 数据来自共享存储（整个窗口一个轮询）：订阅额度在后台预取，供应商、路由页要及时收到首次查询和授权后的结果，
+  // 所以这两页要的间隔短；其它页签跟侧栏一样。别处改了网关数据（如模型下拉里收藏）也会同步过来。
+  const { payload, error } = useGatewayState(tab === "routing" || tab === "providers" ? LIVE_REFRESH_MS : IDLE_REFRESH_MS);
+  // 切换页签时已有数据，不锁按钮：只有命令执行时才占 busy。
+  const [busy, setBusy] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const accept = (result: GatewayResult) => {
-    if (hasPayload(result)) {
-      memo.payload = result;
-      setPayload(result);
-      // 侧栏状态卡、总览共用的数据也立刻更新，不等它们下次轮询。
-      publishGatewayPayload(result);
-    }
-  };
+  // 命令的结果当作保存推给所有在用的组件（侧栏状态卡、总览），不等下次轮询。
+  const run: Run = makeRun(setBusy, publishGatewayPayload, notify);
 
-  const run: Run = makeRun(setBusy, accept, notify);
-  // 别处改了网关数据（如模型下拉里收藏）也同步过来，不然这里还拿着旧数据，下次保存会把新改的盖掉。
-  useEffect(
-    () =>
-      subscribeGatewayPayload((next) => {
-        memo.payload = next;
-        setPayload(next);
-      }),
-    [],
-  );
-
-  const refresh = async (silent = true) => {
-    setBusy("load");
+  const refresh = async () => {
+    setRefreshing(true);
     try {
-      const result = await invoke<GatewayResult>("load_gateway");
-      accept(result);
+      const result = await refreshGateway();
       if (result.status !== "ok") await notify(t("读取失败"), result.message, "failed");
-      else if (!silent) await notify(t("已刷新"), result.message, "ok");
+      else await notify(t("已刷新"), result.message, "ok");
     } catch (error) {
       await notify(t("调用失败"), String(error), "failed");
     } finally {
-      setBusy(null);
+      setRefreshing(false);
     }
   };
 
+  // 窗口回到前台时静默读一次：别的工具可能趁这时改了 Agent 的配置（被接管提示要跟上）。和轮询共用同一个请求。
   useEffect(() => {
-    void refresh();
-    // 只在进入本页时读一次，之后由本页操作维护。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // 窗口回到前台时静默读一次：别的工具可能趁这时改了 Agent 的配置（被接管提示要跟上）。
-  useEffect(() => {
-    let cancelled = false;
-    const onFocus = () => {
-      const started = gatewayGeneration();
-      void invoke<GatewayResult>("load_gateway")
-        .then((result) => {
-          // 读的过程中保存过：这份是旧的，不用。
-          if (!cancelled && started === gatewayGeneration()) accept(result);
-        })
-        .catch(() => undefined);
-    };
+    const onFocus = () => void refreshGateway().catch(() => undefined);
     window.addEventListener("focus", onFocus);
-    return () => {
-      cancelled = true;
-      window.removeEventListener("focus", onFocus);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => window.removeEventListener("focus", onFocus);
   }, []);
 
-  // 订阅额度在后台预取；供应商页也要及时收到首次查询和授权后的结果。
-  useEffect(() => {
-    if (tab !== "routing" && tab !== "providers") return;
-    let cancelled = false;
-    const timer = window.setInterval(() => {
-      const started = gatewayGeneration();
-      void invoke<GatewayResult>("load_gateway")
-        .then((result) => {
-          if (!cancelled && started === gatewayGeneration()) accept(result);
-        })
-        .catch(() => undefined);
-    }, LIVE_REFRESH_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab]);
-
-  // 与侧栏同序：供应商 → Agent → 路由。
-  const tabs: Array<{ id: Tab; label: string }> = [
-    { id: "providers", label: t("供应商") },
-    { id: "agents", label: t("智能体") },
-    { id: "routing", label: t("路由") },
-    { id: "sessions", label: t("会话") },
-    { id: "usage", label: t("用量") },
-    { id: "gateway", label: t("网关") },
-  ];
+  // 一份数据都还没读到就失败了：各页签显示原因和重试，不再一直「正在读取…」（用量页签读自己的数据，不受影响）。
+  const loadFailed = !payload && error !== null && tab !== "usage";
 
   // 模型下拉里「我的组」旁的「管理」→ 路由页。
-  const nav = { openModelGroups: () => setTab("routing") };
+  const nav = { openModelGroups: () => onTabChange("routing") };
 
   const refreshButton = (
-    <button aria-label={t("刷新")} className="gw-icon-button" disabled={busy !== null} onClick={() => void refresh(false)} title={t("刷新")} type="button">
-      <RefreshCw className={`h-4 w-4 ${busy === "load" ? "animate-spin" : ""}`} />
+    <button aria-label={t("刷新")} className="gw-icon-button" disabled={busy !== null || refreshing} onClick={() => void refresh()} title={t("刷新")} type="button">
+      <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
     </button>
   );
 
   return (
     <div className="mg-page gateway-page">
-      {/* 页面标题由外层框架显示，这里只放分段标签和刷新。 */}
-      {controlledTab ? (
-        // 由外层侧栏控制时不显示页内工具条，刷新按钮放进外壳顶栏。
-        // 用量页签有自己的刷新（读用量和余额），这里的只刷新网关状态，放在一起会让人以为刷新了用量。
-        <TopbarActions>
+      <TopbarActions>
           {tab === "providers" && onOpenLocalOfficialAccounts
             && payload?.pool.some((entry) => entry.source?.startsWith("official-account:")) ? (
             <button className="gw-text-button" onClick={onOpenLocalOfficialAccounts} type="button">{t("本地官方账号库")}</button>
           ) : null}
           {tab === "usage" ? null : refreshButton}
-        </TopbarActions>
-      ) : (
-        <div className="gw-toolbar">
-          <nav aria-label={t("本地网关")} className="gw-tabs" role="tablist">
-            {tabs.map((item) => (
-              <button aria-selected={tab === item.id} data-active={tab === item.id} key={item.id} onClick={() => setTab(item.id)} role="tab" type="button">
-                {item.label}
-              </button>
-            ))}
-          </nav>
-          {refreshButton}
-        </div>
-      )}
+      </TopbarActions>
       <GatewayNavContext.Provider value={nav}>
       <div className="mg-content gw-content">
         {payload && !payload.helperRunning && payload.agents.some((agent) => agent.enabled) ? (
           <p className="gw-alert" role="alert">
             <AlertTriangle className="h-4 w-4" />
-            <span>{t("本地网关当前没有运行，走网关的 Agent 会连不上。请重新保存一次绑定或重启 Codex++。")}</span>
+            <span>{t("Codex++ 本地服务当前没有运行，走本地服务的 Agent 会连不上。请重新保存一次绑定或重启 Codex++。")}</span>
           </p>
         ) : null}
-        {tab === "agents" ? <AgentsView busy={busy} codexRun={codexRun} notify={notify} onManage={() => setTab("providers")} onOpenCodexProviderSettings={onOpenCodexProviderSettings} payload={payload} run={run} /> : null}
-        {tab === "sessions" ? <SessionsView notify={notify} /> : null}
-        {tab === "providers" ? <ProvidersView busy={busy} notify={notify} payload={payload} run={run} /> : null}
-        {tab === "routing" ? <RoutingView busy={busy} payload={payload} run={run} /> : null}
+        {loadFailed && error ? <GatewayLoadError error={error} /> : null}
+        {tab === "agents" && !loadFailed ? <AgentsView busy={busy} codexRun={codexRun} notify={notify} onManage={() => onTabChange("providers")} onOpenCodexProviderSettings={onOpenCodexProviderSettings} payload={payload} run={run} /> : null}
+        {tab === "providers" && !loadFailed ? <ProvidersView busy={busy} notify={notify} payload={payload} run={run} /> : null}
+        {tab === "routing" && !loadFailed ? <RoutingView busy={busy} payload={payload} run={run} /> : null}
         {tab === "usage" ? <UsageView busy={busy} notify={notify} payload={payload} run={run} /> : null}
-        {tab === "gateway" ? <GatewayView busy={busy} notify={notify} payload={payload} run={run} /> : null}
+        {tab === "gateway" && !loadFailed ? <GatewayView busy={busy} notify={notify} payload={payload} run={run} /> : null}
         {tab === "gateway" && extraSettings ? extraSettings : null}
       </div>
       </GatewayNavContext.Provider>
@@ -279,7 +182,8 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
 
 function RoutingSettings({ payload, busy, run }: { payload: GatewayPayload | null; busy: string | null; run: Run }) {
   const [editing, setEditing] = useState<GatewayGroupEntry | "new" | null>(null);
-  const [query, setQuery] = useState("");
+  // 搜索词和自动组的展开状态在切换页签后保留。
+  const [query, setQuery] = useGatewayViewState("routing.query", "");
   const autoOn = payload?.gateway.autoModels !== false;
   const needle = query.trim().toLowerCase();
   const hit = (group: GatewayGroupEntry) =>
@@ -287,8 +191,21 @@ function RoutingSettings({ payload, busy, run }: { payload: GatewayPayload | nul
   const mine = (payload?.groups ?? []).filter(hit);
   const autos = (payload?.autoGroups ?? []).filter(hit);
   // 自动组默认折叠（多家都有的模型一多就是一长串）；自己还没建组、或正在搜索时直接展开。
-  const [autosOpen, setAutosOpen] = useState<boolean | null>(null);
+  const [autosOpen, setAutosOpen] = useGatewayViewState<boolean | null>("routing.autosOpen", null);
   const autosShown = autosOpen ?? ((payload?.groups ?? []).length === 0 || Boolean(needle));
+  // 「某 Agent 刚用过」过一阵要消失：数据没变时每分钟也重算一次成员状态。
+  const [minute, setMinute] = useState(() => Math.floor(Date.now() / 60_000));
+  useEffect(() => {
+    const timer = window.setInterval(() => setMinute(Math.floor(Date.now() / 60_000)), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  // 成员的供应商、显示名、状态、耗时每份数据只算一次（打字搜索、展开折叠不重算），卡片按它判断要不要重渲染。
+  const views = useMemo(
+    () => memberViews(payload, [...(payload?.groups ?? []), ...(payload?.autoGroups ?? [])]),
+    // minute 只用来触发重算。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [payload, minute],
+  );
 
   const saveMine = (group: GatewayGroupEntry, patch: Partial<GatewayGroupEntry>) => {
     const next = { ...group, ...patch };
@@ -316,7 +233,7 @@ function RoutingSettings({ payload, busy, run }: { payload: GatewayPayload | nul
           <Search aria-hidden="true" />
           <input aria-label={t("搜索组或模型")} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索组或模型")} value={query} />
         </label>
-        <div className="gw-models-auto" title={t("多家都有的模型自动成一个组：Agent 选不带供应商的模型名时走它。关掉后只列出你建的组，不带供应商的模型名按供应商池的顺序依次尝试。")}>
+        <div className="gw-models-auto" title={t("多家都有的模型自动成一个组：Agent 选不带供应商的模型名时走它。关掉后只列出你建的组，不带供应商的模型名按共享供应商的顺序依次尝试。")}>
           <span>{t("自动建组")}</span>
           <Switch
             disabled={busy !== null || !payload}
@@ -331,7 +248,7 @@ function RoutingSettings({ payload, busy, run }: { payload: GatewayPayload | nul
         </button>
       </div>
 
-      {!payload ? <div className="gw-card gw-empty">{t("正在读取…")}</div> : null}
+      {!payload ? <CxCard><CxLoading /></CxCard> : null}
 
       {payload ? (
         <SectionLabel>
@@ -353,7 +270,7 @@ function RoutingSettings({ payload, busy, run }: { payload: GatewayPayload | nul
           onDelete={() => void remove(group)}
           onEdit={() => setEditing(group)}
           onToggleEnabled={() => void run(`group:${group.id}`, "set_gateway_group_enabled", { id: group.id, enabled: Boolean(group.disabled) }, t("保存组"), true)}
-          payload={payload}
+          views={views}
         />
       ))}
 
@@ -370,7 +287,7 @@ function RoutingSettings({ payload, busy, run }: { payload: GatewayPayload | nul
       {payload && !autoOn ? (
         <div className="gw-card gw-empty">
           <strong>{t("自动建组已关闭")}</strong>
-          <span>{t("打开后，多家都有的模型会自动成一个组；不带供应商的模型名现在按供应商池的顺序依次尝试。")}</span>
+          <span>{t("打开后，多家都有的模型会自动成一个组；不带供应商的模型名现在按共享供应商的顺序依次尝试。")}</span>
         </div>
       ) : null}
       {payload && autoOn && autos.length === 0 ? (
@@ -389,7 +306,7 @@ function RoutingSettings({ payload, busy, run }: { payload: GatewayPayload | nul
             onChange={(patch) => saveAuto(group, patch)}
             onToggleEnabled={() => void run(`auto:${group.id}`, "set_gateway_auto_group_enabled", { model: group.name, enabled: group.hidden }, t("保存自动组"), true)}
             onReset={group.customized ? () => void run(`auto:${group.id}`, "save_gateway_auto_group", { model: group.name, settings: {} }, t("恢复默认"), true) : undefined}
-            payload={payload}
+            views={views}
           />
         ))
         : null}
@@ -413,20 +330,52 @@ function RoutingSettings({ payload, busy, run }: { payload: GatewayPayload | nul
   );
 }
 
-/** 一张组卡片：标题（名字、Agent 里怎么选它）、路由方式、会话固定、成员列表（状态、额度、耗时）、隐藏成员。 */
-function GroupCard({
-  group,
-  payload,
-  busy,
-  auto = false,
-  onChange,
-  onEdit,
-  onDelete,
-  onToggleEnabled,
-  onReset,
-}: {
+/** 组成员（和图像输入模型）在路由页上要显示的东西；`key` 是它们的指纹，卡片据此判断有没有变。 */
+type MemberView = {
+  target: { entry: GatewayPoolEntry; model: string } | null;
+  view: ModelView;
+  status: MemberStatus | null;
+  speed: number | null;
+  key: string;
+};
+
+/** 一次算好所有组用到的模型：每个成员只扫一遍共享供应商、健康和活动数据。 */
+function memberViews(payload: GatewayPayload | null, groups: GatewayGroupEntry[]): Map<string, MemberView> {
+  const views = new Map<string, MemberView>();
+  const add = (model: string) => {
+    if (!model || views.has(model)) return;
+    const target = memberTarget(payload, model);
+    const view = modelDisplay(payload, model);
+    const status = target ? dispatchStatus(payload, target.entry.id, target.model) : null;
+    const speed = target ? speedOf(payload, target.entry.id, target.model) : null;
+    const key = JSON.stringify([target ? [target.entry.id, target.entry.name, target.entry.baseUrl, target.entry.quota ?? null, target.model] : null, view, status, speed]);
+    views.set(model, { target, view, status, speed, key });
+  };
+  for (const group of groups) {
+    for (const member of group.members) add(member.model);
+    add(group.imageInputModel ?? "");
+  }
+  return views;
+}
+
+const EMPTY_VIEW: ModelView = { title: "", sub: "", group: false };
+
+function viewOf(views: Map<string, MemberView>, model: string): MemberView {
+  return views.get(model) ?? { target: null, view: { ...EMPTY_VIEW, title: model }, status: null, speed: null, key: "" };
+}
+
+/** 卡片只在组本身、它用到的成员状态或 busy 变了时重渲染（回调每次都是新的，但只依赖组和 run，不比较）。 */
+function sameGroupCard(previous: GroupCardProps, next: GroupCardProps): boolean {
+  if (previous.busy !== next.busy || previous.auto !== next.auto || Boolean(previous.onReset) !== Boolean(next.onReset)) return false;
+  if (previous.group !== next.group && JSON.stringify(previous.group) !== JSON.stringify(next.group)) return false;
+  if (previous.views === next.views) return true;
+  const models = [...next.group.members.map((member) => member.model), next.group.imageInputModel ?? ""];
+  return models.every((model) => previous.views.get(model)?.key === next.views.get(model)?.key);
+}
+
+type GroupCardProps = {
   group: GatewayGroupEntry;
-  payload: GatewayPayload | null;
+  views: Map<string, MemberView>;
   busy: string | null;
   auto?: boolean;
   onChange: (patch: Partial<GatewayGroupEntry>) => void;
@@ -434,7 +383,20 @@ function GroupCard({
   onDelete?: () => void;
   onToggleEnabled: () => void;
   onReset?: () => void;
-}) {
+};
+
+/** 一张组卡片：标题（名字、Agent 里怎么选它）、路由方式、会话固定、成员列表（状态、额度、耗时）、隐藏成员。 */
+const GroupCard = memo(function GroupCard({
+  group,
+  views,
+  busy,
+  auto = false,
+  onChange,
+  onEdit,
+  onDelete,
+  onToggleEnabled,
+  onReset,
+}: GroupCardProps) {
   const manual = group.mode === "manual";
   const picked = manual ? (group.members.find((member) => member.model.toLowerCase() === (group.pick ?? "").toLowerCase()) ?? group.members[0])?.model : "";
   const disabled = busy !== null;
@@ -447,7 +409,7 @@ function GroupCard({
           <code className="gw-chip" title={auto ? t("Agent 里选这个名字就走这个组") : t("模型组")}>{auto ? group.name : `${GROUP_MODEL_PREFIX}${group.name}`}</code>
           {auto ? <span className="gw-pill gw-pill-outline">{t("自动")}</span> : null}
           {!auto && group.imageInputModel ? (
-            <span className="gw-pill gw-pill-outline" title={tf("请求里带图片时改发给 {0}", [modelDisplay(payload, group.imageInputModel).title])}>{t("图像输入")}</span>
+            <span className="gw-pill gw-pill-outline" title={tf("请求里带图片时改发给 {0}", [viewOf(views, group.imageInputModel).view.title])}>{t("图像输入")}</span>
           ) : null}
         </div>
         <div className="gw-route-group-controls">
@@ -492,15 +454,15 @@ function GroupCard({
             member={member}
             mode={group.mode}
             onPick={() => onChange({ pick: member.model })}
-            payload={payload}
             picked={picked === member.model}
+            view={viewOf(views, member.model)}
           />
         ))}
         {group.members.length === 0 ? <li className="gw-route-member-empty">{t("没有成员")}</li> : null}
       </ol>
     </section>
   );
-}
+}, sameGroupCard);
 
 /** 组里的一个成员：先后 / 手动选中、供应商与模型、状态、额度、平均耗时。 */
 function RouteMember({
@@ -509,7 +471,7 @@ function RouteMember({
   mode,
   manual,
   picked,
-  payload,
+  view: { target, view, status, speed },
   disabled,
   onPick,
 }: {
@@ -518,14 +480,10 @@ function RouteMember({
   mode: GroupMode;
   manual: boolean;
   picked: boolean;
-  payload: GatewayPayload | null;
+  view: MemberView;
   disabled: boolean;
   onPick: () => void;
 }) {
-  const target = memberTarget(payload, member.model);
-  const view = modelDisplay(payload, member.model);
-  const status = target ? dispatchStatus(payload, target.entry.id, target.model) : null;
-  const speed = target ? speedOf(payload, target.entry.id, target.model) : null;
   const quota = target?.entry.quota ?? null;
   const body = (
     <>
@@ -570,8 +528,142 @@ function imageInputOptions(payload: GatewayPayload | null, members: GroupMember[
     ...listed.map((member) => option(member.model, t("组内成员"))),
   ];
   if (current && !listed.some((member) => member.model === current)) options.push(option(current, t("不在组里")));
-  options.push({ value: IMAGE_INPUT_PICK, label: t("选择其他模型…"), hint: t("从供应商池里选一个收图的模型") });
+  options.push({ value: IMAGE_INPUT_PICK, label: t("选择其他模型…"), hint: t("从共享供应商里选一个收图的模型") });
   return options;
+}
+
+/**
+ * 「按模型批量添加」浮层（#2823）：先选模型，再勾选提供它的供应商，一次加进组里。
+ * 加完回到模型列表接着选下一个模型，浮层不关；已经在组里的那几家不能重复勾选。
+ */
+function BatchMemberPicker({ payload, members, onAdd }: { payload: GatewayPayload | null; members: GroupMember[]; onAdd: (models: string[]) => void }) {
+  const [query, setQuery] = useState("");
+  const [model, setModel] = useState<string | null>(null);
+  const [picked, setPicked] = useState<Set<string>>(() => new Set());
+  const rows = useMemo(() => batchMemberRows(payload, members), [payload, members]);
+  const listRef = useRef<HTMLDivElement>(null);
+  const current = model === null ? null : rows.find((row) => row.model === model) ?? null;
+
+  if (current) {
+    const open = current.candidates.filter((candidate) => !candidate.added);
+    const chosen = open.filter((candidate) => picked.has(candidate.providerId));
+    const allPicked = open.length > 0 && chosen.length === open.length;
+    return (
+      <div className="gw-mp gw-batch">
+        <div className="gw-mp-top">
+          <div className="gw-batch-head">
+            <button aria-label={t("返回")} className="gw-icon-button" onClick={() => setModel(null)} type="button"><ChevronLeft className="h-4 w-4" /></button>
+            <span className="gw-mp-text">
+              <strong>{prettyModelName(current.model)}</strong>
+              <small>{current.model}</small>
+            </span>
+            <button
+              className="gw-text-button"
+              disabled={!open.length}
+              onClick={() => setPicked(allPicked ? new Set() : new Set(open.map((candidate) => candidate.providerId)))}
+              type="button"
+            >
+              {allPicked ? t("全不选") : t("全选")}
+            </button>
+          </div>
+        </div>
+        <div className="gw-mp-list">
+          {current.candidates.map((candidate) => (
+            <label className="gw-select-item" data-added={candidate.added} key={candidate.providerId}>
+              <input
+                checked={candidate.added || picked.has(candidate.providerId)}
+                disabled={candidate.added}
+                onChange={() => setPicked((previous) => {
+                  const next = new Set(previous);
+                  if (!next.delete(candidate.providerId)) next.add(candidate.providerId);
+                  return next;
+                })}
+                type="checkbox"
+              />
+              <Avatar baseUrl={candidate.baseUrl} name={candidate.name} size="sm" />
+              <span>{candidate.name}</span>
+              {candidate.added ? <em>{t("已在组里")}</em> : null}
+            </label>
+          ))}
+        </div>
+        <div className="gw-mp-foot gw-batch-foot">
+          <small className="gw-muted">{tf("已选 {0} / {1} 家", [chosen.length, open.length])}</small>
+          <Button
+            disabled={!chosen.length}
+            onClick={() => {
+              onAdd(chosen.map((candidate) => candidate.member));
+              setModel(null);
+            }}
+            size="sm"
+            type="button"
+          >
+            {tf("添加 {0} 个", [chosen.length])}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  const needle = query.trim().toLowerCase();
+  const visible = needle
+    ? rows.filter((row) => row.model.toLowerCase().includes(needle) || row.candidates.some((candidate) => candidate.name.toLowerCase().includes(needle)))
+    : rows;
+  const pick = (row: BatchMemberRow) => {
+    setModel(row.model);
+    setPicked(new Set(row.candidates.filter((candidate) => !candidate.added).map((candidate) => candidate.providerId)));
+  };
+  return (
+    <div className="gw-mp gw-batch">
+      <div className="gw-mp-top">
+        <label className="gw-mp-search">
+          <Search className="h-4 w-4" />
+          <input
+            autoFocus
+            onChange={(event) => setQuery(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              // ↓ 从搜索框进到列表的第一个模型。
+              if (event.key === "ArrowDown" && listRef.current && moveOptionFocus(listRef.current, "Home")) event.preventDefault();
+            }}
+            placeholder={t("筛选模型或供应商…")}
+            value={query}
+          />
+          <em>{tf("{0} 个", [visible.length])}</em>
+        </label>
+      </div>
+      <div
+        aria-label={t("按模型批量添加")}
+        className="gw-mp-list"
+        onKeyDown={(event) => { if (moveOptionFocus(event.currentTarget, event.key)) event.preventDefault(); }}
+        ref={listRef}
+        role="listbox"
+      >
+        {visible.length === 0 ? (
+          <div className="gw-empty">{rows.length ? t("没有匹配的模型") : t("共享供应商是空的，先在「共享供应商」里添加供应商。")}</div>
+        ) : null}
+        {visible.map((row) => {
+          const added = row.candidates.filter((candidate) => candidate.added).length;
+          return (
+            <div
+              className="gw-mp-item"
+              key={row.model}
+              onClick={() => pick(row)}
+              onKeyDown={(event) => { if (event.key === "Enter") pick(row); }}
+              role="option"
+              aria-selected={false}
+              tabIndex={0}
+            >
+              <span className="gw-mp-text">
+                <strong title={row.model}>{prettyModelName(row.model)}</strong>
+                <small>{row.candidates.map((candidate) => candidate.name).join(" · ")}</small>
+              </span>
+              <em className="gw-batch-count">{added ? tf("已加 {0} / {1} 家", [added, row.candidates.length]) : tf("{0} 家", [row.candidates.length])}</em>
+              <ChevronRight className="gw-picker-glyph h-4 w-4" />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 /** 新建 / 编辑模型组：名称、模式、成员（池里的模型或别的组）、图像输入。 */
@@ -595,12 +687,17 @@ function GroupEditor({
   const [members, setMembers] = useState<GroupMember[]>(group?.members.map((member) => ({ ...member })) ?? []);
   const [picking, setPicking] = useState(false);
   const addRef = useRef<HTMLButtonElement>(null);
+  const [batching, setBatching] = useState(false);
+  const batchRef = useRef<HTMLButtonElement>(null);
   // 图像输入（#3150）：空串跟随默认；可以选成员，也可以从池里另选一个收图的模型。
   const [imageInputModel, setImageInputModel] = useState(group?.imageInputModel ?? "");
   const [pickingImage, setPickingImage] = useState(false);
   const imageRef = useRef<HTMLDivElement>(null);
-  // Esc 栈：「添加成员」浮层、模式下拉开着时 Esc 先关它们。
-  useEscapeLayer(true, onCancel);
+  // 改过就算未保存：Esc、点遮罩、关闭、取消都先确认再丢弃。「添加成员」浮层、模式下拉开着时 Esc 先关它们（Esc 栈）。
+  const [initial] = useState(() => JSON.stringify([group?.name ?? "", group?.mode ?? "inOrder", group?.sticky ?? "cache", group?.members ?? [], group?.imageInputModel ?? ""]));
+  const dirty = pattern.trim() !== "" || JSON.stringify([name, mode, sticky, members, imageInputModel]) !== initial;
+  const titleId = useId();
+  const { requestClose, backdropProps, dialogProps } = useModalShell<HTMLFormElement>({ onClose: onCancel, dirty, labelledBy: titleId });
   // 权重输入框正在编辑的原始文字（允许暂时为空），失焦时再规范成 ≥ 1 的整数。
   const [weightText, setWeightText] = useState<Record<number, string>>({});
   const move = (index: number, delta: number) => {
@@ -633,8 +730,9 @@ function GroupEditor({
       ? t("额度 / 速度相同时按列表顺序")
       : t("答不了时按列表顺序换下一个");
   return createPortal(
-    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
+    <div className="gw-modal-backdrop gw-portal" {...backdropProps}>
       <form
+        {...dialogProps}
         className="gw-modal gw-group-modal"
         onSubmit={(event) => {
           event.preventDefault();
@@ -643,13 +741,13 @@ function GroupEditor({
       >
         <header>
           <span className="gw-avatar gw-avatar-plus"><Waypoints className="h-4 w-4" /></span>
-          <strong>{group ? tf("编辑 {0}", [group.name]) : t("新建模型组")}</strong>
-          <button aria-label={t("关闭")} className="gw-icon-button" onClick={onCancel} type="button"><X className="h-4 w-4" /></button>
+          <strong id={titleId}>{group ? tf("编辑 {0}", [group.name]) : t("新建模型组")}</strong>
+          <button aria-label={t("关闭")} className="gw-icon-button" onClick={() => void requestClose()} type="button"><X className="h-4 w-4" /></button>
         </header>
         <div className="gw-modal-body">
           <label className="gw-field">
             <span>{t("名称")} <small>{name.trim() ? `${GROUP_MODEL_PREFIX}${name.trim()}` : ""}</small></span>
-            <Input autoFocus onChange={(event) => setName(event.currentTarget.value)} placeholder={t("例如 日常编码")} value={name} />
+            <Input autoFocus data-autofocus onChange={(event) => setName(event.currentTarget.value)} placeholder={t("例如 日常编码")} value={name} />
           </label>
           <div className="gw-field">
             <span>{t("模式")}</span>
@@ -731,6 +829,16 @@ function GroupEditor({
                   <Plus className="h-4 w-4" />
                   {t("添加成员")}
                 </button>
+                <button
+                  className="gw-add-row"
+                  onClick={() => setBatching(!batching)}
+                  ref={batchRef}
+                  title={t("先选一个模型，再勾选提供它的供应商，一次加进组里")}
+                  type="button"
+                >
+                  <ListChecks className="h-4 w-4" />
+                  {t("按模型批量添加")}
+                </button>
                 <span className="gw-pattern-input">
                   <Asterisk aria-hidden className="h-3.5 w-3.5" />
                   <input
@@ -764,6 +872,9 @@ function GroupEditor({
                   selectedModel=""
                   skipGroup={group?.id}
                 />
+              </Floating>
+              <Floating anchorRef={batchRef} className="gw-model-popover" onClose={() => setBatching(false)} open={batching} width={420}>
+                <BatchMemberPicker members={members} onAdd={(models) => setMembers(appendGroupMembers(members, models))} payload={payload} />
               </Floating>
             </div>
           </div>
@@ -803,7 +914,7 @@ function GroupEditor({
         </div>
         <footer>
           <span className="gw-error">{error}</span>
-          <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
+          <Button onClick={() => void requestClose()} size="sm" type="button" variant="ghost">{t("取消")}</Button>
           <Button disabled={busy !== null || Boolean(error)} size="sm" type="submit">{busy ? t("保存中") : t("保存")}</Button>
         </footer>
       </form>
@@ -852,11 +963,11 @@ function GatewayPortRow({ notify }: { notify: Notify }) {
     try {
       const result = await invoke<GatewayPortResult>("save_gateway_port", { port: parsed });
       if (result.status !== "ok") {
-        await notify(t("保存本地网关端口失败"), result.message, "failed");
+        await notify(t("保存本地服务端口失败"), result.message, "failed");
         return;
       }
       accept(result);
-      await notify(t("本地网关端口已保存"), t("完全退出 Codex++（含托盘）后重新打开生效；走网关的 Agent 会在启动时改到新端口，没跟上的在「智能体」页重新接入一次。"), "ok");
+      await notify(t("本地服务端口已保存"), t("完全退出 Codex++（含托盘）后重新打开生效；走本地服务的 Agent 会在启动时改到新端口，没跟上的在「Agent 接入」里重新接入一次。"), "ok");
     } catch (error) {
       await notify(t("调用失败"), String(error), "failed");
     } finally {
@@ -874,12 +985,12 @@ function GatewayPortRow({ notify }: { notify: Notify }) {
     <CxRow
       badges={info.restartRequired ? <CxBadge tone="warn">{t("待重启")}</CxBadge> : null}
       detail={detail}
-      title={t("本地网关端口")}
+      title={t("本地服务端口")}
       tooltip={t("Agent 配置里写的是这个端口。保存时会检测端口是否被占用；旧端口会被记住，旧配置里的地址仍认作 Codex++ 的地址。")}
     >
       <Input
         aria-invalid={invalid || undefined}
-        aria-label={t("本地网关端口")}
+        aria-label={t("本地服务端口")}
         className="cx-set-input-port"
         disabled={envLocked || saving}
         inputMode="numeric"
@@ -901,9 +1012,10 @@ function GatewayPortRow({ notify }: { notify: Notify }) {
 }
 
 function GatewayView({ payload, busy, run, notify }: { payload: GatewayPayload | null; busy: string | null; run: Run; notify: Notify }) {
-  const agentFocus = useAgentFocus();
   // 刚复制的那一行，图标短暂换成对勾。
   const [copied, setCopied] = useState<string | null>(null);
+  // 刚换过 token 的 Agent：那一行给个「复制新 token」，方便贴到手动填过 token 的地方。
+  const [rotated, setRotated] = useState<string | null>(null);
   if (!payload) return null;
   const mode = payload.gateway.keyPolicy.mode;
   const restoreOnExit = payload.gateway.restoreOnExit;
@@ -912,7 +1024,7 @@ function GatewayView({ payload, busy, run, notify }: { payload: GatewayPayload |
   const responsesWebsocket = payload.gateway.responsesWebsocket === true;
   const websocketHint = t("Codex 与 Codex++ 之间改用 WebSocket 长连接，延迟更低。只建议上游是 ChatGPT 官方账号或 OpenAI API 时打开；第三方中转常不保留连接内的上下文，会导致工具调用后丢上下文。关着时走 HTTP，与 2.6 一致。新连接生效。");
   const subagentFollow = payload.gateway.subagentModelFollowRequest === true;
-  const saveOptions = (keyRotation: string, restore: boolean) => void run("options", "save_gateway_options", { keyRotation, restoreOnExit: restore }, t("保存网关选项"), true);
+  const saveOptions = (keyRotation: string, restore: boolean) => void run("options", "save_gateway_options", { keyRotation, restoreOnExit: restore }, t("保存本地服务选项"), true);
   const listen = `http://127.0.0.1:${payload.port}`;
   const copy = (key: string, value: string) => {
     void navigator.clipboard?.writeText(value).then(() => {
@@ -925,15 +1037,24 @@ function GatewayView({ payload, busy, run, notify }: { payload: GatewayPayload |
       {copied === key ? <Check /> : <Copy />}
     </button>
   );
+  // 换 token 后旧的立刻失效：先确认，写明谁要跟着改。
+  const rotate = async (agent: string, name: string) => {
+    const ok = await appConfirm(
+      tf("旧 token 会立刻失效。{0} 的配置会自动换成新 token；手动填过旧 token 的地方（比如编辑器、脚本里的设置）要改成新的，正在运行的 {0} 可能要重启后才能继续。", [name]),
+      { title: tf("更换 {0} 的 token？", [name]), confirmText: t("更换 token"), danger: true },
+    );
+    if (!ok) return;
+    if (await run(`rotate:${agent}`, "rotate_gateway_token", { agent }, t("更换 token"))) setRotated(agent);
+  };
   const keyRotationHint = mode === "roundRobin" ? t("每个请求换下一个 Key，用量更平均，但上游缓存命中会变低。") : t("同一会话固定一个 Key，出错才换；保住上游的提示词缓存。");
   const restoreHint = restoreOnExit
-    ? t("网关只在 Codex++ 运行时可用。退出时把 Agent 切回直连，下次启动再自动指回网关。")
-    : t("Agent 一直指着网关：退出 Codex++ 后连不上，再打开就恢复。安装更新前照样会切回直连。");
+    ? t("本地服务只在 Codex++ 运行时可用。退出时把 Agent 切回直连，下次启动再自动指回本地服务。")
+    : t("Agent 一直指着本地服务：退出 Codex++ 后连不上，再打开就恢复。安装更新前照样会切回直连。");
   const suffixHint = modelSuffix
     ? t("多家都有的模型，在 Codex 的模型列表和输入框里显示成「GPT-6 Astra（ChatGPT Pro）」，自动组显示「（自动）」。")
     : t("只显示模型名「GPT-6 Astra」，看不出是哪一家；Codex 选择器里仍按供应商分组。");
   const discoveryHint = localDiscovery
-    ? t("读取 Kiro、Cursor、Gemini CLI、Devin、Droid、Command Code 本机的登录文件，供应商页提示可以导入；不读钥匙串，导入前不会加进供应商池。")
+    ? t("读取 Kiro、Cursor、Gemini CLI、Devin、Droid、Command Code 本机的登录文件，供应商页提示可以导入；不读钥匙串，导入前不会加进共享供应商。")
     : t("关着时不读其它客户端的登录文件。打开后，本机已登录的 Kiro、Cursor 等账号会在供应商页提示导入。");
   // 参照 Cursor 设置页：地址一节、选项一节；每行标题 + 一行说明，右侧控件。地址可复制，token 更换收进三点菜单。
   return (
@@ -949,7 +1070,7 @@ function GatewayView({ payload, busy, run, notify }: { payload: GatewayPayload |
           >
             {copyButton("listen", listen)}
           </CxRow>
-          {visibleAgents(agentFocus, glanceAgents(payload.agents)).map((agent) => {
+          {glanceAgents(payload.agents).map((agent) => {
             const binding = payload.gateway.bindings[agent.agent];
             return (
               <CxRow
@@ -960,10 +1081,16 @@ function GatewayView({ payload, busy, run, notify }: { payload: GatewayPayload |
                 title={agent.name}
                 tooltip={agent.enabled ? t("已写入该 Agent 的配置") : t("开启后写入该 Agent 的配置")}
               >
+                {rotated === agent.agent && binding?.token ? (
+                  <button className="cx-secondary" onClick={() => copy(`token:${agent.agent}`, binding.token)} type="button">
+                    {copied === `token:${agent.agent}` ? <Check /> : <Copy />}
+                    {t("复制新 token")}
+                  </button>
+                ) : null}
                 {copyButton(agent.agent, agent.baseUrl)}
                 {binding?.token ? (
                   <Menu>
-                    <MenuItem disabled={busy !== null} onClick={() => void run(`rotate:${agent.agent}`, "rotate_gateway_token", { agent: agent.agent }, t("更换 token"))}>
+                    <MenuItem disabled={busy !== null} onClick={() => void rotate(agent.agent, agent.name)}>
                       {t("更换 token")}
                     </MenuItem>
                   </Menu>
@@ -974,10 +1101,10 @@ function GatewayView({ payload, busy, run, notify }: { payload: GatewayPayload |
         </CxCard>
       </CxSection>
 
-      <CxSection title={t("网关选项")}>
+      <CxSection title={t("本地服务选项")}>
         <CxCard>
           <GatewayPortRow notify={notify} />
-          <CxRow detail={keyRotationHint} title={t("多 Key 轮换")} tooltip={keyRotationHint}>
+          <CxRow detail={keyRotationHint} title={t("多 Key 轮换")}>
             <AppSelect
               className="cx-set-select"
               disabled={busy !== null}
@@ -991,37 +1118,36 @@ function GatewayView({ payload, busy, run, notify }: { payload: GatewayPayload |
               value={mode}
             />
           </CxRow>
-          <CxRow detail={restoreHint} title={t("退出 Codex++ 时恢复直连")} tooltip={restoreHint}>
+          <CxRow detail={restoreHint} title={t("退出 Codex++ 时恢复直连")}>
             <Switch pending={busy !== null} label={t("退出 Codex++ 时恢复直连")} on={restoreOnExit} onToggle={() => saveOptions(mode, !restoreOnExit)} />
           </CxRow>
-          <CxRow detail={suffixHint} title={t("模型名后带供应商")} tooltip={suffixHint}>
+          <CxRow detail={suffixHint} title={t("模型名后带供应商")}>
             <Switch
               pending={busy !== null}
               label={t("模型名后带供应商")}
               on={modelSuffix}
-              onToggle={() => void run("model-suffix", "save_gateway_model_suffix", { enabled: !modelSuffix }, t("保存网关选项"), true)}
+              onToggle={() => void run("model-suffix", "save_gateway_model_suffix", { enabled: !modelSuffix }, t("保存本地服务选项"), true)}
             />
           </CxRow>
-          <CxRow detail={websocketHint} title={t("Codex 用 WebSocket 连接")} tooltip={websocketHint}>
+          <CxRow detail={websocketHint} title={t("Codex 用 WebSocket 连接")}>
             <Switch
               pending={busy !== null}
               label={t("Codex 用 WebSocket 连接")}
               on={responsesWebsocket}
-              onToggle={() => void run("responses-websocket", "save_gateway_responses_websocket", { enabled: !responsesWebsocket }, t("保存网关选项"), true)}
+              onToggle={() => void run("responses-websocket", "save_gateway_responses_websocket", { enabled: !responsesWebsocket }, t("保存本地服务选项"), true)}
             />
           </CxRow>
-          <CxRow detail={discoveryHint} title={t("发现本机已登录的订阅账号")} tooltip={discoveryHint}>
+          <CxRow detail={discoveryHint} title={t("发现本机已登录的订阅账号")}>
             <Switch
               pending={busy !== null}
               label={t("发现本机已登录的订阅账号")}
               on={localDiscovery}
-              onToggle={() => void run("local-login-discovery", "save_gateway_local_login_discovery", { enabled: !localDiscovery }, t("保存网关选项"), true)}
+              onToggle={() => void run("local-login-discovery", "save_gateway_local_login_discovery", { enabled: !localDiscovery }, t("保存本地服务选项"), true)}
             />
           </CxRow>
           <CxRow
             detail={t("默认让子智能体继承父回合的模型和供应商，避免被悄悄换到别家；打开后按 Codex 实际请求的模型发送，例如 code review 指定了别的模型。")}
             title={t("子智能体使用自己请求的模型")}
-            tooltip={t("默认让子智能体继承父回合的模型和供应商，避免被悄悄换到别家；打开后按 Codex 实际请求的模型发送，例如 code review 指定了别的模型。")}
           >
             <Switch
               pending={busy !== null}

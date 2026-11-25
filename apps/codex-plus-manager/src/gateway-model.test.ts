@@ -13,6 +13,8 @@ import {
   isDirectProxy,
   proxyAddressError,
   agentModels,
+  appendGroupMembers,
+  batchMemberRows,
   bindingFromDraft,
   blankBinding,
   connectedAgents,
@@ -20,7 +22,6 @@ import {
   draftFromBinding,
   formatRemaining,
   keyLabel,
-  activeSponsorIds,
   gatewayPresets,
   groupModelId,
   groupDisplayName,
@@ -56,8 +57,10 @@ import {
   type GatewayAgentView,
   type GatewayPayload,
 } from "./gateway-model.ts";
+import type { ProviderPreset } from "./presets.ts";
+import { appDeclarationSource, readAppSource } from "./app-source.test-helper.ts";
 
-const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+const app = readAppSource();
 const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 
 function payload(): GatewayPayload {
@@ -120,7 +123,7 @@ test("Codex 可把当前登录账号的同名模型切换为自动组默认模�
   const binding = bindingFromDraft(draft, previous, item);
   assert.equal(binding.model, `codex-plus-auto/${slug}`);
   assert.equal(binding.defaultModelSelection, null);
-  const missing = "供应商池里没有这个模型";
+  const missing = "共享供应商里没有这个模型";
   assert.equal(validateDraft(draft, data), missing, "仅识别 Codex 原生模型的自动组别名");
   assert.equal(validate("codex-plus-auto/unknown"), missing);
   assert.equal(validate(draft.model, ["glm"]), missing);
@@ -172,21 +175,21 @@ test("校验：池里要有能用的供应商，模型要能路由，窗口格�
   assert.equal(validateDraft({ ...base, model: "glm-5.3" }, data), null);
   assert.equal(validateDraft({ ...base, model: "group/daily" }, data), null);
   assert.equal(validateDraft({ ...base, model: "deepseek/deepseek-v5" }, data), null);
-  assert.equal(validateDraft({ ...base, model: "nope" }, data), "供应商池里没有这个模型");
-  assert.equal(validateDraft({ ...base, poolExclude: ["deepseek", "glm", "bare"] }, data), "供应商池是空的，先到「供应商」里添加");
+  assert.equal(validateDraft({ ...base, model: "nope" }, data), "共享供应商里没有这个模型");
+  assert.equal(validateDraft({ ...base, poolExclude: ["deepseek", "glm", "bare"] }, data), "共享供应商是空的，先在「共享供应商」里添加供应商");
   assert.equal(validateDraft({ ...base, contextWindow: "12" }, data), "上下文窗口格式不对，例如 200000、200k 或 1M");
 });
 
-test("保留已停用的绑定组时，让后端按新的供应商池验证回退模型", () => {
+test("保留已停用的绑定组时，让后端按新的共享供应商验证回退模型", () => {
   const data = payload();
   data.groups[0].disabled = true;
   const draft = { ...draftFromBinding(undefined), model: "group/daily", poolExclude: ["deepseek"] };
   assert.equal(modelRoutable(data, "deepseek-v4-pro", draft.poolExclude), false, "旧回退模型不在新池里");
   assert.equal(modelRoutable(data, "glm-5.3", draft.poolExclude), true, "新池仍有可用模型");
   assert.equal(validateDraft(draft, data, "group/daily"), null);
-  assert.equal(validateDraft(draft, data), "供应商池里没有这个模型", "新绑定不能选择停用组");
-  assert.equal(validateDraft(draft, data, "group/other"), "供应商池里没有这个模型", "更换成停用组不能绕过校验");
-  assert.equal(validateDraft({ ...draft, poolExclude: ["deepseek", "glm", "bare"] }, data, "group/daily"), "供应商池是空的，先到「供应商」里添加");
+  assert.equal(validateDraft(draft, data), "共享供应商里没有这个模型", "新绑定不能选择停用组");
+  assert.equal(validateDraft(draft, data, "group/other"), "共享供应商里没有这个模型", "更换成停用组不能绕过校验");
+  assert.equal(validateDraft({ ...draft, poolExclude: ["deepseek", "glm", "bare"] }, data, "group/daily"), "共享供应商是空的，先在「共享供应商」里添加供应商");
   assert.equal(validateDraft({ ...draft, contextWindow: "12" }, data, "group/daily"), "上下文窗口格式不对，例如 200000、200k 或 1M");
 });
 
@@ -196,9 +199,9 @@ test("保留不可用的默认供应商时允许修改详情，新选择仍需�
   const draft = { ...draftFromBinding(undefined), model: "deepseek/deepseek-v4-pro" };
   data.pool[0].enabled = false;
   assert.equal(validateDraft(draft, data, draft.model, selection), null);
-  assert.equal(validateDraft(draft, data), "供应商池里没有这个模型");
-  assert.equal(validateDraft({ ...draft, model: "missing/model" }, data, draft.model, selection), "供应商池里没有这个模型");
-  assert.equal(validateDraft({ ...draft, poolExclude: ["glm", "bare"] }, data, draft.model, selection), "供应商池是空的，先到「供应商」里添加");
+  assert.equal(validateDraft(draft, data), "共享供应商里没有这个模型");
+  assert.equal(validateDraft({ ...draft, model: "missing/model" }, data, draft.model, selection), "共享供应商里没有这个模型");
+  assert.equal(validateDraft({ ...draft, poolExclude: ["glm", "bare"] }, data, draft.model, selection), "共享供应商是空的，先在「共享供应商」里添加供应商");
   data.pool[0].enabled = true;
   assert.equal(validateDraft({ ...draft, poolExclude: ["deepseek"] }, data, draft.model, selection), null);
 });
@@ -475,6 +478,38 @@ test("「模型」页矩阵：每个模型列出提供它的供应商，按池�
   assert.deepEqual(rows[0].providers[0].excludedBy, []);
 });
 
+test("按模型批量添加（#2823）：多家都有的模型每家一份固定写法，已在组里的标出来，追加时不重复", () => {
+  const data = payload();
+  data.pool[2].models = ["glm-5.3", "bare-1"];
+  data.pool.push({ id: "off", name: "Off", baseUrl: "https://off.test/v1", protocol: "responses", official: false, models: ["glm-5.3"], keyCount: 1, enabled: false, source: "" });
+  // 组里已有：deepseek 的固定写法，以及当时只有一家时加的裸名 bare-1。
+  const members = [{ model: "deepseek/deepseek-v4-flash", weight: 3 }, { model: "bare-1", weight: 1 }];
+  const rows = batchMemberRows(data, members);
+  const row = (model: string) => rows.find((item) => item.model === model)!;
+  assert.deepEqual(
+    row("glm-5.3").candidates.map((candidate) => [candidate.providerId, candidate.member, candidate.added]),
+    [["glm", "glm/glm-5.3", false], ["bare", "bare/glm-5.3", false]],
+    "多家都有：写成 <供应商 id>/<模型>；关掉的供应商不列",
+  );
+  assert.deepEqual(
+    row("deepseek-v4-pro").candidates.map((candidate) => [candidate.member, candidate.added]),
+    [["deepseek-v4-pro", false]],
+    "只有一家：用裸名，与模型选择器一致",
+  );
+  assert.equal(row("deepseek-v4-flash").candidates[0].added, true, "固定写法指向这一家");
+  assert.equal(row("bare-1").candidates[0].added, true, "只有一家的裸名也算已在组里");
+
+  const next = appendGroupMembers(members, ["glm/glm-5.3", "BARE-1", "bare/glm-5.3", "glm/glm-5.3"]);
+  assert.deepEqual(next, [
+    { model: "deepseek/deepseek-v4-flash", weight: 3 },
+    { model: "bare-1", weight: 1 },
+    { model: "glm/glm-5.3", weight: 1 },
+    { model: "bare/glm-5.3", weight: 1 },
+  ]);
+  assert.equal(members.length, 2, "不改原数组");
+  assert.deepEqual(batchMemberRows(null, []), []);
+});
+
 test("上一个请求的路由说明：先列计划，再逐个尝试，最后谁回答", () => {
   const data = withActivity();
   const lines = routeNarrative("claude", data.activity!.agents[0].last!, data);
@@ -545,6 +580,7 @@ test("供应商表单：多 Key 每行一个；本机服务预填 Key；编辑�
     proxy: "",
     stripImageGenerationTool: false,
     stripResponsesImageDetail: false,
+    stripResponsesOutputEncryptedContent: false,
     disableToolSearch: false,
     customHeaders: [],
   });
@@ -553,6 +589,10 @@ test("供应商表单：多 Key 每行一个；本机服务预填 Key；编辑�
   assert.equal(providerInput({ ...editing, stripImageGenerationTool: true }).stripImageGenerationTool, true);
   assert.equal(providerDraftFromEntry({ ...payload().pool[0], stripResponsesImageDetail: true }).stripResponsesImageDetail, true);
   assert.equal(providerInput({ ...editing, stripResponsesImageDetail: true }).stripResponsesImageDetail, true);
+  // 严格 Responses 上游：额外 include 项的开关也能读回、原样提交。
+  assert.equal(providerDraftFromEntry({ ...payload().pool[0], stripResponsesOutputEncryptedContent: true }).stripResponsesOutputEncryptedContent, true);
+  assert.equal(providerInput({ ...editing, stripResponsesOutputEncryptedContent: true }).stripResponsesOutputEncryptedContent, true);
+  assert.equal(providerInput({ ...editing, stripResponsesOutputEncryptedContent: false }).stripResponsesOutputEncryptedContent, false);
   // #2868：「不发送 tool_search」从池条目读回、原样提交。
   assert.equal(providerDraftFromEntry({ ...payload().pool[0], disableToolSearch: true }).disableToolSearch, true);
   assert.equal(providerInput({ ...editing, disableToolSearch: true }).disableToolSearch, true);
@@ -688,7 +728,7 @@ test("全应用不用原生下拉框，统一用 AppSelect", () => {
     const source = readFileSync(new URL(file, dir), "utf8");
     assert.doesNotMatch(source, /<select[\s>]/, file);
   }
-  const shared = app.slice(app.indexOf("function SharedServiceSettings("), app.indexOf("function ProxySettingsScreen("));
+  const shared = appDeclarationSource("SharedServiceSettings");
   assert.match(shared, /<AppSelect/);
 });
 
@@ -715,24 +755,23 @@ test("普通供应商的价格与代理在详情里编辑，官方账号可在�
   assert.match(extras, /placeholder="http:\/\/127\.0\.0\.1:7890"/);
 });
 
-test("赞助商单独一组放在「添加供应商」最前面，不再混在中转里", () => {
-  const presets = gatewayPresets(new Date(2026, 9, 26));
-  const sponsors = presets.filter((preset) => preset.section === "sponsor").map((preset) => preset.key);
-  assert.deepEqual(sponsors, ["jojocode-max", "runapi", "apikeyfun", "cccccc-api", "tokenmy"]);
-  // 到期日当天仍显示，第二天起从目录里去掉。
-  const keys = (date: Date) => gatewayPresets(date).map((preset) => preset.key);
-  assert.ok(keys(new Date(2026, 11, 7)).includes("runapi"));
-  assert.ok(!keys(new Date(2026, 11, 8)).includes("runapi"));
-  assert.ok(keys(new Date(2026, 10, 20)).includes("tokenmy"));
-  assert.ok(!keys(new Date(2026, 10, 21)).includes("tokenmy"));
-  assert.deepEqual(activeSponsorIds(new Date(2026, 10, 23)), ["jojocode-max", "runapi", "cccccc-api"]);
-  assert.deepEqual(activeSponsorIds(new Date(2026, 11, 2)), ["jojocode-max", "runapi"]);
-  for (const gone of ["pateway", "therouter", "shengsuanyun", "ccsub"]) assert.ok(!keys(new Date(2026, 9, 26)).includes(gone), gone);
+test("赞助商只来自远端推荐清单，单独一组放在「添加供应商」最前面", () => {
+  // 没拉到清单时没有赞助商，内置预设里也不再有赞助商。
+  assert.ok(!gatewayPresets().some((preset) => preset.section === "sponsor"));
+  for (const gone of ["jojocode-max", "runapi", "apikeyfun", "cccccc-api", "tokenmy", "vegaapi", "pateway", "therouter", "shengsuanyun", "ccsub"]) {
+    assert.ok(!gatewayPresets().some((preset) => preset.key === gone), gone);
+  }
+  const sponsor = (id: string, baseUrl: string): ProviderPreset => ({ id, name: id, category: "aggregator", baseUrl, protocol: "responses", model: "" });
+  // 与内置预设同 id 的赞助商只出现一次，放在赞助商组。
+  const presets = gatewayPresets([sponsor("vegaapi", "https://vegaapi.com/v1"), sponsor("openrouter", "https://openrouter.ai/api/v1")]);
+  assert.deepEqual(presets.filter((preset) => preset.section === "sponsor").map((preset) => preset.key), ["vegaapi", "openrouter"]);
   assert.equal(presets[0].section, "sponsor");
+  assert.equal(presets.filter((preset) => preset.key === "openrouter").length, 1);
   const relays = presets.filter((preset) => preset.section === "relay").map((preset) => preset.key);
-  assert.ok(relays.includes("openrouter") && relays.includes("siliconflow") && relays.includes("opencode-go"));
+  assert.ok(relays.includes("siliconflow") && relays.includes("opencode-go"));
   const catalog = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
   assert.ok(catalog.indexOf('key: "sponsor"') < catalog.indexOf('key: "subscription"'));
+  assert.match(catalog, /gatewayPresets\(sponsors\)/);
 });
 
 test("起名模型随绑定草稿往返，空值和旧版后端缺字段都当成不指定", () => {
@@ -811,13 +850,13 @@ test("请求日志认出去掉别家签发的压缩上下文，并显示成说�
   assert.match(app, /t\("已去掉别家压缩上下文"\)/);
 });
 
-test("供应商池详情能编辑每个 Key 的限速", () => {
+test("共享供应商详情能编辑每个 Key 的限速", () => {
   const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
   assert.match(providers, /"save_gateway_provider_limits", \{ id: entry\.id, rpm, concurrency \}/);
   assert.match(lib, /gateway_commands::save_gateway_provider_limits,/);
 });
 
-test("供应商池：编辑在标题栏、各处编辑是图标按钮；已保存的 Key 打码列出，按标识单独替换、删除（#2782）", () => {
+test("共享供应商：编辑在标题栏、各处编辑是图标按钮；已保存的 Key 打码列出，按标识单独替换、删除（#2782）", () => {
   const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
   // 详情里不再有「编辑」文字按钮，底部也没有「编辑 >」；标题栏有铅笔按钮，悬停与无障碍名保留文案。
   assert.doesNotMatch(providers, /\{t\("编辑"\)\}/);

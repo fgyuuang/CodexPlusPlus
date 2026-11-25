@@ -339,7 +339,7 @@
     if (!client) return;
     const queries = client.getQueryCache().findAll({
       queryKey: ["models", "list", "local"],
-      predicate: (query) => query.queryKey[3] !== "team",
+      predicate: (query) => query.queryKey[3] !== "team" && !query.queryKey.includes("page"),
     });
     for (const query of queries) {
       const response = query.state.data;
@@ -369,7 +369,21 @@
   function modelReasoningEfforts(modelName) {
     const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
     if (Array.isArray(supported) && supported.length > 0) {
-      return supported.map((entry) => typeof entry === "string" ? entry : { ...entry });
+      // 目录声明存在三种形态：字符串数组（provider 配置）、Codex 原生 {effort} 对象
+      // 与前端 {reasoningEffort} 对象。归一化后再消费，避免 {...entry} 把字符串展开
+      // 成空对象、或 {effort} 条目因缺少 reasoningEffort 字段被界面过滤掉（#3210）。
+      const efforts = supported.flatMap((entry) => {
+        if (typeof entry === "string") return entry ? [{ reasoningEffort: entry }] : [];
+        if (!entry || typeof entry !== "object") return [];
+        const effort = typeof entry.reasoningEffort === "string" && entry.reasoningEffort
+          ? entry.reasoningEffort
+          : typeof entry.effort === "string" && entry.effort ? entry.effort : "";
+        if (!effort) return [];
+        const next = { ...entry, reasoningEffort: effort };
+        delete next.effort;
+        return [next];
+      });
+      return efforts;
     }
     return [];
   }
@@ -600,6 +614,12 @@
       descriptor.priority = metadata.priority;
       changed = true;
     }
+    for (const [key, value] of Object.entries(codexPlusModelServiceTiers(metadata, descriptor))) {
+      if (JSON.stringify(descriptor[key] ?? []) !== JSON.stringify(value)) {
+        descriptor[key] = value;
+        changed = true;
+      }
+    }
     // 图片输入能力（#3042）：只在目录/元数据明确声明时覆盖，没声明保留原生描述符的值。
     const modalities = codexPlusModelInputModalities(metadata);
     if (modalities && JSON.stringify(descriptor.inputModalities ?? null) !== JSON.stringify(modalities)) {
@@ -615,14 +635,6 @@
       const nextEfforts = modelReasoningEfforts(modelName);
       if (JSON.stringify(descriptor.supportedReasoningEfforts || []) !== JSON.stringify(nextEfforts)) {
         descriptor.supportedReasoningEfforts = nextEfforts;
-        changed = true;
-      }
-    }
-    for (const key of ["additionalSpeedTiers", "serviceTiers"]) {
-      if (!Array.isArray(metadata[key])) continue;
-      const nextValue = metadata[key].map((entry) => entry && typeof entry === "object" ? { ...entry } : entry);
-      if (JSON.stringify(descriptor[key] || []) !== JSON.stringify(nextValue)) {
-        descriptor[key] = nextValue;
         changed = true;
       }
     }
@@ -652,17 +664,32 @@
       ...(Number.isInteger(metadata?.priority) ? { priority: metadata.priority } : {}),
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
-      ...(Array.isArray(metadata?.additionalSpeedTiers)
-        ? { additionalSpeedTiers: metadata.additionalSpeedTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry) }
-        : {}),
-      ...(Array.isArray(metadata?.serviceTiers)
-        ? { serviceTiers: metadata.serviceTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry) }
-        : {}),
+      ...codexPlusModelServiceTiers(metadata),
       // 图片输入能力只带目录/元数据里声明过的；没声明不写，不替未知模型宣称收图，
       // 与此前的原生行为一致。
       ...(modalities ? { inputModalities: modalities } : {}),
       ...(original !== null ? { supportsImageDetailOriginal: original } : {}),
     };
+  }
+
+  function codexPlusModelServiceTiers(metadata, descriptor) {
+    if (!metadata) return {};
+    const denyFast = metadata.prioritySupportOverride === false;
+    const fields = {};
+    // New-chat model queries use these descriptors before a thread exists.
+    for (const [key, id] of [["serviceTiers", "priority"], ["additionalSpeedTiers", "fast"]]) {
+      const declared = metadata[key];
+      if (Array.isArray(declared) && declared.length) {
+        fields[key] = structuredClone(declared);
+      }
+      if (denyFast) {
+        const existing = fields[key] ?? descriptor?.[key];
+        if (Array.isArray(existing)) {
+          fields[key] = existing.filter((tier) => String(typeof tier === "string" ? tier : tier?.id || "").trim().toLowerCase() !== id);
+        }
+      }
+    }
+    return fields;
   }
 
   // 元数据里声明的输入模态（camelCase / snake_case 都认），没声明返回 null。
@@ -1815,13 +1842,77 @@
 
   // model/list 可在注入前进入 React Query 缓存；只拦后续 RPC 会留下隐藏的来源模型。
   // 只处理明确属于本机的模型查询，不修改远程主机、会话设置或账号身份。
+  function codexPlusLocalModelQueryKey(key) {
+    return Array.isArray(key) && key[0] === "models" && key[1] === "list" && key[2] === "local"
+      && key[3] !== "team" && !key.includes("page");
+  }
+
+  function codexPlusLocalGatewaySelection(requestedProvider, result, response) {
+    if (!codexPlusModelUnlockEnabled() || !codexGatewaySessionRoutingEnabled()
+        || response?.isTeamCatalog || result?.isTeamCatalog
+        || !Array.isArray(result?.models) || !Array.isArray(response?.data) || response.nextCursor) return result;
+    const provider = codexRemoteSessionTargetProvider();
+    if (!provider || (requestedProvider && requestedProvider !== provider)) return result;
+    // Work's local native picker can apply the login account's allowlist after model/list.
+    // Restore routes owned by the active gateway catalog, never account or team models.
+    const present = new Set(result.models.map((entry) => entry.model));
+    const append = response.data.filter((entry) => {
+      const model = entry?.model;
+      if (typeof model !== "string" || entry.hidden !== false || present.has(model)
+          || entry.availableAccessPrograms?.cyber?.length || entry.modelSpecialty
+          || !Array.isArray(entry.supportedReasoningEfforts)
+          || (entry.modelProvider && entry.modelProvider !== provider)) return false;
+      const metadata = codexPlusModelMetadata(model);
+      const group = metadata?.codex_plus_group_id;
+      const hasOwner = typeof group === "string" && group.length > 0;
+      if (metadata?.codex_plus_native_account === true
+          || !(hasOwner || /^(?:group|codex-plus-auto)\/\S/.test(model) || /^[^:/]+:\S/.test(model))
+          || codexRemoteSessionTargetProvider(model) !== provider) return false;
+      present.add(model);
+      return true;
+    });
+    return append.length ? { ...result, models: [...result.models, ...append] } : result;
+  }
+
+  function installCodexLocalModelQuerySelector(client) {
+    const previous = client.__codexPlusLocalModelQuerySelector;
+    if (previous) {
+      previous.select = codexPlusLocalGatewaySelection;
+      return;
+    }
+    if (typeof client.defaultQueryOptions !== "function") return;
+    const original = client.defaultQueryOptions;
+    const wrappers = new WeakMap();
+    const alreadyWrapped = new WeakSet();
+    const state = { select: codexPlusLocalGatewaySelection };
+    client.defaultQueryOptions = function (...args) {
+      const options = original.apply(this, args);
+      const { queryKey, select } = options || {};
+      if (!codexPlusLocalModelQueryKey(queryKey) || queryKey[3] !== "chatgpt"
+          || typeof select !== "function" || alreadyWrapped.has(select)) return options;
+      const requestedProvider = queryKey.find((part) => typeof part?.modelProvider === "string")?.modelProvider || "";
+      let variants = wrappers.get(select);
+      if (!variants) wrappers.set(select, variants = new Map());
+      let wrapped = variants.get(requestedProvider);
+      if (!wrapped) {
+        wrapped = function (response) {
+          return state.select(requestedProvider, select.call(this, response), response);
+        };
+        variants.set(requestedProvider, wrapped);
+        alreadyWrapped.add(wrapped);
+      }
+      return { ...options, select: wrapped };
+    };
+    client.__codexPlusLocalModelQuerySelector = state;
+  }
+
   function refreshCodexModelQueryCache(client = findCodexUsageQueryClient()) {
     if (!codexPlusModelUnlockEnabled() || codexModelCatalog.status !== "ok"
         || !codexPlusModelNames().length || !client?.getQueryCache || !client?.setQueryData) return 0;
     let changed = 0;
     for (const query of client.getQueryCache().findAll({ queryKey: ["models", "list", "local"] })) {
       const key = query.queryKey;
-      if (!Array.isArray(key) || key[0] !== "models" || key[1] !== "list" || key[2] !== "local"
+      if (!codexPlusLocalModelQueryKey(key) || query.state?.data?.isTeamCatalog
           || !query.state?.data || typeof query.state.data !== "object") continue;
       try {
         const data = structuredClone(query.state.data);
@@ -1839,6 +1930,7 @@
   function installCodexModelQueryCachePatch() {
     const client = findCodexUsageQueryClient();
     if (!client?.getQueryCache) return;
+    installCodexLocalModelQuerySelector(client);
     const previous = window.__codexPlusModelQueryCacheRuntime;
     if (previous?.client === client && previous?.patch === refreshCodexModelQueryCache) {
       previous.refresh();
@@ -1853,8 +1945,7 @@
     };
     const unsubscribe = client.getQueryCache().subscribe((event) => {
       const key = event?.query?.queryKey;
-      if (event?.type === "updated" && key?.[0] === "models" && key?.[1] === "list"
-          && key?.[2] === "local") refresh();
+      if (event?.type === "updated" && codexPlusLocalModelQueryKey(key)) refresh();
     });
     window.__codexPlusModelQueryCacheRuntime = {
       client, patch: refreshCodexModelQueryCache, refresh, dispose: unsubscribe,

@@ -1,4 +1,4 @@
-//! 供应商池里单独管理 API Key（#2782）：列出打码后的 Key，按标识添加、替换、删除，
+//! 共享供应商里单独管理 API Key（#2782）：列出打码后的 Key，按标识添加、替换、删除，
 //! 完整 Key 不出现在给界面的数据里；删改后 Key 池里对应的冷却、会话固定跟着清掉。
 //!
 //! Key 池状态是进程内全局的：每个用例用自己的供应商名，id 不和别的测试撞。
@@ -198,12 +198,13 @@ fn deleting_or_replacing_a_key_clears_its_pool_state() {
     let now = Instant::now();
     key_pool::record_failure(
         &key_of("key-2"),
+        "gpt-test",
         &FailureClass::RateLimited {
             retry_after: Some(Duration::from_secs(600)),
         },
         now,
     );
-    key_pool::record_success(&key_of("key-3"), Some("conversation-2782"));
+    key_pool::record_success(&key_of("key-3"), "", Some("conversation-2782"));
     let pinned = key_pool::order_keys(
         &before,
         KeyRotationMode::Sticky,

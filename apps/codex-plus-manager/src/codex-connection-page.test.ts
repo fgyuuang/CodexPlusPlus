@@ -102,7 +102,9 @@ test("官方账号库独立管理和返回入口可用，仍由原设置保存�
   assert.equal(h.saved[0], h.form);
   nodes.find((node) => node.type === "button" && node.children.includes("返回供应商池"))!.props.onClick();
   assert.deepEqual(h.calls, ["back"]);
-  assert.match(appText, /if \(navigation.section === "official"\) await refreshOfficialAccounts\(true\)/);
+  assert.match(appText, /await navigate\("relay", false, navigation.section\)/);
+  assert.match(appText, /if \(next === "relay"\) setPendingRelaySection\(relaySection \?\? null\)/);
+  assert.match(appText, /if \(next === "relay" \|\| next === "multiLaunch"\) \{[^}]*await refreshOfficialAccounts\(true\)/);
 });
 
 test("供应商池仅在存在本地官方账号引用时提供管理入口", () => {
@@ -115,7 +117,10 @@ test("供应商池仅在存在本地官方账号引用时提供管理入口", ()
   const h = harness();
   const globals = h.context;
   const memo = { payload: { pool: [] as any[], agents: [], helperRunning: true }, tab: "providers" };
-  Object.assign(globals, { memo, makeRun: () => () => {}, GatewayNavContext: { Provider: "Provider" },
+  Object.assign(globals, {
+    useGatewayState: () => ({ payload: memo.payload, error: null }),
+    LIVE_REFRESH_MS: 3_000, IDLE_REFRESH_MS: 15_000, publishGatewayPayload() {},
+    makeRun: () => () => {}, GatewayNavContext: { Provider: "Provider" },
     TopbarActions: "TopbarActions", RefreshCw: "RefreshCw", ProvidersView: "ProvidersView", UsageView: "UsageView" });
   vm.runInContext(js, globals);
   const render = (tab: string, callback: any = () => h.calls.push("library")) => elements(globals.GatewayPage({

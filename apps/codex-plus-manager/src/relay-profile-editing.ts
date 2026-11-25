@@ -16,7 +16,7 @@ import type {
   RelayProfile,
   RelayProtocol,
   RelaySessionProvider,
-} from "./App";
+} from "./app-types";
 import { t, tf } from "@/i18n";
 import { isAggregateProfile, normalizeAggregateDefaultRelayId, normalizeAggregateMembers } from "./aggregate-members";
 import { clampAggregateRoutePriority, normalizeAggregateRoutes, validateAggregateRoutes } from "./aggregate-routes";
@@ -30,6 +30,7 @@ import {
   requestCompatibilityEnabled,
   stripImageGenerationToolEnabled,
   stripResponsesImageDetailEnabled,
+  stripResponsesOutputEncryptedContentEnabled,
 } from "./model-routes";
 import { relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey } from "./provider-api-keys";
 import { resolveProviderName } from "./provider-name";
@@ -93,7 +94,7 @@ export function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
 }
 
 export function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "localCompactionPromptAtEnd" | "strictResponsesReasoning" | "stripImageGenerationTool" | "stripResponsesImageDetail" | "pureApiImageGeneration" | "modelMetadata">,
+  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "localCompactionPromptAtEnd" | "strictResponsesReasoning" | "stripImageGenerationTool" | "stripResponsesImageDetail" | "stripResponsesOutputEncryptedContent" | "pureApiImageGeneration" | "modelMetadata">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
   const searchHistoryCompat = profile.webSearchHistoryCompat === true
@@ -104,7 +105,7 @@ export function buildRelayConfigToml(
     && (profile.protocol === "responses" || profile.protocol === "chatCompletions")
     && profile.relayMode !== "aggregate"
     && (profile.relayMode !== "official" || profile.officialMixApiKey);
-  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile) || stripImageGenerationToolEnabled(profile) || stripResponsesImageDetailEnabled(profile) || pureApiImageGenerationEnabled(profile)
+  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile) || stripImageGenerationToolEnabled(profile) || stripResponsesImageDetailEnabled(profile) || stripResponsesOutputEncryptedContentEnabled(profile) || pureApiImageGenerationEnabled(profile)
     ? PROTOCOL_PROXY_BASE_URL
     : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
@@ -217,6 +218,15 @@ export function applyRelayProfilePatchToFiles(
     ? patch
     : { ...patch, sessionProvider: compatibleSession };
   let next: RelayProfile = { ...profile, ...normalizedPatch };
+  if (profile.relayMode === "official" && profile.officialMixApiKey && next.relayMode === "official" && !next.officialMixApiKey) {
+    next.inactiveMixedApi = {
+      configContents: profile.configContents || withGeneratedRelayFiles(profile).configContents,
+      upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl,
+      modelRoutes: profile.modelRoutes,
+    };
+  } else if (profile.relayMode === "official" && !profile.officialMixApiKey && next.officialMixApiKey && profile.inactiveMixedApi) {
+    next = { ...next, ...profile.inactiveMixedApi, inactiveMixedApi: undefined };
+  }
   if (isAggregateRelayProfile(next)) {
     return normalizeAggregateRelayProfile(next, null);
   }
@@ -255,7 +265,7 @@ export function applyRelayProfilePatchToFiles(
   if ("upstreamBaseUrl" in patch) {
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
-  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "stripImageGenerationTool" in patch || "stripResponsesImageDetail" in patch || "pureApiImageGeneration" in patch || "modelMetadata" in patch) {
+  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "stripImageGenerationTool" in patch || "stripResponsesImageDetail" in patch || "stripResponsesOutputEncryptedContent" in patch || "pureApiImageGeneration" in patch || "modelMetadata" in patch) {
     const searchHistoryCompat = next.webSearchHistoryCompat === true
       && next.protocol === "responses"
       && next.relayMode !== "aggregate"
@@ -264,7 +274,7 @@ export function applyRelayProfilePatchToFiles(
       && (next.protocol === "responses" || next.protocol === "chatCompletions")
       && next.relayMode !== "aggregate"
       && (next.relayMode !== "official" || next.officialMixApiKey);
-    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next) || stripImageGenerationToolEnabled(next) || stripResponsesImageDetailEnabled(next) || pureApiImageGenerationEnabled(next)
+    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next) || stripImageGenerationToolEnabled(next) || stripResponsesImageDetailEnabled(next) || stripResponsesOutputEncryptedContentEnabled(next) || pureApiImageGenerationEnabled(next)
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {
@@ -774,6 +784,25 @@ export function relaySettingsValidation(settings: BackendSettings): string | nul
     if (sessionProviderError) return sessionProviderError;
   }
   return relayModelRoutesSettingsValidation(settings);
+}
+
+/**
+ * 保存某个供应商时的整份设置校验：和 relaySettingsValidation 查的一样，
+ * 但出问题的是别的供应商时点名是哪一个，免得以为是正在编辑的这个有错。
+ */
+export function relaySettingsValidationForSave(settings: BackendSettings, editingId: string): string | null {
+  const named = (profileId: string, message: string) => {
+    if (profileId === editingId) return message;
+    const other = settings.relayProfiles.find((profile) => profile.id === profileId);
+    return tf("供应商「{0}」配置有误：{1}", [other?.name || t("未命名供应商"), message]);
+  };
+  for (const profile of settings.relayProfiles) {
+    const sessionProviderError = relaySessionProviderValidation(profile);
+    if (sessionProviderError) return named(profile.id, sessionProviderError);
+  }
+  const routeIssue = findRelayModelRouteIssue(settings.relayProfiles, settings.relayProfiles);
+  const routeMessage = relayModelRouteIssueMessage(routeIssue);
+  return routeIssue && routeMessage ? named(routeIssue.sourceRelayId, routeMessage) : null;
 }
 
 export function relaySessionProviderValidation(profile: RelayProfile): string | null {

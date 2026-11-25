@@ -1,8 +1,8 @@
-/** 本地网关 · 供应商：网关自己的供应商池（可开关、排序、编辑、删除），右上角「添加供应商」打开目录弹窗。
+/** 本地网关 · 供应商：网关自己的共享供应商（可开关、排序、编辑、删除），右上角「添加供应商」打开目录弹窗。
  *
  * 与直连模式完全独立：这里的增删改只动 gateway.json；「导入…」是把直连模式的供应商复制一份过来。
  */
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { closestCenter, DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS as DndCSS } from "@dnd-kit/utilities";
@@ -28,6 +28,7 @@ import {
   importCandidates,
   memberStatus,
   pendingImportCount,
+  pendingImports,
   presetAdded,
   presetHost,
   poolExcludeToggle,
@@ -65,20 +66,20 @@ import {
 import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaWindows, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, ProviderLimitsDialog, ProviderNewApiAccessDialog, keyLimitSummary, priceSummary } from "./ProviderExtrasDialog";
-import { ProviderWindowsDialog, windowSummary, withUnlistedWindows } from "./ProviderWindowsDialog";
+import { ProviderWindowsDialog, windowSummary, withUnlistedWindows, type WindowSyncPick } from "./ProviderWindowsDialog";
 import { withUnlistedAutoCompact } from "./gateway-auto-compact-model";
-import { ProviderReasoningDialog, reasoningSummary } from "./ProviderReasoningDialog";
-import { ProviderModelsDialog } from "./ProviderModelsDialog";
-import { ProviderSyncDialog } from "./ProviderSyncDialog";
-import { ProviderMetaSyncDialog } from "./ProviderMetaSyncDialog";
-import type { MetaSyncKind } from "./provider-meta-sync-model";
+import { ProviderReasoningDialog, reasoningSummary, type ReasoningSyncPick } from "./ProviderReasoningDialog";
+import { ProviderModelsDialog, type ModelSyncPicks } from "./ProviderModelsDialog";
 import { ProviderKeyList } from "./ProviderKeyList";
 import { ProviderTestDialog } from "./ProviderTestDialog";
-import { gatewayJump } from "./gateway-store";
+import { takeGatewayJump, useGatewayViewState } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
 import { singleAgent, visibleAgents } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
 import { AccountQuotaDetails } from "./ProviderQuotaPanel";
+import { useModalShell } from "./use-modal-shell";
+import { MAGPIE_UPSTREAM_ID, togglePoolPick } from "./third-party-import-model";
+import { useSponsorPresets } from "./sponsor-store";
 
 /** 能在网关里直接登录的订阅。 */
 type AccountKind = "chatgpt" | "chatgpt-api" | "copilot" | "grok" | `sub:${string}`;
@@ -117,9 +118,8 @@ type FormState = ProviderFormState;
 const MODEL_CHIP_PREVIEW = 6;
 const MODEL_CHIP_COLLAPSE = 8;
 
-/** 供应商池上次用的视图（切页再回来保持）。 */
+/** 共享供应商上次用的视图（切页再回来保持）。 */
 
-/** 重置卡的时间只到分钟；缺失时间由调用方分别标注。 */
 function creditTime(value: number | null | undefined, missing: string): string {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return missing;
   return new Date(value).toLocaleString(getLanguage() === "en" ? "en-US" : "zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
@@ -302,14 +302,12 @@ export function ProvidersView({
   notify: Notify;
 }) {
   const pool = payload?.pool ?? [];
-  const [query, setQuery] = useState("");
+  // 搜索词、展开的那一家、「已关闭」折叠状态在切换页签后保留。
+  const [query, setQuery] = useGatewayViewState("providers.query", "");
   // 从别的页跳过来指定了供应商：展开那一家并滚到它。读完就清掉。
-  const [expanded, setExpanded] = useState<string | null>(() => {
-    const jumped = gatewayJump.provider;
-    gatewayJump.provider = null;
-    return jumped;
-  });
-  const jumpedTo = useRef(expanded);
+  const [jumped] = useState(() => takeGatewayJump("provider"));
+  const [expanded, setExpanded] = useGatewayViewState<string | null>("providers.expanded", null, jumped ?? undefined);
+  const jumpedTo = useRef(jumped);
   useEffect(() => {
     const id = jumpedTo.current;
     jumpedTo.current = null;
@@ -339,7 +337,7 @@ export function ProvidersView({
   const { active: onList, inactive: offList } = providerPoolSections(ordered, query);
   const visible = ordered.filter((entry) => onList.includes(entry) || offList.includes(entry));
   // 关掉的供应商默认折叠在「已关闭」里；搜索时、或者一家都没开时照常全列出来。从别的页跳到某家时先展开，免得它正好藏在折叠里。
-  const [offOpen, setOffOpen] = useState(Boolean(expanded));
+  const [offOpen, setOffOpen] = useGatewayViewState("providers.offOpen", false, jumped ? true : undefined);
   const collapseOff = onList.length > 0 && offList.length > 0 && !needle;
   const renderRow = (entry: GatewayPoolEntry) => (
     <PoolRow
@@ -348,7 +346,7 @@ export function ProvidersView({
       entry={entry}
       expanded={expanded === entry.id}
       key={entry.id}
-      onEdit={() => setForm({ mode: "edit", entry })}
+      onEdit={(focus) => setForm({ mode: "edit", entry, focus })}
       loggingIn={Boolean(entry.account) && loginPending === entry.account}
       onRelogin={() => void login(entry.account as AccountKind)}
       onToggleExpand={() => setExpanded(expanded === entry.id ? null : entry.id)}
@@ -444,9 +442,9 @@ export function ProvidersView({
       ) : null}
       {payload !== null && pool.length === 0 ? (
         <div className="gw-card gw-pool-empty">
-          <strong>{t("供应商池还是空的")}</strong>
+          <strong>{t("共享供应商还是空的")}</strong>
           {pendingImports ? (
-            <span>{tf("直连模式里有 {0} 个供应商，可以一次导入网关；之后两边各改各的。也可以登录订阅，或添加新的厂商 API、中转站。", [pendingImports])}</span>
+            <span>{tf("直连模式里有 {0} 个供应商，可以一次导入本地服务；之后两边各改各的。也可以登录订阅，或添加新的厂商 API、中转站。", [pendingImports])}</span>
           ) : (
             <span>{t("登录订阅，或添加厂商 API、中转站的 Key。所有接入的 Agent 共用这里的供应商。")}</span>
           )}
@@ -662,7 +660,7 @@ function LocalLoginsCard({ found, busy, pending, onImport, onDismiss }: { found:
   return (
     <div className="gw-local-logins">
       <div className="gw-local-logins-line">
-        <button aria-expanded={open} className="gw-pool-off-toggle gw-local-logins-toggle" onClick={() => setOpen(!open)} title={t("来自这些官方客户端的登录文件，导入时复制一份登录凭据进网关。不想看到这条提示，可以在「网关」页关掉「发现本机已登录的订阅账号」。")} type="button">
+        <button aria-expanded={open} className="gw-pool-off-toggle gw-local-logins-toggle" onClick={() => setOpen(!open)} title={t("来自这些官方客户端的登录文件，导入时复制一份登录凭据进本地服务。不想看到这条提示，可以在「本地服务设置」里关掉「发现本机已登录的订阅账号」。")} type="button">
           <ChevronRight className="h-3.5 w-3.5" />
           {tf("发现 {0} 个本机已登录的订阅账号：{1}", [found.length, names])}
           <span className="gw-local-logins-action">{t("导入")}</span>
@@ -690,7 +688,7 @@ function LocalLoginsCard({ found, busy, pending, onImport, onDismiss }: { found:
 }
 
 /** 「添加供应商」整套流程：目录弹窗 → 填写表单或订阅登录，顶部可选给哪些 Agent 用。
- * 供应商池和总览都用它；流程结束（添加成功、取消或登录结束）时调 `onClose`。 */
+ * 共享供应商和总览都用它；流程结束（添加成功、取消或登录结束）时调 `onClose`。 */
 export function ProviderAdder({
   payload,
   busy,
@@ -698,6 +696,7 @@ export function ProviderAdder({
   notify,
   onClose,
   startWith = "catalog",
+  includeAgents = [],
 }: {
   payload: GatewayPayload | null;
   busy: string | null;
@@ -706,9 +705,11 @@ export function ProviderAdder({
   onClose: () => void;
   /** 「import」：引导卡片点进来，直接打开从直连模式导入。 */
   startWith?: "catalog" | "import";
+  /** 不管「添加供应商时自动加入」怎么设都预先勾上的 Agent（从 Claude 页添加时勾上 Claude Desktop）。 */
+  includeAgents?: GatewayAgentId[];
 }) {
-  // 这次添加给哪些 Agent 用：按各 Agent 的「添加供应商时自动加入」预选。
-  const [picked, setPicked] = useState<GatewayAgentId[]>(() => defaultProviderAgents(payload));
+  // 这次添加给哪些 Agent 用：按各 Agent 的「添加供应商时自动加入」预选，再加上调用方指定的。
+  const [picked, setPicked] = useState<GatewayAgentId[]>(() => [...new Set([...defaultProviderAgents(payload), ...includeAgents])]);
   const skipAgents = skippedAgents(payload, picked);
   const [catalogOpen, setCatalogOpen] = useState(startWith === "catalog");
   const [importOnly, setImportOnly] = useState(startWith === "import");
@@ -827,7 +828,8 @@ function PoolRow({
   expanded: boolean;
   dragging: boolean;
   onToggleExpand: () => void;
-  onEdit: () => void;
+  /** 打开编辑弹窗；「headers」时直接滚到请求头一节。 */
+  onEdit: (focus?: "headers") => void;
   onRelogin: () => void;
   /** 这个账号类型正在登录（浏览器 / 设备码），按钮显示进行中。 */
   loggingIn: boolean;
@@ -860,41 +862,39 @@ function PoolRow({
   // 价格、代理各开各的弹窗。
   const [extrasOpen, setExtrasOpen] = useState<"price" | "proxy" | null>(null);
   const [limitsOpen, setLimitsOpen] = useState(false);
-  const [modelsOpen, setModelsOpen] = useState(false);
-  const [windowsOpen, setWindowsOpen] = useState(false);
+  // 模型弹窗：「edit」直接编辑，「sync」打开就从上游同步（「从上游同步」按钮和「+N 新模型」都走这个）。
+  const [modelsOpen, setModelsOpen] = useState<"edit" | "sync" | null>(null);
+  // 窗口 / 思考等级弹窗：「sync」时打开就展开「从上游同步」。
+  const [windowsOpen, setWindowsOpen] = useState<"edit" | "sync" | null>(null);
   // 生图模型单独一行，「模型」里只列能聊天的。
   const imageModels = entry.imageModels ?? [];
   const chatModels = entry.models.filter((model) => !imageModels.some((image) => image.toLowerCase() === model.toLowerCase()));
   const [allModels, setAllModels] = useState(false);
   const modelsCollapsible = chatModels.length > MODEL_CHIP_COLLAPSE;
   const shownModels = modelsCollapsible && !allModels ? chatModels.slice(0, MODEL_CHIP_PREVIEW) : chatModels;
-  const [reasoningOpen, setReasoningOpen] = useState(false);
+  const [reasoningOpen, setReasoningOpen] = useState<"edit" | "sync" | null>(null);
   // 「测试」弹窗：null 时用当前选中的 Key，给了标识就只用那个 Key；undefined 表示没打开。
   const [testKey, setTestKey] = useState<string | null | undefined>(undefined);
   const reasoning = reasoningSummary(entry);
-  const saveReasoning = async (modelMetadata: string) => {
-    if (await run(`reasoning:${entry.id}`, "save_gateway_provider_metadata", { id: entry.id, modelMetadata }, t("保存思考等级"))) setReasoningOpen(false);
+  // 从上游同步上下文窗口 / 思考等级（#2807）在两个弹窗里：填入后随保存写入；
+  // 保存时仍是上游值的再按同步写一遍，记成「同步来的」，下次同步才默认跟着上游更新。订阅账号的模型接口不带这些资料。
+  const metaSyncable = !entry.account && entry.models.length > 0;
+  const saveReasoning = async (modelMetadata: string, synced: ReasoningSyncPick[]) => {
+    if (!(await run(`reasoning:${entry.id}`, "save_gateway_provider_metadata", { id: entry.id, modelMetadata }, t("保存思考等级")))) return;
+    if (synced.length) await run(`reasoning-sync:${entry.id}`, "apply_gateway_provider_reasoning_sync", { id: entry.id, picks: synced }, t("从上游同步思考等级"), true);
+    setReasoningOpen(null);
   };
   const windows = windowSummary(entry);
-  const saveWindows = async (modelWindows: Record<string, number>, fallback: number | null, autoCompact: { models: Record<string, number>; fallback: number | null }) => {
-    if (await run(`windows:${entry.id}`, "save_gateway_provider_windows", { id: entry.id, windows: modelWindows, fallback, autoCompact }, t("保存上下文窗口"))) setWindowsOpen(false);
-  };
-  // 从上游同步上下文窗口 / 思考等级（#2807）：先列差异，勾选后才写入。订阅账号的模型接口不带这些资料。
-  const [metaSync, setMetaSync] = useState<MetaSyncKind | null>(null);
-  const metaSyncable = !entry.account && entry.models.length > 0;
-  const applyWindowsSync = async (picks: Array<{ model: string; window: number }>) => {
-    if (await run(`windows-sync:${entry.id}`, "apply_gateway_provider_windows_sync", { id: entry.id, picks }, t("从上游同步上下文窗口"))) setMetaSync(null);
-  };
-  const applyReasoningSync = async (picks: Array<{ model: string; levels: string[]; defaultLevel: string | null }>) => {
-    if (await run(`reasoning-sync:${entry.id}`, "apply_gateway_provider_reasoning_sync", { id: entry.id, picks }, t("从上游同步思考等级"))) setMetaSync(null);
+  const saveWindows = async (modelWindows: Record<string, number>, fallback: number | null, autoCompact: { models: Record<string, number>; fallback: number | null }, synced: WindowSyncPick[]) => {
+    if (!(await run(`windows:${entry.id}`, "save_gateway_provider_windows", { id: entry.id, windows: modelWindows, fallback, autoCompact }, t("保存上下文窗口")))) return;
+    if (synced.length) await run(`windows-sync:${entry.id}`, "apply_gateway_provider_windows_sync", { id: entry.id, picks: synced }, t("从上游同步上下文窗口"), true);
+    setWindowsOpen(null);
   };
   const newModels = entry.upstreamNew?.length ?? 0;
-  const [syncOpen, setSyncOpen] = useState(false);
-  const applySync = async (remove: string[], add: string[]) => {
-    if (await run(`sync-models:${entry.id}`, "apply_gateway_provider_models_sync", { id: entry.id, remove, add }, t("从上游同步"))) setSyncOpen(false);
-  };
-  const saveModels = async (models: string[], defaultModel: string) => {
-    if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(false);
+  const saveModels = async (models: string[], defaultModel: string, sync: ModelSyncPicks | null) => {
+    // 同步勾选的改动先按同步写（被删模型的价格、窗口、思考等级一并清掉），再写最终列表和默认模型。
+    if (sync && !(await run(`sync-models:${entry.id}`, "apply_gateway_provider_models_sync", { id: entry.id, remove: sync.remove, add: sync.add }, t("从上游同步"), true))) return;
+    if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(null);
   };
   const price = priceSummary(entry);
   // 订阅账号和 OpenCode Go、Command Code 等 API Key 套餐能查额度（#3084）；后端给标志，首次查询前就显示这一行。
@@ -910,7 +910,7 @@ function PoolRow({
     if (await run(`limits:${entry.id}`, "save_gateway_provider_limits", { id: entry.id, rpm, concurrency }, t("保存限速"))) setLimitsOpen(false);
   };
   const remove = async () => {
-    const ok = await appConfirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [maskAccountName(entry.name)]), { title: t("删除供应商"), confirmText: t("删除"), danger: true });
+    const ok = await appConfirm(tf("从本地服务删除「{0}」？直连模式里的供应商不受影响。", [maskAccountName(entry.name)]), { title: t("删除供应商"), confirmText: t("删除"), danger: true });
     if (ok) await run(`remove:${entry.id}`, "delete_gateway_provider", { id: entry.id }, t("删除供应商"));
   };
   return (
@@ -943,7 +943,7 @@ function PoolRow({
         </div>
         <span className="gw-pool-status">
           {newModels ? (
-            <button className="gw-new-models" onClick={() => setModelsOpen(true)} title={t("后台检查发现上游有新模型，点开查看")} type="button">
+            <button className="gw-new-models" onClick={() => setModelsOpen("sync")} title={t("后台检查发现上游有新模型，点开查看")} type="button">
               {tf("+{0} 新模型", [newModels])}
             </button>
           ) : null}
@@ -967,7 +967,7 @@ function PoolRow({
             <button
               aria-label={tf("编辑 {0}", [maskAccountName(entry.name)])}
               className="gw-icon-button gw-pool-edit"
-              onClick={onEdit}
+              onClick={() => onEdit()}
               title={entry.account === "chatgpt" ? t("编辑订阅额度策略") : t("编辑名称、地址、协议与模型")}
               type="button"
             >
@@ -1000,12 +1000,12 @@ function PoolRow({
               ) : null}
             </div>
             <span className="gw-detail-actions">
-              <EditIcon disabled={busy !== null} label={t("编辑模型列表")} onClick={() => setModelsOpen(true)} />
-              {/* 从上游同步（#2785）：先拉上游列出差异，勾选要删、要加的再写入；拉取失败不改列表。 */}
+              <EditIcon disabled={busy !== null} label={t("编辑模型列表")} onClick={() => setModelsOpen("edit")} />
+              {/* 从上游同步（#2785）：打开模型弹窗就拉上游、列出差异，勾选要删、要加的再保存；拉取失败不改列表。 */}
               <button
                 className="gw-text-button gw-sync-button"
                 disabled={busy !== null}
-                onClick={() => setSyncOpen(true)}
+                onClick={() => setModelsOpen("sync")}
                 title={t("用已保存的 Key 或登录拉取上游模型，先列出差异，勾选后再改列表")}
                 type="button"
               >
@@ -1085,7 +1085,7 @@ function PoolRow({
               <div className="gw-detail-value">
                 {t("按官方窗口限制")}
               </div>
-              <span className="gw-detail-actions"><EditIcon disabled={busy !== null} label={t("编辑订阅额度策略")} onClick={onEdit} /></span>
+              <span className="gw-detail-actions"><EditIcon disabled={busy !== null} label={t("编辑订阅额度策略")} onClick={() => onEdit()} /></span>
             </div>
           ) : null}
           {/* 价格、窗口、思考等级、代理、限速不常改：收进「更多设置」，展开详情先看到模型、Key、额度。 */}
@@ -1133,12 +1133,12 @@ function PoolRow({
               <span className={windows ? undefined : "gw-muted"}>{windows || t("未填写，用模型自带资料")}</span>
             </div>
             <span className="gw-detail-actions">
-              <EditIcon disabled={busy !== null || entry.models.length === 0} label={t("编辑上下文窗口")} onClick={() => setWindowsOpen(true)} />
+              <EditIcon disabled={busy !== null || entry.models.length === 0} label={t("编辑上下文窗口")} onClick={() => setWindowsOpen("edit")} />
               {metaSyncable ? (
                 <MetaSyncButton
                   busy={busy}
                   busyKey={`windows-sync:${entry.id}`}
-                  onClick={() => setMetaSync("windows")}
+                  onClick={() => setWindowsOpen("sync")}
                   title={t("读取上游 /models 返回的上下文窗口，先列出差异，勾选后再写入")}
                 />
               ) : null}
@@ -1150,12 +1150,12 @@ function PoolRow({
               <span className={reasoning ? undefined : "gw-muted"}>{reasoning || t("按内置资料")}</span>
             </div>
             <span className="gw-detail-actions">
-              <EditIcon disabled={busy !== null || entry.models.length === 0} label={t("编辑思考等级")} onClick={() => setReasoningOpen(true)} />
+              <EditIcon disabled={busy !== null || entry.models.length === 0} label={t("编辑思考等级")} onClick={() => setReasoningOpen("edit")} />
               {metaSyncable ? (
                 <MetaSyncButton
                   busy={busy}
                   busyKey={`reasoning-sync:${entry.id}`}
-                  onClick={() => setMetaSync("reasoning")}
+                  onClick={() => setReasoningOpen("sync")}
                   title={t("读取上游 /models 返回的思考等级，先列出差异，勾选后再写入")}
                 />
               ) : null}
@@ -1189,7 +1189,7 @@ function PoolRow({
                 {headersSummary ? <code className="gw-chip" title={t("测试连接、获取模型和实际请求都会带上")}>{headersSummary}</code> : <span className="gw-muted">{t("未设置")}</span>}
               </div>
               <span className="gw-detail-actions">
-                <EditIcon disabled={busy !== null} label={t("编辑自定义请求头")} onClick={onEdit} />
+                <EditIcon disabled={busy !== null} label={t("编辑自定义请求头")} onClick={() => onEdit("headers")} />
               </span>
             </div>
           ) : null}
@@ -1223,28 +1223,35 @@ function PoolRow({
           </div>
         </div>
       ) : null}
-      {testKey !== undefined ? <ProviderTestDialog entry={entry} keyId={testKey} onEditSubscription={onEdit} onClose={() => setTestKey(undefined)} /> : null}
-      {metaSync ? (
-        <ProviderMetaSyncDialog
+      {testKey !== undefined ? <ProviderTestDialog entry={entry} keyId={testKey} onEditSubscription={() => onEdit()} onClose={() => setTestKey(undefined)} /> : null}
+      {modelsOpen ? (
+        <ProviderModelsDialog
           busy={busy !== null}
           entry={entry}
-          kind={metaSync}
-          onApplyReasoning={(picks) => void applyReasoningSync(picks)}
-          onApplyWindows={(picks) => void applyWindowsSync(picks)}
-          onCancel={() => setMetaSync(null)}
+          onCancel={() => setModelsOpen(null)}
+          onSave={(models, defaultModel, sync) => void saveModels(models, defaultModel, sync)}
+          syncOnOpen={modelsOpen === "sync"}
         />
       ) : null}
-      {syncOpen ? (
-        <ProviderSyncDialog busy={busy !== null} entry={entry} onApply={(remove, add) => void applySync(remove, add)} onCancel={() => setSyncOpen(false)} />
-      ) : null}
-      {modelsOpen ? (
-        <ProviderModelsDialog busy={busy !== null} entry={entry} onCancel={() => setModelsOpen(false)} onSave={(models, defaultModel) => void saveModels(models, defaultModel)} />
-      ) : null}
       {reasoningOpen ? (
-        <ProviderReasoningDialog busy={busy !== null} entry={entry} onCancel={() => setReasoningOpen(false)} onSave={(modelMetadata) => void saveReasoning(modelMetadata)} />
+        <ProviderReasoningDialog
+          busy={busy !== null}
+          entry={entry}
+          onCancel={() => setReasoningOpen(null)}
+          onSave={(modelMetadata, synced) => void saveReasoning(modelMetadata, synced)}
+          syncOnOpen={reasoningOpen === "sync"}
+          upstreamSync={metaSyncable}
+        />
       ) : null}
       {windowsOpen ? (
-        <ProviderWindowsDialog busy={busy !== null} entry={entry} onCancel={() => setWindowsOpen(false)} onSave={(modelWindows, fallback, autoCompact) => void saveWindows(modelWindows, fallback, autoCompact)} />
+        <ProviderWindowsDialog
+          busy={busy !== null}
+          entry={entry}
+          onCancel={() => setWindowsOpen(null)}
+          onSave={(modelWindows, fallback, autoCompact, synced) => void saveWindows(modelWindows, fallback, autoCompact, synced)}
+          syncOnOpen={windowsOpen === "sync"}
+          upstreamSync={metaSyncable}
+        />
       ) : null}
       {accessOpen ? (
         <ProviderNewApiAccessDialog
@@ -1271,7 +1278,7 @@ function PoolRow({
   );
 }
 
-/** 详情里「上下文窗口」「思考等级」的「从上游同步」（#2807）。 */
+/** 详情里「上下文窗口」「思考等级」的「从上游同步」（#2807）：打开对应弹窗并展开同步面板。 */
 function MetaSyncButton({ busy, busyKey, title, onClick }: { busy: string | null; busyKey: string; title: string; onClick: () => void }) {
   return (
     <button className="gw-text-button gw-sync-button" disabled={busy !== null} onClick={onClick} title={title} type="button">
@@ -1293,10 +1300,8 @@ function EditIcon({ label, disabled, onClick }: { label: string; disabled: boole
 /** 添加时给哪些 Agent 用：一排可切换的 Agent，默认按各自的「添加供应商时自动加入」。 */
 function AgentPicks({ payload, picked, onChange }: { payload: GatewayPayload | null; picked: GatewayAgentId[]; onChange: (next: GatewayAgentId[]) => void }) {
   // 只列内置的三个和已接入的通用 Agent；装了但没接入的不在这里出现。
-  // 没勾选的 Agent 不列（保持各自的默认）；单 Agent 模式下只有一个可选，整行不显示。
-  const focus = useAgentFocus();
-  const agents = visibleAgents(focus, glanceAgents(payload?.agents));
-  if (!agents.length || singleAgent(focus)) return null;
+  const agents = glanceAgents(payload?.agents);
+  if (!agents.length) return null;
   return (
     <div className="gw-agent-picks">
       <span>{t("添加后给这些 Agent 用")}</span>
@@ -1325,15 +1330,14 @@ type CatalogItem = { key: string; name: string; added?: boolean; icon?: ReactNod
 
 /** 编辑时给哪些 Agent 用（#3030）：每个已接入 Agent 一个开关，改的是各自的「挑选」排除列表。 */
 function EditAgentPicks({ payload, busy, run, entry }: { payload: GatewayPayload | null; busy: string | null; run: Run; entry: GatewayPoolEntry }) {
-  const focus = useAgentFocus();
   const connected = connectedAgents(payload);
   // 只列已接入的 Agent：没接入的谈不上用不用这家供应商。
-  const agents = visibleAgents(focus, glanceAgents(payload?.agents)).filter((agent) => connected.includes(agent.agent));
-  if (!agents.length || singleAgent(focus)) return null;
+  const agents = glanceAgents(payload?.agents).filter((agent) => connected.includes(agent.agent));
+  if (!agents.length) return null;
   const toggle = (agent: GatewayAgentId, on: boolean) => {
     const binding = payload?.gateway.bindings[agent];
     if (!binding) return;
-    void run(`pool:${agent}:${entry.id}`, "save_gateway_binding", { agent, binding: { ...binding, poolExclude: poolExcludeToggle(binding.poolExclude, entry.id, on) } }, t("保存网关绑定"));
+    void run(`pool:${agent}:${entry.id}`, "save_gateway_binding", { agent, binding: { ...binding, poolExclude: poolExcludeToggle(binding.poolExclude, entry.id, on) } }, t("保存本地服务绑定"));
   };
   return (
     <div className="gw-agent-picks">
@@ -1387,7 +1391,8 @@ function ProviderCatalog({
 }) {
   const [query, setQuery] = useState("");
   const [importing, setImporting] = useState(false);
-  const presets = useMemo(() => gatewayPresets(), []);
+  const sponsors = useSponsorPresets();
+  const presets = useMemo(() => gatewayPresets(sponsors), [sponsors]);
   const needle = query.trim().toLowerCase();
   const hit = (...values: string[]) => !needle || values.some((value) => value.toLowerCase().includes(needle));
   const presetItems = (section: PresetSection): CatalogItem[] => presets
@@ -1400,10 +1405,19 @@ function ProviderCatalog({
       { kind: "chatgpt-api", name: "ChatGPT API", icon: "openai" },
       { kind: "copilot", name: "GitHub Copilot", icon: "githubcopilot" },
       { kind: "grok", name: "SuperGrok", icon: "grok" },
-      ...(payload?.subscriptions ?? []).map((item) => ({ kind: `sub:${item.id}` as AccountKind, name: item.name, icon: item.id })),
     ] as Array<{ kind: AccountKind; name: string; icon: string }>
   )
     .filter((item) => hit(item.name, t("订阅")))
+    .map((item) => ({
+      key: `login:${item.kind}`,
+      name: item.name,
+      added: loggedIn(item.kind),
+      onClick: () => onLogin(item.kind),
+    }));
+  // 私有接口订阅（Cursor、Kiro、Zed 等）单独一节标成实验：冒用官方客户端身份，随时可能失效，不再新增。
+  const experimentalSubscriptions: CatalogItem[] = (payload?.subscriptions ?? [])
+    .map((item) => ({ kind: `sub:${item.id}` as AccountKind, name: item.name }))
+    .filter((item) => hit(item.name, t("订阅"), t("实验")))
     .map((item) => ({
       key: `login:${item.kind}`,
       name: item.name,
@@ -1425,19 +1439,21 @@ function ProviderCatalog({
     { key: "vendor", title: t("供应商"), hint: t("模型厂商的 API"), items: presetItems("vendor") },
     { key: "relay", title: t("中转"), hint: t("一个密钥用多家模型"), items: presetItems("relay") },
     { key: "local", title: t("本机"), hint: t("本机运行的模型服务，或任意兼容地址"), items: local },
+    { key: "experimental", title: t("实验订阅"), hint: t("冒用官方客户端身份调用未公开的接口，可能随时失效，也有账号被限制的风险；不再新增"), items: experimentalSubscriptions },
   ].filter((section) => section.items.length);
 
   // Esc 栈：从这里打开的「导入…」在上面一层，Esc 先关导入，不会把整个添加流程关掉。
-  useEscapeLayer(true, onClose);
+  const titleId = useId();
+  const { backdropProps, dialogProps } = useModalShell<HTMLDivElement>({ onClose, labelledBy: titleId });
 
   return createPortal(
-    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <div className="gw-modal gw-catalog-modal" role="dialog" aria-label={t("添加供应商")}>
+    <div className="gw-modal-backdrop gw-portal" {...backdropProps}>
+      <div {...dialogProps} className="gw-modal gw-catalog-modal">
         <header>
-          <strong>{t("添加供应商")}</strong>
+          <strong id={titleId}>{t("添加供应商")}</strong>
           <label className="gw-sheet-search">
             <Search className="h-4 w-4" />
-            <input autoFocus onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("查找供应商…")} value={query} />
+            <input autoFocus data-autofocus onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("查找供应商…")} value={query} />
           </label>
           <button className="gw-text-button" onClick={() => setImporting(true)} type="button">{t("导入…")}</button>
           <button aria-label={t("关闭")} className="gw-icon-button" onClick={onClose} type="button"><X className="h-4 w-4" /></button>
@@ -1451,7 +1467,7 @@ function ProviderCatalog({
                   <button className="gw-catalog-item" disabled={busy !== null} key={item.key} onClick={item.onClick} type="button">
                     {item.icon ?? <Avatar name={item.name} size="sm" />}
                     <span>{item.name}</span>
-                    {item.added ? <i className="gw-dot" data-tone="added" title={t("已在供应商池里")} /> : null}
+                    {item.added ? <i className="gw-dot" data-tone="added" title={t("已在共享供应商里")} /> : null}
                   </button>
                 ))}
               </div>
@@ -1498,16 +1514,14 @@ function ImportDialog({
   skipAgents: GatewayAgentId[];
   agentPicks?: ReactNode;
 }) {
-  useEscapeLayer(true, onClose);
+  const titleId = useId();
+  const { backdropProps, dialogProps } = useModalShell<HTMLDivElement>({ onClose, labelledBy: titleId });
   const candidates = importCandidates(payload);
   const keyOf = (item: ImportCandidate) => `${item.source}:${item.id}`;
-  const [picked, setPicked] = useState<Set<string>>(() => new Set(candidates.filter((item) => !item.imported).map(keyOf)));
-  const toggle = (key: string) => {
-    const next = new Set(picked);
-    if (next.has(key)) next.delete(key);
-    else next.add(key);
-    setPicked(next);
-  };
+  // 默认勾上还没导入的。Magpie 的两种导入方式（当作一个上游 / 复制它的供应商）二选一：默认是当作上游，勾了一种会取消另一种。
+  const pendingKeys = () => new Set(pendingImports(payload).map(keyOf));
+  const [picked, setPicked] = useState<Set<string>>(pendingKeys);
+  const toggle = (item: ImportCandidate) => setPicked(togglePoolPick(picked, item, candidates));
   const chosen = candidates.filter((item) => picked.has(keyOf(item)));
   const submit = async () => {
     const items = chosen.map((item) => ({ source: item.source, id: item.id }));
@@ -1527,6 +1541,15 @@ function ImportDialog({
       }
       case "claude":
         return t("Anthropic 协议，原样转发");
+      case "ccswitch":
+        return t("CC Switch 里的 Claude 供应商，复制一份进本地服务");
+      case "claudemom":
+        return t("ClaudeMom 的上游，Anthropic 协议");
+      case "magpie":
+        // `@gateway` 不是复制某一家，而是把 Magpie 本身当作一个上游（指向它的本地网关）。
+        return item.id === MAGPIE_UPSTREAM_ID
+          ? t("把 Magpie 当作一个上游：请求经 Magpie 转发，用它里面的账号和路由，Magpie 要开着；和下面的复制二选一")
+          : t("Magpie 的供应商，复制一份进本地服务，模型导入后自动获取；和上面的当作上游二选一");
       case "grok":
         return t("Grok 页里配置的供应商");
       default:
@@ -1537,27 +1560,31 @@ function ImportDialog({
     { key: "codex", title: t("Codex 的供应商") },
     { key: "aggregate", title: t("模型组（来自 Codex 的聚合供应商）") },
     { key: "claude", title: t("Claude Code 的供应商") },
+    { key: "ccswitch", title: t("CC Switch 里的 Claude 供应商") },
+    { key: "claudemom", title: t("ClaudeMom 的上游") },
+    { key: "magpie", title: t("Magpie 的供应商") },
     { key: "grok", title: t("Grok 的供应商") },
     { key: "opencode", title: t("OpenCode 里保存的 Key") },
   ];
   const official = payload?.codexOfficial ?? [];
   const chatgptLoggedIn = Boolean(payload?.pool.some((entry) => entry.account === "chatgpt"));
-  const pending = candidates.filter((item) => !item.imported);
+  // 「全选未导入的」就是默认会导的那些：Magpie 只含「当作上游」那一条（它和复制二选一）。
+  const pending = pendingImports(payload);
   const allPicked = pending.length > 0 && pending.every((item) => picked.has(keyOf(item)));
   return createPortal(
-    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <div className="gw-modal gw-import-modal">
+    <div className="gw-modal-backdrop gw-portal" {...backdropProps}>
+      <div {...dialogProps} className="gw-modal gw-import-modal">
         <header>
-          <strong>{t("从直连模式导入")}</strong>
+          <strong id={titleId}>{t("从直连模式导入")}</strong>
           {pending.length ? (
-            <button className="gw-text-button" onClick={() => setPicked(allPicked ? new Set() : new Set(pending.map(keyOf)))} type="button">
+            <button className="gw-text-button" onClick={() => setPicked(allPicked ? new Set() : pendingKeys())} type="button">
               {allPicked ? t("全不选") : t("全选未导入的")}
             </button>
           ) : null}
           <button aria-label={t("关闭")} className="gw-icon-button" onClick={onClose} type="button"><X className="h-4 w-4" /></button>
         </header>
         <div className="gw-modal-body">
-          <p className="gw-muted gw-import-note">{t("复制一份进网关，之后两边各改各的，互不影响。")}</p>
+          <p className="gw-muted gw-import-note">{t("复制一份进本地服务，之后两边各改各的，互不影响。")}</p>
           {sections.map((section) => {
             const items = candidates.filter((item) => item.source === section.key);
             if (!items.length) return null;
@@ -1568,7 +1595,7 @@ function ImportDialog({
                   const key = keyOf(item);
                   const on = picked.has(key);
                   return (
-                    <button aria-pressed={on} className="gw-import-item" data-on={on} disabled={busy !== null} key={key} onClick={() => toggle(key)} type="button">
+                    <button aria-pressed={on} className="gw-import-item" data-on={on} disabled={busy !== null} key={key} onClick={() => toggle(item)} type="button">
                       <span className="gw-import-check">{on ? <Check className="h-3.5 w-3.5" /> : null}</span>
                       <Avatar name={item.name} size="sm" />
                       <span>
@@ -1625,7 +1652,9 @@ function ImportDialog({
 
 /** Copilot 设备码登录：显示验证码，等你在 GitHub 页面里输入并授权。关掉弹窗（含 Esc）就是取消登录。 */
 function DeviceCodeDialog({ code, notify, onCancel }: { code: DeviceCode; notify: Notify; onCancel: () => void }) {
-  useEscapeLayer(true, onCancel);
+  // 点遮罩不关（关掉就是取消登录，误点代价大）；Esc、关闭键照常取消。
+  const titleId = useId();
+  const { dialogProps } = useModalShell<HTMLDivElement>({ onClose: onCancel, labelledBy: titleId, dismissOnBackdrop: false });
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(code.userCode);
@@ -1636,9 +1665,9 @@ function DeviceCodeDialog({ code, notify, onCancel }: { code: DeviceCode; notify
   };
   return createPortal(
     <div className="gw-modal-backdrop gw-portal">
-      <div className="gw-modal gw-device-modal">
+      <div {...dialogProps} className="gw-modal gw-device-modal">
         <header>
-          <strong>{code.title ?? t("登录 GitHub Copilot")}</strong>
+          <strong id={titleId}>{code.title ?? t("登录 GitHub Copilot")}</strong>
           <button aria-label={t("取消登录")} className="gw-icon-button" onClick={onCancel} title={t("取消登录")} type="button"><X className="h-4 w-4" /></button>
         </header>
         <div className="gw-modal-body">
@@ -1669,16 +1698,18 @@ function SubscriptionLoginDialog({
   onCancel: () => void;
   onStart: (method: SubscriptionLoginMethod, input: string) => void;
 }) {
-  useEscapeLayer(true, onCancel);
   const [method, setMethod] = useState<SubscriptionLoginMethod>(item.methods[0] ?? "browser");
   const [input, setInput] = useState("");
   const ready = method !== "paste" || input.trim().length > 0;
+  const titleId = useId();
+  // 粘贴了 token / Cookie 再误点遮罩或 Esc：先确认，不丢。
+  const { backdropProps, dialogProps, requestClose } = useModalShell<HTMLDivElement>({ onClose: onCancel, dirty: input.trim() !== "", labelledBy: titleId });
   return createPortal(
-    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
-      <div className="gw-modal gw-device-modal" role="dialog" aria-label={tf("登录 {0}", [item.name])}>
+    <div className="gw-modal-backdrop gw-portal" {...backdropProps}>
+      <div {...dialogProps} className="gw-modal gw-device-modal">
         <header>
-          <strong>{tf("登录 {0}", [item.name])}</strong>
-          <button aria-label={t("关闭")} className="gw-icon-button" onClick={onCancel} type="button"><X className="h-4 w-4" /></button>
+          <strong id={titleId}>{tf("登录 {0}", [item.name])}</strong>
+          <button aria-label={t("关闭")} className="gw-icon-button" onClick={() => void requestClose()} type="button"><X className="h-4 w-4" /></button>
         </header>
         <div className="gw-modal-body">
           {item.note ? <p className="gw-muted">{t(item.note)}</p> : null}
@@ -1694,12 +1725,12 @@ function SubscriptionLoginDialog({
             </div>
           ) : null}
           {method === "paste" ? (
-            <textarea autoFocus className="gw-textarea" onChange={(event) => setInput(event.currentTarget.value)} placeholder={t("粘贴 token、Cookie 或导出的登录文件内容")} rows={4} value={input} />
+            <textarea autoFocus className="gw-textarea" data-autofocus onChange={(event) => setInput(event.currentTarget.value)} placeholder={t("粘贴 token、Cookie 或导出的登录文件内容")} rows={4} value={input} />
           ) : null}
         </div>
         <footer>
           <span className="gw-error" />
-          <button className="gw-soft-button" onClick={onCancel} type="button">{t("取消")}</button>
+          <button className="gw-soft-button" onClick={() => void requestClose()} type="button">{t("取消")}</button>
           <button className="gw-primary-button" disabled={!ready} onClick={() => onStart(method, input.trim())} type="button">{t("开始登录")}</button>
         </footer>
       </div>

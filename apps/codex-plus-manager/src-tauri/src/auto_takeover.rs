@@ -13,7 +13,7 @@
 //! - 宽限期：`open` 返回到页面可注入之间有 2.5~3.4 秒空窗，没有宽限期会自杀式重启。
 //! - 串行化：复用管理器进程内的 `LAUNCH_IN_PROGRESS`，不与用户点「启动」抢跑。
 //! - 多开：`osascript quit` 按应用名发事件，会把用户正在用的多开实例一起退出。
-//! - 平台：仅 macOS；Windows 走 AUMID 激活，语义完全不同。
+//! - 平台：macOS、Linux、Windows（`PLATFORM_SUPPORTED`）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +50,10 @@ const EXIT_GRACE: Duration = Duration::from_secs(15);
 const EXIT_FORCE_GRACE: Duration = Duration::from_secs(5);
 /// 退出轮询间隔（macOS 实测 100ms 足够）。
 const EXIT_POLL: Duration = Duration::from_millis(100);
+
+/// 支持自动接管的平台。状态快照、判据输入、日志都只读这一个，
+/// 各写各的曾经让 Windows 上「界面说不支持、后台却在接管」（#2573）。
+const PLATFORM_SUPPORTED: bool = cfg!(any(target_os = "macos", windows, target_os = "linux"));
 
 /// 「疑似有人在用」的会话事件流新鲜度阈值。
 const USER_ACTIVE_WINDOW: Duration = Duration::from_secs(20);
@@ -93,12 +97,20 @@ struct Inner {
     last_success: Option<Instant>,
     last_failure: Option<Instant>,
     consecutive_failures: u32,
+    /// 上一次重启之后，还没有哪次探测确认「已接管」。重启命令返回成功不等于接管成功：
+    /// 没确认就又要重启时，按一次失败计入退避（#3188）。
+    restart_unconfirmed: bool,
+    /// App 在跑但 CDP 探测失败的连续次数。
+    cdp_miss_streak: u32,
     /// 我们自己刚发起启动的时刻（宽限期起点，必须在调用 start() **之前**打点）。
     our_launch_at: Option<Instant>,
     /// 最近一次系统唤醒（睡眠/唤醒后给 CDP 恢复宽限）。
     last_wake_at: Option<Instant>,
-    /// 上一次 tick 的单调时钟，用来识别挂起（睡眠后 Instant 会跳）。
+    /// 上一次 tick 的单调时钟：在睡眠期间也走字的平台上，唤醒后会留下间隙。
     last_tick: Option<Instant>,
+    /// 上一次 tick 的墙钟：macOS 的 `Instant` 睡眠期间不走字（#3188），
+    /// 长睡眠后唤醒留不下单调间隙，必须靠墙钟补检。
+    last_tick_wall: Option<std::time::SystemTime>,
     /// 守护线程启动时刻，用于启动静默期。
     started_at: Option<Instant>,
     platform_supported: bool,
@@ -112,7 +124,7 @@ fn inner() -> &'static Mutex<Inner> {
     INNER.get_or_init(|| {
         Mutex::new(Inner {
             state: "disabled",
-            platform_supported: cfg!(any(target_os = "macos", target_os = "linux")),
+            platform_supported: PLATFORM_SUPPORTED,
             ..Inner::default()
         })
     })
@@ -148,13 +160,19 @@ pub fn start_supervisor() {
         with_inner(|state| state.state = "disabled");
         return;
     }
+    // 先撤销停止请求：关掉又马上打开时，旧线程还在睡（最多 2 秒），让它接着跑；
+    // 否则这里见 RUNNING 为真直接返回，旧线程醒来看到 STOP 就退出，开关开着却没人监听。
+    STOP.store(false, Ordering::Release);
     if RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
-    STOP.store(false, Ordering::Release);
+    let paused = load_paused_instance();
     with_inner(|state| {
         state.started_at = Some(Instant::now());
         state.state = "probing";
+        if state.paused_instance.is_none() {
+            state.paused_instance = paused;
+        }
     });
     let spawned = std::thread::Builder::new()
         .name("codex-plus-auto-takeover".into())
@@ -216,7 +234,7 @@ pub fn take_over_now() -> Result<(), String> {
         Err(error) => return Err(error),
     };
     if !inputs.platform_supported {
-        return Err("自动接管目前只支持 macOS。".to_string());
+        return Err("当前系统不支持自动接管。".to_string());
     }
     if inputs.session.is_degraded() {
         return Err("当前会话注入已降级，请先重试注入。".to_string());
@@ -279,7 +297,7 @@ fn active_policy() -> ActivePolicy {
 fn supervisor_loop() {
     log_event(
         "takeover.probe_decision",
-        json!({ "decision": "start", "platformSupported": cfg!(target_os = "macos") }),
+        json!({ "decision": "start", "platformSupported": PLATFORM_SUPPORTED }),
     );
     while !STOP.load(Ordering::Acquire) {
         let tick_started = Instant::now();
@@ -293,18 +311,27 @@ fn supervisor_loop() {
     });
     RUNNING.store(false, Ordering::Release);
     log_event("takeover.supervisor_stopped", json!({}));
+    // 退出循环后、清 RUNNING 前又被重新打开：那次 start 以为线程还在而直接返回了，这里补起。
+    if !STOP.load(Ordering::Acquire) {
+        start_supervisor();
+    }
 }
 
 /// 一次探测 + 决策。返回下一次 tick 的间隔。
 fn tick() -> Duration {
-    // 睡眠/唤醒检测：挂起期间 Instant 会跳跃，这里把它当作「刚唤醒」，
+    // 睡眠/唤醒检测：两次 tick 间单调时钟或墙钟跳过阈值，就当作「刚唤醒」，
     // 给 CDP 一段恢复宽限，避免唤醒瞬间误重启。
     let now = Instant::now();
+    let now_wall = std::time::SystemTime::now();
+    let threshold = Duration::from_secs(90);
     let woke = with_inner(|state| {
-        let woke = state
-            .last_tick
-            .is_some_and(|last| now.duration_since(last) > Duration::from_secs(90));
+        let mono_gap = state.last_tick.map(|last| now.duration_since(last));
+        let wall_gap = state
+            .last_tick_wall
+            .map(|last| now_wall.duration_since(last));
+        let woke = codex_plus_core::auto_takeover::is_wake_gap(mono_gap, wall_gap, threshold);
         state.last_tick = Some(now);
+        state.last_tick_wall = Some(now_wall);
         if woke {
             state.last_wake_at = Some(now);
         }
@@ -346,7 +373,24 @@ fn tick() -> Duration {
         }
     };
 
-    let decision = codex_plus_core::auto_takeover::decide(&inputs);
+    let attached = inputs.cdp_ready && inputs.session.is_running();
+    let cdp_misses = with_inner(|state| {
+        if attached {
+            // 探测确认已接管：上一次重启算成功，退避清零。
+            state.restart_unconfirmed = false;
+            state.consecutive_failures = 0;
+        }
+        if matches!(inputs.app, AppProbe::Running(_)) && !inputs.cdp_ready {
+            state.cdp_miss_streak = state.cdp_miss_streak.saturating_add(1);
+        } else {
+            state.cdp_miss_streak = 0;
+        }
+        state.cdp_miss_streak
+    });
+    let decision = codex_plus_core::auto_takeover::confirm_cdp_miss(
+        codex_plus_core::auto_takeover::decide(&inputs),
+        cdp_misses,
+    );
     publish(&inputs, decision);
 
     if decision.is_takeover() {
@@ -413,16 +457,15 @@ fn collect_inputs() -> Result<TakeoverInputs, String> {
             state.last_attempt,
             state.our_launch_at,
             state.last_wake_at,
-            state.consecutive_failures,
+            // 还没确认接管成功的那次重启，先按一次失败参与退避。
+            state
+                .consecutive_failures
+                .saturating_add(u32::from(state.restart_unconfirmed)),
             state.restart_history_ms.clone(),
             state.paused_instance.clone(),
         )
     });
-    // 与 `Inner::default()` 和 `payload()` 保持同一判定：自动接管只在 macOS 启用。
-    // 此前这里单独用 `any(macos, windows)`，Windows 上守护线程确实会运行，
-    // 而 UI 读到的 platform_supported 却是 false，用户勾选开关后表现为
-    // 「反复拉起白色窗口、界面却显示不支持」（#2573）。
-    let platform_supported = cfg!(any(target_os = "macos", target_os = "linux"));
+    let platform_supported = PLATFORM_SUPPORTED;
     let enabled = is_enabled();
     let session_snapshot = codex_plus_launcher::session_snapshot();
     let latest = StatusStore::default().load_latest().ok().flatten();
@@ -448,7 +491,23 @@ fn collect_inputs() -> Result<TakeoverInputs, String> {
             current_pid,
         )
     }) || multi_instance_running();
-    let user_active = user_seems_active();
+
+    // 「本次不接管」只管那一个实例：它退了或换了代，跳过标记就作废，
+    // 否则状态行一直显示「本次已跳过」，重开管理器后读回的旧标记也会一直挂着。
+    let paused_instance = match (&state.5, &app) {
+        (Some(paused), AppProbe::Running(current)) if paused != current => None,
+        (Some(_), AppProbe::NotRunning) => None,
+        (paused, _) => paused.clone(),
+    };
+    if state.5.is_some() && paused_instance.is_none() {
+        with_inner(|state| {
+            state.paused_instance = None;
+            if state.state == "paused" {
+                state.state = "probing";
+            }
+        });
+        let _ = std::fs::remove_file(paused_instance_path());
+    }
 
     let session = SessionSnapshot {
         owned: session_snapshot.owned,
@@ -462,6 +521,10 @@ fn collect_inputs() -> Result<TakeoverInputs, String> {
         debug_port: session_snapshot.debug_port,
         started_at_ms: session_snapshot.started_at_ms,
     };
+    // 「疑似有人在用」要把会话目录整个走一遍，只在真可能接管时才算（每 2 秒一次）。
+    let user_active = matches!(app, AppProbe::Running(_))
+        && !(cdp_ready && session.is_running())
+        && user_seems_active();
 
     let now = Instant::now();
     let inputs = TakeoverInputs {
@@ -485,7 +548,7 @@ fn collect_inputs() -> Result<TakeoverInputs, String> {
         consecutive_failures: state.3,
         user_active,
         active_policy: active_policy(),
-        paused_instance: state.5.clone(),
+        paused_instance,
         restart_history_ms: state.4.clone(),
         now_ms: now_ms(),
     };
@@ -628,6 +691,9 @@ fn quiesce_desktop_app(app_dir: &Path, instance: &InstanceKey) {
             outcome = "still_running";
         }
     }
+    if outcome == "exited" {
+        codex_plus_core::auto_takeover::reap_leftover_children(app_dir, instance);
+    }
     log_event(
         "takeover.exit_result",
         json!({ "pid": instance.pid, "outcome": outcome, "forced": forced }),
@@ -670,6 +736,11 @@ fn spawn_takeover(actual_port: u16) {
     // 后者不动用户窗口，不能算进重启额度，也不能记成重启（否则日志与预算都会失真）。
     let restarting = !codex_plus_core::cdp::endpoint_available(actual_port);
     with_inner(|state| {
+        // 上一次重启一直没被确认就又要接管：那次算失败，退避档位上调。
+        if std::mem::take(&mut state.restart_unconfirmed) {
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        }
+        state.cdp_miss_streak = 0;
         state.our_launch_at = Some(started_at);
         state.last_attempt = Some(started_at);
         state.state = "taking_over";
@@ -731,7 +802,12 @@ fn spawn_takeover(actual_port: u16) {
         match result {
             Ok(()) => {
                 with_inner(|state| {
-                    state.consecutive_failures = 0;
+                    if restarting {
+                        // 启动命令成功只说明 App 拉起来了；等探测确认已接管再清退避。
+                        state.restart_unconfirmed = true;
+                    } else {
+                        state.consecutive_failures = 0;
+                    }
                     state.last_success = Some(Instant::now());
                     state.our_launch_at = Some(Instant::now());
                     state.state = "probing";
@@ -783,6 +859,16 @@ fn persist_paused_instance(key: &InstanceKey) {
     let _ = codex_plus_core::settings::atomic_write(&paused_instance_path(), &bytes);
 }
 
+/// 读回上次的「本次不接管」：管理器重开后，用户跳过的那个实例仍要跳过。
+fn load_paused_instance() -> Option<InstanceKey> {
+    let bytes = std::fs::read(paused_instance_path()).ok()?;
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    Some(InstanceKey::new(
+        u32::try_from(value.get("pid")?.as_u64()?).ok()?,
+        value.get("lstart")?.as_str()?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,7 +883,7 @@ mod tests {
         let payload = payload();
         assert_eq!(
             payload.platform_supported,
-            cfg!(any(target_os = "macos", target_os = "linux"))
+            cfg!(any(target_os = "macos", windows, target_os = "linux"))
         );
     }
 

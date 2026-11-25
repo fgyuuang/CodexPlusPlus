@@ -1,4 +1,4 @@
-//! #3100：网关供应商池按模型设自动压缩阈值（窗口的百分比）。
+//! #3100：网关共享供应商按模型设自动压缩阈值（窗口的百分比）。
 //!
 //! - 设了的模型：Codex 模型目录里 `auto_compact_token_limit = 窗口 × 百分比`；
 //! - 没设的模型、一个都没设时：目录与原来一致（`auto_compact_token_limit` 为 null，交给 Codex 默认）；
@@ -74,6 +74,7 @@ fn deepseek_input() -> ProviderInput {
         strip_image_generation_tool: None,
         subscription_policy: None,
         strip_responses_image_detail: None,
+        strip_responses_output_encrypted_content: None,
         disable_tool_search: None,
         custom_headers: None,
     }

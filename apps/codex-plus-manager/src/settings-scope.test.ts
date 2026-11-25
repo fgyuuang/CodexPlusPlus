@@ -2,16 +2,19 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import ts from "typescript";
+import { appDeclarationSource, readAppSource } from "./app-source.test-helper.ts";
 
-const text = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+const text = readAppSource();
 const app = ts.createSourceFile("App.tsx", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+// 侧栏路由表在 routes.ts：全局导航那几张表从 globalNavigationRoutes 排到设置模式的路由表之前。
+const routesSource = readFileSync(new URL("./routes.ts", import.meta.url), "utf8");
 
 function functionSource(name: string) {
   const declaration = app.statements.find(
     (statement): statement is ts.FunctionDeclaration => ts.isFunctionDeclaration(statement) && statement.name?.text === name,
   );
   assert.ok(declaration, `${name} should exist`);
-  return declaration.getText(app);
+  return declaration.getText(app).replace(/^export /, "");
 }
 
 test("整体设置只放应用级选项，Agent 设置承担工具级选项", () => {
@@ -37,9 +40,9 @@ test("整体设置只放应用级选项，Agent 设置承担工具级选项", ()
 test("Codex 设置与整体设置都进齿轮的设置模式，不占 Agent 的页签", () => {
   const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
   assert.doesNotMatch(sections, /"agentSettings"/);
-  assert.match(text, /const settingsModeRoutes = new Set<Route>\(\["settings", "about", "agentSettings", "maintenance",/);
+  assert.match(text, /const settingsModeRoutes = new Set<Route>\(\["settings", "agentSettings",/);
 
-  const globalNavigation = text.slice(text.indexOf("const globalNavigationRoutes"), text.indexOf("const defaultSettings"));
+  const globalNavigation = routesSource.slice(routesSource.indexOf("const globalNavigationRoutes"), routesSource.indexOf("const settingsModeRoutes"));
   assert.match(globalNavigation, /"settings"/);
   assert.doesNotMatch(globalNavigation, /"agentSettings"/);
 });
@@ -54,16 +57,15 @@ test("Computer Use 放在设置模式的 Beta 分组，不再出现在每个 Age
   const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
   assert.doesNotMatch(sections, /"computerUse"/);
 
-  const globalNavigation = text.slice(text.indexOf("const globalNavigationRoutes"), text.indexOf("const defaultSettings"));
+  const globalNavigation = routesSource.slice(routesSource.indexOf("const globalNavigationRoutes"), routesSource.indexOf("const settingsModeRoutes"));
   assert.match(globalNavigation, /"computerUse"/);
-  // 推荐内容并进了首页（侧栏第一项），「工具」组从 Computer Use 开始；网关自己一组。
-  assert.match(globalNavigation, /const toolNavigationRoutes: Route\[\] = \["computerUse", "agentCollaboration",/);
-  assert.match(globalNavigation, /const gatewayNavigationRoutes: Route\[\] = \["hub", "gatewayProviders", "gateway", "gatewayRouting",/);
-  const entries = text.slice(text.indexOf("function settingsNavEntries"), text.indexOf("const settingsModeRoutes"));
+  // Computer Use、Agent 协作、缓存清理都在设置模式里，⌘K 经设置分类搜到；本地服务的几页在 ⌘K 里自己一组。
+  assert.match(functionSource("App"), /toolNavigationRoutes\.filter\(\(routeId\) => !settingsEntries\.some\(\(entry\) => entry\.route === routeId\)\)/);
+  assert.match(globalNavigation, /const gatewayNavigationRoutes: Route\[\] = \["gatewayProviders", "gateway", "gatewayRouting",/);
+  const entries = appDeclarationSource("settingsNavEntries");
   assert.match(entries, /\{ key: "computerUse", label: "Computer Use", icon: MousePointerClick, route: "computerUse", group: "beta"/);
-  assert.match(entries, /entries\.filter\(\(entry\) => routeVisible\(focus, entry\.route\)/);
-  // 只管理 Codex 时不显示：Codex 自带 Computer Use，这一页接入的是其他客户端。
-  assert.match(globalNavigation, /const multiAgentRoutes = new Set<Route>\(\["agentCollaboration", "computerUse"\]\);/);
+  // 设置分类只有 Codex 一项看 Codex 可不可用，其余始终显示。
+  assert.match(entries, /entry\.key !== "codex" \|\| codexAvailable/);
 });
 
 test("标题：设置模式用分类名，Agent 自己的页面和其余页面都用页面名", () => {
@@ -75,20 +77,12 @@ test("标题：设置模式用分类名，Agent 自己的页面和其余页面�
   assert.match(entry, /const activeToolName = toolEntries\.find/);
 });
 
-test("只用增强功能：隐藏供应商页面，配置保存成功后才提交模式", () => {
-  const helpers = text.slice(text.indexOf("const multiAgentRoutes"), text.indexOf("function agentFocusDescription"));
-  assert.match(helpers, /const providerRoutes = new Set<Route>\(\["hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewaySettings", "gatewayUsage", "requestLog", "relay", "relayEnvironment", "multiLaunch"\]\);/);
-  assert.match(helpers, /providersHidden\(focus\) && providerRoutes\.has\(routeId\)/);
-  // 侧栏、页签、命令面板都按同一条规则过滤。
-  // 聚合网关整组按模式过滤，一项都不剩时连标题一起隐藏。
-  assert.match(functionSource("AppSidebar"), /const shownGateway = gatewayEntries\.filter\(\(item\) => routeVisible\(focus, item\.route\)\);/);
-  assert.match(functionSource("AppSidebar"), /\{shownGateway\.length \? \(/);
-  assert.match(functionSource("AppSidebar"), /\.flatMap\(\(entry\) => visibleRoutes\(focus, entry\.routes\)\)/);
-  assert.match(text, /if \(!item \|\| !routeVisible\(agentFocus, routeId\)\) return null;/);
-  // 启动默认停在网关总览：模式不让看就回落脚页。
-  assert.match(text, /if \(!routeVisible\(agentFocus, route\)\) void navigate\(agentHomeRoute\[activeTool\] \?\? "overview"\);/);
-  assert.match(text, /closeAgentFocus = \(mode: FocusMode\) => commitAgentFocusSelection\(mode,/);
-  assert.match(text, /normalizeSettings\(\{ \.\.\.latest\.settings, relayProfilesEnabled: false \}\)/);
-  assert.match(text, /rebaseSettingsEdits\(normalizeSettings\(current\), previous, saved\)/);
-  assert.doesNotMatch(text, /relayOffRequested/);
+test("保留使用模式：侧栏、页签和命令面板共享路由约束，增强模式先确认才关闭直连配置写入", () => {
+  const sidebar = functionSource("AppSidebar");
+  assert.match(sidebar, /general\.filter\(\(item\) => routeVisible\(focus, item\.route\)\)/);
+  assert.match(sidebar, /\.flatMap\(\(entry\) => visibleRoutes\(focus, entry\.routes\)\)/);
+  assert.match(text, /commitAgentFocusSelection/);
+  assert.match(text, /relayProfilesEnabled: false/);
+  const modes = readFileSync(new URL("./agent-focus-model.ts", import.meta.url), "utf8");
+  assert.match(modes, /if \(mode === "enhance" && !\(await actions\.disableRelaySwitching\(\)\)\) return false;/);
 });

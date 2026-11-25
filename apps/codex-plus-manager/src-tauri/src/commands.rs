@@ -286,6 +286,163 @@ pub async fn claude_localization_set_bash_timeout(
     }
 }
 
+/// Claude 增强的轻量状态：生效方式和两种方式共用的设置。不探测副本和进程，切页面时随便读。
+fn claude_enhance_payload() -> anyhow::Result<Value> {
+    let settings = codex_plus_core::settings::SettingsStore::default().load()?;
+    Ok(json!({
+        "delivery": codex_plus_core::claude_localization::enhance_delivery(&settings),
+        "bashTimeout": settings.claude_app_bash_timeout,
+        "claudeExtensions": settings.claude_app_extensions,
+    }))
+}
+
+fn claude_enhance_result(message: &str, result: anyhow::Result<Value>) -> CommandResult<Value> {
+    match result {
+        Ok(payload) => ok(message, payload),
+        Err(error) => failed(&format!("{error:#}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_enhance_status() -> CommandResult<Value> {
+    claude_enhance_result("Claude 增强状态已读取。", claude_enhance_payload())
+}
+
+#[tauri::command]
+pub async fn claude_enhance_set_delivery(mode: String) -> CommandResult<Value> {
+    let result = codex_plus_core::claude_localization::set_enhance_delivery(&mode)
+        .and_then(|_| claude_enhance_payload());
+    claude_enhance_result("生效方式已保存。", result)
+}
+
+/// 只存设置、不探测副本：完整功能模式页改 Bash 时限用（副本页仍走 claude_localization_set_bash_timeout）。
+#[tauri::command]
+pub async fn claude_enhance_set_bash_timeout(
+    mut timeout: codex_plus_core::settings::ClaudeBashTimeoutSettings,
+) -> CommandResult<Value> {
+    let result = (|| {
+        timeout.normalize();
+        let store = codex_plus_core::settings::SettingsStore::default();
+        let mut settings = store.load()?;
+        settings.claude_app_bash_timeout = timeout;
+        store.save(&settings)?;
+        claude_enhance_payload()
+    })();
+    claude_enhance_result("Bash 时间限制已保存，重新启动 Claude 后生效。", result)
+}
+
+fn page_extensions_payload() -> Value {
+    json!({ "extensions": codex_plus_core::claude_local_backend::page_extensions() })
+}
+
+#[tauri::command]
+pub async fn claude_page_extensions() -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(page_extensions_payload).await {
+        Ok(payload) => ok("页面扩展已读取。", payload),
+        Err(error) => failed(&format!("读取页面扩展失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_page_extension_enable(id: String, enabled: bool) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::claude_local_backend::set_page_extension_enabled(&id, enabled)
+    })
+    .await
+    {
+        Ok(Ok(list)) => ok(
+            if enabled {
+                "扩展已启用，刷新 Claude 页面后生效。"
+            } else {
+                "扩展已停用，刷新 Claude 页面后生效。"
+            },
+            json!({ "extensions": list }),
+        ),
+        Ok(Err(error)) => failed(&format!("{error:#}"), page_extensions_payload()),
+        Err(error) => failed(&format!("设置扩展失败：{error}"), page_extensions_payload()),
+    }
+}
+
+/// 新装的扩展默认启用；更新（同 id 换版本）保留原来的开关。
+fn enable_new_install(
+    imported: &codex_plus_core::claude_local_backend::PageExtensionImported,
+) -> anyhow::Result<String> {
+    let manifest = &imported.manifest;
+    match &imported.replaced {
+        Some(old) => Ok(format!(
+            "「{}」已从 {old} 更新到 {}。",
+            manifest.name, manifest.version
+        )),
+        None => {
+            codex_plus_core::claude_local_backend::set_page_extension_enabled(&manifest.id, true)?;
+            Ok(format!(
+                "「{}」已安装并启用，刷新 Claude 页面后生效。",
+                manifest.name
+            ))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn claude_page_extension_import(path: String) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let imported = codex_plus_core::claude_local_backend::import_page_extension(
+            std::path::Path::new(&path),
+        )?;
+        enable_new_install(&imported)
+    })
+    .await
+    {
+        Ok(Ok(message)) => ok(&message, page_extensions_payload()),
+        Ok(Err(error)) => failed(&format!("{error:#}"), page_extensions_payload()),
+        Err(error) => failed(&format!("导入扩展失败：{error}"), page_extensions_payload()),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_page_extension_remove(id: String) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::claude_local_backend::remove_page_extension(&id)
+    })
+    .await
+    {
+        Ok(Ok(name)) => ok(&format!("「{name}」已删除。"), page_extensions_payload()),
+        Ok(Err(error)) => failed(&format!("{error:#}"), page_extensions_payload()),
+        Err(error) => failed(&format!("删除扩展失败：{error}"), page_extensions_payload()),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_page_extension_open_folder() -> CommandResult<Value> {
+    match codex_plus_core::claude_local_backend::open_page_extension_folder() {
+        Ok(()) => ok("已打开扩展文件夹。", json!({})),
+        Err(error) => failed(&format!("{error:#}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_page_extension_market() -> CommandResult<Value> {
+    match codex_plus_core::claude_page_market::fetch().await {
+        Ok(entries) => ok("扩展市场已读取。", json!({ "entries": entries })),
+        Err(error) => failed(&format!("{error:#}"), json!({ "entries": [] })),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_page_extension_install(
+    entry: codex_plus_core::claude_page_market::MarketEntry,
+) -> CommandResult<Value> {
+    let result = async {
+        let imported = codex_plus_core::claude_page_market::install(&entry).await?;
+        tauri::async_runtime::spawn_blocking(move || enable_new_install(&imported)).await?
+    }
+    .await;
+    match result {
+        Ok(message) => ok(&message, page_extensions_payload()),
+        Err(error) => failed(&format!("{error:#}"), page_extensions_payload()),
+    }
+}
+
 #[tauri::command]
 pub async fn scan_agent_cache() -> CommandResult<Value> {
     let result = tauri::async_runtime::spawn_blocking(|| -> anyhow::Result<Value> {
@@ -494,8 +651,6 @@ pub struct DreamSkinRuntimeRequest {
     pub debug_port: u16,
     #[serde(default = "default_dream_skin_helper_port")]
     pub helper_port: u16,
-    #[serde(default)]
-    pub screenshot_path: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -547,6 +702,44 @@ pub struct CcsProvidersPayload {
     pub configured_db_path: String,
     pub fallback_reason: Option<String>,
     pub providers: Vec<codex_plus_core::ccs_import::CcsProviderImport>,
+    /// 已经导入过的条目（`sourceId`），导入对话框里标「已导入」、默认不勾。
+    pub imported: Vec<String>,
+}
+
+/// 「从第三方导入」里 Magpie 的一条供应商。不带 Key：列表只用来勾选，导入时后端再读一次。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MagpieProviderEntry {
+    pub source_id: String,
+    pub name: String,
+    pub base_url: String,
+    pub protocol: codex_plus_core::settings::RelayProtocol,
+    /// 在 Magpie 里关掉了。
+    pub disabled: bool,
+    pub has_key: bool,
+    pub imported: bool,
+}
+
+/// 「把 Magpie 当作一个上游」那一条：指向 Magpie 本地网关的地址。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MagpieGatewayEntry {
+    pub source_id: String,
+    pub base_url: String,
+    pub imported: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MagpieProvidersPayload {
+    /// 实际读的 `providers.json`。
+    pub path: String,
+    /// 这个文件在不在（不在就是没装 Magpie，或还没在里面加过供应商）。
+    pub found: bool,
+    /// 可以复制过来的各家供应商。
+    pub providers: Vec<MagpieProviderEntry>,
+    /// 把 Magpie 本身当作一个上游；没装 Magpie 时没有。
+    pub gateway: Option<MagpieGatewayEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -587,7 +780,37 @@ pub struct LocalSessionsPayload {
     pub offset: usize,
     pub limit: usize,
     pub has_more: bool,
+    /// 筛选后的会话总数。
     pub total_count: usize,
+    /// 筛选结果里每个项目的会话数（不受分页影响），按项目分组时显示整个项目的数量。
+    pub projects: Vec<LocalSessionProjectCount>,
+    /// 本页对应的搜索词和归档筛选，界面据此判断结果是不是当前条件的。
+    pub query: String,
+    pub archived: Option<bool>,
+}
+
+impl LocalSessionsPayload {
+    fn empty(offset: usize, limit: usize) -> Self {
+        Self {
+            db_path: String::new(),
+            db_paths: Vec::new(),
+            sessions: Vec::new(),
+            offset,
+            limit,
+            has_more: false,
+            total_count: 0,
+            projects: Vec::new(),
+            query: String::new(),
+            archived: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSessionProjectCount {
+    pub path: String,
+    pub count: usize,
 }
 
 const DEFAULT_LOCAL_SESSIONS_PAGE_SIZE: usize = 50;
@@ -604,6 +827,15 @@ pub struct ListLocalSessionsRequest {
     pub offset: usize,
     #[serde(default = "default_local_sessions_page_size")]
     pub limit: usize,
+    /// 搜索词：标题、目录、会话 ID、供应商里每个词都出现才算命中。在全部会话里搜，不只是当前页。
+    #[serde(default)]
+    pub query: String,
+    /// 只看某个项目目录下的会话。
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// `true` 只看已归档，`false` 只看未归档，不传看全部。
+    #[serde(default)]
+    pub archived: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -621,6 +853,32 @@ pub struct DeleteLocalSessionRequest {
     pub title: String,
     #[serde(default)]
     pub db_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLocalSessionsRequest {
+    #[serde(default)]
+    pub sessions: Vec<DeleteLocalSessionRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedLocalSession {
+    pub session_id: String,
+    pub title: String,
+    pub deleted: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLocalSessionsPayload {
+    pub results: Vec<DeletedLocalSession>,
+    pub succeeded: usize,
+    pub failed: usize,
+    /// 这次删除的全部备份，交给 `undo_delete_local_sessions` 一次恢复；没有可恢复的备份时为空。
+    pub undo_token: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3310,7 +3568,8 @@ pub fn run_auto_takeover_launch(request: LaunchRequest) -> Result<(), String> {
     codex_plus_launcher::start(launch_options).map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+// 界面会轮询 / 聚焦时读：不占主线程。
+#[tauri::command(async)]
 pub fn load_auto_takeover_state() -> CommandResult<crate::auto_takeover::AutoTakeoverPayload> {
     ok("自动接管状态已加载。", crate::auto_takeover::payload())
 }
@@ -3333,6 +3592,59 @@ pub fn pause_auto_takeover_for_instance() -> CommandResult<crate::auto_takeover:
         ),
         Err(message) => failed(&message, crate::auto_takeover::payload()),
     }
+}
+
+type ClaudeAutoTakeoverResult =
+    CommandResult<crate::claude_auto_takeover::ClaudeAutoTakeoverPayload>;
+
+/// Claude 自动接管的几个命令都要探测进程（pgrep / ps），放到阻塞线程里跑，不占主线程。
+async fn claude_auto_takeover_command(
+    success: &'static str,
+    action: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> ClaudeAutoTakeoverResult {
+    let result = tauri::async_runtime::spawn_blocking(action)
+        .await
+        .unwrap_or_else(|error| Err(format!("Claude 自动接管操作失败：{error}")));
+    let payload = tauri::async_runtime::spawn_blocking(crate::claude_auto_takeover::payload)
+        .await
+        .unwrap_or_else(|_| crate::claude_auto_takeover::payload());
+    match result {
+        Ok(()) => ok(success, payload),
+        Err(message) => failed(&message, payload),
+    }
+}
+
+#[tauri::command]
+pub async fn load_claude_auto_takeover_state() -> ClaudeAutoTakeoverResult {
+    claude_auto_takeover_command("Claude 自动接管状态已加载。", || Ok(())).await
+}
+
+/// 开关单独写 settings.json（前端随后广播设置已变，App 只合并这个键），保存后立刻生效。
+#[tauri::command]
+pub async fn set_claude_auto_takeover(enabled: bool) -> ClaudeAutoTakeoverResult {
+    claude_auto_takeover_command(
+        if enabled {
+            "Claude 自动接管已开启。"
+        } else {
+            "Claude 自动接管已关闭。"
+        },
+        move || crate::claude_auto_takeover::set_enabled(enabled),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn take_over_claude_now() -> ClaudeAutoTakeoverResult {
+    claude_auto_takeover_command("已发起接管。", crate::claude_auto_takeover::take_over_now).await
+}
+
+#[tauri::command]
+pub async fn pause_claude_auto_takeover_for_instance() -> ClaudeAutoTakeoverResult {
+    claude_auto_takeover_command(
+        "本次不再自动接管，重开 Claude 后恢复。",
+        crate::claude_auto_takeover::pause_until_next_instance,
+    )
+    .await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3382,7 +3694,8 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     // 早先用 `find_codex_processes_for_debug_port`，但它在非 macOS 上返回全部
     // Codex 进程：Windows 上只要有多开实例在跑，就会把「主 Codex 没开」误判成
     // 「已运行」，进而走进重启分支去停进程。
-    let app_running = codex_plus_core::cdp::endpoint_available(request.debug_port);
+    let app_running =
+        codex_plus_core::cdp::endpoint_available(running_debug_port(request.debug_port));
     if restart_disposition(request.sync_active_relay, app_running, cfg!(windows))
         == RestartDisposition::LaunchOnly
     {
@@ -3596,10 +3909,10 @@ fn stop_main_codex_process(request: &LaunchRequest) -> anyhow::Result<usize> {
         );
     }
     #[cfg(not(windows))]
-    let was_running = codex_plus_core::cdp::endpoint_available(request.debug_port)
-        || main_codex_running_without_debug_port();
+    let debug_port = running_debug_port(request.debug_port);
     #[cfg(not(windows))]
-    let debug_port = request.debug_port;
+    let was_running = codex_plus_core::cdp::endpoint_available(debug_port)
+        || main_codex_running_without_debug_port();
     #[cfg(target_os = "macos")]
     codex_plus_core::watcher::stop_main_codex_processes_and_wait(debug_port);
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -3616,6 +3929,32 @@ fn stop_main_codex_process(request: &LaunchRequest) -> anyhow::Result<usize> {
     );
     #[cfg(not(windows))]
     Ok(usize::from(was_running))
+}
+
+/// 主 Codex 实际在用的调试端口。
+///
+/// 首选端口被别的程序占着时，启动器会给 Codex 换一个空闲端口（见
+/// `ports::select_packaged_codex_debug_port`）。这时按表单里的端口探测，会把正在运行的 Codex
+/// 当成「没开」：「重启」只启动不停止、复用旧会话，「停止」直接报没有在运行（#3191）。
+/// 本进程拉起的会话还活着时，以它的端口为准。
+fn running_debug_port(requested: u16) -> u16 {
+    let session = codex_plus_launcher::session_snapshot();
+    resolve_running_debug_port(
+        requested,
+        session.owned.then_some(session.debug_port).flatten(),
+        codex_plus_core::cdp::endpoint_available,
+    )
+}
+
+fn resolve_running_debug_port(
+    requested: u16,
+    owned: Option<u16>,
+    endpoint_available: impl Fn(u16) -> bool,
+) -> u16 {
+    match owned {
+        Some(port) if port != requested && endpoint_available(port) => port,
+        _ => requested,
+    }
 }
 
 /// 主 Codex 开着却没带调试端口：从 Dock / Finder 等外部启动，调试端口探测不到它。
@@ -3657,7 +3996,7 @@ fn stop_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         }),
     );
     if !cfg!(windows)
-        && !codex_plus_core::cdp::endpoint_available(request.debug_port)
+        && !codex_plus_core::cdp::endpoint_available(running_debug_port(request.debug_port))
         && !main_codex_running_without_debug_port()
     {
         return ok("Codex 没有在运行。", json!({}));
@@ -4558,7 +4897,8 @@ pub async fn weixin_connect_projects(
         .map_err(|error| format!("读取微信连接项目失败：{error:#}"))
 }
 
-#[tauri::command]
+// 界面会轮询 / 聚焦时读：不占主线程。
+#[tauri::command(async)]
 pub fn weixin_connect_status() -> CommandResult<codex_plus_core::connect::WeixinConnectStatus> {
     let mut status = weixin_status()
         .lock()
@@ -5252,7 +5592,8 @@ pub async fn native_browser_status() -> NativeBrowserDiagnostics {
     }
 }
 
-#[tauri::command]
+// 界面会轮询 / 聚焦时读：不占主线程。
+#[tauri::command(async)]
 pub fn load_settings() -> CommandResult<SettingsPayload> {
     let Ok(_guard) = relay_switch_mutex().lock() else {
         return failed(
@@ -5409,6 +5750,7 @@ pub fn save_settings(
             }
             // 自动接管是常驻行为，保存后立刻生效，不必重启管理器。
             crate::auto_takeover::apply_enabled(settings.codex_app_auto_takeover);
+            crate::claude_auto_takeover::apply_enabled(settings.claude_app_auto_takeover);
             // 请求体上限是运行期策略：保存后立刻让正在运行的本地代理按新上限收请求，
             // 不必重启 Codex++/Codex。等待下一次 helper 启动的路径也会读到同一设置。
             codex_plus_core::launcher::set_http_body_limit_bytes(
@@ -6017,6 +6359,30 @@ pub fn reset_dream_skin_image() -> CommandResult<DreamSkinImagePayload> {
     ok("已恢复目标项目默认图片。", empty_dream_skin_image_payload())
 }
 
+fn empty_dream_skin_image_payload() -> DreamSkinImagePayload {
+    DreamSkinImagePayload {
+        path: String::new(),
+        content_type: String::new(),
+        size_bytes: 0,
+    }
+}
+
+fn dream_skin_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
 #[tauri::command]
 pub fn list_dream_skin_themes()
 -> CommandResult<codex_plus_core::dream_skin_library::DreamSkinThemeLibrary> {
@@ -6093,7 +6459,8 @@ pub async fn install_dream_skin_community_theme(
     }
 }
 
-#[tauri::command]
+// 界面会轮询 / 聚焦时读：不占主线程。
+#[tauri::command(async)]
 pub fn load_pending_dream_skin_community() -> CommandResult<PendingDreamSkinCommunityPayload> {
     match codex_plus_core::dream_skin_community::load_pending_community_link() {
         Ok(version_id) => ok(
@@ -6247,22 +6614,6 @@ pub async fn install_dream_skin_market_theme(id: String) -> CommandResult<DreamS
             themes: manifest.themes,
         },
     )
-}
-
-#[tauri::command]
-pub fn load_dream_skin_theme(
-    id: String,
-) -> CommandResult<codex_plus_core::dream_skin_library::DreamSkinThemeDraft> {
-    match codex_plus_core::dream_skin_library::load_stored_dream_skin_theme(
-        &codex_plus_core::paths::default_app_state_dir(),
-        id.trim(),
-    ) {
-        Ok(draft) => ok("Dream Skin 主题已加载。", draft),
-        Err(error) => failed(
-            &format!("加载 Dream Skin 主题失败：{error}"),
-            builtin_dream_skin_draft(),
-        ),
-    }
 }
 
 #[tauri::command]
@@ -6469,51 +6820,6 @@ pub async fn dream_skin_status(
 }
 
 #[tauri::command]
-pub async fn apply_dream_skin(
-    request: DreamSkinRuntimeRequest,
-) -> CommandResult<codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus> {
-    let store = SettingsStore::default();
-    let settings = match store.update(json!({ "codexAppDreamSkinPaused": false })) {
-        Ok(settings) => settings,
-        Err(error) => {
-            return failed(
-                &format!("更新 Dream Skin 状态失败：{error}"),
-                codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus::not_running(
-                    true, false,
-                ),
-            );
-        }
-    };
-    if !settings.enhancements_enabled || !settings.codex_app_dream_skin_enabled {
-        return failed(
-            "请先启用 Codex增强和 Dream Skin。",
-            codex_plus_core::dream_skin_runtime::dream_skin_status(request.debug_port).await,
-        );
-    }
-    if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
-        true,
-        &settings.codex_app_dream_skin_theme_config,
-    ) {
-        return failed(
-            &format!("同步 Dream Skin 基础主题失败：{error}"),
-            codex_plus_core::dream_skin_runtime::dream_skin_status(request.debug_port).await,
-        );
-    }
-    match codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
-        request.debug_port,
-        request.helper_port,
-    )
-    .await
-    {
-        Ok(status) => ok("Dream Skin 已应用。", status),
-        Err(error) => failed(
-            &format!("实时应用失败，下次启动会继续应用：{error}"),
-            codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus::not_running(true, false),
-        ),
-    }
-}
-
-#[tauri::command]
 pub async fn restore_dream_skin(
     request: DreamSkinRuntimeRequest,
 ) -> CommandResult<codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus> {
@@ -6544,67 +6850,6 @@ pub async fn restore_dream_skin(
         Err(error) => ok(
             &format!("外观配置已恢复，重启 Codex 后完整生效；当前无法清理实时皮肤：{error}"),
             status,
-        ),
-    }
-}
-
-#[tauri::command]
-pub fn reset_dream_skin_theme() -> CommandResult<SettingsPayload> {
-    let store = SettingsStore::default();
-    let previous = store.load().unwrap_or_default();
-    let theme = serde_json::to_value(codex_plus_core::settings::DreamSkinThemeConfig::default())
-        .unwrap_or_else(|_| json!({}));
-    if let Err(error) = store.update(json!({
-        "codexAppDreamSkinThemeConfig": theme,
-        "codexAppDreamSkinImagePath": ""
-    })) {
-        return failed(
-            &format!("恢复默认 Dream Skin 主题失败：{error}"),
-            fallback_settings_payload(),
-        );
-    }
-    if let Err(error) = codex_plus_core::dream_skin::clear_managed_dream_skin_image(
-        &codex_plus_core::paths::default_app_state_dir(),
-    ) {
-        let previous_theme = serde_json::to_value(&previous.codex_app_dream_skin_theme_config)
-            .unwrap_or_else(|_| json!({}));
-        let _ = store.update(json!({
-            "codexAppDreamSkinThemeConfig": previous_theme,
-            "codexAppDreamSkinImagePath": previous.codex_app_dream_skin_image_path
-        }));
-        return failed(
-            &format!("清理自定义 Dream Skin 图片失败：{error}"),
-            fallback_settings_payload(),
-        );
-    }
-    settings_payload("已恢复目标项目默认主题。", "恢复后重新读取设置失败")
-}
-
-#[tauri::command]
-pub async fn verify_dream_skin(
-    request: DreamSkinRuntimeRequest,
-) -> CommandResult<codex_plus_core::dream_skin_runtime::DreamSkinVerification> {
-    let screenshot = request
-        .screenshot_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(Path::new);
-    match codex_plus_core::dream_skin_runtime::verify_dream_skin(request.debug_port, screenshot)
-        .await
-    {
-        Ok(result) if result.pass => ok("Dream Skin 实机验证通过。", result),
-        Ok(result) => failed("Dream Skin 实机验证未通过。", result),
-        Err(error) => failed(
-            &format!("Dream Skin 实机验证失败：{error}"),
-            codex_plus_core::dream_skin_runtime::DreamSkinVerification {
-                state: codex_plus_core::dream_skin_runtime::DreamSkinState::NotRunning,
-                pass: false,
-                version: None,
-                checks: Vec::new(),
-                screenshot_path: None,
-                raw: json!({}),
-            },
         ),
     }
 }
@@ -6692,14 +6937,6 @@ async fn failed_dream_skin_activation_payload(
     }
 }
 
-fn empty_dream_skin_image_payload() -> DreamSkinImagePayload {
-    DreamSkinImagePayload {
-        path: String::new(),
-        content_type: String::new(),
-        size_bytes: 0,
-    }
-}
-
 fn managed_dream_skin_image_backup(
     path: &Path,
     state_dir: &Path,
@@ -6719,22 +6956,6 @@ fn restore_managed_dream_skin_image_backup(
     codex_plus_core::settings::atomic_write(&backup.path, &backup.bytes)
 }
 
-fn dream_skin_content_type(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("webp") => "image/webp",
-        Some("gif") => "image/gif",
-        Some("bmp") => "image/bmp",
-        _ => "application/octet-stream",
-    }
-}
-
 #[tauri::command]
 pub fn load_ccs_providers() -> CommandResult<CcsProvidersPayload> {
     let settings = SettingsStore::default().load().unwrap_or_default();
@@ -6745,6 +6966,7 @@ pub fn load_ccs_providers() -> CommandResult<CcsProvidersPayload> {
                 source.providers.len()
             ),
             CcsProvidersPayload {
+                imported: codex_plus_core::ccs_import::imported_source_ids(&settings, &source),
                 db_path: source.db_path.to_string_lossy().to_string(),
                 configured_db_path: source.configured_db_path,
                 fallback_reason: source.fallback_reason,
@@ -6760,14 +6982,17 @@ pub fn load_ccs_providers() -> CommandResult<CcsProvidersPayload> {
                 configured_db_path: settings.ccs_db_path,
                 fallback_reason: None,
                 providers: Vec::new(),
+                imported: Vec::new(),
             },
         ),
     }
 }
 
+/// `only` 是导入对话框里勾选的条目（`sourceId`）；不传就是全部（旧行为）。
 #[tauri::command]
 pub fn import_ccs_providers(
     bindings: Option<std::collections::BTreeMap<String, String>>,
+    only: Option<Vec<String>>,
 ) -> CommandResult<SettingsPayload> {
     let store = SettingsStore::default();
     let mut settings = match store.load() {
@@ -6779,7 +7004,7 @@ pub fn import_ccs_providers(
             );
         }
     };
-    let source =
+    let mut source =
         match codex_plus_core::ccs_import::resolve_codex_provider_source(&settings.ccs_db_path) {
             Ok(source) => source,
             Err(error) => {
@@ -6789,6 +7014,11 @@ pub fn import_ccs_providers(
                 );
             }
         };
+    if let Some(only) = &only {
+        source
+            .providers
+            .retain(|provider| only.contains(&provider.source_id));
+    }
     let (imported, linked) = match codex_plus_core::ccs_import::import_providers_with_origins(
         &mut settings,
         &source,
@@ -6817,7 +7047,98 @@ pub fn import_ccs_providers(
     }
 }
 
+/// 「从第三方导入」的 Magpie 一栏：列出它的供应商（不含 Key），标出已经导入过的。只读 Magpie 的文件。
+#[tauri::command(async)]
+pub fn load_magpie_providers() -> CommandResult<MagpieProvidersPayload> {
+    let path = codex_plus_core::magpie_import::default_providers_path();
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let imported = codex_plus_core::magpie_import::imported_ids(&settings, &path);
+    let gateway =
+        codex_plus_core::magpie_import::gateway_provider().map(|gateway| MagpieGatewayEntry {
+            imported: imported.contains(&gateway.id),
+            source_id: gateway.id,
+            base_url: gateway.base_url,
+        });
+    let payload = |providers| MagpieProvidersPayload {
+        path: path.to_string_lossy().to_string(),
+        found: path.is_file(),
+        providers,
+        gateway: gateway.clone(),
+    };
+    match codex_plus_core::magpie_import::list_providers_at(&path) {
+        Ok(providers) => {
+            let entries: Vec<MagpieProviderEntry> = providers
+                .into_iter()
+                .map(|provider| MagpieProviderEntry {
+                    imported: imported.contains(&provider.id),
+                    source_id: provider.id,
+                    name: provider.name,
+                    base_url: provider.base_url,
+                    protocol: provider.protocol,
+                    disabled: provider.disabled,
+                    has_key: !provider.api_key.is_empty(),
+                })
+                .collect();
+            ok(
+                &format!("已读取 Magpie 的供应商：{} 个。", entries.len()),
+                payload(entries),
+            )
+        }
+        Err(error) => failed(
+            &format!("读取 Magpie 的供应商失败：{error:#}"),
+            payload(Vec::new()),
+        ),
+    }
+}
+
+/// 把勾选的 Magpie 条目导入成直连供应商：各家供应商是复制，`@gateway` 是把 Magpie 本身当作一个上游。
+/// 已导入过的跳过，已有配置不覆盖。
 #[tauri::command]
+pub fn import_magpie_providers(ids: Vec<String>) -> CommandResult<SettingsPayload> {
+    let store = SettingsStore::default();
+    let mut settings = match store.load() {
+        Ok(settings) => settings,
+        Err(error) => {
+            return failed(
+                &format!("读取设置失败：{error}"),
+                fallback_settings_payload(),
+            );
+        }
+    };
+    let path = codex_plus_core::magpie_import::default_providers_path();
+    let (imported, skipped) =
+        match codex_plus_core::magpie_import::import_into_settings(&mut settings, &path, &ids) {
+            Ok(counts) => counts,
+            Err(error) => {
+                return failed(
+                    &format!("导入 Magpie 失败：{error:#}"),
+                    fallback_settings_payload(),
+                );
+            }
+        };
+    if imported == 0 {
+        return settings_payload("勾选的供应商都已导入，保留已有配置。", "设置读取失败");
+    }
+    match store.save(&settings) {
+        Ok(()) => settings_payload(
+            &if skipped > 0 {
+                format!(
+                    "已从 Magpie 导入 {imported} 个供应商，{skipped} 个之前导入过；已有配置未覆盖。"
+                )
+            } else {
+                format!("已从 Magpie 导入 {imported} 个供应商。")
+            },
+            "导入后读取设置失败",
+        ),
+        Err(error) => failed(
+            &format!("保存 Magpie 供应商失败：{error}"),
+            fallback_settings_payload(),
+        ),
+    }
+}
+
+// 界面会轮询 / 聚焦时读：不占主线程。
+#[tauri::command(async)]
 pub fn load_pending_provider_import() -> CommandResult<PendingProviderImportPayload> {
     match codex_plus_core::provider_import::load_pending_provider_import_with_fingerprint() {
         Ok(pending) => ok(
@@ -6842,12 +7163,12 @@ pub fn confirm_pending_provider_import(fingerprint: String) -> CommandResult<Set
                 (true, true) => {
                     crate::gateway_commands::after_url_pool_import(result.profile_id.clone());
                     format!(
-                        "已加入网关供应商池：{}，正在从上游获取模型。",
+                        "已加入网关共享供应商：{}，正在从上游获取模型。",
                         result.profile_name
                     )
                 }
                 (true, false) => format!(
-                    "供应商池里已有相同地址和 Key 的供应商：{}。",
+                    "共享供应商里已有相同地址和 Key 的供应商：{}。",
                     result.profile_name
                 ),
                 (false, true) => format!("已导入供应商配置：{}。", result.profile_name),
@@ -6906,15 +7227,7 @@ pub async fn list_local_sessions(
         Ok(result) => result,
         Err(error) => failed(
             &format!("会话查询后台任务失败：{error}"),
-            LocalSessionsPayload {
-                db_path: String::new(),
-                db_paths: Vec::new(),
-                sessions: Vec::new(),
-                offset,
-                limit,
-                has_more: false,
-                total_count: 0,
-            },
+            LocalSessionsPayload::empty(offset, limit),
         ),
     }
 }
@@ -6929,116 +7242,40 @@ pub async fn list_project_sessions(
         Ok(result) => result,
         Err(error) => failed(
             &format!("项目会话查询后台任务失败：{error}"),
-            LocalSessionsPayload {
-                db_path: String::new(),
-                db_paths: Vec::new(),
-                sessions: Vec::new(),
-                offset: 0,
-                limit: 1,
-                has_more: false,
-                total_count: 0,
-            },
+            LocalSessionsPayload::empty(0, 1),
         ),
     }
 }
 
-fn normalized_project_path(path: &str) -> String {
-    // 与前端 normalizeProjectPath 一致：统一分隔符和末尾斜杠，保留大小写及路径中的空格；
-    // 去掉 Windows 长路径前缀（\\?\C:\ → C:/，\\?\UNC\srv\share → //srv/share），
-    // 否则同一项目带不带前缀会被当成两个目录（#2791）。
-    let path = path.replace('\\', "/");
-    let path = path.trim_end_matches('/');
-    for prefix in ["//?/", "//./"] {
-        let Some(rest) = path.strip_prefix(prefix) else {
-            continue;
-        };
-        if rest
-            .get(..4)
-            .is_some_and(|head| head.eq_ignore_ascii_case("UNC/"))
-        {
-            return format!("//{}", &rest[4..]);
-        }
-        let bytes = rest.as_bytes();
-        if bytes.len() >= 2
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && (bytes.len() == 2 || bytes[2] == b'/')
-        {
-            return rest.to_string();
-        }
-    }
-    path.to_string()
-}
-
-fn list_project_sessions_blocking(cwd: String) -> CommandResult<LocalSessionsPayload> {
-    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
-    let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
-    static PROJECT_PAGER: std::sync::OnceLock<
-        std::sync::Mutex<codex_plus_data::LocalSessionPager>,
-    > = std::sync::OnceLock::new();
-    let page = match PROJECT_PAGER.get_or_init(Default::default).lock() {
-        Ok(mut pager) => pager.list_page_with_thread_names(&home, &db_paths, 0, usize::MAX),
-        Err(_) => codex_plus_data::LocalSessionPage {
-            errors: vec!["项目会话查询缓存不可用，请重启管理窗口。".to_string()],
-            ..Default::default()
-        },
-    };
-    let target = normalized_project_path(&cwd);
-    let sessions = page
-        .sessions
-        .into_iter()
-        .filter(|session| normalized_project_path(&session.cwd) == target)
-        .collect::<Vec<_>>();
-    let payload = LocalSessionsPayload {
-        db_path: db_paths
-            .first()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_default(),
-        db_paths: db_paths
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect(),
-        limit: sessions.len().max(1),
-        total_count: sessions.len(),
-        sessions,
-        offset: 0,
-        has_more: false,
-    };
-    if page.errors.is_empty() {
-        ok(
-            &format!("已读取项目全部 {} 个会话。", payload.total_count),
-            payload,
-        )
-    } else {
-        failed(
-            &format!("读取项目会话时出现部分错误：{}", page.errors.join("; ")),
-            payload,
-        )
-    }
-}
-
-fn list_local_sessions_blocking(
-    request: Option<ListLocalSessionsRequest>,
-) -> CommandResult<LocalSessionsPayload> {
-    let request = request.unwrap_or(ListLocalSessionsRequest {
-        offset: 0,
-        limit: DEFAULT_LOCAL_SESSIONS_PAGE_SIZE,
-    });
-    let offset = request.offset;
-    let limit = request.limit.clamp(1, MAX_LOCAL_SESSIONS_PAGE_SIZE);
-    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
-    let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
+/// 会话列表和「全选项目」共用一个分页器：索引按库文件指纹缓存，两边都不用重建。
+fn local_session_page(
+    home: &Path,
+    db_paths: &[PathBuf],
+    filter: &codex_plus_data::LocalSessionFilter,
+    offset: usize,
+    limit: usize,
+) -> codex_plus_data::LocalSessionPage {
     static PAGER: std::sync::OnceLock<std::sync::Mutex<codex_plus_data::LocalSessionPager>> =
         std::sync::OnceLock::new();
-    let pager = PAGER.get_or_init(Default::default);
-    let page = match pager.lock() {
-        Ok(mut pager) => pager.list_page_with_thread_names(&home, &db_paths, offset, limit),
+    match PAGER.get_or_init(Default::default).lock() {
+        Ok(mut pager) => {
+            pager.list_filtered_page_with_thread_names(home, db_paths, filter, offset, limit)
+        }
         Err(_) => codex_plus_data::LocalSessionPage {
             errors: vec!["会话查询缓存不可用，请重启管理窗口。".to_string()],
             ..Default::default()
         },
-    };
-    let payload = LocalSessionsPayload {
+    }
+}
+
+fn local_sessions_payload(
+    db_paths: &[PathBuf],
+    page: codex_plus_data::LocalSessionPage,
+    filter: &codex_plus_data::LocalSessionFilter,
+    offset: usize,
+    limit: usize,
+) -> LocalSessionsPayload {
+    LocalSessionsPayload {
         db_path: db_paths
             .first()
             .map(|path| path.to_string_lossy().to_string())
@@ -7052,9 +7289,64 @@ fn list_local_sessions_blocking(
         limit,
         has_more: page.has_more,
         total_count: page.total_count,
+        projects: page
+            .projects
+            .into_iter()
+            .map(|(path, count)| LocalSessionProjectCount { path, count })
+            .collect(),
+        query: filter.query.clone(),
+        archived: filter.archived,
+    }
+}
+
+fn list_project_sessions_blocking(cwd: String) -> CommandResult<LocalSessionsPayload> {
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
+    let filter = codex_plus_data::LocalSessionFilter {
+        cwd: Some(cwd),
+        ..Default::default()
     };
+    let page = local_session_page(&home, &db_paths, &filter, 0, usize::MAX);
+    let errors = page.errors.clone();
+    let mut payload = local_sessions_payload(&db_paths, page, &filter, 0, 1);
+    payload.limit = payload.sessions.len().max(1);
+    if errors.is_empty() {
+        ok(
+            &format!("已读取项目全部 {} 个会话。", payload.total_count),
+            payload,
+        )
+    } else {
+        failed(
+            &format!("读取项目会话时出现部分错误：{}", errors.join("; ")),
+            payload,
+        )
+    }
+}
+
+fn list_local_sessions_blocking(
+    request: Option<ListLocalSessionsRequest>,
+) -> CommandResult<LocalSessionsPayload> {
+    let request = request.unwrap_or(ListLocalSessionsRequest {
+        offset: 0,
+        limit: DEFAULT_LOCAL_SESSIONS_PAGE_SIZE,
+        query: String::new(),
+        cwd: None,
+        archived: None,
+    });
+    let offset = request.offset;
+    let limit = request.limit.clamp(1, MAX_LOCAL_SESSIONS_PAGE_SIZE);
+    let filter = codex_plus_data::LocalSessionFilter {
+        query: request.query.trim().to_string(),
+        cwd: request.cwd.filter(|cwd| !cwd.trim().is_empty()),
+        archived: request.archived,
+    };
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
+    let page = local_session_page(&home, &db_paths, &filter, offset, limit);
+    let errors = page.errors.clone();
+    let payload = local_sessions_payload(&db_paths, page, &filter, offset, limit);
     let page_number = (offset / limit).saturating_add(1);
-    if page.errors.is_empty() {
+    if errors.is_empty() {
         ok(
             &format!(
                 "已读取第 {page_number} 页，共 {} 个本地会话。",
@@ -7064,14 +7356,187 @@ fn list_local_sessions_blocking(
         )
     } else {
         failed(
-            &format!("读取部分本地会话失败：{}", page.errors.join("; ")),
+            &format!("读取部分本地会话失败：{}", errors.join("; ")),
             payload,
         )
     }
 }
 
+/// 删除一个 Codex 会话（先备份，结果里带撤销用的 token）。在后台线程执行，不卡界面。
 #[tauri::command]
-pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult<DeleteResult> {
+pub async fn delete_local_session(
+    request: DeleteLocalSessionRequest,
+) -> CommandResult<DeleteResult> {
+    let session_id = request.session_id.clone();
+    match tauri::async_runtime::spawn_blocking(move || delete_local_session_blocking(request)).await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            failed_delete_result(format!("删除会话后台任务失败：{error}"), session_id, None)
+        }
+    }
+}
+
+fn failed_delete_result(
+    message: String,
+    session_id: String,
+    undo_token: Option<String>,
+) -> CommandResult<DeleteResult> {
+    failed(
+        &message,
+        DeleteResult {
+            status: codex_plus_core::models::DeleteStatus::Failed,
+            session_id,
+            message: message.clone(),
+            undo_token,
+            backup_path: None,
+        },
+    )
+}
+
+/// 一次删除多个 Codex 会话：逐个删除并备份，汇总成一条结果；所有备份合成一个撤销 token。
+#[tauri::command]
+pub async fn delete_local_sessions(
+    request: DeleteLocalSessionsRequest,
+) -> CommandResult<DeleteLocalSessionsPayload> {
+    match tauri::async_runtime::spawn_blocking(move || delete_local_sessions_blocking(request))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => failed(
+            &format!("批量删除后台任务失败：{error}"),
+            DeleteLocalSessionsPayload {
+                results: Vec::new(),
+                succeeded: 0,
+                failed: 0,
+                undo_token: None,
+            },
+        ),
+    }
+}
+
+fn delete_local_sessions_blocking(
+    request: DeleteLocalSessionsRequest,
+) -> CommandResult<DeleteLocalSessionsPayload> {
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+    let mut tokens = Vec::new();
+    for session in request.sessions {
+        if !seen.insert(session.session_id.trim().to_string()) {
+            continue;
+        }
+        let title = if session.title.trim().is_empty() {
+            session.session_id.clone()
+        } else {
+            session.title.clone()
+        };
+        let result = delete_local_session_blocking(session);
+        if let Some(token) = result.payload.undo_token.as_deref() {
+            tokens.extend(
+                serde_json::from_str::<Vec<String>>(token)
+                    .unwrap_or_else(|_| vec![token.to_string()]),
+            );
+        }
+        results.push(DeletedLocalSession {
+            session_id: result.payload.session_id.clone(),
+            title,
+            deleted: result.status == "ok",
+            message: result.message,
+        });
+    }
+    let succeeded = results.iter().filter(|item| item.deleted).count();
+    let failed_count = results.len() - succeeded;
+    let undo_token = match tokens.len() {
+        0 => None,
+        1 => tokens.pop(),
+        _ => Some(json!(tokens).to_string()),
+    };
+    let message = if failed_count == 0 {
+        format!("已删除 {succeeded} 个会话。")
+    } else {
+        format!(
+            "已删除 {succeeded} 个，失败 {failed_count} 个：{}",
+            results
+                .iter()
+                .filter(|item| !item.deleted)
+                .take(3)
+                .map(|item| format!("{}（{}）", item.title, item.message))
+                .collect::<Vec<_>>()
+                .join("；")
+        )
+    };
+    let status = if succeeded > 0 || failed_count == 0 {
+        "ok"
+    } else {
+        "failed"
+    };
+    CommandResult {
+        status: status.to_string(),
+        message,
+        payload: DeleteLocalSessionsPayload {
+            results,
+            succeeded,
+            failed: failed_count,
+            undo_token,
+        },
+    }
+}
+
+/// 撤销刚才的删除：按删除结果里的 token 从备份恢复会话记录、rollout 文件和侧栏索引。
+#[tauri::command]
+pub async fn undo_delete_local_sessions(token: String) -> CommandResult<DeleteResult> {
+    let fallback = token.clone();
+    match tauri::async_runtime::spawn_blocking(move || undo_delete_local_sessions_blocking(&token))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => failed_delete_result(
+            format!("撤销删除后台任务失败：{error}"),
+            String::new(),
+            Some(fallback),
+        ),
+    }
+}
+
+fn undo_delete_local_sessions_blocking(token: &str) -> CommandResult<DeleteResult> {
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
+    let Some(primary) = db_paths.first().cloned() else {
+        return failed_delete_result(
+            "找不到 Codex 会话数据库，无法撤销删除。".to_string(),
+            String::new(),
+            Some(token.to_string()),
+        );
+    };
+    let adapter = codex_plus_data::SQLiteStorageAdapter::new(
+        primary,
+        codex_plus_data::BackupStore::new(
+            codex_plus_core::paths::default_app_state_dir().join("backups"),
+        ),
+    )
+    .with_allowed_db_paths(db_paths)
+    .with_codex_home(&home);
+    let mut result = adapter.undo(token);
+    log_manager_event(
+        "manager.undo_delete_local_sessions",
+        json!({ "status": format!("{:?}", result.status), "message": result.message }),
+    );
+    let undone = matches!(result.status, codex_plus_core::models::DeleteStatus::Undone);
+    result.message = if undone {
+        "已从备份恢复删除的会话。".to_string()
+    } else {
+        format!("撤销删除失败：{}", result.message)
+    };
+    CommandResult {
+        status: if undone { "ok" } else { "failed" }.to_string(),
+        message: result.message.clone(),
+        payload: result,
+    }
+}
+
+fn delete_local_session_blocking(
+    request: DeleteLocalSessionRequest,
+) -> CommandResult<DeleteResult> {
     let session_id = request.session_id.trim();
     if session_id.is_empty() {
         return failed(
@@ -7268,6 +7733,131 @@ fn archive_one_local_session(path: &Path, session_id: &str, archived: bool) -> a
     anyhow::ensure!(changed > 0, "未找到会话记录");
     transaction.commit()?;
     Ok(())
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRelocationPreviewPayload {
+    #[serde(flatten)]
+    plan: codex_plus_data::SessionRelocationPlan,
+    /// 目标目录在本机是否存在。
+    target_exists: bool,
+    /// Codex 桌面端在运行时不能执行：它会覆盖全局状态，正在写的 rollout 也不能替换。
+    codex_running: bool,
+}
+
+fn session_relocation_target(request: &codex_plus_data::SessionRelocationRequest) -> &str {
+    match request {
+        codex_plus_data::SessionRelocationRequest::Remap { to, .. }
+        | codex_plus_data::SessionRelocationRequest::Move { to, .. } => to.trim(),
+    }
+}
+
+/// 预览会话目录重定位（#1085）：只读，列出会改到新目录的会话和跟着改的项目根路径。
+#[tauri::command]
+pub async fn preview_session_relocation(
+    request: codex_plus_data::SessionRelocationRequest,
+) -> CommandResult<SessionRelocationPreviewPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        match codex_plus_data::plan_session_relocation(&home, &request) {
+            Ok(plan) => ok(
+                &format!("将把 {} 个会话改到新目录。", plan.items.len()),
+                SessionRelocationPreviewPayload {
+                    plan,
+                    target_exists: Path::new(session_relocation_target(&request)).is_dir(),
+                    codex_running:
+                        !codex_plus_core::watcher::find_session_index_cleanup_blocking_processes()
+                            .is_empty(),
+                },
+            ),
+            Err(error) => failed(&format!("无法移动会话：{error:#}"), Default::default()),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| failed(&format!("预览会话移动失败：{error}"), Default::default()))
+}
+
+/// 执行会话目录重定位（#1085）：会话库、侧边栏目录库、rollout 和全局状态一起改，改动前的值写进备份目录。
+#[tauri::command]
+pub async fn apply_session_relocation(
+    request: codex_plus_data::SessionRelocationRequest,
+) -> CommandResult<codex_plus_data::SessionRelocationReport> {
+    tauri::async_runtime::spawn_blocking(move || apply_session_relocation_blocking(request))
+        .await
+        .unwrap_or_else(|error| {
+            failed(
+                &format!("移动会话的后台任务失败：{error}"),
+                Default::default(),
+            )
+        })
+}
+
+fn apply_session_relocation_blocking(
+    request: codex_plus_data::SessionRelocationRequest,
+) -> CommandResult<codex_plus_data::SessionRelocationReport> {
+    let running = codex_plus_core::watcher::find_session_index_cleanup_blocking_processes();
+    if !running.is_empty() {
+        return failed(
+            "Codex 仍在运行，请完全退出 Codex 后再移动会话。",
+            Default::default(),
+        );
+    }
+    let target = session_relocation_target(&request);
+    if !Path::new(target).is_dir() {
+        return failed(&format!("目标文件夹不存在：{target}"), Default::default());
+    }
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let backups = codex_plus_core::paths::default_app_state_dir().join("backups");
+    let report = match codex_plus_data::apply_session_relocation(&home, &request, &backups) {
+        Ok(report) => report,
+        Err(error) => return failed(&format!("移动会话失败：{error:#}"), Default::default()),
+    };
+    log_manager_event(
+        "manager.session_relocation.finish",
+        json!({
+            "moved": report.moved,
+            "rollouts_rewritten": report.rollouts_rewritten,
+            "rollouts_missing": report.rollouts_missing,
+            "project_roots_updated": report.project_roots_updated,
+            "failures": report.failures.len(),
+            "backup_dir": report.backup_dir,
+        }),
+    );
+    if report.moved == 0 && report.project_roots_updated == 0 && report.failures.is_empty() {
+        return ok("没有需要移动的会话。", report);
+    }
+    let mut message = format!("已把 {} 个会话改到新目录", report.moved);
+    if report.rollouts_missing > 0 {
+        message.push_str(&format!(
+            "（其中 {} 个找不到会话文件，只更新了索引）",
+            report.rollouts_missing
+        ));
+    }
+    if report.project_roots_updated > 0 {
+        message.push_str(&format!(
+            "，更新了 {} 处项目根路径",
+            report.project_roots_updated
+        ));
+    }
+    if let Some(backup) = &report.backup_dir {
+        message.push_str(&format!("。改动前的记录已备份到 {backup}"));
+    }
+    if report.failures.is_empty() {
+        ok(&format!("{message}。"), report)
+    } else {
+        let details = report
+            .failures
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("；");
+        failed(
+            &format!("{message}；{} 项未完成：{details}", report.failures.len()),
+            report,
+        )
+    }
 }
 
 /// 归一化「Codex 应用路径」。**无效路径一律丢弃，不落库。**
@@ -8065,9 +8655,11 @@ pub async fn load_ads() -> CommandResult<AdsPayload> {
     }
 }
 
+/// 读拓展市场清单。`force` 省略或为 false 时用内存缓存（进页面、装完拓展后刷新都走这条），
+/// 只有用户点「刷新列表」才传 true 重新下载。
 #[tauri::command]
-pub async fn refresh_script_market() -> CommandResult<ScriptMarketPayload> {
-    match script_market::cached_market_manifest(true).await {
+pub async fn refresh_script_market(force: Option<bool>) -> CommandResult<ScriptMarketPayload> {
+    match script_market::cached_market_manifest(force.unwrap_or(false)).await {
         Ok(manifest) => ok(
             "脚本市场已刷新。",
             script_market_payload_from_manifest(&manifest, "ok", "脚本市场已刷新。"),
@@ -8317,7 +8909,8 @@ pub fn set_user_scripts_enabled(
     }
 }
 
-/// 记下管理器的使用模式（#2902）：页面本地存储之外再存进设置文件，本地存储丢了也能补回。
+/// 记下管理器的启动引导已经出现过（#2902）：页面本地存储之外再在设置文件里留个记号，本地存储丢了也不会重复弹。
+/// 这个字段原来记的是使用模式（已取消，所有功能始终显示），所以取值还是那三个模式名，前端现在只写 "all"、只看非空。
 #[tauri::command]
 pub fn set_manager_agent_focus(mode: String) -> CommandResult<SettingsPayload> {
     let mode = mode.trim();
@@ -8476,16 +9069,25 @@ pub async fn extension_manager_backend_call(
 }
 
 /// 保存拓展包的配置（清单 config 里声明的项）。页面侧要热重载后才读到新值，由前端随后触发。
+/// `merge`：只覆盖给出的项、其余已存的值保留。拓展自己的面板调 `codexPlusManager.config.set(values)` 时用，
+/// 它常常只传改动的那一项；设置表单提交的是整份，照旧整份替换。
 #[tauri::command]
 pub fn set_extension_config(
     key: String,
     values: serde_json::Map<String, Value>,
+    merge: Option<bool>,
 ) -> CommandResult<SettingsPayload> {
     let trimmed = key.trim();
     if trimmed.is_empty() {
         return failed("拓展 key 不能为空。", fallback_settings_payload());
     }
-    match default_user_script_manager().set_extension_config(trimmed, &values) {
+    let manager = default_user_script_manager();
+    let saved = if merge.unwrap_or(false) {
+        manager.update_extension_config(trimmed, &values)
+    } else {
+        manager.set_extension_config(trimmed, &values)
+    };
+    match saved {
         Ok(_) => settings_payload("拓展配置已保存。", "拓展配置保存失败"),
         Err(error) => failed(
             &format!("拓展配置保存失败：{error:#}"),
@@ -9076,6 +9678,105 @@ fn import_local_skills_blocking(path: &str) -> CommandResult<SkillsPayload> {
             payload,
         )
     }
+}
+
+/// 把选中的 Skill 连同分组、各 Agent 的启用状态导出成迁移包（#2852）。
+#[tauri::command]
+pub async fn export_skill_bundle(
+    path: String,
+    skills: Vec<codex_plus_core::skills::SkillBundleSelection>,
+    groups: Vec<String>,
+) -> CommandResult<codex_plus_core::skills::SkillBundleExport> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let destination = std::path::PathBuf::from(path.trim());
+        match default_skills_manager().export_skill_bundle(&skills, &groups, &destination) {
+            Ok(outcome) if outcome.errors.is_empty() => ok(
+                &format!(
+                    "已导出 {} 个 Skill：{}",
+                    outcome.exported.len(),
+                    destination.display()
+                ),
+                outcome,
+            ),
+            Ok(outcome) => failed(
+                &format!(
+                    "已导出 {} 个 Skill，{} 个未导出：{}",
+                    outcome.exported.len(),
+                    outcome.errors.len(),
+                    outcome.errors.join("；")
+                ),
+                outcome,
+            ),
+            Err(error) => failed(
+                &format!("导出 Skill 迁移包失败：{error:#}"),
+                Default::default(),
+            ),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        failed(
+            &format!("导出 Skill 迁移包失败：{error}"),
+            Default::default(),
+        )
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillBundleImportPayload {
+    #[serde(flatten)]
+    skills: SkillsPayload,
+    bundle: codex_plus_core::skills::SkillBundleImport,
+}
+
+/// 导入 Skill 迁移包（#2852）。本机已有的同名 Skill 不覆盖文件；分组由界面按返回的清单恢复。
+#[tauri::command]
+pub async fn import_skill_bundle(path: String) -> CommandResult<SkillBundleImportPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let manager = default_skills_manager();
+        let result = manager.import_skill_bundle(std::path::Path::new(path.trim()));
+        let skills = current_skills_payload(&manager);
+        match result {
+            Ok(bundle) => {
+                let summary = format!(
+                    "已导入 {} 个 Skill，{} 个本机已有（未覆盖文件）",
+                    bundle.imported.len(),
+                    bundle.existing.len()
+                );
+                if bundle.errors.is_empty() {
+                    ok(
+                        &format!("{summary}。"),
+                        SkillBundleImportPayload { skills, bundle },
+                    )
+                } else {
+                    let message = format!(
+                        "{summary}；{} 项失败：{}",
+                        bundle.errors.len(),
+                        bundle.errors.join("；")
+                    );
+                    failed(&message, SkillBundleImportPayload { skills, bundle })
+                }
+            }
+            Err(error) => failed(
+                &format!("导入 Skill 迁移包失败：{error:#}"),
+                SkillBundleImportPayload {
+                    skills,
+                    bundle: Default::default(),
+                },
+            ),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        failed(
+            &format!("导入 Skill 迁移包失败：{error}"),
+            SkillBundleImportPayload {
+                skills: current_skills_payload(&default_skills_manager()),
+                bundle: Default::default(),
+            },
+        )
+    })
 }
 
 #[tauri::command]
@@ -10245,32 +10946,63 @@ pub async fn request_context_preview(
         .map_err(|_| "Local request context preview is unavailable".into())
 }
 
-/// 实时请求流：托盘「流量」页签和总览拓扑图的光点动画每秒轮询它。
-/// 默认只读日志末尾和进行中的请求。路由页可额外读取本地 Codex 会话标题。
+/// 一次读出多个供应商的独立代理（「Codex 连接 → 高级」里的供应商列表用），不再每个供应商单独请求一次。
 #[tauri::command]
-pub fn load_request_flow(
+pub fn load_relay_proxies(profile_ids: Vec<String>) -> CommandResult<Value> {
+    let proxies: serde_json::Map<String, Value> = profile_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            (
+                id.to_string(),
+                json!({
+                    "proxyUrl": codex_plus_core::relay_proxy::proxy_for_profile(id).unwrap_or_default(),
+                    "configured": codex_plus_core::relay_proxy::configured_proxy_for_profile(id).is_some()
+                }),
+            )
+        })
+        .collect();
+    ok("供应商代理已读取。", json!({ "proxies": proxies }))
+}
+
+// 下面两个读请求日志的命令都被页面定时轮询：放到阻塞线程池里做，读文件、查会话库期间不卡界面线程。
+/// 实时请求流：托盘「流量」页签和总览拓扑图的光点动画每秒轮询它。
+/// 默认只读日志末尾和进行中的请求，路由页可选择补充会话标题。
+#[tauri::command]
+pub async fn load_request_flow(
     limit: Option<usize>,
     include_thread_titles: Option<bool>,
 ) -> CommandResult<Value> {
     let limit = limit.unwrap_or(30).clamp(1, 200);
-    match codex_plus_core::request_log::read_recent_request_logs(limit) {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::request_log::read_recent_request_logs(limit)
+    })
+    .await
+    .unwrap_or_else(|error| Err(std::io::Error::other(error.to_string())));
+    match result {
         Ok(entries) if include_thread_titles.unwrap_or(false) => {
-            let titles = request_log_thread_titles(&entries);
-            let count = entries.len();
-            let entries: Vec<Value> = entries
-                .iter()
-                .map(|entry| {
-                    let mut value = serde_json::to_value(entry).unwrap_or_else(|_| json!({}));
-                    if let Some(title) = entry.thread_id.as_ref().and_then(|id| titles.get(id)) {
-                        value["threadTitle"] = json!(title);
-                    }
-                    value
-                })
-                .collect();
-            ok(
-                &format!("已读取 {count} 条请求。"),
-                json!({ "entries": entries }),
-            )
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let titles = request_log_thread_titles(&entries);
+                let count = entries.len();
+                let entries: Vec<Value> = entries
+                    .iter()
+                    .map(|entry| {
+                        let mut value = serde_json::to_value(entry).unwrap_or_else(|_| json!({}));
+                        if let Some(title) = entry.thread_id.as_ref().and_then(|id| titles.get(id))
+                        {
+                            value["threadTitle"] = json!(title);
+                        }
+                        value
+                    })
+                    .collect();
+                ok(
+                    &format!("已读取 {count} 条请求。"),
+                    json!({ "entries": entries }),
+                )
+            })
+            .await;
+            result.unwrap_or_else(|_| failed("读取会话标题失败", json!({"entries": []})))
         }
         Ok(entries) => ok(
             &format!("已读取 {} 条请求。", entries.len()),
@@ -10301,8 +11033,10 @@ fn request_log_thread_titles(
     codex_plus_data::local_session_titles(&db_paths, &thread_ids)
 }
 
+/// 读请求日志。带上次返回的 `cursor` 时只读之后新写入的记录（自动刷新用），
+/// 返回 `incremental: true`，前端把新记录并进已有列表；游标对不上（清空、裁剪过）时照常整页返回。
 #[tauri::command]
-pub fn load_request_logs(
+pub async fn load_request_logs(
     limit: Option<usize>,
     since_ms: Option<u64>,
     completed_date: Option<String>,
@@ -10310,8 +11044,8 @@ pub fn load_request_logs(
     relay_id: Option<String>,
     relay_unknown: Option<bool>,
     model: Option<String>,
+    cursor: Option<codex_plus_core::request_log::RequestLogCursor>,
 ) -> CommandResult<Value> {
-    let limit = limit.unwrap_or(200).clamp(1, 1000);
     let present = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
     let filter = codex_plus_core::request_log::RequestLogFilter {
         since_ms,
@@ -10321,52 +11055,47 @@ pub fn load_request_logs(
         relay_unknown: relay_unknown.unwrap_or(false),
         model: present(model),
     };
+    tauri::async_runtime::spawn_blocking(move || load_request_logs_blocking(limit, filter, cursor))
+        .await
+        .unwrap_or_else(|error| {
+            failed(
+                &format!("读取请求日志失败：{error}"),
+                json!({ "entries": [] }),
+            )
+        })
+}
+
+fn load_request_logs_blocking(
+    limit: Option<usize>,
+    filter: codex_plus_core::request_log::RequestLogFilter,
+    cursor: Option<codex_plus_core::request_log::RequestLogCursor>,
+) -> CommandResult<Value> {
+    let limit = limit.unwrap_or(200).clamp(1, 1000);
+    if let Some(cursor) = cursor {
+        match codex_plus_core::request_log::read_request_logs_after(&filter, &cursor) {
+            Ok(Some(delta)) => {
+                let entries = decorate_request_log_entries(&delta.entries);
+                return ok(
+                    &format!("已读取 {} 条新请求日志。", entries.len()),
+                    json!({ "entries": entries, "incremental": true, "cursor": delta.cursor }),
+                );
+            }
+            // 游标失效：落到下面整页重读。
+            Ok(None) => {}
+            Err(error) => {
+                return failed(
+                    &format!("读取请求日志失败：{error}"),
+                    json!({ "entries": [] }),
+                );
+            }
+        }
+    }
     match codex_plus_core::request_log::read_request_log_page(limit, &filter) {
         Ok(page) => {
-            let entries = page.entries;
-            // 分开上游实扣与当前配置费率，不把积分当作货币。
-            let gateway = codex_plus_core::gateway::store::GatewayStore::default()
-                .load()
-                .unwrap_or_default();
-            // 会话标题来自 Codex 本地会话库，只用于展示；查不到时前端退回短 id。
-            let titles = request_log_thread_titles(&entries);
-            let entries: Vec<Value> = entries
-                .iter()
-                .map(|entry| {
-                    let mut value = serde_json::to_value(entry).unwrap_or_else(|_| json!({}));
-                    let pricing = codex_plus_core::gateway::usage::entry_pricing(entry, &gateway);
-                    if entry.state.as_deref() != Some("running") {
-                        value["pricing"] = json!(pricing);
-                    }
-                    if let Some(usage) = entry.usage.as_ref()
-                        && let Some(object) = value.get_mut("usage").and_then(Value::as_object_mut)
-                    {
-                        let verified = entry.final_response_evidence.as_deref()
-                            == Some(codex_plus_core::request_log::FINAL_RESPONSE_EVIDENCE_V1);
-                        object.insert(
-                            "cachedTokensKnown".to_string(),
-                            json!(usage.reported_cached_tokens(verified).is_some()),
-                        );
-                    }
-                    if let Some(title) = entry
-                        .thread_id
-                        .as_ref()
-                        .and_then(|thread_id| titles.get(thread_id))
-                        && let Some(object) = value.as_object_mut()
-                    {
-                        object.insert("threadTitle".to_string(), json!(title));
-                    }
-                    if let Some(cost) = codex_plus_core::gateway::usage::entry_cost(entry, &gateway)
-                        && let Some(object) = value.as_object_mut()
-                    {
-                        object.insert("cost".to_string(), json!(cost));
-                    }
-                    value
-                })
-                .collect();
+            let entries = decorate_request_log_entries(&page.entries);
             ok(
                 &format!("已读取 {} 条请求日志。", entries.len()),
-                json!({ "entries": entries, "more": page.more, "oldestMs": page.oldest_ms }),
+                json!({ "entries": entries, "more": page.more, "oldestMs": page.oldest_ms, "cursor": page.cursor }),
             )
         }
         Err(error) => failed(
@@ -10374,6 +11103,56 @@ pub fn load_request_logs(
             json!({ "entries": [] }),
         ),
     }
+}
+
+/// 给请求日志补上展示用的会话标题和估算费用；没有记录时不读网关配置、不开会话库。
+fn decorate_request_log_entries(
+    entries: &[codex_plus_core::request_log::RequestLogEntry],
+) -> Vec<Value> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    // 费用按供应商里现在填的价格估算，和用量统计一致。
+    let gateway = codex_plus_core::gateway::store::GatewayStore::default()
+        .load()
+        .unwrap_or_default();
+    // 会话标题来自 Codex 本地会话库，只用于展示；查不到时前端退回短 id。
+    let titles = request_log_thread_titles(entries);
+    entries
+        .iter()
+        .map(|entry| {
+            let mut value = serde_json::to_value(entry).unwrap_or_else(|_| json!({}));
+            if entry.state.as_deref() != Some("running") {
+                value["pricing"] = json!(codex_plus_core::gateway::usage::entry_pricing(
+                    entry, &gateway
+                ));
+            }
+            if let Some(usage) = entry.usage.as_ref()
+                && let Some(object) = value.get_mut("usage").and_then(Value::as_object_mut)
+            {
+                let verified = entry.final_response_evidence.as_deref()
+                    == Some(codex_plus_core::request_log::FINAL_RESPONSE_EVIDENCE_V1);
+                object.insert(
+                    "cachedTokensKnown".to_string(),
+                    json!(usage.reported_cached_tokens(verified).is_some()),
+                );
+            }
+            if let Some(title) = entry
+                .thread_id
+                .as_ref()
+                .and_then(|thread_id| titles.get(thread_id))
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert("threadTitle".to_string(), json!(title));
+            }
+            if let Some(cost) = codex_plus_core::gateway::usage::entry_cost(entry, &gateway)
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert("cost".to_string(), json!(cost));
+            }
+            value
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -10968,7 +11747,7 @@ pub fn switch_relay_profile(
         &settings.active_relay_id,
     ) {
         return failed(
-            "Codex 正由 Codex++ 网关接管：先在「供应商配置」顶部或「Agent 接入」里点「断开并还原」，再切换供应商。",
+            "Codex 正由 Codex++ 本地服务接管：先在「供应商配置」顶部或「Agent 接入」里点「断开并还原」，再切换供应商。",
             relay_switch_payload(
                 store.load().unwrap_or_default(),
                 codex_plus_core::relay_config::relay_status_from_home(&home),
@@ -11003,7 +11782,7 @@ pub fn switch_relay_profile(
                     "liveBackupPath": outcome.live_backup_path.as_ref()
                 }),
             );
-            // 在 Codex 供应商页切到别的供应商等于断开网关，切回「Codex++ 网关」等于重新接入。
+            // 在 Codex 供应商页切到别的供应商等于断开网关，切回「Codex++ 本地服务」等于重新接入。
             let binding_update = codex_plus_core::gateway::apply::note_codex_switched(
                 &codex_plus_core::gateway::store::GatewayStore::default(),
                 &result.settings.active_relay_id,
@@ -11297,9 +12076,7 @@ pub fn backfill_relay_profile_from_live(
             )
         }
         Err(error) => {
-            let live_conflict = error
-                .chain()
-                .any(|cause| cause.is::<codex_plus_core::relay_config::LiveEndpointChanged>());
+            let live_conflict = codex_plus_core::relay_config::is_live_endpoint_conflict(&error);
             log_manager_event(
                 "manager.backfill_relay_profile_from_live.failed",
                 json!({
@@ -11362,8 +12139,28 @@ pub fn read_live_context_entries() -> CommandResult<LiveContextEntriesPayload> {
     }
 }
 
+/// 纯文本换算，但设置可能很大，放到后台线程，不占主线程。
 #[tauri::command]
-pub fn upsert_context_entry(request: ContextEntryRequest) -> CommandResult<ContextEntriesPayload> {
+pub async fn upsert_context_entry(
+    request: ContextEntryRequest,
+) -> CommandResult<ContextEntriesPayload> {
+    let fallback = request.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || upsert_context_entry_blocking(request))
+        .await
+        .unwrap_or_else(|error| {
+            failed(
+                &format!("保存MCP&插件后台任务失败：{error}"),
+                ContextEntriesPayload {
+                    settings: fallback,
+                    entries: empty_context_entries(),
+                },
+            )
+        })
+}
+
+fn upsert_context_entry_blocking(
+    request: ContextEntryRequest,
+) -> CommandResult<ContextEntriesPayload> {
     let mut settings = request.settings;
     match codex_plus_core::relay_config::upsert_context_entry_in_common_config(
         &settings.relay_context_config_contents,
@@ -11540,8 +12337,24 @@ pub fn import_mcp_servers_json(request: McpImportRequest) -> CommandResult<Conte
     result
 }
 
+/// 读写 live config.toml 并先做备份，放到后台线程执行。
 #[tauri::command]
-pub fn sync_live_context_entries(
+pub async fn sync_live_context_entries(
+    request: ContextSettingsRequest,
+) -> CommandResult<LiveContextEntriesPayload> {
+    tauri::async_runtime::spawn_blocking(move || sync_live_context_entries_blocking(request))
+        .await
+        .unwrap_or_else(|error| {
+            failed(
+                &format!("同步 live MCP&插件后台任务失败：{error}"),
+                LiveContextEntriesPayload {
+                    entries: empty_context_entries(),
+                },
+            )
+        })
+}
+
+fn sync_live_context_entries_blocking(
     request: ContextSettingsRequest,
 ) -> CommandResult<LiveContextEntriesPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
@@ -11630,6 +12443,98 @@ pub fn sync_live_context_entries(
                 entries: empty_context_entries(),
             },
         ),
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyContextEntryRequest {
+    pub settings: BackendSettings,
+    pub kind: String,
+    pub id: String,
+    /// 新的表体；为 None 表示删除这一条。
+    #[serde(default)]
+    pub toml_body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedContextEntryPayload {
+    /// 保存后的设置；改动没能写进设置时为 None。
+    pub saved: Option<SettingsPayload>,
+    /// 同步后 live config.toml 里的条目；没同步成功时为 None。
+    pub live_entries: Option<codex_plus_core::relay_config::CodexContextEntries>,
+}
+
+/// MCP 页的一次开关 / 编辑 / 删除：改公共配置 → 保存设置 → 同步到 live config.toml，
+/// 一次往返在后台线程里做完（原来前端要串行调三个命令）。
+#[tauri::command]
+pub async fn apply_context_entry(
+    request: ApplyContextEntryRequest,
+) -> CommandResult<AppliedContextEntryPayload> {
+    tauri::async_runtime::spawn_blocking(move || apply_context_entry_blocking(request))
+        .await
+        .unwrap_or_else(|error| {
+            failed(
+                &format!("保存MCP&插件后台任务失败：{error}"),
+                AppliedContextEntryPayload {
+                    saved: None,
+                    live_entries: None,
+                },
+            )
+        })
+}
+
+fn apply_context_entry_blocking(
+    request: ApplyContextEntryRequest,
+) -> CommandResult<AppliedContextEntryPayload> {
+    let changed = match request.toml_body {
+        Some(toml_body) => upsert_context_entry_blocking(ContextEntryRequest {
+            settings: request.settings,
+            kind: request.kind,
+            id: request.id,
+            toml_body,
+        }),
+        None => delete_context_entry(ContextDeleteRequest {
+            settings: request.settings,
+            kind: request.kind,
+            id: request.id,
+        }),
+    };
+    if changed.status != "ok" {
+        return failed(
+            &changed.message,
+            AppliedContextEntryPayload {
+                saved: None,
+                live_entries: None,
+            },
+        );
+    }
+    let saved = save_settings(changed.payload.settings, None);
+    if saved.status != "ok" {
+        return failed(
+            &saved.message,
+            AppliedContextEntryPayload {
+                saved: Some(saved.payload),
+                live_entries: None,
+            },
+        );
+    }
+    let synced = sync_live_context_entries_blocking(ContextSettingsRequest {
+        settings: saved.payload.settings.clone(),
+    });
+    let synced_ok = synced.status == "ok";
+    CommandResult {
+        status: synced.status,
+        message: if synced_ok {
+            "MCP&插件已保存并同步。".to_string()
+        } else {
+            synced.message
+        },
+        payload: AppliedContextEntryPayload {
+            saved: Some(saved.payload),
+            live_entries: synced_ok.then_some(synced.payload.entries),
+        },
     }
 }
 
@@ -13219,7 +14124,10 @@ fn diagnostics_report() -> String {
         "generatedAtMs": generated_at_ms,
         "version": codex_plus_core::version::VERSION,
         "overview": overview.payload,
-        "settings": settings,
+        // 报告会被整段贴进 issue：设置里的 Key、登录 token 一律打码（#3129）。
+        "settings": codex_plus_core::diagnostic_redaction::redact_report_value(
+            serde_json::to_value(&settings).unwrap_or_default()
+        ),
         "codexAppTools": codex_app_tools,
         "logs": {
             "diagnosticLogPath": codex_plus_core::paths::default_diagnostic_log_path(),
@@ -14426,6 +15334,17 @@ base_url = "https://example.invalid/v1"
         }
     }
 
+    /// #3191：首选端口被别的程序占着、Codex 实际跑在备用端口时，重启和停止要认备用端口。
+    #[test]
+    fn running_port_follows_the_owned_session_when_it_moved_off_the_requested_port() {
+        let alive = |port: u16| port == 51234;
+        assert_eq!(resolve_running_debug_port(9229, Some(51234), alive), 51234);
+        // 本进程没有会话、会话就在首选端口、或会话端口已经不通：都按首选端口。
+        assert_eq!(resolve_running_debug_port(9229, None, alive), 9229);
+        assert_eq!(resolve_running_debug_port(9229, Some(9229), alive), 9229);
+        assert_eq!(resolve_running_debug_port(9229, Some(40000), alive), 9229);
+    }
+
     #[test]
     fn restart_and_launch_share_a_single_flight_guard() {
         let first = try_acquire_launch_guard().unwrap();
@@ -14563,21 +15482,6 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
-    fn dream_skin_image_payload_does_not_expose_image_bytes() {
-        let payload = DreamSkinImagePayload {
-            path: "managed/current.png".to_string(),
-            content_type: "image/png".to_string(),
-            size_bytes: 42,
-        };
-
-        let value = serde_json::to_value(payload).unwrap();
-
-        assert!(value.get("bytes").is_none());
-        assert_eq!(value["contentType"], "image/png");
-        assert_eq!(value["sizeBytes"], 42);
-    }
-
-    #[test]
     fn dream_skin_theme_library_payload_does_not_expose_image_bytes() {
         let settings = BackendSettings::default();
         let library = empty_dream_skin_library(&settings);
@@ -14605,28 +15509,28 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
-    fn dream_skin_commands_are_registered_with_tauri() {
+    fn manager_registers_only_the_dream_skin_commands_it_still_calls() {
         let source =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
 
         for command in [
-            "commands::dream_skin_status",
-            "commands::import_dream_skin_image",
-            "commands::reset_dream_skin_theme",
-            "commands::apply_dream_skin",
-            "commands::restore_dream_skin",
-            "commands::verify_dream_skin",
-            "commands::list_dream_skin_themes",
-            "commands::refresh_dream_skin_market",
-            "commands::install_dream_skin_market_theme",
-            "commands::load_dream_skin_theme",
-            "commands::create_dream_skin_theme",
-            "commands::save_dream_skin_theme",
-            "commands::rename_dream_skin_theme",
-            "commands::delete_dream_skin_theme",
-            "commands::activate_dream_skin_theme",
+            "commands::restore_dream_skin,",
+            "commands::load_pending_dream_skin_community,",
+            "commands::confirm_pending_dream_skin_community,",
+            "commands::dismiss_pending_dream_skin_community,",
+            "dream_skin_bridge::activate_installed_dream_skin_theme,",
         ] {
             assert!(source.contains(command), "missing Tauri command {command}");
+        }
+        // 皮肤的编辑、市场与社区都搬进了 Codex 设置页，经 /dream-skin 桥走，不再给管理器前端开口子。
+        for command in [
+            "commands::dream_skin_status,",
+            "commands::activate_dream_skin_theme,",
+            "commands::save_dream_skin_theme,",
+            "commands::install_dream_skin_market_theme,",
+            "commands::import_dream_skin_theme_package,",
+        ] {
+            assert!(!source.contains(command), "stale Tauri command {command}");
         }
     }
 
@@ -14639,23 +15543,6 @@ base_url = "https://example.invalid/v1"
         assert!(source.contains("Menu::with_items(&app, &[&show, &quit])"));
         assert!(!source.contains("tray_apply_dream_skin"));
         assert!(!source.contains("apply_dream_skin_from_tray"));
-    }
-
-    #[test]
-    fn dream_skin_theme_reset_rollback_preserves_unknown_settings_fields() {
-        let source =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
-                .unwrap();
-        let start = source.find("pub fn reset_dream_skin_theme").unwrap();
-        let end = source[start..]
-            .find("pub async fn verify_dream_skin")
-            .unwrap()
-            + start;
-        let reset_source = &source[start..end];
-
-        assert!(!reset_source.contains("store.save(&previous)"));
-        assert!(reset_source.contains("codexAppDreamSkinThemeConfig"));
-        assert!(reset_source.contains("codexAppDreamSkinImagePath"));
     }
 
     #[test]
@@ -15470,7 +16357,7 @@ base_url = "https://example.invalid/v1"
         unsafe {
             std::env::set_var("CODEX_HOME", &codex_home);
         }
-        let result = delete_local_session(DeleteLocalSessionRequest {
+        let result = delete_local_session_blocking(DeleteLocalSessionRequest {
             session_id: "t1".to_string(),
             title: "Active Thread".to_string(),
             db_path: Some(stale_db.to_string_lossy().to_string()),
@@ -15496,37 +16383,6 @@ base_url = "https://example.invalid/v1"
                 })
                 .unwrap(),
             0
-        );
-    }
-
-    #[test]
-    fn project_path_identity_matches_frontend_grouping() {
-        assert_eq!(
-            normalized_project_path(r"C:\Projects\Foo\\"),
-            "C:/Projects/Foo"
-        );
-        assert_eq!(normalized_project_path("/Projects/Foo///"), "/Projects/Foo");
-        // Windows 长路径前缀不进入项目身份（#2791）。
-        assert_eq!(
-            normalized_project_path(r"\\?\C:\Projects\Foo\"),
-            "C:/Projects/Foo"
-        );
-        assert_eq!(
-            normalized_project_path(r"\\?\UNC\server\share\Foo"),
-            normalized_project_path(r"\\server\share\Foo")
-        );
-        assert_eq!(normalized_project_path(r"\\?\C:\"), "C:");
-        assert_eq!(
-            normalized_project_path(r"\\?\Volume{abc}\Foo"),
-            "//?/Volume{abc}/Foo"
-        );
-        assert_ne!(
-            normalized_project_path("/Projects/Foo"),
-            normalized_project_path("/Projects/foo")
-        );
-        assert_ne!(
-            normalized_project_path("/Projects/Foo"),
-            normalized_project_path(" /Projects/Foo")
         );
     }
 
@@ -15609,6 +16465,9 @@ base_url = "https://example.invalid/v1"
         let first_page = list_local_sessions_blocking(Some(ListLocalSessionsRequest {
             offset: 0,
             limit: 2,
+            query: String::new(),
+            cwd: None,
+            archived: None,
         }));
         assert_eq!(first_page.payload.sessions.len(), 2);
         assert_eq!(first_page.payload.sessions[0].id, "t2");
@@ -15619,6 +16478,9 @@ base_url = "https://example.invalid/v1"
         let second_page = list_local_sessions_blocking(Some(ListLocalSessionsRequest {
             offset: 2,
             limit: 2,
+            query: String::new(),
+            cwd: None,
+            archived: None,
         }));
         restore_codex_home(previous_codex_home);
 
@@ -15645,10 +16507,16 @@ base_url = "https://example.invalid/v1"
             tauri::async_runtime::block_on(list_local_sessions(Some(ListLocalSessionsRequest {
                 offset: 0,
                 limit: 0,
+                query: String::new(),
+                cwd: None,
+                archived: None,
             })));
         let beyond = list_local_sessions_blocking(Some(ListLocalSessionsRequest {
             offset: usize::MAX,
             limit: usize::MAX,
+            query: String::new(),
+            cwd: None,
+            archived: None,
         }));
         restore_codex_home(previous_codex_home);
         assert_eq!(first.status, "failed");
@@ -15749,7 +16617,7 @@ base_url = "https://example.invalid/v1"
         unsafe {
             std::env::set_var("CODEX_HOME", &codex_home);
         }
-        let result = delete_local_session(DeleteLocalSessionRequest {
+        let result = delete_local_session_blocking(DeleteLocalSessionRequest {
             session_id: "t1".to_string(),
             title: "Legacy Copy".to_string(),
             db_path: Some(legacy_db.to_string_lossy().to_string()),
@@ -15759,6 +16627,106 @@ base_url = "https://example.invalid/v1"
         assert_eq!(result.status, "ok");
         assert_eq!(thread_count(&current_db, "t1"), 0);
         assert_eq!(thread_count(&legacy_db, "t1"), 0);
+    }
+
+    #[test]
+    fn batch_delete_reports_each_session_and_one_token_undoes_them_all() {
+        let _codex_home_guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let codex_home = temp.path().join("codex-home");
+        let sqlite_dir = codex_home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let db = sqlite_dir.join("state_5.sqlite");
+        create_minimal_thread_db(&db, "keep", "Keep", 300);
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads VALUES ('b1', '', 'Batch one', 200);\
+                 INSERT INTO threads VALUES ('b2', '', 'Batch two', 100);",
+            )
+            .unwrap();
+        drop(connection);
+
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+        let request = |id: &str| DeleteLocalSessionRequest {
+            session_id: id.to_string(),
+            title: String::new(),
+            db_path: Some(db.to_string_lossy().to_string()),
+        };
+        let deleted = delete_local_sessions_blocking(DeleteLocalSessionsRequest {
+            sessions: vec![
+                request("b1"),
+                request("b2"),
+                request("b1"),
+                request("missing"),
+            ],
+        });
+        let after_delete = (thread_count(&db, "b1"), thread_count(&db, "b2"));
+        let undone = deleted
+            .payload
+            .undo_token
+            .as_deref()
+            .map(undo_delete_local_sessions_blocking);
+        restore_codex_home(previous_codex_home);
+
+        // 重复的 ID 只删一次；删不到的单独记失败，不影响其它会话。
+        assert_eq!(deleted.status, "ok");
+        assert_eq!(deleted.payload.results.len(), 3);
+        assert_eq!(deleted.payload.succeeded, 2);
+        assert_eq!(deleted.payload.failed, 1);
+        assert!(!deleted.payload.results[2].deleted);
+        assert_eq!(after_delete, (0, 0));
+        assert_eq!(thread_count(&db, "keep"), 1);
+        let undone = undone.expect("批量删除应返回撤销 token");
+        assert_eq!(undone.status, "ok", "{}", undone.message);
+        assert_eq!(thread_count(&db, "b1"), 1);
+        assert_eq!(thread_count(&db, "b2"), 1);
+    }
+
+    #[test]
+    fn list_local_sessions_filters_archived_and_searches_beyond_the_first_page() {
+        let _codex_home_guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let home = temp.path().join("codex-home");
+        let sqlite = home.join("sqlite");
+        std::fs::create_dir_all(&sqlite).unwrap();
+        let db = rusqlite::Connection::open(sqlite.join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, cwd TEXT, archived INTEGER, updated_at_ms INTEGER);\
+             INSERT INTO threads VALUES ('new', '', 'Newest', '/work/a', 0, 30);\
+             INSERT INTO threads VALUES ('old', '', 'Archived', '/work/a', 1, 20);\
+             INSERT INTO threads VALUES ('far', '', 'Needle', '/work/b', 0, 10);",
+        )
+        .unwrap();
+        drop(db);
+        unsafe {
+            std::env::set_var("CODEX_HOME", &home);
+        }
+        let request = |query: &str, archived: Option<bool>| ListLocalSessionsRequest {
+            offset: 0,
+            limit: 1,
+            query: query.to_string(),
+            cwd: None,
+            archived,
+        };
+        let active = list_local_sessions_blocking(Some(request("", Some(false))));
+        let archived = list_local_sessions_blocking(Some(request("", Some(true))));
+        let search = list_local_sessions_blocking(Some(request("  needle ", None)));
+        restore_codex_home(previous_codex_home);
+
+        assert_eq!(active.payload.total_count, 2);
+        assert!(active.payload.has_more);
+        assert_eq!(active.payload.archived, Some(false));
+        assert_eq!(active.payload.projects.len(), 2);
+        assert_eq!(archived.payload.total_count, 1);
+        assert_eq!(archived.payload.sessions[0].id, "old");
+        assert_eq!(search.payload.total_count, 1);
+        assert_eq!(search.payload.sessions[0].id, "far");
+        assert_eq!(search.payload.query, "needle");
     }
 
     fn create_minimal_thread_db(path: &Path, id: &str, title: &str, updated_at_ms: i64) {
@@ -16279,7 +17247,7 @@ model_reasoning_effort = "high"
     #[test]
     fn context_entry_commands_update_settings_payload() {
         let settings = BackendSettings::default();
-        let upsert = upsert_context_entry(ContextEntryRequest {
+        let upsert = upsert_context_entry_blocking(ContextEntryRequest {
             settings: settings.clone(),
             kind: "mcp".to_string(),
             id: "context7".to_string(),

@@ -12,6 +12,7 @@
 //! - 本机回环 `127.0.0.1:port`（HTTP），认主令牌与设备令牌；
 //! - 局域网 / Tailscale `0.0.0.0:lan_port`（自签 HTTPS，默认关），只认配对过的设备令牌。
 
+pub mod chat_notifications;
 pub mod devices;
 pub mod follower;
 pub mod headless;
@@ -231,6 +232,7 @@ impl ListenOptions {
 
 struct Running {
     options: ListenOptions,
+    port: u16,
     /// 局域网入口实际是否在听（端口被占时只有本机入口）。
     lan_listening: bool,
     stop: tokio::sync::oneshot::Sender<()>,
@@ -324,7 +326,7 @@ pub fn start_with(options: ListenOptions) -> anyhow::Result<()> {
     if let Some(running) = slot.take() {
         stop_running(running);
     }
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<bool>>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<(u16, bool)>>();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let thread_options = options.clone();
     let thread = std::thread::Builder::new()
@@ -343,12 +345,22 @@ pub fn start_with(options: ListenOptions) -> anyhow::Result<()> {
                 }
             };
             runtime.block_on(async move {
-                let port = options.port;
-                let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                    Ok(listener) => listener,
+                let preferred_port = options.port;
+                let listener =
+                    match tokio::net::TcpListener::bind(("127.0.0.1", preferred_port)).await {
+                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                            tokio::net::TcpListener::bind(("127.0.0.1", 0)).await
+                        }
+                        result => result,
+                    };
+                let (listener, port) = match listener
+                    .and_then(|listener| Ok((listener.local_addr()?.port(), listener)))
+                {
+                    Ok((port, listener)) => (listener, port),
                     Err(error) => {
-                        let _ = ready_tx
-                            .send(Err(anyhow::anyhow!("监听 127.0.0.1:{port} 失败：{error}")));
+                        let _ = ready_tx.send(Err(anyhow::anyhow!(
+                            "无法启动本机远程控制监听（首选端口 {preferred_port}）：{error}"
+                        )));
                         return;
                     }
                 };
@@ -376,7 +388,7 @@ pub fn start_with(options: ListenOptions) -> anyhow::Result<()> {
                 // 加加的工具经本机入口转回来：先告诉它端口，再起后台循环（没配置过就什么也不做）。
                 let jiajia = service.jiajia();
                 jiajia.set_port(port);
-                jiajia.start();
+                jiajia.start_with_lan_port(lan_listener.as_ref().map(|(_, _, port)| *port));
                 register_hosted(&service);
                 let local = Arc::new(server::ServerContext {
                     service: service.clone(),
@@ -384,7 +396,7 @@ pub fn start_with(options: ListenOptions) -> anyhow::Result<()> {
                     port,
                     scope: server::Scope::Loopback,
                 });
-                let _ = ready_tx.send(Ok(lan_listener.is_some()));
+                let _ = ready_tx.send(Ok((port, lan_listener.is_some())));
                 let lan_task = async {
                     match lan_listener {
                         Some((listener, acceptor, lan_port)) => {
@@ -410,7 +422,7 @@ pub fn start_with(options: ListenOptions) -> anyhow::Result<()> {
         })
         .context("无法创建远程控制线程")?;
     match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(lan_listening)) => {
+        Ok(Ok((port, lan_listening))) => {
             let lan_port = options
                 .lan
                 .as_ref()
@@ -418,10 +430,11 @@ pub fn start_with(options: ListenOptions) -> anyhow::Result<()> {
                 .map(|lan| lan.port);
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "remote_control.started",
-                json!({ "port": options.port, "lanPort": lan_port }),
+                json!({ "port": port, "preferredPort": options.port, "lanPort": lan_port }),
             );
             *slot = Some(Running {
                 options,
+                port,
                 lan_listening,
                 stop: stop_tx,
                 thread,
@@ -446,7 +459,7 @@ fn stop_running(running: Running) {
     let _ = running.thread.join();
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "remote_control.stopped",
-        json!({ "port": running.options.port }),
+        json!({ "port": running.port }),
     );
 }
 
@@ -465,7 +478,7 @@ pub fn running_port() -> Option<u16> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map(|running| running.options.port)
+        .map(|running| running.port)
 }
 
 /// 局域网入口正在监听的端口。
@@ -657,6 +670,35 @@ pub fn bridge_route(payload: &Value) -> anyhow::Result<Value> {
     Ok(value)
 }
 
+/// Codex 远程控制页里「钉钉与飞书通知」的 bridge 路由 `/remote-control/robots`：`{ action, provider?, update? }`，
+/// 动作同管理器（`chat_notifications::dispatch`）。通知由管理器里的远程控制服务发出，机器人配置也缓存在它的内存里，
+/// 所以同样只在管理器进程里放行。不在拓展路由白名单里。
+pub async fn robots_bridge_route(payload: &Value) -> anyhow::Result<Value> {
+    if !HOSTED.load(std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!(
+            "Codex++ 管理器未运行，暂时不能在 Codex 里设置钉钉与飞书通知；请先打开 Codex++。"
+        );
+    }
+    let field = |key: &str| payload.get(key).filter(|value| !value.is_null()).cloned();
+    let provider = field("provider")
+        .map(serde_json::from_value)
+        .transpose()
+        .context("不支持的机器人平台")?;
+    let update = field("update")
+        .map(serde_json::from_value)
+        .transpose()
+        .context("机器人配置格式不对")?;
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("status");
+    let mut value = chat_notifications::dispatch(action, provider, update).await?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("status".into(), json!("ok"));
+    }
+    Ok(value)
+}
+
 fn render_qr_svg(content: &str) -> Option<String> {
     let code = qrcode::QrCode::new(content.as_bytes()).ok()?;
     Some(
@@ -669,8 +711,9 @@ fn render_qr_svg(content: &str) -> Option<String> {
 }
 
 pub fn status() -> Value {
-    let state = load_state_from(&state_path());
+    let mut state = load_state_from(&state_path());
     let running = running_port();
+    state.port = running.unwrap_or(state.port);
     let lan_port = running_lan_port();
     let last_error = last_error_slot()
         .lock()

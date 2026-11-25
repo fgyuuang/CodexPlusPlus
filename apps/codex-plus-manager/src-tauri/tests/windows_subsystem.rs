@@ -37,7 +37,20 @@ fn manager_repeated_launch_activates_existing_window() {
         .expect("read manager lib.rs");
 
     assert!(lib_rs.contains("focus_existing_manager_window();"));
-    assert!(lib_rs.contains("windows_activate_process_window"));
+    // 管理器二次启动只唤起可见窗口，隐藏/已销毁的主窗口交给请求文件，
+    // 不能用会 ShowWindow 隐藏窗口的版本，否则会翻出托盘快捷面板（issue #3223）。
+    assert!(lib_rs.contains("windows_activate_visible_process_window(process.process_id)"));
+    assert!(!lib_rs.contains("windows_activate_process_window("));
+    assert!(lib_rs.contains("window_activation_request_path()"));
+
+    // 启动器唤起 Codex 的行为不变：仍可显示隐藏的 Codex 窗口。
+    let launcher_rs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../codex-plus-launcher/src/main.rs"
+    ))
+    .expect("read launcher main.rs");
+    assert!(launcher_rs.contains(".any(codex_plus_core::windows_activate_process_window)"));
+    assert!(!launcher_rs.contains("windows_activate_visible_process_window"));
 }
 
 #[test]
@@ -68,15 +81,15 @@ fn manager_close_minimizes_to_tray_without_confirmation() {
     let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("read manager lib.rs");
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let app_tsx = read_manager_app_source(manifest_dir);
 
     assert!(!lib_rs.contains("MessageDialogButtons"));
     assert!(!lib_rs.contains(".dialog()"));
     assert!(!lib_rs.contains("manager://close-requested"));
     assert!(lib_rs.contains("let _ = close_event_window.hide();"));
-    assert!(!lib_rs.contains("startup_is_transient()"));
     // 登录启动可以按已有设置隐藏窗口，手动打开仍保持可见。
+    assert!(lib_rs.contains("let start_minimized = startup_is_background()"));
+    assert!(lib_rs.contains("autostart && codex_plus_core::watcher::watcher_start_minimized()"));
     assert!(lib_rs.contains("build_main_window(app.handle(), url, !start_minimized)"));
     assert!(lib_rs.contains(".visible(visible)"));
     assert!(lib_rs.contains("codex_plus_launcher::shutdown()"));
@@ -229,7 +242,7 @@ fn manager_queues_codexplusplus_provider_urls_for_confirmation_on_startup() {
 }
 
 #[test]
-fn only_the_gui_binary_is_built_with_the_codex_icon() {
+fn explicit_gui_entry_points_use_the_codex_icon() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let launcher_manifest = manifest_dir
         .parent()
@@ -239,10 +252,16 @@ fn only_the_gui_binary_is_built_with_the_codex_icon() {
     let launcher = std::fs::read_to_string(&launcher_manifest).expect("read runtime manifest");
     let manager = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
     let config = std::fs::read_to_string(manifest_dir.join("tauri.conf.json")).unwrap();
+    let launcher_dir = launcher_manifest.parent().unwrap();
+    let launcher_build = std::fs::read_to_string(launcher_dir.join("build.rs")).unwrap();
+    let standalone = std::fs::read_to_string(launcher_dir.join("src/standalone.rs")).unwrap();
     assert!(launcher.contains("autobins = false"));
-    assert!(launcher.contains("build = false"));
-    assert!(!launcher.contains("[[bin]]"));
-    assert!(manager.contains("name = \"codex-plus-plus\""));
+    assert_eq!(launcher.matches("[[bin]]").count(), 1);
+    assert!(launcher.contains("name = \"codex-plus-plus\""));
+    assert!(launcher.contains("path = \"src/standalone.rs\""));
+    assert!(standalone.contains("windows_subsystem = \"windows\""));
+    assert!(launcher_build.contains("icons/icon.ico"));
+    assert!(manager.contains("name = \"codex-plus-plus-manager\""));
     assert!(config.contains("icons/icon.ico"));
 }
 
@@ -384,8 +403,7 @@ fn github_release_workflow_uploads_static_latest_json() {
 #[test]
 fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let app_tsx = read_manager_app_source(manifest_dir);
     // 供应商编辑纯函数已从 App.tsx 抽到 relay-profile-editing.ts（管理器与 Codex 供应商页共用）。
     let editing_ts = manifest_dir
         .parent()
@@ -394,6 +412,7 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
     let editing_ts = std::fs::read_to_string(&editing_ts).expect("read relay-profile-editing.ts");
     let commands_rs = manifest_dir.join("src/commands.rs");
     let commands_rs = std::fs::read_to_string(&commands_rs).expect("read manager commands.rs");
+    let lib_rs = std::fs::read_to_string(manifest_dir.join("src/lib.rs")).unwrap();
 
     assert!(!app_tsx.contains("snapshotActiveRelayFilesBeforeSwitch"));
     assert!(!app_tsx.contains("backfill_relay_profile_from_live"));
@@ -415,58 +434,62 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
         )
     );
     assert!(!commands_rs.contains("缺少独立 auth.json"));
-    assert!(!commands_rs.contains("backfill_relay_profile_from_live"));
+    assert!(!lib_rs.contains("commands::backfill_relay_profile_from_live"));
+    assert!(lib_rs.contains("commands::switch_relay_profile"));
     assert!(commands_rs.contains("apply_relay_profile_to_home_with_switch_rules"));
 }
 
 #[test]
 fn manager_exposes_official_experience_routes_without_adding_official_to_rotation() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let app_tsx = read_manager_app_source(manifest_dir);
+    let editing = std::fs::read_to_string(
+        manifest_dir
+            .parent()
+            .unwrap()
+            .join("src/relay-profile-editing.ts"),
+    )
+    .unwrap();
 
     assert!(app_tsx.contains("officialLoginMixedMode"));
     assert!(app_tsx.contains("officialLoginRelayId"));
-    assert!(app_tsx.contains("官方体验多来源路由"));
-    assert!(app_tsx.contains("主官方账号始终是默认入口"));
+    assert!(app_tsx.contains("<CapabilityBindingsEditor"));
+    assert!(app_tsx.contains("固定账号聊天不参与调度"));
+    assert!(app_tsx.contains("primaryOfficialAccountId"));
     assert!(app_tsx.contains("capabilityBindings"));
-    assert!(app_tsx.contains("&& !isAggregateRelayProfile(profile)"));
-    assert!(app_tsx.contains("&& !isCliproxyManagedProfile(profile)"));
-    assert!(app_tsx.contains("&& isApiRelayProfile(profile)"));
+    assert!(editing.contains("!isAggregateRelayProfile(profile)"));
+    assert!(editing.contains("(!requireCredentials || isApiRelayProfile(profile))"));
+    assert!(
+        app_tsx.contains("isOfficialLoginProfile(profile) || isCliproxyOfficialProfile(profile)")
+    );
 }
 
 #[test]
 fn relay_context_management_is_global_not_supplier_scoped() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
-    let styles = manifest_dir.parent().unwrap().join("src/styles.css");
-    let styles = std::fs::read_to_string(&styles).expect("read manager styles.css");
+    let app_tsx = read_manager_app_source(manifest_dir);
+    let commands_rs = manifest_dir.join("src/commands.rs");
+    let commands_rs = std::fs::read_to_string(&commands_rs).expect("read manager commands.rs");
 
-    assert!(app_tsx.contains("作为全局配置独立管理"));
+    // MCP 页（ManagementPages.tsx 的 McpPage）是全局配置，不挂在供应商下面。
     assert!(app_tsx.contains("label: \"MCP\"") || app_tsx.contains("label: t(\"MCP\")"));
-    assert!(
-        app_tsx.contains("title={t(\"Codex MCP&插件\")}")
-            || app_tsx.contains("title=\"Codex MCP&插件\"")
-    );
     assert!(!app_tsx.contains("label: \"上下文配置\""));
     assert!(!app_tsx.contains("title=\"上下文配置\""));
     assert!(!app_tsx.contains("<strong>Codex 上下文</strong>"));
     assert!(app_tsx.contains("id: \"context\""));
-    assert!(app_tsx.contains("function ContextScreen"));
     assert!(app_tsx.contains("route === \"context\""));
-    assert!(app_tsx.contains("if (next === \"context\")"));
-    assert!(app_tsx.contains("selectedContextConfigToml(entries)"));
-    assert!(app_tsx.contains("toggleContextEntryEnabled"));
-    assert!(app_tsx.contains("relayFiles={relayFiles}"));
+    assert!(app_tsx.contains("<McpPage"));
     assert!(app_tsx.contains("read_live_context_entries"));
-    assert!(app_tsx.contains("sync_live_context_entries"));
     assert!(app_tsx.contains("refreshLiveContextEntries"));
+    // 保存 / 启停 / 删除都走 apply_context_entry：后端在同一次调用里改公共配置、保存设置、同步 live 配置。
+    assert!(app_tsx.contains("\"apply_context_entry\""));
+    assert!(commands_rs.contains("fn apply_context_entry_blocking("));
+    assert!(
+        commands_rs
+            .contains("let synced = sync_live_context_entries_blocking(ContextSettingsRequest {")
+    );
+    // JSON 导入仍是导入后再同步 live 配置。
     assert!(app_tsx.contains("syncLiveContextEntries(next, true)"));
-    assert!(app_tsx.contains("const syncContextEntries = async (next: BackendSettings) =>"));
-    // 保存 / 启停 / 删除 / JSON 导入，四条写入路径都要把改动同步进 live 配置
-    assert_eq!(app_tsx.matches("await syncContextEntries(next)").count(), 4);
-    assert!(app_tsx.contains("if (!(await syncContextEntries(next))) return;"));
     assert!(app_tsx.contains("function contextEntriesWithLiveEntries"));
     assert!(app_tsx.contains("liveByKind"));
     assert!(app_tsx.contains("mergeLiveContextEntries"));
@@ -475,26 +498,14 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     // 关掉「应用通用配置」或条目刚新增时，面板会把所有 MCP 显示成已停用（#1928）。
     // 后端 context_entry_enabled 的默认同样是「没有 enabled 键即启用」。
     assert!(!app_tsx.contains("live.enabled } : { ...entry, enabled: false }"));
-    assert!(app_tsx.contains("contextEnabledSwitch"));
-    assert!(!app_tsx.contains("entry.enabled ? \"已启用\" : \"已禁用\""));
-    assert!(!app_tsx.contains("空配置体"));
-    assert!(app_tsx.contains("relay-context-delete"));
     assert!(!app_tsx.contains("切换供应商时只合并勾选项"));
     assert!(!app_tsx.contains("未勾选的条目不会写入"));
-    assert!(!app_tsx.contains("className=\"context-switch\""));
-    assert!(!styles.contains(".context-switch {"));
-    assert!(styles.contains(".context-enabled-switch"));
-    assert!(styles.contains(".context-switch-track"));
-    assert!(styles.contains(".context-switch-thumb"));
-    assert!(!styles.contains(".relay-context-row code"));
-    assert!(styles.contains(".relay-context-delete"));
 }
 
 #[test]
 fn manager_window_and_relay_detail_header_stay_usable() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let app_tsx = read_manager_app_source(manifest_dir);
     let styles = manifest_dir.parent().unwrap().join("src/styles.css");
     let styles = std::fs::read_to_string(&styles).expect("read manager styles.css");
     let lib_rs =
@@ -525,8 +536,7 @@ fn manager_window_and_relay_detail_header_stay_usable() {
 #[test]
 fn relay_preview_deduplicates_root_keys_when_merging_common_config() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let app_tsx = read_manager_app_source(manifest_dir);
 
     assert!(app_tsx.contains("dedupeTomlRootLines"));
     assert!(app_tsx.contains("rootSeen.add(key)"));
@@ -534,22 +544,9 @@ fn relay_preview_deduplicates_root_keys_when_merging_common_config() {
 }
 
 #[test]
-fn provider_presets_include_runapi() {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let presets = manifest_dir.parent().unwrap().join("src/presets.ts");
-    let presets = std::fs::read_to_string(&presets).expect("read manager presets.ts");
-
-    assert!(presets.contains("id: \"runapi\""));
-    assert!(presets.contains("name: \"RunAPI\""));
-    assert!(presets.contains("category: \"aggregator\""));
-    assert!(presets.contains("baseUrl: \"https://runapi.host/v1\""));
-}
-
-#[test]
 fn manager_no_longer_exposes_mobile_control() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let app_tsx = read_manager_app_source(manifest_dir);
 
     assert!(!app_tsx.contains("mobileControl"));
     assert!(!app_tsx.contains("手机控制"));
@@ -560,8 +557,7 @@ fn manager_no_longer_exposes_mobile_control() {
 #[test]
 fn manager_ui_no_longer_exposes_command_wrapper_or_startup_marketplace_prompt() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let app_tsx = read_manager_app_source(manifest_dir);
 
     assert!(!app_tsx.contains("启用 Codex 命令包装器"));
     assert!(!app_tsx.contains("修复后端"));
@@ -572,8 +568,7 @@ fn manager_ui_no_longer_exposes_command_wrapper_or_startup_marketplace_prompt() 
 #[test]
 fn manager_update_install_keeps_visible_progress_bar() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let app_tsx = read_manager_app_source(manifest_dir);
 
     // 有可用更新时后台先下好安装包：按钮按是否下好写「安装 / 下载并安装」，弹窗里写「立即安装 / 立即更新」。
     assert!(app_tsx.contains("t(\"下载并安装\")"));
@@ -593,8 +588,7 @@ fn manager_update_install_keeps_visible_progress_bar() {
 #[test]
 fn provider_sync_ui_keeps_explicit_targets_and_provider_counts() {
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
+    let app_tsx = read_manager_app_source(&manifest_dir);
     let commands = std::fs::read_to_string(manifest_dir.join("src/commands.rs"))
         .expect("read manager commands.rs");
 
@@ -604,6 +598,37 @@ fn provider_sync_ui_keeps_explicit_targets_and_provider_counts() {
     assert!(app_tsx.contains("{ targetProvider }"));
     assert!(app_tsx.contains("修复历史会话"));
     assert!(commands.contains("target_provider: Option<String>"));
-    assert!(commands.contains("run_provider_sync_with_target(None, target_provider.as_deref())"));
+    let sync_call = commands
+        .split_once("codex_plus_data::run_provider_sync_with_target_and_progress(")
+        .expect("sync uses the progress-aware provider API")
+        .1;
+    assert!(sync_call.trim_start().starts_with("None,"));
+    assert!(sync_call.contains("target_provider.as_deref(),"));
     assert!(!commands.contains("normalize_all_session_providers_to_custom(None)"));
+}
+
+/// 管理器主界面按页面拆成了多个文件，清单登记在 `src/app-source.test-helper.ts` 的 `APP_SOURCE_FILES`
+/// （前端源码测试共用这一份）；这里按清单读出来拼在一起，断言不用关心代码落在哪个文件。
+fn read_manager_app_source(manifest_dir: &std::path::Path) -> String {
+    let src = manifest_dir.parent().unwrap().join("src");
+    let helper = std::fs::read_to_string(src.join("app-source.test-helper.ts"))
+        .expect("read app-source.test-helper.ts");
+    let list = helper
+        .split_once("APP_SOURCE_FILES = [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(list, _)| list)
+        .expect("APP_SOURCE_FILES list");
+    let files: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+    assert!(
+        files.contains(&"App.tsx"),
+        "APP_SOURCE_FILES should list App.tsx"
+    );
+    files
+        .iter()
+        .map(|name| {
+            std::fs::read_to_string(src.join(name))
+                .unwrap_or_else(|_| panic!("read manager {name}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

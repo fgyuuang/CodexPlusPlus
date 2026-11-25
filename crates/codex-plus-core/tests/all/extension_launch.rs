@@ -107,6 +107,13 @@ fn invalid_preload_and_launch_declarations_are_reported() {
         json!({ "launch": { "args": ["--remote-debugging-port=1"] } }),
         &[],
     );
+    // 调试端口的变体写法同样拦住（黑名单按前缀）。
+    write_package(
+        &temp,
+        "inspect",
+        json!({ "launch": { "args": ["--inspect-brk=9229"] } }),
+        &[],
+    );
     write_package(
         &temp,
         "shell",
@@ -123,6 +130,7 @@ fn invalid_preload_and_launch_declarations_are_reported() {
         ("user:outside", "相对路径"),
         ("user:missing", "nope.js"),
         ("user:port", "--remote-debugging-port"),
+        ("user:inspect", "--inspect-brk"),
         ("user:shell", "不合法"),
         ("user:timeout", "launch.timeout"),
     ] {

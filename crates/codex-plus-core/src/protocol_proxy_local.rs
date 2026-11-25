@@ -3474,7 +3474,9 @@ mod direct_official_auth_tests {
                 assert!(request.contains("\"model\":\"gpt-6.1-sol\""));
                 let expected_version = crate::gateway::chatgpt_backend::select_codex_version(
                     Some("0.166.0"),
-                    crate::codex_cli_version::installed_codex_version_cached().as_deref(),
+                    crate::codex_cli_version::installed_codex_version()
+                        .await
+                        .as_deref(),
                 );
                 assert!(
                     request
@@ -3980,7 +3982,8 @@ async fn open_official_chatgpt_responses_request(
         .unwrap_or("");
     let client_version = crate::gateway::chatgpt_backend::codex_version(
         &crate::codex_home::default_codex_home_dir(),
-    );
+    )
+    .await;
     let client = crate::http_client::proxied_client(&effective_user_agent(
         configured_user_agent,
         original_user_agent,

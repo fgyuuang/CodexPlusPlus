@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
-import { agentVisible, providersHidden, singleAgent } from "./agent-focus-model.ts";
 import { pageVisibleForTool } from "./page-groups.ts";
+import { agentVisible, providersHidden, singleAgent, type AgentFocus } from "./agent-focus-model.ts";
 import {
   extensionEnabledForHost,
   extensionHostForTool,
@@ -13,8 +13,9 @@ import {
   type ExtensionHost,
 } from "./extension-host-model.ts";
 import { defaultMarketSort, parseMarketTime, sortMarketScripts } from "./script-market-model.ts";
+import { readAppSource } from "./app-source.test-helper.ts";
 
-const text = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+const text = readAppSource();
 const app = ts.createSourceFile("App.tsx", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 
 function declaration(name: string): ts.VariableDeclaration {
@@ -36,13 +37,15 @@ function functionSource(name: string) {
     (statement): statement is ts.FunctionDeclaration => ts.isFunctionDeclaration(statement) && statement.name?.text === name,
   );
   assert.ok(node, name);
-  return node.getText(app);
+  // 拆分后跨文件用到的函数带 `export`，这里只把它们放进 vm 里当普通函数用。
+  return node.getText(app).replace(/^export /, "");
 }
 
 const navigationNames = [
   "routes", "routeTool", "globalNavigationRoutes", "gatewayNavigationRoutes", "managementNavigationRoutes",
-  "navAliasRoute", "toolNavigationRoutes", "multiAgentRoutes", "providerRoutes", "routeVisible", "visibleRoutes",
-  "settingsModeRoutes", "customizeRoutes",
+  "navAliasRoute",
+  "settingsModeRoutes", "localServiceRoutes", "customizeRoutes",
+  "multiAgentRoutes", "providerRoutes", "routeVisible", "visibleRoutes",
 ];
 const navigationSource = navigationNames.map((name) => `const ${declaration(name).getText(app)};`).join("\n");
 const icons = [...text.matchAll(/icon: (\w+)/g)].map((match) => match[1]);
@@ -71,10 +74,18 @@ function harness() {
     t: (value: string) => value,
     tf: (value: string, args: unknown[]) => value.replace(/\{(\d+)\}/g, (_, index) => String(args[Number(index)])),
     agentName: (value: string) => value,
-    singleAgent, providersHidden, pageVisibleForTool,
+    pageVisibleForTool,
+    providersHidden,
+    singleAgent,
     useGatewayPayload: () => null,
+    useClaudeEnhance: () => null,
     useState: () => [[], () => {}],
-    loadCollapsedGroups: () => [],
+    useEffect: () => {},
+    // 选中色块只在真实 DOM 里起作用，这里不渲染。
+    useRef: () => ({ current: null }),
+    useSideIndicator: () => {},
+    loadCachedGatewayInUse: () => false,
+    storeCachedGatewayInUse: () => {},
     getLanguage: () => "zh",
     paletteShortcut: "Ctrl+K",
     APP_LOGO_URL: "logo.png",
@@ -88,9 +99,10 @@ function harness() {
     context,
     routes: context.routes as Array<{ id: string; tool?: string; tools?: string[] }>,
     navigations,
-    sidebar: (activeTool: string, focus: "all" | "enhance" | "codex" = "all") => context.sidebar({
+    sidebar: (activeTool: string, focus: AgentFocus = "all") => context.sidebar({
+      focus,
       tools: [{ id: activeTool, name: activeTool, switchable: true, relayCount: 0 }],
-      activeTool, focus, soloAgent: singleAgent(focus), route: "overview", theme: "light", version: "test",
+      activeTool, route: "overview", theme: "light", version: "test",
       codexRun: { running: true, busy: false, unavailableReason: null, onStart: () => {}, onStop: () => {} },
       claudeRun: { running: false, busy: false, unavailableReason: null, onStart: () => {}, onStop: () => {} },
       onNavigate: (route: string) => navigations.push(route),
@@ -120,9 +132,6 @@ test("万物皆拓展是独立入口，不随侧栏当前 Agent 显隐；宿主�
     entry.props.onClick();
     assert.deepEqual(h.navigations, ["userScripts"]);
   }
-  const h = harness();
-  assert.ok(extensions(h.sidebar("claude", "enhance")), "只用增强功能时也保留万物皆拓展");
-  assert.equal(agentVisible("codex", "claude"), false, "原来的只管理 Codex 模式仍不显示 Claude");
 });
 
 test("只有显式 tools 限定的入口按宿主过滤，其余全局管理保持原行为", () => {
@@ -135,6 +144,13 @@ test("只有显式 tools 限定的入口按宿主过滤，其余全局管理保�
   for (const key of ["customize", "sessions"]) {
     assert.ok(entries.some((node) => node.props["data-nav"] === key), key);
   }
+});
+
+test("增强模式仍可打开拓展、会话和 MCP，但不显示供应商和路由入口", () => {
+  const h = harness();
+  const entries = elements(h.sidebar("claude", "enhance")).map((node) => node.props["data-nav"]);
+  for (const key of ["extensions", "sessions", "customize"]) assert.ok(entries.includes(key), key);
+  for (const key of ["hub", "providers", "gateway", "routing", "usage"]) assert.ok(!entries.includes(key), key);
 });
 
 test("Codex 的共享拓展页仍有重启按钮，Claude 下不显示 Codex 重启", () => {
@@ -172,7 +188,9 @@ function extensionHarness() {
   let cursor = 0;
   const calls: Array<[string, ...unknown[]]> = [];
   const context = vm.createContext({
-    ...Object.fromEntries([...icons, ...componentNames].map((name) => [name, name])),
+    ...Object.fromEntries([...icons, ...componentNames, "ClaudePageExtensions"].map((name) => [name, name])),
+    useClaudeEnhance: () => null,
+    agentVisible,
     React: {
       Fragment: "Fragment",
       createElement: (type: Element["type"], props: object | null, ...children: unknown[]) => ({ type, props: { ...props, children } }),
@@ -192,7 +210,7 @@ function extensionHarness() {
     useMemo: (compute: () => unknown) => compute(),
     // 打开页面时市场还没读过就自动读一次：记下调用，渲染时不执行副作用。
     useEffect: () => undefined,
-    agentVisible, extensionEnabledForHost, extensionHostForTool, extensionsForHost, extensionStateForHost,
+    extensionEnabledForHost, extensionHostForTool, extensionsForHost, extensionStateForHost,
     defaultMarketSort, parseMarketTime, sortMarketScripts,
     formatMarketUpdatedAt: (value: string) => value,
   });
@@ -227,7 +245,7 @@ function extensionScreenProps(h: ReturnType<typeof extensionHarness>, host: Exte
     host,
     onHostChange: (next: ExtensionHost) => h.calls.push(["host", next]),
     onOpenClaude: () => h.calls.push(["openClaude"]),
-    onOpenBuiltins: () => h.calls.push(["openBuiltins"]),
+    onOpenRescue: () => h.calls.push(["openRescue"]),
     actions: h.actions,
     settings: {
       user_scripts: {
@@ -275,45 +293,34 @@ test("页内宿主切换绑定共享路由并传递当前宿主", () => {
   }
 });
 
-test("拓展页宿主切换遵守只管理 Codex 模式（只有一个宿主时不显示切换），其余模式保留双宿主", () => {
-  const invocation = text.split("\n").find((line) => line.includes("<UserScriptsScreen"));
-  assert.ok(invocation);
-  assert.match(invocation, /\bfocus=\{agentFocus\}/);
-  for (const focus of ["codex", "enhance", "all", null] as const) {
-    const h = extensionHarness();
-    const props = { ...extensionScreenProps(h, "codex"), focus };
-    const hero = elements(h.render("UserScriptsScreen", props)).find((node) => node.type === h.context.ExtensionsHero);
-    assert.ok(hero);
-    assert.equal(hero.props.focus, focus);
-    const controls = elements(h.render("ExtensionsHero", hero.props)).filter((node) => node.type === "button");
-    assert.equal(controls.some((node) => elementText(node).trim() === "Codex"), focus !== "codex");
-    const claude = controls.find((node) => elementText(node).trim() === "Claude");
-    assert.equal(Boolean(claude), focus !== "codex", String(focus));
-    if (claude) {
-      claude.props.onClick();
-      assert.deepEqual(h.calls, [["host", "claude"]]);
-    } else {
-      assert.deepEqual(h.calls, []);
-    }
-  }
-});
-
 test("Claude 页只显示已声明适配的本地包，并按 Claude 开关排序", () => {
   const h = extensionHarness();
-  const nodes = elements(h.render("UserScriptsScreen", extensionScreenProps(h, "claude")));
+  const props = extensionScreenProps(h, "claude");
+  // Claude 下先显示页面扩展（格式和市场与 ClaudeMom 相同）；一排胶囊由它出，第三个是 Claude Code 拓展。
+  let nodes = elements(h.render("UserScriptsScreen", props));
+  const page = nodes.find((node) => node.type === "ClaudePageExtensions");
+  assert.ok(page);
+  assert.equal(page.props.pane, "installed");
+  assert.equal(page.props.codeCount, 2);
+  assert.equal(nodes.some((node) => node.type === h.context.ScriptRow), false);
+  assert.equal(nodes.some((node) => node.type === "CxFilters"), false, "不再有第二排胶囊");
+  page.props.onPaneChange("code");
+  nodes = elements(h.render("UserScriptsScreen", props));
+  assert.equal(nodes.find((node) => node.type === "ClaudePageExtensions")?.props.pane, "code", "胶囊那排还在");
   const rows = nodes.filter((node) => node.type === h.context.ScriptRow);
   assert.deepEqual(rows.map((node) => node.props.script.key), ["user:claude-on", "user:claude-off"]);
   assert.ok(rows.every((node) => node.props.host === "claude" && node.props.globalEnabled === true));
   // 「已启用」「未启用」两节按 Claude 开关分组，数量就是原来摘要里的「已启用 N 个」。
   const sections = nodes.filter((node) => node.type === "CxSection").map((node) => [node.props.title, node.props.count]);
   assert.deepEqual(sections, [["已启用", 1], ["未启用", 1]]);
-  for (const component of ["ExtensionCreatorCard", "CuratedPackagesSection", "CommunityExtensionsPanel", "MyPublishedPanel", "DshPluginsPanel", "BuiltinExtensionsSummary", "CxFilters"]) {
+  for (const component of ["ExtensionCreatorCard", "CuratedPackagesSection", "CommunityExtensionsPanel", "MyPublishedPanel", "DshPluginsPanel", "BuiltinExtensionsSummary"]) {
     assert.equal(nodes.some((node) => node.type === component), false, component);
   }
   assert.equal(nodes.some((node) => node.type === "MenuItem" && elementText(node) === "下次启动跳过拓展"), false);
   assert.equal(nodes.some((node) => node.props.role === "tab"), false);
   assert.equal(nodes.some((node) => node.type === "button" && elementText(node).includes("热重载拓展")), false);
-  const open = nodes.find((node) => node.type === "button" && elementText(node).includes("Claude 补丁版"));
+  // 生效方式没读到时按完整功能模式，按钮去 Desktop 增强页；补丁副本时叫「Claude 补丁版」。
+  const open = nodes.find((node) => node.type === "button" && elementText(node).includes("Desktop 增强"));
   assert.ok(open);
   open.props.onClick();
   assert.deepEqual(h.calls, [["openClaude"]]);
@@ -606,6 +613,8 @@ test("后台设置变更事件同步 Claude 和 Computer Use 字段及 revision�
     claudeAppComputerUse: true,
     claudeAppBashTimeout: 900000,
     claudeDesktopLocal: { enabled: true, model: "claude-test", localization: true, voiceInput: true, computerUse: false, backgroundMode: false },
+    // Claude 自动接管的开关由 set_claude_auto_takeover 单独写入。
+    claudeAppAutoTakeover: true,
     // #2937：记下使用模式也由后端单独写入，表单要跟上，否则下一次整份保存会写回旧值。
     managerAgentFocus: "enhance",
     nativeAuthSelection: { mode: "account", accountRef: "fixture-b" },
@@ -621,6 +630,7 @@ test("后台设置变更事件同步 Claude 和 Computer Use 字段及 revision�
     claudeAppComputerUse: false,
     claudeAppBashTimeout: 60000,
     claudeDesktopLocal: { enabled: false, model: "", localization: true, voiceInput: false, computerUse: false, backgroundMode: false },
+    claudeAppAutoTakeover: false,
     managerAgentFocus: "",
     nativeAuthSelection: { mode: "account", accountRef: "fixture-a" },
     theme: "unsaved-theme",
@@ -666,4 +676,18 @@ test("后台设置变更事件同步 Claude 和 Computer Use 字段及 revision�
   assert.deepEqual(draft, originalDraft);
   cleanup();
   assert.equal(listeners.size, 0);
+});
+
+test("「刷新列表」强制重新下载市场清单，其余刷新走缓存", async () => {
+  const h = extensionHarness();
+  const nodes = elements(h.render("UserScriptsScreen", extensionScreenProps(h, "codex")));
+  const refresh = nodes.find((node) => node.type === "MenuItem" && elementText(node) === "刷新列表");
+  assert.ok(refresh);
+  refresh.props.onClick();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.calls, [["refreshScriptMarket", false, false, true], ["refreshCurrent"]]);
+  // 后端：force 省略时为 false（用缓存）。
+  const commands = readFileSync(new URL("../src-tauri/src/commands.rs", import.meta.url), "utf8");
+  assert.match(commands, /pub async fn refresh_script_market\(force: Option<bool>\)[^{]*\{\s*match script_market::cached_market_manifest\(force\.unwrap_or\(false\)\)/);
+  assert.match(text, /call<ScriptMarketResult>\("refresh_script_market", \{ force \}\)/);
 });

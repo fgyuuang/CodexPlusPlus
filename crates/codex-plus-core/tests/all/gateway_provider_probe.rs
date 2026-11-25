@@ -1,4 +1,4 @@
-//! 供应商池的「测试」：按这家供应商的协议、代理和 Key 发一条很短的请求，
+//! 共享供应商的「测试」：按这家供应商的协议、代理和 Key 发一条很短的请求，
 //! 报出成功 / 失败、状态码、耗时、回复和排查分类；测试请求不碰 Key 池的冷却、
 //! 限速名额、会话固定和测速。
 //!
@@ -242,7 +242,7 @@ async fn auth_failure_uses_only_the_chosen_key_and_names_it() {
         key_id: "key-1".into(),
         fingerprint: key_pool::fingerprint(KEY_A),
     };
-    key_pool::record_success(&first_key, Some("probe-conversation"));
+    key_pool::record_success(&first_key, "", Some("probe-conversation"));
     let upstream = tokio::spawn(serve(
         listener,
         vec![reply(
@@ -472,7 +472,7 @@ async fn requests_go_through_the_providers_own_proxy() {
 }
 
 #[tokio::test]
-async fn official_catalog_and_probe_negotiate_one_version_despite_an_old_native_cache() {
+async fn first_official_probe_and_catalog_negotiate_one_version_despite_an_old_native_cache() {
     use base64::Engine;
     use codex_plus_core::gateway::apply;
     use codex_plus_core::settings::{RelayMode, RelayProfile};
@@ -577,7 +577,7 @@ async fn official_catalog_and_probe_negotiate_one_version_despite_an_old_native_
             .await
             .unwrap()
             .unwrap();
-        let version = codex_plus_core::gateway::chatgpt_backend::codex_version(temp.path());
+        let version = codex_plus_core::gateway::chatgpt_backend::codex_version(temp.path()).await;
         // 本机安装的 Codex 更新时会取安装版本（#3178），所以缓存版本只是下限。
         if cached_version == "0.124.0" {
             assert_ne!(version, cached_version);
@@ -588,11 +588,14 @@ async fn official_catalog_and_probe_negotiate_one_version_despite_an_old_native_
                 "{version}"
             );
         }
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].request_line.starts_with("GET /v1/models?"));
         assert!(
             seen[0]
                 .request_line
                 .contains(&format!("client_version={version}"))
         );
+        assert!(seen[1].request_line.starts_with("POST /v1/responses "));
         for request in &seen {
             assert_eq!(request.header("version").as_deref(), Some(version.as_str()));
             assert!(

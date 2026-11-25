@@ -1,9 +1,9 @@
 /** 网关模式的前端数据模型：与 `codex_plus_core::gateway` 的序列化结构一一对应，外加表单转换。
  *
- * 网关模式与直连模式完全独立：供应商池、模型组只属于网关；所有接入的 Agent 共用整个池。
+ * 网关模式与直连模式完全独立：共享供应商、模型组只属于网关；所有接入的 Agent 共用整个池。
  * 模型名三种写法：裸模型名（池里提供它的供应商依次尝试）、`<供应商 id>/<模型>`、`group/<组 id>`。
  */
-import { PRESETS } from "./presets.ts";
+import { PRESETS, type ProviderPreset } from "./presets.ts";
 import { modelSlugFromRowName } from "./model-metadata.ts";
 import { normalizeSubscriptionPolicy, type SubscriptionPolicy, type SubscriptionPolicyInput } from "./subscription-policy.ts";
 import { providerHeaderInputs, providerHeaderRows, providerHeadersValidationMessage, type ProviderHeaderRow, type ProviderHeaderView } from "./relay-headers.ts";
@@ -107,6 +107,8 @@ export type GatewayPoolEntry = {
   stripImageGenerationTool?: boolean;
   /** 转发前移除 Responses 图片 `detail`（#2870）。旧版后端没有。 */
   stripResponsesImageDetail?: boolean;
+  /** 转发前移除 Responses `include` 里的 `output.encrypted_content`。旧版后端没有。 */
+  stripResponsesOutputEncryptedContent?: boolean;
   /** 不向该上游发送 `tool_search`（#2868）。旧版后端没有。 */
   disableToolSearch?: boolean;
   /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */
@@ -124,10 +126,10 @@ export type GatewayPoolEntry = {
   lentToCodex?: boolean;
   /** 订阅账号（或 OpenCode Go、Command Code 等套餐）的剩余额度；查不到或普通供应商为空。 */
   quota?: ProviderQuota | null;
-  /** ChatGPT 账号手上的额度重置卡；只有订阅账号有，没查过时为空。 */
-  resetCredits?: ResetCredits | null;
   /** 有额度可查（订阅账号，或按地址认出的 API Key 套餐，#3084）。旧版后端没有。 */
   quotaApi?: boolean;
+  /** ChatGPT 账号手上的额度重置卡；只有订阅账号有，没查过时为空。 */
+  resetCredits?: ResetCredits | null;
   /** 已保存的 Key（打码，#2782）：订阅账号等不用 Key 的为空。旧版后端没有。 */
   keys?: ProviderKeyView[];
   /** 有余额接口的厂商（DeepSeek、Kimi 等，#2793）：卡片用「用量」页同一份余额。旧版后端没有。 */
@@ -261,6 +263,7 @@ export type GatewayDisconnectPreview = {
   files: GatewayDisconnectFile[];
   warnings: string[];
   canDisconnect: boolean;
+  needsDirectProvider?: boolean;
   /** 没法逐项预览时（Codex 接入前没留下实时存档等）：断开会完整切换到这个直连供应商，确认后走「完整切换并断开」。 */
   fullSwitch?: { relayId: string; name: string } | null;
 };
@@ -353,7 +356,7 @@ export type GatewayPayload = {
   helperRunning: boolean;
   /** Codex 旧版供应商配置总开关；旧版后端没有这个字段。 */
   relayProfilesEnabled?: boolean;
-  /** 网关自己的供应商池（不含 Key）。 */
+  /** 网关自己的共享供应商（不含 Key）。 */
   pool: GatewayPoolEntry[];
   groups: GatewayGroupEntry[];
   agents: GatewayAgentView[];
@@ -367,6 +370,12 @@ export type GatewayPayload = {
   /** 能在网关里登录的私有接口订阅（Cursor、Kiro 等）；旧版后端没有。 */
   subscriptions?: SubscriptionView[];
   claudeProviders: Array<{ id: string; name: string }>;
+  /** CC Switch 里的 Claude / Claude Desktop 供应商（旧后端没有这一项）。 */
+  ccSwitchClaude?: Array<{ id: string; name: string }>;
+  /** ClaudeMom 的上游（旧后端没有这一项）。 */
+  claudeMomProfiles?: Array<{ id: string; name: string }>;
+  /** Magpie 的供应商（旧后端没有这一项）。 */
+  magpieProviders?: Array<{ id: string; name: string }>;
   grokProfiles: Array<{ id: string; name: string }>;
   /** OpenCode 里保存的 OpenCode Go / Zen Key。 */
   opencodeKeys?: Array<{ id: string; name: string }>;
@@ -673,14 +682,14 @@ export function modelRoutable(payload: GatewayPayload | null, model: string, exc
 /** 表单校验：返回错误文案（中文原文，界面再翻译），没问题返回 null。 */
 export function validateDraft(draft: BindingDraft, payload: GatewayPayload | null, retainedModel?: string, retainedSelection?: DefaultModelSelection | null, native?: GatewayAgentView["nativeModels"]): string | null {
   if (payload) {
-    if (!agentPoolProviders(payload, draft.poolExclude).length) return "供应商池是空的，先到「供应商」里添加";
+    if (!agentPoolProviders(payload, draft.poolExclude).length) return "共享供应商是空的，先在「共享供应商」里添加供应商";
     const model = draft.model.trim();
     const retainedDisabledModel = draft.model === retainedModel && disabledGroup(payload, model);
     const retainedProvider = retainedSelection && payload.pool.find((entry) => entry.id === retainedSelection.providerId);
     const retainedUnavailableModel = draft.model === retainedModel && retainedSelection
       && modelSlugFromRowName(model).toLowerCase() === `${retainedSelection.providerId}/${modelSlugFromRowName(retainedSelection.upstreamModel)}`.toLowerCase()
       && (retainedSelection.providerRemoved || !retainedProvider || !providerEnabled(retainedProvider) || draft.poolExclude.includes(retainedProvider.id));
-    if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude, native)) return "供应商池里没有这个模型";
+    if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude, native)) return "共享供应商里没有这个模型";
   }
   const window = parseContextWindow(draft.contextWindow);
   if (window !== null && (!Number.isFinite(window) || window < 1_000)) return "上下文窗口格式不对，例如 200000、200k 或 1M";
@@ -1117,7 +1126,7 @@ export function quotaSupported(entry: GatewayPoolEntry): boolean {
   return entry.quotaApi ?? (entry.account === "chatgpt" || entry.account === "copilot" || entry.account === "grok");
 }
 
-/** 「用量」页的额度一节：打开的、有额度可查的供应商（和供应商池卡片同一份缓存）。 */
+/** 「用量」页的额度一节：打开的、有额度可查的供应商（和共享供应商卡片同一份缓存）。 */
 export function quotaEntries(pool: GatewayPoolEntry[] | undefined): GatewayPoolEntry[] {
   return (pool ?? []).filter((entry) => entry.enabled !== false && quotaSupported(entry));
 }
@@ -1232,7 +1241,7 @@ export function memberStatus(payload: GatewayPayload | null, relayId: string, no
 }
 
 /**
- * 供应商池「按模型」矩阵、路由页组成员里一格（供应商 × 模型）的状态：冷却、熔断按整家供应商算；「刚用过」只标在真正被请求的那个模型上。
+ * 共享供应商「按模型」矩阵、路由页组成员里一格（供应商 × 模型）的状态：冷却、熔断按整家供应商算；「刚用过」只标在真正被请求的那个模型上。
  * 其它情况不显示（返回 null）。
  */
 export function dispatchStatus(payload: GatewayPayload | null, relayId: string, model: string, nowMs: number = Date.now()): MemberStatus | null {
@@ -1304,7 +1313,7 @@ export type DispatchProvider = { id: string; name: string; baseUrl: string; excl
 export type DispatchRow = { model: string; providers: DispatchProvider[] };
 
 /**
- * 供应商池「按模型」矩阵：每个模型名列出池里提供它的供应商，顺序就是网关的尝试顺序（与后端 `expand_model` 一致：
+ * 共享供应商「按模型」矩阵：每个模型名列出池里提供它的供应商，顺序就是网关的尝试顺序（与后端 `expand_model` 一致：
  * 打开的供应商按池顺序）。有备用的模型排前面；`excludedBy` 是在「挑选」里排除了这家的已接入 Agent。
  */
 export function modelDispatch(payload: GatewayPayload | null): DispatchRow[] {
@@ -1416,50 +1425,35 @@ const GATEWAY_EXTRA_PRESETS: GatewayPreset[] = [
   },
 ];
 
-/** 「添加供应商」里的全部预设：厂商（官方 / 国内官方）、中转、本机。 */
-/**
- * 赞助商：「添加供应商」目录里单独一组，放在最前面。到期日与赞助商广告清单一致，
- * 过了到期日（当天仍显示）就不再出现在目录里。续约时改这里的日期。
- */
-export const SPONSORS: Array<{ id: string; expiresAt: string }> = [
-  { id: "jojocode-max", expiresAt: "2029-06-15" },
-  { id: "runapi", expiresAt: "2026-12-07" },
-  { id: "apikeyfun", expiresAt: "2026-11-22" },
-  { id: "cccccc-api", expiresAt: "2026-12-01" },
-  { id: "tokenmy", expiresAt: "2026-11-20" },
-];
-
-/** 本地日期（YYYY-MM-DD），与到期日按天比较。 */
-function localDay(now: Date): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-}
-
-export function activeSponsorIds(now: Date = new Date()): string[] {
-  const today = localDay(now);
-  return SPONSORS.filter((sponsor) => sponsor.expiresAt >= today).map((sponsor) => sponsor.id);
-}
-
-export function gatewayPresets(now: Date = new Date()): GatewayPreset[] {
-  const sponsorIds = activeSponsorIds(now);
-  const expired = new Set(SPONSORS.map((sponsor) => sponsor.id).filter((id) => !sponsorIds.includes(id)));
-  const shared = PRESETS.filter((preset) => !expired.has(preset.id)).map((preset): GatewayPreset => ({
+function toGatewayPreset(preset: ProviderPreset, section: PresetSection): GatewayPreset {
+  return {
     key: preset.id,
     name: preset.name,
     baseUrl: preset.baseUrl,
     protocol: preset.protocol,
     model: preset.model,
     modelList: preset.modelList ?? (preset.model ? [preset.model] : []),
-    section: sponsorIds.includes(preset.id)
-      ? "sponsor"
-      : preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay",
+    section,
     apiKeyUrl: preset.apiKeyUrl,
-  }));
+  };
+}
+
+/**
+ * 「添加供应商」里的全部预设：赞助商单独一组放在最前（来自远端推荐清单，见 sponsorPresets），
+ * 然后是厂商（官方 / 国内官方）、中转、本机。
+ */
+export function gatewayPresets(sponsors: ProviderPreset[] = []): GatewayPreset[] {
+  const sponsorIds = new Set(sponsors.map((preset) => preset.id));
+  const shared = PRESETS.filter((preset) => !sponsorIds.has(preset.id)).map((preset) =>
+    toGatewayPreset(preset, preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay"));
   const vendors = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "vendor"), ...shared.filter((preset) => preset.section === "vendor")];
   const relays = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "relay"), ...shared.filter((preset) => preset.section === "relay")];
-  // 赞助商按名单顺序排。
-  const sponsors = sponsorIds.flatMap((id) => shared.filter((preset) => preset.key === id));
-  return [...sponsors, ...vendors, ...relays, ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")];
+  return [
+    ...sponsors.map((preset) => toGatewayPreset(preset, "sponsor")),
+    ...vendors,
+    ...relays,
+    ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local"),
+  ];
 }
 
 function normalizeUrl(url: string): string {
@@ -1504,13 +1498,15 @@ export type ProviderDraft = {
   subscriptionPolicy?: SubscriptionPolicy | null;
   /** 转发前移除 Responses 图片 `detail`：不认 OpenAI detail 扩展的上游用（#2870）。 */
   stripResponsesImageDetail?: boolean;
+  /** 转发前移除 Responses `include` 里的 `output.encrypted_content`。 */
+  stripResponsesOutputEncryptedContent?: boolean;
   /** 不向上游发送 `tool_search`：上游 400 时开启（#2868）。 */
   disableToolSearch?: boolean;
   /** 自定义请求头（#3075）：测试、拉模型、实际请求都带上；不带表示不改。 */
   customHeaders?: ProviderHeaderRow[];
 };
 
-const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false, stripResponsesImageDetail: false, disableToolSearch: false };
+const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false, stripResponsesImageDetail: false, stripResponsesOutputEncryptedContent: false, disableToolSearch: false };
 
 export function providerDraftFromPreset(preset: GatewayPreset | null): ProviderDraft {
   if (!preset) return { name: "", baseUrl: "", keys: "", protocol: "chatCompletions", model: "", modelList: "", ...NO_PRICE };
@@ -1542,6 +1538,7 @@ export function providerDraftFromEntry(entry: GatewayPoolEntry): ProviderDraft {
     stripImageGenerationTool: entry.stripImageGenerationTool === true,
     subscriptionPolicy: entry.subscriptionPolicy == null ? entry.subscriptionPolicy : normalizeSubscriptionPolicy(entry.subscriptionPolicy),
     stripResponsesImageDetail: entry.stripResponsesImageDetail === true,
+    stripResponsesOutputEncryptedContent: entry.stripResponsesOutputEncryptedContent === true,
     disableToolSearch: entry.disableToolSearch === true,
     customHeaders: providerHeaderRows(entry.customHeaders),
   };
@@ -1562,6 +1559,7 @@ export function providerInput(draft: ProviderDraft) {
     stripImageGenerationTool: draft.stripImageGenerationTool === true,
     ...(draft.subscriptionPolicy !== undefined ? { subscriptionPolicy: draft.subscriptionPolicy } : {}),
     stripResponsesImageDetail: draft.stripResponsesImageDetail === true,
+    stripResponsesOutputEncryptedContent: draft.stripResponsesOutputEncryptedContent === true,
     disableToolSearch: draft.disableToolSearch === true,
     ...(draft.customHeaders !== undefined ? { customHeaders: providerHeaderInputs(draft.customHeaders) } : {}),
   };
@@ -1851,6 +1849,11 @@ function maskEmailsIn(text: string): string {
   return text.replace(EMAIL_PATTERN, (_match, lead: string, email: string) => lead + maskEmail(email));
 }
 
+/** 供应商名的短写法：`·` 前那段（「ChatGPT Pro · 邮箱」→「ChatGPT Pro」），完整名放在悬停提示里。 */
+export function shortProviderName(name: string): string {
+  return name.split("·")[0].trim() || name;
+}
+
 /**
  * 订阅账号的显示名打码：「ChatGPT Pro · me@example.com」「Copilot · octocat」这类名字里的账号部分只露头尾，
  * 名字里出现的邮箱也一样。只在显示时处理，存储的名字不变；普通供应商名不受影响。
@@ -1891,7 +1894,7 @@ function maskToken(value: string): string {
 
 /* —————————————— 从直连模式导入 —————————————— */
 
-export type ImportSource = "codex" | "claude" | "grok" | "opencode" | "aggregate";
+export type ImportSource = "codex" | "claude" | "ccswitch" | "claudemom" | "magpie" | "grok" | "opencode" | "aggregate";
 export type ImportCandidate = { source: ImportSource; id: string; name: string; imported: boolean };
 
 /** 能导入网关的供应商（不含官方登录账号）：已导入过的标 `imported`。 */
@@ -1903,14 +1906,38 @@ export function importCandidates(payload: GatewayPayload | null): ImportCandidat
     ...plain("codex", payload?.codexProviders),
     ...(payload?.codexAggregates ?? []).map((item) => ({ source: "aggregate" as const, id: item.id, name: item.name, imported: item.imported })),
     ...plain("claude", payload?.claudeProviders),
+    ...plain("ccswitch", payload?.ccSwitchClaude),
+    ...plain("claudemom", payload?.claudeMomProfiles),
+    ...plain("magpie", payload?.magpieProviders),
     ...plain("grok", payload?.grokProfiles),
     ...plain("opencode", payload?.opencodeKeys),
   ];
 }
 
+/** 「把 Magpie 当作一个上游」那一条在后端的 id（`magpie_import::GATEWAY_ID`）。 */
+export const MAGPIE_UPSTREAM_ID = "@gateway";
+
+/**
+ * 还没导入、默认会去导的那些。别的来源就是没导入的条目；Magpie 的两种方式二选一，默认是当作一个上游：
+ * Magpie 里已经有任何一条导入过（不管哪种方式）就不再算；否则只算「当作上游」那一条，
+ * 没有那一条（旧版后端）才算可复制的各家。导入弹窗的默认勾选、各处的「还有 N 个没导」都按这个来。
+ */
+export function pendingImports(payload: GatewayPayload | null): ImportCandidate[] {
+  const candidates = importCandidates(payload);
+  const magpie = candidates.filter((item) => item.source === "magpie");
+  const magpieDone = magpie.some((item) => item.imported);
+  const upstream = magpie.find((item) => item.id === MAGPIE_UPSTREAM_ID);
+  return candidates.filter((item) => {
+    if (item.imported) return false;
+    if (item.source !== "magpie") return true;
+    if (magpieDone) return false;
+    return upstream ? item === upstream : true;
+  });
+}
+
 /** 还没导入网关的供应商数（引导卡片用）。 */
 export function pendingImportCount(payload: GatewayPayload | null): number {
-  return importCandidates(payload).filter((item) => !item.imported).length;
+  return pendingImports(payload).length;
 }
 
 /* —————————————— 模型收藏 —————————————— */
@@ -1989,4 +2016,46 @@ export function memberTarget(payload: GatewayPayload | null, model: string): { e
   if (qualified) return qualified;
   const serving = servingProviders(payload, model);
   return serving.length === 1 ? { entry: serving[0], model: model.trim() } : null;
+}
+
+/** 「按模型批量添加」里一个模型下的一家供应商：`member` 是加进组里的成员值，`added` 表示组里已经有它。 */
+export type BatchMemberCandidate = { providerId: string; name: string; baseUrl: string; member: string; added: boolean };
+export type BatchMemberRow = { model: string; candidates: BatchMemberCandidate[] };
+
+/**
+ * 「按模型批量添加」（#2823）：每个模型列出池里提供它的供应商，勾选后一次加成组成员。
+ * 成员值与模型选择器一致：多家都有的模型写成 `<供应商 id>/<模型>` 固定到这一家，只有一家的用裸名。
+ */
+export function batchMemberRows(payload: GatewayPayload | null, members: GroupMember[]): BatchMemberRow[] {
+  const taken = new Set<string>();
+  for (const member of members) {
+    const target = memberTarget(payload, member.model);
+    if (target) taken.add(`${target.entry.id}/${target.model}`.toLowerCase());
+  }
+  return modelDispatch(payload).map((row) => {
+    const pinned = row.providers.length > 1 || Boolean(disabledGroup(payload, row.model));
+    return {
+      model: row.model,
+      candidates: row.providers.map((provider) => ({
+        providerId: provider.id,
+        name: provider.name,
+        baseUrl: provider.baseUrl,
+        member: pinned ? `${provider.id}/${row.model}` : row.model,
+        added: taken.has(`${provider.id}/${row.model}`.toLowerCase()),
+      })),
+    };
+  });
+}
+
+/** 把勾选的成员追加到组里：已有的（按成员值，不分大小写）跳过，新成员权重为 1。 */
+export function appendGroupMembers(members: GroupMember[], models: string[]): GroupMember[] {
+  const seen = new Set(members.map((member) => member.model.toLowerCase()));
+  const next = [...members];
+  for (const model of models) {
+    const key = model.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push({ model, weight: 1 });
+  }
+  return next;
 }

@@ -368,39 +368,27 @@ mod tests {
                                 .join("\n");
                             for (id, name) in ids.into_iter().zip(names) {
                                 let model = format!("group/{id}");
-                                let expected = if spec.id == "minimax-code" {
-                                    files::yaml_block(&model, &serde_json::json!({ "name": name }))
+                                let id_line = format!("id: {}", serde_json::json!(model));
+                                let name_line = format!("name: {}", serde_json::json!(name));
+                                let contains_label = if spec.id == "minimax-code" {
+                                    let label = serde_json::json!({ "name": name });
+                                    let expected = files::yaml_block(&model, &label)
                                         .lines()
                                         .map(str::trim_start)
                                         .collect::<Vec<_>>()
-                                        .join("\n")
+                                        .join("\n");
+                                    lines.contains(&expected)
                                 } else if spec.id == "dsh" {
-                                    // dsh 的模型还声明图片输入，YAML 中 input 位于 id/name 之间。
-                                    format!(
-                                        "id: {}\ninput:\n\"text\"\n\"image\"\nname: {}",
-                                        serde_json::json!(model),
-                                        serde_json::json!(name),
-                                    )
-                                } else {
-                                    format!(
-                                        "id: {}\nname: {}",
-                                        serde_json::json!(model),
-                                        serde_json::json!(name),
-                                    )
-                                };
-                                // dsh 的条目在 id 和 name 之间还有 input 等字段（#3042 起声明可收图），
-                                // 所以只要求 name 出现在同一条目里：id 行之后、下一个 id 行之前。
-                                let (id_line, name_line) = expected.split_once('\n').unwrap();
-                                let in_same_entry = || {
+                                    // DSH 模型条目还含有图片输入等字段，字段顺序取决于序列化配置。
                                     let mut rows = lines.lines().skip_while(|row| *row != id_line);
                                     rows.next().is_some()
                                         && rows
                                             .take_while(|row| !row.starts_with("id: "))
                                             .any(|row| row == name_line)
+                                } else {
+                                    lines.contains(&format!("{id_line}\n{name_line}"))
                                 };
-                                if lines.contains(&expected)
-                                    || (spec.id == "dsh" && in_same_entry())
-                                {
+                                if contains_label {
                                     labels.push((model, name.to_string()));
                                 }
                             }

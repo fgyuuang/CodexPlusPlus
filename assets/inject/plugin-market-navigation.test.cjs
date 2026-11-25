@@ -76,7 +76,6 @@ function fixture(layout = "sidebar") {
     codexPlusSidebarNavId: "codex-plus-sidebar-nav", codexPlusMenuId: "codex-plus-menu", codexPlusPageClass: "codex-plus-page",
     codexPlusRailNavId: "codex-plus-rail-nav", codexPlusRailExtensionsId: "codex-plus-rail-extensions", codexPlusRailSponsorId: "codex-plus-rail-sponsor", codexPlusRailProviderId: "codex-plus-rail-provider", codexPlusRailRemoteId: "codex-plus-rail-remote", codexPlusRailWeixinId: "codex-plus-rail-weixin", codexPlusRailTasksId: "codex-plus-rail-tasks",
     codexPlusRailSelector: 'nav[data-app-navigation-rail]', codexPlusRailDestinationSelector: "[data-sidebar-destination]",
-    codexPlusWorkGatewayProject: 'form button[data-composer-navigation-target="workspace-project"]',
     codexPlusDefaultExtensionIconPath: "", codexPlusLogoDataUrl: "", codexPlusExtensionConstants: { extensionAttribute: "data-codex-plus-ext" },
     codexPlusBackendStatus: { status: "ok" }, codexPlusActiveEntry: () => "", setCodexPlusSidebarNavActive() {},
     closeCodexPlusPage() {}, closeCodexPlusPageAfterNativeNavigation() {}, clearPluginMarketplaceQueryCache() {},
@@ -84,6 +83,8 @@ function fixture(layout = "sidebar") {
     // 拓展的图标栏入口随内置入口一起补画，这里只记次数。
     refreshCodexPlusRailNavigation: () => { railRefreshes += 1; },
     attachCodexPlusRailTooltip() {},
+    // 侧栏收起时的悬浮卡片随入口一起装（document 级 pointermove），这里不测。
+    installCodexPlusNavPeek() {},
     markCodexPlusExtensionNode: (node, owner) => node.setAttribute("data-codex-plus-ext", owner),
     isExtensionUiNode: extension,
     visibleElement: node => node.isConnected && node.visible,
@@ -198,4 +199,20 @@ test("native rail mutations schedule reconciliation while owned fallback writes 
   assert.equal(f.context.shouldScheduleScan([{ target: f.nav, addedNodes: [native], removedNodes: [] }]), true);
   native.remove();
   assert.equal(f.context.shouldScheduleScan([{ target: f.nav, addedNodes: [], removedNodes: [native] }]), true);
+});
+
+test("only the native Plugins entry remains: old buttons are cleaned up, the adapter is kept and third parties get no market routes", () => {
+  const extensionApi = fragment("91-extension-api.js");
+  const manifest = JSON.parse(fragment("manifest.json"));
+  assert.doesNotMatch(navigation, /id: codexPlusRailPluginMarketId, label: "Codex 插件市场"/);
+  assert.doesNotMatch(navigation, /\[codexPlusRailPluginMarketId, "plugin-market"\]/);
+  assert.doesNotMatch(navigation, /installCodexPlusPluginMarketSidebarNavigation\(/);
+  assert.match(entryNavigation, /document\.getElementById\(codexPlusRailPluginMarketId\)\?\.remove\(\)/);
+  assert.match(entryNavigation, /document\.getElementById\(codexPlusSidebarPluginMarketId\)\?\.remove\(\)/);
+  assert.match(adapter, /function codexPlusNativePluginNavigationEntry\(/);
+  assert.match(adapter, /function openCodexPlusNativePluginMarket\(/);
+  assert.match(adapter, /native\.click\(\)/);
+  assert.doesNotMatch(extensionApi, /["']\/plugin-market\/(?:install|list|install-status)["']/);
+  // Codex 里装插件走原生插件页（62 的适配层）；以前那个自己画的插件市场页已删掉。
+  assert.ok(!manifest.fragments.some((item) => item.name === "61-plugin-market-ui.js"));
 });

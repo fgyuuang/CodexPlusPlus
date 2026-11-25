@@ -347,7 +347,7 @@ codexPlus.extension((ctx) => {
   打开这个页面（和[管理器面板](#管理器面板)同一套沙箱与 `codexPlusManager` 接口，拓展停用时也能打开）；Codex 里
   「拓展」页面选中这个拓展时，详情的「设置」页签显示 `ctx.registerSettingsPanel({ render({ container, config, saveConfig }) })` 画的面板
   （拓展停用、面板还没登记时退回按清单生成的通用表单），
-  `saveConfig(values)` 只存本拓展声明过的项、回生效配置，可返回清理函数。两边想用同一份界面，就把界面写成一个函数，
+  `saveConfig(values)` 只存本拓展声明过的项（只覆盖给出的项，其余保留）、回生效配置，可返回清理函数。两边想用同一份界面，就把界面写成一个函数，
   页面脚本里调一次、设置页里内联一份（官方的 Agent 桌宠拓展就是这样，见 `assets/extensions/agent-pet/settings.js`）。
 - 不重载地接住新配置：`ctx.onConfigUpdate((next, prev) => { 应用 next; return true; })`。管理器保存后先问页面，这个拓展的
   每个实例都返回 `true` 时 `ctx.config` 原地换成新值，不再热重载；有一个实例没接（没注册或返回别的）就照常整体热重载。
@@ -602,7 +602,7 @@ codexPlus.extension({ inject: ["sessionQuery"], async apply(ctx) {
 | `listSessions({ archived?, limit?, offset? })` | 会话数组，新到旧 |
 | `filterSessions({ id?, cwd?, archived?, createdAfter?, createdBefore?, limit? })` | 会话数组 |
 | `readSession(id)` | `{ session, events }` 完整事件日志 |
-| `readTitle(id)` | 标题 |
+| `readTitle(id)` | 标题，优先使用侧栏的最新会话名称，无名称时使用数据库标题 |
 | `listEvents(id, { types?, offset?, limit?, fromEnd? })` | 轻量事件（长文本截到 200 字） |
 | `filterEvents(id, { types?, text?, limit? })` | 匹配的事件（文本不分大小写） |
 | `readEvent({ sessionId, seq, before?, after? })` | 以 seq 为中心的事件窗口 |
@@ -883,7 +883,8 @@ Codex++ 自带的功能全部是内置拓展：管理器「Codex → 内置拓�
 - `launch.before` / `launch.after`：启动 Codex 之前 / Codex 退出之后各跑一次（Node，默认导出函数），拿到
   `{ event, extension, codexHome, stateDir, appDir, platform, config }`，不含任何凭据。超时 `timeout` 秒（1~30，默认 10）；
   出错、超时只记诊断日志，不挡 Codex 启动。
-- 都只在用户脚本总开关与增强都开着时生效；「下次启动跳过拓展」开着时也跳过。
+- 都只在用户脚本总开关与增强都开着时生效；「下次启动跳过拓展」开着时也跳过。Codex++ 重启后只补回桥接（Codex 没重启）时
+  不跑启动前后脚本、也不为 preload 刷新页面。
 
 ### 悬浮球页签、工具调用视图、设置页分区
 
@@ -1065,7 +1066,7 @@ codexPlus.extension((ctx) => {
 
 | `codexPlusManager` 成员 | 说明 |
 | --- | --- |
-| `config.get()` / `config.set(values)` / `config.onChange(fn)` | 读写本拓展的配置（只能写清单 `config` 里声明过的项，类型要对）；保存后和设置表单一样热更新到 Codex 页面 |
+| `config.get()` / `config.set(values)` / `config.onChange(fn)` | 读写本拓展的配置（只能写清单 `config` 里声明过的项，类型要对）；`set` 只覆盖给出的项，其余已存的值保留；保存后和设置表单一样热更新到 Codex 页面 |
 | `backend.call(method, params)` | 调本拓展的常驻后台（`backend.script` 导出的方法），超时 30 秒 |
 | `asset(path)` | 本拓展 `assets/` 里资源的 data URL |
 | `toast(text)` | 在管理器里弹一条提示 |
@@ -1091,9 +1092,11 @@ codexPlus.extension((ctx) => {
   `icon` 可选 `app-window`、`bar-chart`、`list`、`server`、`store`、`palette`、`network`、`book`、`waypoints`、`plug`、`split`、
   `messages`、`paw`、`git-branch`、`wrench`、`settings`、`code`、`layers`，其余用默认图标。
 - `replaces`：顶替的管理器页面（路由 id：`hub`、`gatewayProviders`、`gateway`、`gatewayRouting`、`gatewayUsage`、`gatewaySettings`、
-  `requestLog`、`overview`、`relay`、`multiLaunch`、`relayEnvironment`、`claude`、`sessions`、`context`、`skills`、`weixin`、`dreamSkin`、
-  `pluginMarket`、`recommendations`、`agentCache`、`agentCollaboration`、`computerUse`）。打开这些页面时显示拓展页面，
-  上方有「查看内置页面」随时切回。「万物皆拓展」「内置拓展」「设置」三页是停用拓展的入口，不能顶替。
+  `requestLog`、`overview`、`relay`、`multiLaunch`、`claude`、`sessions`、`context`、`skills`、`weixin`、
+  `pluginMarket`、`agentCache`、`agentCollaboration`、`computerUse`）。打开这些页面时显示拓展页面，
+  上方有「查看内置页面」随时切回。「万物皆拓展」「启动急救」「设置」三页是停用拓展的入口，不能顶替；首页、Claude 的供应商与补丁页、
+  远程控制、Codex 设置也不开放。旧 id `relayEnvironment`、`recommendations`、`dreamSkin` 对应的页面已经并进别处，
+  写在清单里不报错，但不再顶替任何页面。
 - `data`：页面经 `codexPlusManager.data(name, params)` 能读的只读数据，要先在这里声明：`requestFlow`（最近的请求，`{ limit }`）、
   `requestLogs`（请求日志，`{ limit, sinceMs, agent, relayId, model }`）、`gatewayUsage`（用量统计，`{ range }`）、
   `localSessions`（本机会话，`{ offset, limit }`）。都不含 Key。
@@ -1480,9 +1483,18 @@ window.codexPlus.call("/thread-usage-history", { session_id })
 | `/thread-usage-live` | 会话最近的 token 事件 `{ session_id, events }`，参数同 `/thread-usage-history`。只读 rollout 尾部，可以秒级轮询（只读，与官方拓展包「用量状态栏」同源） |
 | `/backend/status` | Codex++ 版本与连接状态 `{ status, message, version }`（只读） |
 | `/settings/public` | 设置的公开子集：`codexPlusVersion`、`codexAppVersion`、`enhancementsEnabled`、`relayProfilesEnabled`、`modelCatalogFingerprint`，以及 `activeProfile { id, name, relayMode, protocol, model, contextWindow, autoCompactLimit, aggregate }`。不含地址、Key 与 config / auth 内容（只读） |
+| `/provider-prices/public` | 网关中已配置供应商的配置价 `{ providers: [{ id, name, price, modelPrices }] }`，包含停用的供应商；不含地址、Key 或其他设置（只读） |
 | `/model-catalog/public` | 当前供应商的模型目录：`models`、`modelMetadata`（每模型的 `contextWindow` 等）、`model`、`default_model`、`provider_name`、`model_provider`、`service_tier`。去掉了来源地址与本机路径（只读） |
 
 **写能力没有开放**：`/settings/set`、`/delete`、`/undo` 等都不在名单内。如果你确实需要某个路由，去 Codex++ 仓库提 issue 说明用途，不要在脚本里绕过白名单直接调底层桥接（见下方「限制」第 1 条）。
+
+`/provider-prices/public` 返回的是 Codex++ 配置价，不是上游实时报价或实际账单，也不会请求上游。`price` 是供应商默认价，未设置时为 `null`；`modelPrices` 按原始上游模型名保存逐模型价，缺项时为空对象。价格包含 `currency`、`input`、`cachedInput`、`output`，单位是每百万 Token。宿主现有配置不能区分价格字段中的未填写和明确免费，两者都可能为 `0`；通过管理器保存的全零价格会被视为未填写，不能据此断言免费或价格完整。
+
+查找模型价格时，宿主先将模型名及配置键两端去空白，剥去末尾合法的窗口后缀（例如 `[1M]`），按 ASCII 大小写不敏感比较。命中逐模型价时使用整条价格，不能用默认价填补其中的字段；未命中才使用 `price`。多个配置键归一化后匹配同一模型时，宿主按原始键的 UTF-8 字节顺序取第一条，不优先精确大小写。返回值保留全部原始键，调用方应维持同样规则；无价格和非目标币种均不等于零费用。
+
+```ts
+const result = await window.codexPlus.call<CodexPlusProviderPrices>("/provider-prices/public");
+```
 
 `/cdp/evaluate` 是显式开放的底层注入能力，用来把脚本打进宠物 overlay 这类独立窗口。它**不是**任意 CDP 协议：只能 `Runtime.evaluate`，只能打到 `app://-/index.html` 的 Codex 页面，返回值里也不带 WebSocket URL。调用时必须提供 `kind` 或 `target_id` 其一：
 

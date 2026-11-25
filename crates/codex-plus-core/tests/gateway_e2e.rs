@@ -131,7 +131,7 @@ fn binding(model: &str, token: &str) -> AgentBinding {
     }
 }
 
-/// 网关的供应商池只存在 gateway.json，不碰 settings.json。
+/// 网关的共享供应商只存在 gateway.json，不碰 settings.json。
 fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
     relays
         .into_iter()
@@ -513,6 +513,59 @@ async fn gateway_end_to_end() {
         "{text}"
     );
     assert_eq!(events.last().unwrap()["type"], "message_stop", "{text}");
+
+    // —— 2c. 上游在完成事件前掐断流：失败原因要进诊断日志，不能只留在请求日志里（#3164） ——
+    let cut_sse = format!(
+        "data: {}\n\n",
+        json!({"id":"c4","object":"chat.completion.chunk","model":"up","choices":[{"index":0,"delta":{"role":"assistant","content":"半截"}}]})
+    );
+    let (cut_base, _) = mock_upstream(vec![(200, "text/event-stream", cut_sse)]).await;
+    gateway.providers = providers(vec![relay(
+        "chat",
+        &cut_base,
+        "sk-chat",
+        RelayProtocol::ChatCompletions,
+        "deepseek-v4-pro",
+    )]);
+    save(&gateway);
+    let (status, text) = post(port, "/gw/claude/v1/messages", token, &claude_request(true)).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("上游在完成事件前结束了响应流"), "{text}");
+    let diagnostic_path = codex_plus_core::diagnostic_log::diagnostic_log_path();
+    let mut failed = None;
+    for _ in 0..40 {
+        failed = std::fs::read_to_string(&diagnostic_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|record| record["event"] == "gateway.claude_stream_failed");
+        if failed.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let failed = failed.unwrap_or_else(|| {
+        panic!(
+            "诊断日志缺少 gateway.claude_stream_failed：\n{}",
+            std::fs::read_to_string(&diagnostic_path).unwrap_or_default()
+        )
+    });
+    let detail = &failed["detail"];
+    assert_eq!(detail["agent"], "claude", "{failed}");
+    assert_eq!(detail["relayId"], "chat", "{failed}");
+    assert_eq!(detail["model"], "claude-sonnet-5", "{failed}");
+    assert_eq!(detail["upstreamModel"], "deepseek-v4-pro", "{failed}");
+    assert_eq!(detail["path"], "/gw/claude/v1/messages", "{failed}");
+    assert_eq!(detail["error"], "上游在完成事件前结束了响应流", "{failed}");
+    assert_eq!(detail["upstreamError"], "上游缺少完成事件", "{failed}");
+    assert!(
+        !failed.to_string().contains("sk-chat"),
+        "诊断日志不能带上游 Key：{failed}"
+    );
+    assert!(
+        !failed.to_string().contains(token),
+        "诊断日志不能带网关 token：{failed}"
+    );
 
     // —— 3. 非流式 → 原生 Responses 上游 ——
     let responses_body = json!({
@@ -1313,7 +1366,7 @@ async fn gateway_end_to_end() {
     }
 
     // —— 8d. Codex 以 ChatGPT 官方身份接入：请求带着 Codex 自己的登录先到本地代理（openai_base_url），
-    //        经托管的「Codex++ 网关」供应商转进网关，再按池路由 ——
+    //        经托管的「Codex++ 本地服务」供应商转进网关，再按池路由 ——
     let (codex_base, codex_seen) =
         mock_upstream(vec![(200, "text/event-stream", chat_sse("经网关回答"))]).await;
     gateway.providers = providers(vec![relay(

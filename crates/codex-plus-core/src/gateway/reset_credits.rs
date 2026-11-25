@@ -873,8 +873,8 @@ mod tests {
         let alias = official("reset-operation-alias");
         let now = Instant::now();
         let exhausted = FailureClass::QuotaExhausted { reset_after: None };
-        key_pool::record_failure(&original, &exhausted, now);
-        key_pool::record_failure(&alias, &exhausted, now);
+        key_pool::record_failure(&original, "", &exhausted, now);
+        key_pool::record_failure(&alias, "", &exhausted, now);
         let first = open_current(root.path(), &credential.account_id);
         let request_id = first.request_id.clone();
         record_reset_start(&first, &original.relay_id, now);
@@ -884,7 +884,7 @@ mod tests {
                 .is_err()
         );
         drop(first);
-        assert!(key_pool::cooling_remaining(&original, now).is_some());
+        assert!(key_pool::cooling_remaining(&original, "", now).is_some());
         let pending = current(root.path(), &credential.account_id);
         let mut limited =
             Redemption::open(root.path(), &credential.account_id, &pending.confirmation).unwrap();
@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(outcome, ConsumeOutcome::Rejected(429));
         assert!(finish_reset(&mut limited, outcome).is_err());
         drop(limited);
-        assert!(key_pool::cooling_remaining(&original, now).is_some());
+        assert!(key_pool::cooling_remaining(&original, "", now).is_some());
         let mut retry =
             Redemption::open(root.path(), &credential.account_id, &pending.confirmation).unwrap();
         record_reset_start(&retry, &alias.relay_id, now + Duration::from_secs(1));
@@ -904,8 +904,8 @@ mod tests {
         assert_eq!(outcome, ConsumeOutcome::AlreadyRedeemed);
         finish_reset(&mut retry, outcome).unwrap();
         drop(retry);
-        assert!(key_pool::cooling_remaining(&original, now).is_none());
-        assert!(key_pool::cooling_remaining(&alias, now).is_some());
+        assert!(key_pool::cooling_remaining(&original, "", now).is_none());
+        assert!(key_pool::cooling_remaining(&alias, "", now).is_some());
         assert!(
             Redemption::open(root.path(), &credential.account_id, &pending.confirmation).is_err()
         );
@@ -934,13 +934,14 @@ mod tests {
             let later = started_at + Duration::from_secs(1);
             key_pool::record_failure(
                 &key,
+                "",
                 &FailureClass::QuotaExhausted { reset_after: None },
                 later,
             );
             let mut retry = open_current(root.path(), account);
             record_reset_start(&retry, &key.relay_id, later);
             finish_reset(&mut retry, ConsumeOutcome::AlreadyRedeemed).unwrap();
-            assert!(key_pool::cooling_remaining(&key, later).is_some());
+            assert!(key_pool::cooling_remaining(&key, "", later).is_some());
             key_pool::reset(&key.relay_id);
         }
     }

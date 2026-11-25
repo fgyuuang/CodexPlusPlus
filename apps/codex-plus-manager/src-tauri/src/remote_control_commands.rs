@@ -16,6 +16,22 @@ pub async fn remote_control_request(action: String, args: Option<Value>) -> Resu
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+pub async fn chat_robot_request(
+    window: tauri::WebviewWindow,
+    action: String,
+    provider: Option<rc::chat_notifications::Provider>,
+    update: Option<rc::chat_notifications::Update>,
+) -> Result<Value, String> {
+    if window.label() != "main" {
+        return Err("请从管理器主窗口操作".into());
+    }
+    // 与 Codex 远程控制页（bridge `/remote-control/robots`）共用 core 的分发。
+    rc::chat_notifications::dispatch(&action, provider, update)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// 管理器启动时：标记服务由本进程托管（Codex 页面经 bridge 操作时据此放行），
 /// 开关打开就把服务拉起来（后台线程，不拖慢窗口出现）。
 pub fn start_from_saved_state_in_background() {

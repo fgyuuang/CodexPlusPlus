@@ -4,8 +4,10 @@ import test from "node:test";
 import vm from "node:vm";
 import { MANAGER_DATA_SOURCES, managerDataRequest, managerExtensionPages, managerNavPages, managerPageOverrides } from "./extension-manager-pages.ts";
 import { handleManagerRequest, MANAGER_PANEL_BOOTSTRAP, type ManagerBridgeDeps } from "./extension-manager-bridge.ts";
+import { isRouteAlias } from "./route-aliases.ts";
+import { readAppSource } from "./app-source.test-helper.ts";
 
-const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+const app = readAppSource();
 const rust = readFileSync(new URL("../../../crates/codex-plus-core/src/user_scripts.rs", import.meta.url), "utf8");
 
 /** Rust 侧 `pub const NAME: &[&str] = &[...]` 里的字符串。 */
@@ -41,7 +43,8 @@ test("拓展页面只取启用中、清单无误的；先声明的拓展优先�
 test("能顶替的页面都是管理器里真有的路由，且不含停用拓展的入口", () => {
   const routeIds = new Set([...app.matchAll(/\{ id: "([A-Za-z]+)",/g)].map((match) => match[1]));
   const replaceable = rustList("MANAGER_REPLACEABLE_PAGES");
-  for (const id of replaceable) assert.ok(routeIds.has(id), `${id} 不是管理器路由`);
+  // 旧 id（relayEnvironment、recommendations…）已并进别的页面，留在清单里只是兼容，不会再被顶替。
+  for (const id of replaceable) assert.ok(routeIds.has(id) || isRouteAlias(id), `${id} 不是管理器路由`);
   for (const id of ["userScripts", "enhance", "settings", "extension"]) assert.ok(!replaceable.includes(id), `${id} 不能被顶替`);
 });
 
@@ -104,9 +107,8 @@ test("面板桥接的 data / navigate：没给能力或页面不认得时回错�
 });
 
 test("App 把拓展页面接进侧栏、命令面板与页面渲染", () => {
-  // 侧栏：网关分组的拓展页面跟在聚合网关后面，其余两组合成一节「拓展页面」。
-  assert.match(app, /const gatewayExtensionItems = managerNavPages\(extensionPages, "gateway"\);/);
-  assert.match(app, /\(\["management", "tools"\] as ManagerNavGroup\[\]\)\.flatMap\(\(group\) => managerNavPages\(extensionPages, group\)\)/);
+  // 侧栏：本地服务不再占一组，声明在 gateway 分组的拓展页面和其余两组合成一节「拓展页面」（分组名照旧认）。
+  assert.match(app, /\(\["gateway", "management", "tools"\] as ManagerNavGroup\[\]\)\.flatMap\(\(group\) => managerNavPages\(extensionPages, group\)\)/);
   assert.match(app, /\{extensionPageView \?\? \(<>/);
   assert.match(app, /查看内置页面/);
 });
